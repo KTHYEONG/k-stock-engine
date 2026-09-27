@@ -53,6 +53,7 @@ class _ReferenceMaps:
     flow_receipt_count: int  # legacy per-cell investor_flow receipts
     receipt_source: Mapping[str, str]  # content_hash -> source of its latest receipt
     stored_blobs: frozenset[str]  # blobs already registered, skipped without file reads
+    unreferenced_blobs: frozenset[str]  # stored blobs whose verdict may still be upgraded
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +74,8 @@ def _catalog_database(runtime: DataRuntime) -> Path:
 def _load_reference_maps(database: Path) -> _ReferenceMaps:
     """Snapshot receipt references and stored blobs from the catalog file alone."""
     empty = _ReferenceMaps(
-        flow_hashes=frozenset(), flow_receipt_count=0, receipt_source={}, stored_blobs=frozenset()
+        flow_hashes=frozenset(), flow_receipt_count=0, receipt_source={},
+        stored_blobs=frozenset(), unreferenced_blobs=frozenset(),
     )
     if not database.is_file():
         return empty
@@ -119,6 +121,16 @@ def _load_reference_maps(database: Path) -> _ReferenceMaps:
                 if "blobs" in tables
                 else frozenset()
             )
+            unreferenced = (
+                frozenset(
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT content_hash FROM blobs WHERE usable = 0 AND unusable_reason = 'unreferenced'"
+                    ).fetchall()
+                )
+                if "blobs" in tables
+                else frozenset()
+            )
         finally:
             connection.close()
     except sqlite3.Error as exc:
@@ -128,6 +140,7 @@ def _load_reference_maps(database: Path) -> _ReferenceMaps:
         flow_receipt_count=int(count_row[0]) if count_row is not None else 0,
         receipt_source={key: source for key, (_, source) in latest.items()},
         stored_blobs=stored,
+        unreferenced_blobs=unreferenced,
     )
 
 
@@ -389,6 +402,53 @@ def _classify_industry(
     )
 
 
+def _classify_corp_disclosures(
+    *,
+    kind: EvidenceKind,
+    kind_dir: str,
+    content_hash: str,
+    payload_path: Path,
+    retrieved_at: datetime,
+    document: object,
+) -> _Decision | None:
+    """Usable per-corp disclosure page with its keyed receipt, or None when the shape differs."""
+    from src.data.evidence_sources import DART_CORP_DISCLOSURES_SOURCE
+
+    if kind_dir != "disclosures" or not isinstance(document, Mapping):
+        return None
+    corp = str(document.get("corp_code") or "").strip()
+    if not corp:
+        return None
+    try:
+        start = date.fromisoformat(str(document.get("start") or "").strip())
+        end = date.fromisoformat(str(document.get("end") or "").strip())
+    except ValueError:
+        return None
+    if end < start:
+        return None
+    records = document.get("records")
+    if not isinstance(records, list):
+        return None
+    natural_key = f"{corp}:{start.isoformat()}..{end.isoformat()}"
+    status = EvidenceStatus.SUCCESS if records else EvidenceStatus.EMPTY
+    return _Decision(
+        blob=BlobEntry(
+            content_hash=content_hash, kind=kind, source=DART_CORP_DISCLOSURES_SOURCE, usable=True,
+            unusable_reason=None, retrieved_at=retrieved_at, payload_path=payload_path,
+        ),
+        ranges=(),
+        entries=(
+            ReceiptIndexEntry(
+                source=DART_CORP_DISCLOSURES_SOURCE, natural_key=natural_key, as_of=end,
+                fiscal_period=None, status=status, content_hash=content_hash,
+                retrieved_at=retrieved_at, payload_path=payload_path,
+            ),
+        ),
+        usable_source=DART_CORP_DISCLOSURES_SOURCE,
+        unusable_reason=None,
+    )
+
+
 def _classify_blob(
     *,
     kind: EvidenceKind,
@@ -440,6 +500,12 @@ def _classify_blob(
             usable_source=receipt_source,
             unusable_reason=None,
         )
+    corp_decision = _classify_corp_disclosures(
+        kind=kind, kind_dir=kind_dir, content_hash=content_hash, payload_path=payload_path,
+        retrieved_at=retrieved_at, document=document,
+    )
+    if corp_decision is not None:
+        return corp_decision
     return _unusable_blob(
         kind=kind, content_hash=content_hash, payload_path=payload_path,
         retrieved_at=retrieved_at, source=kind_dir, reason="unreferenced",
@@ -454,9 +520,10 @@ def index_bronze(
     Payload files are read one at a time and released before the next is
     opened, so memory does not grow with the size of Bronze. Blobs already in
     the ``blobs`` table are skipped without reading their files, so a rerun
-    after an interruption continues where it stopped. Classification never
-    rewrites or deletes a payload; an unusable blob keeps its bytes and gets a
-    reason.
+    after an interruption continues where it stopped. A rerun upgrades a blob
+    still marked ``unreferenced`` when a rule now matches; no other stored
+    verdict is ever changed. Classification never rewrites or deletes a
+    payload; an unusable blob keeps its bytes and gets a reason.
 
     Raises:
         PITDataError: a payload's bytes do not hash to its directory name.
@@ -509,7 +576,7 @@ def index_bronze(
                     if blob_entry.name.startswith(".") or not blob_entry.is_dir(follow_symlinks=False):
                         continue
                     content_hash = blob_entry.name
-                    if content_hash in maps.stored_blobs:
+                    if content_hash in maps.stored_blobs and content_hash not in maps.unreferenced_blobs:
                         scanned += 1
                         already_registered += 1
                         continue
@@ -524,6 +591,9 @@ def index_bronze(
                         payload_path=payload_path,
                         maps=maps,
                     )
+                    if content_hash in maps.unreferenced_blobs and decision.usable_source is None:
+                        already_registered += 1
+                        continue
                     pending_blobs.append(decision.blob)
                     pending_ranges.extend(decision.ranges)
                     pending_entries.extend(decision.entries)

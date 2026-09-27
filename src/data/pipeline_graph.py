@@ -280,8 +280,7 @@ def _build_dividend_events(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pu
     _ = inputs
     runtime = ctx.runtime
     path = materialize_dividend_events(
-        bronze_root=runtime.workspace.bronze_root,
-        universe_root=runtime.workspace.silver_root,
+        catalog=ctx.catalog,
         silver_root=runtime.workspace.silver_root,
         calendar=_build_calendar(ctx),
     )
@@ -507,10 +506,12 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
         disclosure_digest = _reference(candidate.name, kind="disclosures")
         break
     bridge_receipt_hash: str | None = None
-    if (runtime.workspace.bronze_root / "dart_corp_codes").exists():
+    try:
         _, bridge_receipt_hash = load_frozen_dart_ticker_bridge(
             bronze_root=runtime.workspace.bronze_root, decision_time=ctx.decision_time
         )
+    except PITDataError:  # pragma: no cover - missing bridge preview fallback
+        bridge_receipt_hash = None
     calendar = _build_calendar(ctx)
     calendar_digest = hashlib.sha256(
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
@@ -569,16 +570,19 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
     from src.data.datasets import DatasetLayer as _Layer
     from src.data.dividend_events import POLICY_VERSION, _iter_decision_envelopes
 
-    bronze_root = ctx.runtime.workspace.bronze_root
-    envelopes = _iter_decision_envelopes(bronze_root)
+    envelopes = _iter_decision_envelopes(ctx.catalog)
     envelope_hashes = [
         hashlib.sha256(
             _json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         ).hexdigest()
         for envelope in envelopes
     ]
-    bridge_paths = sorted((bronze_root / "dart_corp_codes").glob("*/payload.json"))
-    bridge_receipt_hash = bridge_paths[-1].parent.name if bridge_paths else ""
+    try:
+        from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
+
+        _, bridge_receipt_hash = _read_bridge(ctx.catalog)
+    except PITDataError:  # pragma: no cover - missing bridge preview fallback
+        bridge_receipt_hash = ""
     calendar = _build_calendar(ctx)
     return DatasetIdentity(
         kind="dividend_events",
@@ -1026,6 +1030,12 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
     """Collection jobs in refresh order, from disclosures to investor flow."""
     return (
         (
+            "dart_corp_codes",
+            lambda ctx, *, dry_run, emit: _run_dart_collection_step(
+                ctx, "dart_corp_codes", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
             "dart_disclosures",
             lambda ctx, *, dry_run, emit: _run_dart_collection_step(
                 ctx, "dart_disclosures", dry_run=dry_run, emit=emit
@@ -1066,7 +1076,36 @@ def run_collection_jobs(
     """Run collection steps in order, reporting every step without building."""
     reports: list[CollectionStepReport] = []
     for name, step in steps if steps is not None else _default_collection_steps():
-        report = step(ctx, dry_run=dry_run, emit=emit)
+        try:
+            report = step(ctx, dry_run=dry_run, emit=emit)
+        except Exception as exc:
+            from src.data.jobs.dart import DisclosureCoverageError
+
+            if isinstance(exc, DisclosureCoverageError):
+                report = CollectionStepReport(
+                    job=name, status="coverage_gap", done=0, pending_left=0, requests_used=0,
+                )
+                emit(
+                    {
+                        "type": "collection",
+                        "job": report.job,
+                        "status": report.status,
+                        "done": report.done,
+                        "pending_left": report.pending_left,
+                        "requests_used": report.requests_used,
+                        "periods": list(exc.periods),
+                        "error": str(exc),
+                    }
+                )
+                _LOG.warning(
+                    "[DATA] stage=refresh_collect job=%s status=%s periods=%s",
+                    report.job,
+                    report.status,
+                    ",".join(exc.periods),
+                )
+                reports.append(report)
+                continue
+            raise
         if report.job != name:
             raise PITDataError(f"collection step name mismatch: expected={name!r} actual={report.job!r}")
         emit(

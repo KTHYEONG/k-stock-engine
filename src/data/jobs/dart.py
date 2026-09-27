@@ -13,10 +13,14 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
 
 from src.core.pit import EvidenceKind, PITDataError
 from src.data.collection import dart_fact_scoped_payload
+from src.data.dart_disclosures import (
+    iter_disclosure_records,
+    per_corp_coverage,
+    periodic_filing_identities,
+)
 from src.data.dart_documents import DartDocumentStore
 from src.data.evidence_sources import DART_DISCLOSURE_WINDOWS_SOURCE, DIVIDEND_DECISION_SOURCE
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
@@ -24,13 +28,14 @@ from src.data.jobs.universe import corp_code_bridge, eligible_tickers
 from src.data.receipt_catalog import EvidenceStatus
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedRawPayload, dart_fact_natural_key
 from src.integrations.dart.dividend_decision import is_dividend_decision_title
-from src.integrations.dart.xbrl import DartXbrlCollector, is_transport_failure_page
+from src.integrations.dart.xbrl import is_transport_failure_page
 from src.integrations.errors import ProviderQuotaExhaustedError, ProviderRetryableError
 
 __all__ = [
     "DART_JOBS",
     "DartDisclosuresJob",
     "DartFactsJob",
+    "DisclosureCoverageError",
     "DividendDecisionsJob",
     "disclosure_windows",
     "import_legacy_dividend_cache",
@@ -49,6 +54,15 @@ _LEGACY_DIVIDEND_CACHE = "dividend_decision_lists.json"
 _KST = timedelta(hours=9)
 
 _ANSWERED = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY, EvidenceStatus.EXTRACTION_FAILED})
+_COMPLETED_ANSWERED = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EXTRACTION_FAILED})
+
+
+class DisclosureCoverageError(PITDataError):
+    """A required fiscal period whose filing deadline has passed has no discoverable periodic filing."""
+
+    def __init__(self, message: str, *, periods: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.periods = tuple(periods)
 
 
 def _kst_today(now: datetime) -> date:
@@ -146,31 +160,6 @@ def import_legacy_dividend_cache(ctx: JobContext) -> int:
     return len(payloads)
 
 
-def _per_corp_coverage(bronze_root: Path) -> dict[str, list[tuple[date, date]]]:
-    """Retained per-corp disclosure ranges; window receipts carry no corp range."""
-    coverage: dict[str, list[tuple[date, date]]] = {}
-    disclosures = Path(bronze_root) / "disclosures"
-    if not disclosures.is_dir():
-        return coverage
-    for payload_path in sorted(disclosures.glob("*/payload.json")):
-        try:
-            payload = json.loads(payload_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        corp = str(payload.get("corp_code") or "").strip()
-        try:
-            start = date.fromisoformat(str(payload.get("start") or "").strip())
-            end = date.fromisoformat(str(payload.get("end") or "").strip())
-        except ValueError:
-            continue
-        if not corp or end < start:
-            continue
-        coverage.setdefault(corp, []).append((start, end))
-    return coverage
-
-
 def _window_covered(
     coverage: Mapping[str, Sequence[tuple[date, date]]],
     corps: frozenset[str],
@@ -247,17 +236,32 @@ class DartDisclosuresJob:
         bridge = corp_code_bridge(ctx)
         tickers = eligible_tickers(ctx)
         eligible = frozenset(code for code, ticker in bridge.items() if ticker in tickers)
-        coverage = _per_corp_coverage(ctx.runtime.workspace.bronze_root)
+        coverage = per_corp_coverage(ctx.catalog)
         today = _kst_today(ctx.now())
         units: list[JobUnit] = []
-        for detail_type in ctx.provider.dart.disclosure_types:
+        for disclosure_filter in ctx.provider.dart.disclosure_filters:
+            detail_type = disclosure_filter.code
             for w_start, w_end in disclosure_windows(ctx.runtime.scope.evidence_start, today):
                 if w_end < today and _window_covered(coverage, eligible, w_start, w_end):
                     continue
                 key = _window_key(detail_type, w_start, w_end)
+                if w_end >= today:
+                    units.append(
+                        JobUnit(
+                            source=DISCLOSURE_WINDOW_SOURCE,
+                            natural_key=key,
+                            payload={
+                                "detail_type": detail_type,
+                                "window_start": w_start.isoformat(),
+                                "window_end": w_end.isoformat(),
+                            },
+                            max_requests=_DISCLOSURE_WINDOW_MAX_REQUESTS,
+                        )
+                    )
+                    continue
                 answered = ctx.catalog.latest(source=DISCLOSURE_WINDOW_SOURCE, natural_keys={key})
                 entry = answered.get(key)
-                if w_end < today and entry is not None and entry.status in _ANSWERED:
+                if entry is not None and entry.status in _COMPLETED_ANSWERED:
                     continue
                 units.append(
                     JobUnit(
@@ -275,11 +279,19 @@ class DartDisclosuresJob:
         return units
 
     def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
+        from src.config.providers import disclosure_filter_for_code
+
         out: list[ScopedRawPayload] = []
+        today = _kst_today(ctx.now())
         for unit in units:
             w_start = date.fromisoformat(unit.payload["window_start"])
             w_end = date.fromisoformat(unit.payload["window_end"])
-            rows = ctx.collector.list_disclosures(w_start, w_end, detail_type=unit.payload["detail_type"])
+            disclosure_filter = disclosure_filter_for_code(unit.payload["detail_type"])
+            rows = ctx.collector.list_disclosures(w_start, w_end, disclosure_filter=disclosure_filter)
+            if not rows and w_end < today:
+                raise PITDataError(
+                    f"DART list returned no filings for completed window {unit.natural_key}"
+                )
             out.append(
                 _window_payload(
                     detail_type=unit.payload["detail_type"],
@@ -295,6 +307,37 @@ class DartDisclosuresJob:
         ctx.collector.health_check()
 
 
+def _identity_fiscal_period(item: Mapping[str, str]) -> str | None:
+    raw = str(item.get("fiscal_period") or "").strip()
+    if raw:
+        return raw
+    biz_year = str(item.get("biz_year") or "").strip()
+    reprt_code = str(item.get("reprt_code") or "").strip()
+    quarter = {"11013": "Q1", "11012": "Q2", "11014": "Q3", "11011": "Q4"}.get(reprt_code)
+    if not biz_year or quarter is None:
+        return None
+    return f"{biz_year}{quarter}"
+
+
+def _check_disclosure_coverage(
+    identities: Sequence[Mapping[str, str]], *, periods: frozenset[str], today: date
+) -> None:
+    """Fail when a published period has no discoverable periodic filing."""
+    have: set[str] = set()
+    for item in identities:
+        period = _identity_fiscal_period(item)
+        if period is not None:
+            have.add(period)
+    missing = sorted(
+        period for period in periods if _publication_cutoff(period) < today and period not in have
+    )
+    if missing:
+        raise DisclosureCoverageError(
+            f"no discoverable periodic filing for {', '.join(missing)}",
+            periods=tuple(missing),
+        )
+
+
 class DartFactsJob:
     """Periodic-report facts for eligible corp codes, latest filing wins."""
 
@@ -306,15 +349,18 @@ class DartFactsJob:
         eligible = frozenset(code for code, ticker in bridge.items() if ticker in tickers)
         scope = ctx.runtime.scope
         end = last_completed_kst_day(ctx.now())
+        today = _kst_today(ctx.now())
         periods = frozenset(required_periods(fiscal_start=scope.features.fundamental_fiscal_start, today=end))
-        identities = DartXbrlCollector.filing_identities_from_bronze(
-            ctx.runtime.workspace.bronze_root,
+        records = iter_disclosure_records(ctx.catalog)
+        identities = periodic_filing_identities(
+            records,
             start=scope.evidence_start,
             end=end,
             ticker_by_corp_code={code: bridge[code] for code in eligible},
             required_periods=periods,
             corp_codes=eligible,
         )
+        _check_disclosure_coverage(identities, periods=periods, today=today)
         latest: dict[str, dict[str, str]] = {}
         for item in identities:
             key = dart_fact_natural_key(corp_code=item["corp_code"], biz_year=item["biz_year"], reprt_code=item["reprt_code"])
@@ -405,37 +451,21 @@ class DividendDecisionsJob:
         scope = ctx.runtime.scope
         end = last_completed_kst_day(ctx.now())
         matches: dict[str, dict[str, str]] = {}
-        for payload_path in sorted((ctx.runtime.workspace.bronze_root / "disclosures").glob("*/payload.json")):
-            try:
-                payload = json.loads(payload_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise PITDataError("retained disclosure Bronze receipt is unreadable") from exc
-            records = payload.get("records") if isinstance(payload, dict) else None
-            if not isinstance(records, list):
+        for record in iter_disclosure_records(ctx.catalog):
+            if record.corp_code not in eligible:
                 continue
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                corp_code = str(record.get("corp_code") or "").strip()
-                if corp_code not in eligible:
-                    continue
-                receipt_day = str(record.get("rcept_dt") or "").strip()
-                if len(receipt_day) != 8 or not receipt_day.isdigit():
-                    continue
-                as_of = date(int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:]))
-                if as_of < scope.evidence_start or as_of > end:
-                    continue
-                if not is_dividend_decision_title(str(record.get("report_nm") or "")):
-                    continue
-                rcept_no = str(record.get("rcept_no") or "").strip()
-                if not rcept_no:
-                    continue
-                matches[rcept_no] = {
-                    "rcept_no": rcept_no,
-                    "corp_code": corp_code,
-                    "rcept_dt": receipt_day,
-                    "report_nm": str(record.get("report_nm") or ""),
-                }
+            as_of = record.rcept_dt
+            if as_of < scope.evidence_start or as_of > end:
+                continue
+            if not is_dividend_decision_title(record.report_nm):
+                continue
+            receipt_day = as_of.strftime("%Y%m%d")
+            matches[record.rcept_no] = {
+                "rcept_no": record.rcept_no,
+                "corp_code": record.corp_code,
+                "rcept_dt": receipt_day,
+                "report_nm": record.report_nm,
+            }
         pending_keys = _unanswered(ctx, source=DIVIDEND_DECISION_SOURCE, keys=sorted(matches))
         return [
             JobUnit(
@@ -480,10 +510,17 @@ class DividendDecisionsJob:
         ctx.collector.health_check()
 
 
+def _dart_corp_codes_job() -> JobSpec:
+    from src.data.jobs.corp_codes import DartCorpCodesJob
+
+    return DartCorpCodesJob()
+
+
 DART_JOBS: Mapping[str, JobSpec] = {
     DartDisclosuresJob.name: DartDisclosuresJob(),
     DartFactsJob.name: DartFactsJob(),
     DividendDecisionsJob.name: DividendDecisionsJob(),
+    "dart_corp_codes": _dart_corp_codes_job(),
 }
 
 

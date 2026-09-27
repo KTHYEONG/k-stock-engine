@@ -511,6 +511,7 @@ def test_dart_client_pacing_is_explicit_with_no_env_fallback(monkeypatch) -> Non
 def test_dart_client_passes_disclosure_detail_type() -> None:
     from datetime import date
 
+    from src.config.providers import DisclosureFilter
     from src.integrations.dart.client import DartApiClient
 
     seen: dict[str, str] = {}
@@ -520,10 +521,75 @@ def test_dart_client_passes_disclosure_detail_type() -> None:
         return {"status": "000", "list": []}
 
     DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
-        date(2024, 1, 1), date(2024, 1, 1), detail_type="A001"
+        date(2024, 1, 1), date(2024, 1, 1),
+        disclosure_filter=DisclosureFilter(code="A001", parameter="pblntf_detail_ty"),
     )
 
     assert seen["pblntf_detail_ty"] == "A001"
+
+
+def test_type_filter_sends_pblntf_ty() -> None:
+    from datetime import date
+
+    from src.config.providers import DisclosureFilter
+    from src.integrations.dart.client import DartApiClient
+
+    seen: dict[str, str] = {}
+
+    def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        seen.update(params)
+        return {"status": "000", "list": []}
+
+    DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
+        date(2024, 1, 1), date(2024, 1, 1),
+        disclosure_filter=DisclosureFilter(code="A", parameter="pblntf_ty"),
+    )
+
+    assert seen["pblntf_ty"] == "A"
+    assert "pblntf_detail_ty" not in seen
+
+
+def test_detail_filter_sends_pblntf_detail_ty() -> None:
+    from datetime import date
+
+    from src.config.providers import DisclosureFilter
+    from src.integrations.dart.client import DartApiClient
+
+    seen: dict[str, str] = {}
+
+    def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
+        seen.update(params)
+        return {"status": "000", "list": []}
+
+    DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
+        date(2024, 1, 1), date(2024, 1, 1),
+        disclosure_filter=DisclosureFilter(code="I001", parameter="pblntf_detail_ty"),
+    )
+
+    assert seen["pblntf_detail_ty"] == "I001"
+    assert "pblntf_ty" not in seen
+
+
+def test_collector_list_disclosures_delegates_filter() -> None:
+    from datetime import date
+
+    from src.config.providers import DisclosureFilter
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    seen: list[object] = []
+
+    class _Fake:
+        def list_disclosures(self, start, end, *, disclosure_filter=None):  # type: ignore[no-untyped-def]
+            seen.append(disclosure_filter)
+            return []
+
+    collector = DartXbrlCollector(api_key="k", min_interval=0.0, max_workers=1, client=_Fake())
+    collector.list_disclosures(
+        date(2024, 1, 1), date(2024, 1, 2),
+        disclosure_filter=DisclosureFilter(code="A", parameter="pblntf_ty"),
+    )
+
+    assert seen[0].parameter == "pblntf_ty"
 
 
 def test_request_validated_raises_distinguishable_quota_exhausted_type() -> None:

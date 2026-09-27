@@ -283,6 +283,8 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
     Command("collect-kis-investor-flow", "Collect range-planned KIS investor-flow pages", _add_flow_job, _run_kis_flow_job),
     Command("collect-dart-disclosures", "Collect market-wide DART disclosure windows", _add_dart_job,
             lambda args: _run_dart_job(args, job_name="dart_disclosures")),
+    Command("collect-dart-corp-codes", "Refresh the DART corp-code bridge when the universe needs it", _add_dart_job,
+            lambda args: _run_dart_job(args, job_name="dart_corp_codes")),
     Command("collect-dart-facts", "Collect DART periodic-report facts for eligible filings", _add_dart_job,
             lambda args: _run_dart_job(args, job_name="dart_facts")),
     Command("collect-dividend-decisions", "Collect DART cash-dividend decision archives", _add_dart_job,

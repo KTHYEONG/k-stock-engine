@@ -1,9 +1,11 @@
 """Provider throughput and quota policy loaded from ``config/providers.toml``."""
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, NonNegativeInt, PositiveFloat, PositiveInt, field_validator, model_validator
 
@@ -13,16 +15,46 @@ from src.config.runtime import RuntimeConfig
 __all__ = [
     "DartKeyPolicy",
     "DartPolicy",
+    "DisclosureFilter",
     "KisPolicy",
     "KrxPolicy",
     "LsPolicy",
     "ProviderPolicy",
     "RunnerPolicy",
+    "disclosure_filter_for_code",
     "load_provider_policy",
 ]
 
 # Sustained 15 rps was clean and 30 rps dropped the connection: 20 rps (0.05 s) is the floor.
 MIN_DART_INTERVAL_SECONDS = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class DisclosureFilter:
+    """One OpenDART ``list.json`` filter.
+
+    OpenDART separates the publication type (one letter, ``pblntf_ty``) from
+    the detail type (one letter plus three digits, ``pblntf_detail_ty``).
+    Sending a type as a detail code is not rejected by the API; it silently
+    returns no data, so the form is fixed when the configuration is read.
+    """
+
+    code: str
+    parameter: Literal["pblntf_ty", "pblntf_detail_ty"]
+
+
+_TYPE_CODE_PATTERN = re.compile(r"^[A-J]$")
+_DETAIL_CODE_PATTERN = re.compile(r"^[A-J][0-9]{3}$")
+
+
+def disclosure_filter_for_code(code: str) -> DisclosureFilter:
+    """Map one configured disclosure code to its OpenDART parameter."""
+    text = str(code).strip()
+    if _TYPE_CODE_PATTERN.fullmatch(text):
+        return DisclosureFilter(code=text, parameter="pblntf_ty")
+    if _DETAIL_CODE_PATTERN.fullmatch(text):
+        return DisclosureFilter(code=text, parameter="pblntf_detail_ty")
+    raise ConfigError(f"invalid disclosure type {code!r}: expected [A-J] or [A-J]NNN")
 
 
 class DartKeyPolicy(BaseModel):
@@ -60,6 +92,7 @@ class DartPolicy(BaseModel):
     batch_identities: PositiveInt
     shared_ip_avoid_windows_kst: list[tuple[str, str]] = []
     disclosure_types: tuple[str, ...] = ("A", "I001")
+    corp_codes_max_age_days: PositiveInt = 30
     keys: dict[str, DartKeyPolicy]
 
     @field_validator("keys")
@@ -74,8 +107,16 @@ class DartPolicy(BaseModel):
     def _check_disclosure_types(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         cleaned = tuple(item.strip() for item in value if item.strip())
         if not cleaned:
-            raise ValueError("dart.disclosure_types must declare at least one list type")
+            raise ConfigError("dart.disclosure_types must declare at least one list type")
+        for item in cleaned:
+            if not (_TYPE_CODE_PATTERN.fullmatch(item) or _DETAIL_CODE_PATTERN.fullmatch(item)):
+                raise ConfigError(f"invalid disclosure type {item!r}: expected [A-J] or [A-J]NNN")
         return cleaned
+
+    @property
+    def disclosure_filters(self) -> tuple[DisclosureFilter, ...]:
+        """Configured codes mapped to the OpenDART parameter each one requires."""
+        return tuple(disclosure_filter_for_code(code) for code in self.disclosure_types)
 
     @field_validator("shared_ip_avoid_windows_kst")
     @classmethod

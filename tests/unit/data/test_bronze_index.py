@@ -310,14 +310,18 @@ def test_index_bronze_collapses_cell_receipts_into_ranges(tmp_path: Path) -> Non
 
 
 def test_index_bronze_resumes_without_reopening_indexed_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An interrupted run continues where it stopped and never re-reads batch one."""
+    """An interrupted run continues where it stopped and never re-reads usable batch one."""
     from src.data.receipt_catalog import ReceiptCatalog as Catalog
 
     bronze_a = _bronze_root(tmp_path / "a")
     bronze_b = _bronze_root(tmp_path / "b")
     for bronze_root in (bronze_a, bronze_b):
         for index in range(5):
-            _json_blob(bronze_root, "daily_market", {"close": index})
+            _json_blob(bronze_root, "investor_flow", {
+                "provider": "LS", "endpoint": "t1702",
+                "query": {"symbol": f"00593{index}", "start": "2024-01-02", "end": "2024-01-04"},
+                "rows": [{"date": "20240102"}],
+            })
 
     real_publish = Catalog.publish
     calls = 0
@@ -349,17 +353,19 @@ def test_index_bronze_resumes_without_reopening_indexed_files(tmp_path: Path, mo
 
     rerun = index_bronze(_runtime(tmp_path / "a"), dry_run=False, batch_size=2, emit=lambda _: None)
     for content_hash in committed:
-        assert opens.get(str(bronze_a / "daily_market" / content_hash / "payload.json"), 0) == before.get(
-            str(bronze_a / "daily_market" / content_hash / "payload.json"), 0
+        assert opens.get(str(bronze_a / "investor_flow" / content_hash / "payload.json"), 0) == before.get(
+            str(bronze_a / "investor_flow" / content_hash / "payload.json"), 0
         )
     assert rerun.scanned == 5
     assert rerun.registered == 3
     assert rerun.already_registered == 2
-    assert dict(rerun.unusable) == {"unreferenced": 3}
+    assert dict(rerun.unusable) == {}
+    assert dict(rerun.usable) == {"ls_investor_flow": 3}
 
     clean = index_bronze(_runtime(tmp_path / "b"), dry_run=False, batch_size=2, emit=lambda _: None)
     assert rerun.scanned == clean.scanned
-    assert dict(rerun.ranges_published) == dict(clean.ranges_published) == {}
+    assert dict(rerun.ranges_published) == {"ls_investor_flow": 3}
+    assert dict(clean.ranges_published) == {"ls_investor_flow": 5}
     assert dict(rerun.receipts_removed) == dict(clean.receipts_removed) == {}
     assert rerun.registered == clean.registered - len(committed)
     assert rerun.already_registered == len(committed)
@@ -479,3 +485,101 @@ def test_index_bronze_cli_reports_counts(tmp_path: Path, capsys: pytest.CaptureF
     summary = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["scanned"] == 1
     assert summary["registered"] == 1
+
+
+def test_index_bronze_registers_per_corp_disclosure_page(tmp_path: Path) -> None:
+    """A per-corp disclosure blob becomes a usable dart_corp_disclosures receipt."""
+    from src.data.receipt_catalog import ReceiptCatalog
+
+    bronze_root = _bronze_root(tmp_path)
+    digest = _json_blob(
+        bronze_root, "disclosures",
+        {"corp_code": "00126380", "start": "2015-01-01", "end": "2019-06-30", "records": []},
+    )
+    malformed = [
+        {"start": "2015-01-01", "end": "2019-06-30", "records": []},
+        {"corp_code": "00126380", "start": "not-a-date", "end": "2019-06-30", "records": []},
+        {"corp_code": "00126380", "start": "2019-06-30", "end": "2015-01-01", "records": []},
+        {"corp_code": "00126380", "start": "2015-01-01", "end": "2019-06-30", "records": {}},
+    ]
+    malformed_hashes = [_json_blob(bronze_root, "disclosures", doc) for doc in malformed]
+
+    report = index_bronze(_runtime(tmp_path), dry_run=False, batch_size=10, emit=lambda _: None)
+
+    assert _blob_row(bronze_root, digest) == ("dart_corp_disclosures", 1, None)
+    for content_hash in malformed_hashes:
+        assert _blob_row(bronze_root, content_hash) == ("disclosures", 0, "unreferenced")
+    assert dict(report.usable) == {"dart_corp_disclosures": 1}
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    found = catalog.latest(source="dart_corp_disclosures", natural_keys={"00126380:2015-01-01..2019-06-30"})
+    assert found["00126380:2015-01-01..2019-06-30"].as_of == date(2019, 6, 30)
+
+
+def test_index_bronze_rerun_upgrades_unreferenced_only(tmp_path: Path) -> None:
+    """A rerun upgrades an unreferenced per-corp page but never a mapped-only blob."""
+    import json as _json
+
+    from src.core.pit import EvidenceKind
+    from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
+
+    bronze_root = _bronze_root(tmp_path)
+    per_corp_doc = {"corp_code": "00126380", "start": "2015-01-01", "end": "2019-06-30", "records": []}
+    per_corp = _json_blob(bronze_root, "disclosures", per_corp_doc)
+    mapped = _json_blob(bronze_root, "investor_flow", {
+        "provider": "KIS", "query": {"symbol": "005930", "anchor": "2024-01-04"},
+        "rows": [], "records": [{"ticker": "005930"}],
+    })
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    catalog.publish(
+        [],
+        blobs=[
+            BlobEntry(
+                content_hash=per_corp, kind=EvidenceKind.DISCLOSURES, source="disclosures",
+                usable=False, unusable_reason="unreferenced", retrieved_at=RETRIEVED_AT,
+                payload_path=bronze_root / "disclosures" / per_corp / "payload.json",
+            ),
+            BlobEntry(
+                content_hash=mapped, kind=EvidenceKind.INVESTOR_FLOW, source="kis_investor_flow",
+                usable=False, unusable_reason="kis_mapped_only", retrieved_at=RETRIEVED_AT,
+                payload_path=bronze_root / "investor_flow" / mapped / "payload.json",
+            ),
+        ],
+    )
+    assert _blob_row(bronze_root, per_corp) == ("disclosures", 0, "unreferenced")
+
+    report = index_bronze(_runtime(tmp_path), dry_run=False, batch_size=10, emit=lambda _: None)
+
+    assert _blob_row(bronze_root, per_corp) == ("dart_corp_disclosures", 1, None)
+    assert _blob_row(bronze_root, mapped) == ("kis_investor_flow", 0, "kis_mapped_only")
+    assert dict(report.usable) == {"dart_corp_disclosures": 1}
+    found = catalog.latest(source="dart_corp_disclosures", natural_keys={"00126380:2015-01-01..2019-06-30"})
+    assert found["00126380:2015-01-01..2019-06-30"].as_of == date(2019, 6, 30)
+    rerun = index_bronze(_runtime(tmp_path), dry_run=False, batch_size=10, emit=lambda _: None)
+    assert rerun.registered == 0
+    assert _json.loads((bronze_root / "disclosures" / per_corp / "payload.json").read_text()) == per_corp_doc
+
+
+def test_index_bronze_rerun_keeps_still_unusable_unreferenced(tmp_path: Path) -> None:
+    """An unreferenced blob with no matching rule stays unreferenced without a new row."""
+    from src.core.pit import EvidenceKind
+    from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
+
+    bronze_root = _bronze_root(tmp_path)
+    digest = _json_blob(bronze_root, "daily_market", {"close": 1})
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    catalog.publish(
+        [],
+        blobs=[
+            BlobEntry(
+                content_hash=digest, kind=EvidenceKind.DAILY_MARKET, source="daily_market",
+                usable=False, unusable_reason="unreferenced", retrieved_at=RETRIEVED_AT,
+                payload_path=bronze_root / "daily_market" / digest / "payload.json",
+            ),
+        ],
+    )
+
+    report = index_bronze(_runtime(tmp_path), dry_run=False, batch_size=10, emit=lambda _: None)
+
+    assert report.registered == 0
+    assert report.already_registered == 1
+    assert _blob_row(bronze_root, digest) == ("daily_market", 0, "unreferenced")

@@ -516,7 +516,8 @@ class ReceiptCatalog:
     def _write_blob(self, connection: sqlite3.Connection, blob: BlobEntry) -> None:
         stored_path = blob.payload_path.relative_to(self._bronze_root).as_posix()
         current = connection.execute(
-            "SELECT retrieved_at FROM blobs WHERE content_hash = ?", (blob.content_hash,)
+            "SELECT retrieved_at, usable, unusable_reason FROM blobs WHERE content_hash = ?",
+            (blob.content_hash,),
         ).fetchone()
         if current is None:
             connection.execute(
@@ -536,7 +537,16 @@ class ReceiptCatalog:
                 ),
             )
             return
-        if datetime.fromisoformat(str(current[0])) < blob.retrieved_at:
+        stored_retrieved_at = datetime.fromisoformat(str(current[0]))
+        upgrade_unreferenced = (
+            blob.usable
+            and int(current[1]) == 0
+            and str(current[2] or "") == "unreferenced"
+            and stored_retrieved_at <= blob.retrieved_at
+        )
+        if stored_retrieved_at >= blob.retrieved_at and not upgrade_unreferenced:
+            return
+        if True:
             connection.execute(
                 """
                 UPDATE blobs

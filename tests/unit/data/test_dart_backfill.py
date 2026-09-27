@@ -101,13 +101,13 @@ def test_scoped_batch_excludes_pre_floor_filing(tmp_path) -> None:
 
 
 def test_scoped_batch_reports_missing_without_discovery(tmp_path, monkeypatch) -> None:
+    from src.data import dart_disclosures as dart_disclosures_module
     from src.data.dart_backfill import build_scoped_dart_fact_batch
-    from src.integrations.dart import xbrl as dart_xbrl
 
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("disclosure-list discovery must not run")
 
-    monkeypatch.setattr(dart_xbrl.DartXbrlCollector, "filing_identities_from_bronze", _forbidden)
+    monkeypatch.setattr(dart_disclosures_module, "periodic_filing_identities", _forbidden)
     runtime = _scoped_runtime(tmp_path)
     incomplete = {"corp_code": "00126380", "biz_year": "2019", "reprt_code": "11013", "ticker": "005930"}
     batch = build_scoped_dart_fact_batch(
@@ -301,9 +301,7 @@ def test_scoped_batch_rejects_invalid_inputs(tmp_path) -> None:
         )
 
 
-def test_collect_dart_facts_command_dry_run(tmp_path, capsys) -> None:
-    import hashlib
-
+def test_collect_dart_facts_command_dry_run(tmp_path, capsys, monkeypatch) -> None:
     import polars as pl
 
     from src.data.cli import main
@@ -311,19 +309,31 @@ def test_collect_dart_facts_command_dry_run(tmp_path, capsys) -> None:
     from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
     from src.data.runtime import load_data_runtime
 
+    monkeypatch.setattr("src.data.jobs.dart._check_disclosure_coverage", lambda *a, **k: None)
+
     runtime = load_data_runtime(
         scope_config=Path("config/research/kr_swing_2019_v1.toml"), data_root=tmp_path / "data"
     )
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from src.core.pit import EvidenceKind as _Kind
+    from src.data.bronze import BronzeStore as _Store
+    from src.data.receipt_catalog import BlobEntry as _Blob, EvidenceStatus as _Status, ReceiptCatalog as _Catalog, ReceiptIndexEntry as _Entry
+
     bridge_raw = json.dumps(
         [{"ticker": "005930", "corp_code": "00126380", "corp_name": "Test Co"}],
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
-    bridge_path = (
-        runtime.workspace.bronze_root / "dart_corp_codes" / hashlib.sha256(bridge_raw).hexdigest() / "payload.json"
+    _moment = _datetime(2026, 9, 24, 3, 0, tzinfo=_UTC)
+    _store = _Store(runtime.workspace.bronze_root)
+    _receipt = _store.import_bytes(bridge_raw, kind=_Kind.SECURITY_MASTER, retrieved_at=_moment, source_label="test:bridge")
+    _catalog = _Catalog(runtime.workspace.bronze_root / "catalog")
+    _catalog.publish(
+        [_Entry(source="dart_corp_codes", natural_key="dart_corp_codes", as_of=_receipt.retrieved_at.date(), fiscal_period=None, status=_Status.SUCCESS, content_hash=_receipt.content_hash, retrieved_at=_receipt.retrieved_at, payload_path=_receipt.payload_path)],
+        blobs=[_Blob(content_hash=_receipt.content_hash, kind=_Kind.SECURITY_MASTER, source="dart_corp_codes", usable=True, unusable_reason=None, retrieved_at=_receipt.retrieved_at, payload_path=_receipt.payload_path)],
     )
-    bridge_path.parent.mkdir(parents=True, exist_ok=True)
-    bridge_path.write_bytes(bridge_raw)
     published = publish_dataset(
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(
@@ -344,11 +354,13 @@ def test_collect_dart_facts_command_dry_run(tmp_path, capsys) -> None:
         "corp_code": "00126380",
     }
     page_raw = json.dumps(page, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    page_path = (
-        runtime.workspace.bronze_root / "disclosures" / hashlib.sha256(page_raw).hexdigest() / "payload.json"
+    from datetime import date as _date
+
+    _page_receipt = _store.import_bytes(page_raw, kind=_Kind.DISCLOSURES, retrieved_at=_moment, source_label="test:disclosure")
+    _catalog.publish(
+        [_Entry(source="dart_corp_disclosures", natural_key="00126380:2015-01-01..2019-06-30", as_of=_date(2019, 6, 30), fiscal_period=None, status=_Status.SUCCESS, content_hash=_page_receipt.content_hash, retrieved_at=_page_receipt.retrieved_at, payload_path=_page_receipt.payload_path)],
+        blobs=[_Blob(content_hash=_page_receipt.content_hash, kind=_Kind.DISCLOSURES, source="dart_corp_disclosures", usable=True, unusable_reason=None, retrieved_at=_page_receipt.retrieved_at, payload_path=_page_receipt.payload_path)],
     )
-    page_path.parent.mkdir(parents=True, exist_ok=True)
-    page_path.write_bytes(page_raw)
     base = [
         "collect-dart-facts",
         "--scope-config", "config/research/kr_swing_2019_v1.toml",

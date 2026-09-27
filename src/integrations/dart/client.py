@@ -8,7 +8,7 @@ import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 from xml.etree import ElementTree
 
 import requests
@@ -21,6 +21,9 @@ from src.integrations.errors import (
 )
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
 from src.integrations.transport import HttpTransport, RetryPolicy
+
+if TYPE_CHECKING:
+    from src.config.providers import DisclosureFilter
 
 __all__ = [
     "DartApiError",
@@ -123,7 +126,7 @@ class DartClientProtocol(Protocol):
 
     def request_validated(self, endpoint: str, params: Mapping[str, str]) -> dict[str, Any]: ...
     def list_disclosures(
-        self, start: date, end: date, *, corp_code: str | None = ..., detail_type: str | None = ..., page_count: int = ...
+        self, start: date, end: date, *, corp_code: str | None = ..., disclosure_filter: DisclosureFilter | None = ..., page_count: int = ...
     ) -> list[dict[str, str]]: ...
     def fetch_document_archive(self, rcept_no: str) -> bytes: ...
     def ping(self) -> None: ...
@@ -292,7 +295,7 @@ class DartApiClient:
         end: date,
         *,
         corp_code: str | None = None,
-        detail_type: str | None = None,
+        disclosure_filter: DisclosureFilter | None = None,
         page_count: int = 100,
     ) -> list[dict[str, str]]:
         if start > end:
@@ -312,8 +315,8 @@ class DartApiClient:
             }
             if corp_code:
                 params["corp_code"] = corp_code
-            if detail_type:
-                params["pblntf_detail_ty"] = str(detail_type).strip()
+            if disclosure_filter is not None:
+                params[disclosure_filter.parameter] = disclosure_filter.code
             if self._request_json is not None and self._raw_request_json is None:
                 payload = self._request_json(self.DISCLOSURE_ENDPOINT, params)
                 if not isinstance(payload, dict):

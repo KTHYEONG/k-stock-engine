@@ -225,9 +225,10 @@ def load_frozen_dart_ticker_bridge(
     *, bronze_root: Path, decision_time: datetime
 ) -> tuple[dict[str, str], str]:
     from src.data.jobs.universe import read_corp_code_bridge
+    from src.data.receipt_catalog import ReceiptCatalog
 
     _ = decision_time
-    return read_corp_code_bridge(Path(bronze_root))
+    return read_corp_code_bridge(ReceiptCatalog(Path(bronze_root) / "catalog"))
 
 
 def _quarantine_to_json_record(record: QuarantinedFiling) -> dict[str, str]:
