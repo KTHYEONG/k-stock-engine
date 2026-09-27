@@ -1,0 +1,11 @@
+usage: cli.py collect-stock-classification [-h] [--scope-config SCOPE_CONFIG]
+                                           [--data-root DATA_ROOT]
+                                           [--symbols-from SYMBOLS_FROM]
+                                           [--pace-seconds PACE_SECONDS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --symbols-from SYMBOLS_FROM
+  --pace-seconds PACE_SECONDS

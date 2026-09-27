@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 
 @dataclass(frozen=True, slots=True)

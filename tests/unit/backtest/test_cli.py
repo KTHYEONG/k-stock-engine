@@ -174,3 +174,44 @@ def test_cli_rejects_non_silver_dividend_dataset(tmp_path: Path, capsys) -> None
 
     assert main(args) == 1
     assert "not a verified Silver dividend_events" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_excludes_dividends_outside_panel_session_range(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+    _publish(
+        tmp_path / "data",
+        "dividend_events",
+        DatasetLayer.SILVER,
+        pl.DataFrame(
+            {
+                "instrument_id": ["KRX:005930", "KRX:005930", "KRX:005930"],
+                "ex_session": [date(2023, 12, 27), date(2024, 1, 3), date(2024, 1, 3)],
+                "pay_session": [date(2024, 1, 2), date(2024, 1, 3), date(2024, 4, 20)],
+                "dps_krw": [100, 100, 100],
+            }
+        ),
+    )
+
+    assert main(_args(tmp_path, strategy)) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+def test_resolve_runtime_paths_defaults_to_runtime_config() -> None:
+    import argparse
+
+    from src.backtest.cli import _resolve_runtime_paths
+    from src.config import load_runtime_config
+
+    runtime_config = load_runtime_config()
+    args = argparse.Namespace(
+        scope_config=None, data_root=None, strategy="equal_weight_liquid",
+        strategy_config=None, engine_config=None,
+    )
+
+    scope_config, data_root, strategy_config, engine_config, rules_path = _resolve_runtime_paths(args)
+
+    assert scope_config == runtime_config.default_scope
+    assert data_root == runtime_config.data_root
+    assert strategy_config == runtime_config.strategies_root / "equal_weight_liquid.toml"
+    assert engine_config == runtime_config.engine
+    assert rules_path == runtime_config.market_rules

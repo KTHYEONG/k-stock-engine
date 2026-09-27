@@ -210,6 +210,7 @@ def _ensure_archives(
     provider failures; those filings stay missing so the next run resumes them.
     """
     from src.data.dart_documents import DartDocumentStore
+    from src.data.receipt_catalog import ReceiptCatalog
 
     missing = sorted(
         {
@@ -237,7 +238,7 @@ def _ensure_archives(
             health_check()
         except Exception:
             return (0, len(missing), unfetchable, "provider_unreachable")
-    store = DartDocumentStore(bronze_root)
+    store = DartDocumentStore(bronze_root, catalog=ReceiptCatalog(bronze_root / "catalog"))
     fetched = 0
     remaining: list[str] = []
     for filing_id in missing:
@@ -763,7 +764,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
-    from src.data.cli import load_data_runtime  # noqa: PLC0415
     from src.data.collection import dart_fact_scoped_payload  # noqa: PLC0415
     from src.data.dart_backfill import (  # noqa: PLC0415
         build_scoped_dart_collector,
@@ -771,6 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from src.data.receipt_catalog import ReceiptCatalog  # noqa: PLC0415
     from src.data.research_scope import PRIMARY_DART_KEY_ENV  # noqa: PLC0415
+    from src.data.runtime import load_data_runtime  # noqa: PLC0415
     from src.data.scoped_ingestion import ScopedBronzeWriter  # noqa: PLC0415
     from src.integrations.quota import ProviderQuotaStateStore  # noqa: PLC0415
 

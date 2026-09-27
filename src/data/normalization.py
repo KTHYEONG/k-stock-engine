@@ -10,8 +10,8 @@ from typing import Any, Final
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
-from src.data.schemas import PITDataError
 
 _DART_MAPPING_VERSION = "dart-fact-map-v1"
 

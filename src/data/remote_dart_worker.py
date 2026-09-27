@@ -9,20 +9,21 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from src.config.errors import ConfigError
+from src.config.secrets import read_secret
 from src.core.pit import PITDataError
-from src.integrations.dart.client import dart_quota_provider
+from src.data.jobs.runner import seconds_until_window_end
+from src.integrations.dart.client import dart_ledger_for_key
 from src.integrations.quota import ProviderQuotaStateStore
 
-_KST = timedelta(hours=9)
-_REQUESTS_PER_IDENTITY = 3  # worst case: CFS, OFS, document archive
+__all__ = ["WorkerResult", "run_named_job", "run_worker", "seconds_until_window_end"]
 
 
 class _Collector(Protocol):
@@ -31,31 +32,15 @@ class _Collector(Protocol):
     def health_check(self) -> None: ...
 
 
+_REQUESTS_PER_IDENTITY = 3  # worst case: CFS, OFS, document archive
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerResult:
     status: str
     done_total: int
     pending_left: int
     requests_today: int
-
-
-def _minutes(hhmm: str) -> int:
-    hours, minutes = hhmm.split(":")
-    return int(hours) * 60 + int(minutes)
-
-
-def seconds_until_window_end(now: datetime, windows: Sequence[Sequence[str]]) -> float:
-    """Seconds to wait when ``now`` (KST wall clock) is inside a protected window, else 0.
-
-    Windows mark periods when another job that shares this host's IP is expected to call the provider.
-    """
-    kst = now.astimezone(UTC) + _KST
-    minute = kst.hour * 60 + kst.minute
-    for start, end in windows:
-        if _minutes(start) <= minute < _minutes(end):
-            target = kst.replace(hour=_minutes(end) // 60, minute=_minutes(end) % 60, second=0, microsecond=0)
-            return max(0.0, (target - kst).total_seconds())
-    return 0.0
 
 
 def run_worker(
@@ -72,7 +57,9 @@ def run_worker(
     Args:
         root: Worker directory holding ``job.json``; ``out/`` and ``state/`` are created inside it.
         key_env: Environment variable holding the OpenDART key.
-        collect: ``collect_dart_financial_facts``-compatible callable.
+        collect: Collector callable returning an artifact with ``report_path`` and
+            ``filing_ids``; called as ``collect(dart=..., identities=..., bronze_root=...,
+            retrieved_at=...)``.
         build_collector: Factory for the collector given key, own quota ledger, and job policy.
         now: Clock; sleep: Sleep function (both injectable for tests).
 
@@ -113,16 +100,23 @@ def _run_locked(
         raise PITDataError(f"worker job file is missing: {job_path}")
     job = json.loads(job_path.read_text(encoding="utf-8"))
     policy = dict(job["policy"])
-    api_key = os.environ.get(key_env)
-    if not api_key:
-        raise PITDataError(f"{key_env} is not set")
+    try:
+        api_key = read_secret(key_env)
+    except ConfigError as exc:
+        raise PITDataError(f"{key_env} is not set") from exc
+    if not policy.get("quota_provider"):
+        policy["quota_provider"] = dart_ledger_for_key(
+            key_env=key_env,
+            primary_key_env=str(job.get("primary_key_env", key_env)),
+            api_key=api_key,
+        )
     out = root / "out"
     out.mkdir(exist_ok=True)
     done_path = out / "done.txt"
     done = set(done_path.read_text(encoding="utf-8").split()) if done_path.exists() else set()
     pending = [item for item in job["identities"] if str(item["filing_id"]) not in done]
     store = ProviderQuotaStateStore(root / "state")
-    provider = dart_quota_provider(api_key)
+    provider = str(policy["quota_provider"])
 
     def used_today() -> int:
         budget = int(policy["daily_budget"])
@@ -173,3 +167,104 @@ def _run_locked(
             return result("provider_unstable")
     (root / "COMPLETE").write_text(now().isoformat(), encoding="utf-8")
     return result("complete")
+
+
+def run_named_job(
+    *,
+    root: Path,
+    key_env: str,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], None] = time.sleep,
+) -> WorkerResult:
+    """Run the DART job named by ``root/job.json`` through the shared budgeted runner.
+
+    The job file names the job and the scope instead of carrying an identity
+    list, so the worker plans from catalog state like every local run. The job
+    file carries the scope and provider policy dumps, so the collection host
+    needs only the code, the key, and a mirrored data root; the quota ledger
+    lives in the workspace state and the local pull step folds it exactly once.
+
+    Returns:
+        Terminal status: ``complete``, ``budget_exhausted``,
+        ``provider_unreachable``, ``provider_unstable``, ``quota_blocked``,
+        ``chunk_limit``, ``dry_run`` or ``busy``.
+
+    Raises:
+        PITDataError: the job file is missing, malformed, or names an unknown job.
+    """
+    from src.config.providers import ProviderPolicy
+    from src.data.jobs.dart import resolve_dart_job
+    from src.data.jobs.runner import build_job_context, run_job
+    from src.data.research_scope import ResearchScope
+    from src.data.runtime import DataRuntime
+    from src.data.workspace import build_workspace
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    job_path = root / "job.json"
+    if not job_path.is_file():
+        raise PITDataError(f"worker job file is missing: {job_path}")
+    try:
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        job_name = str(job["job"])
+        scope = ResearchScope.model_validate(job["scope"])
+        provider = ProviderPolicy.model_validate(job["provider_policy"])
+        data_root = Path(str(job["data_root"]))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PITDataError(f"worker job file is invalid: {job_path}") from exc
+    spec = resolve_dart_job(job_name)
+    resolved_key = key_env or str(job.get("key_env") or provider.default_key_env)
+    try:
+        api_key = read_secret(resolved_key)
+    except ConfigError as exc:
+        raise PITDataError(f"{resolved_key} is not set") from exc
+    runtime = DataRuntime(scope=scope, workspace=build_workspace(data_root=data_root, scope=scope))
+    store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    try:
+        key_policy = provider.dart_key(resolved_key)
+    except ConfigError as exc:
+        raise PITDataError(f"worker key {resolved_key!r} has no declared policy") from exc
+    collector = DartXbrlCollector(
+        api_key,
+        quota_store=store,
+        quota_provider=dart_ledger_for_key(
+            key_env=resolved_key, primary_key_env=str(job.get("primary_key_env", resolved_key)), api_key=api_key
+        ),
+        max_workers=1,
+        min_interval=key_policy.min_interval_seconds,
+        daily_request_limit=key_policy.daily_budget,
+    )
+    ctx = build_job_context(
+        runtime=runtime, provider=provider, key_env=resolved_key, collector=collector, now=now, sleep=sleep
+    )
+
+    def emit(payload: Mapping[str, object]) -> None:
+        (root / "progress.json").write_text(json.dumps(dict(payload), sort_keys=True, default=str), encoding="utf-8")
+
+    max_chunks = job.get("max_chunks")
+    chunk = job.get("chunk")
+    report = run_job(
+        spec,
+        ctx,
+        chunk_size=int(chunk) if chunk is not None else provider.dart.batch_identities,
+        max_chunks=int(max_chunks) if max_chunks is not None else None,
+        dry_run=bool(job.get("dry_run", False)),
+        emit=emit,
+    )
+    (root / "progress.json").write_text(
+        json.dumps(
+            {
+                "status": report.status,
+                "done_total": report.done,
+                "pending_left": report.pending_left,
+                "requests_today": report.requests_used,
+                "at": now().isoformat(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    if report.status == "complete":
+        (root / "COMPLETE").write_text(now().isoformat(), encoding="utf-8")
+    return WorkerResult(report.status, report.done, report.pending_left, report.requests_used)

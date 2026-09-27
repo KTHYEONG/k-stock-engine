@@ -7,9 +7,11 @@ import re
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from typing import Any
 from xml.etree import ElementTree
+
+from src.integrations.dart.html_tables import decode_member as _decode_member
+from src.integrations.dart.html_tables import extract_tables as _extract_tables_shared
 
 MAPPING_VERSION = "dart-fact-map-v1"
 
@@ -116,41 +118,6 @@ def _is_unsafe_name(name: str) -> bool:
     return "../" in normalized or normalized.endswith("/..")
 
 
-def _decode_member(raw: bytes) -> str | None:
-    if raw.startswith(b"\xef\xbb\xbf"):
-        try:
-            return raw[3:].decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
-        try:
-            return raw.decode("utf-16")
-        except UnicodeDecodeError:
-            return None
-    head = raw[:1024].decode("ascii", errors="ignore")
-    m = re.search(r"encoding\s*=\s*['\"]([^'\"]+)['\"]", head)
-    if m:
-        enc = m.group(1).strip().lower()
-        normalized = enc.replace("_", "-")
-        if normalized in ("utf8", "utf-8"):
-            try:
-                return raw.decode("utf-8")
-            except UnicodeDecodeError:
-                pass
-        if normalized in ("cp949", "euc-kr", "ks-c-5601", "windows-949", "uhc"):
-            try:
-                codec = "cp949" if normalized in ("cp949", "windows-949", "uhc") else "euc-kr"
-                return raw.decode(codec)
-            except (UnicodeDecodeError, LookupError):
-                pass
-    for codec in ("cp949", "euc-kr", "utf-8"):
-        try:
-            return raw.decode(codec)
-        except UnicodeDecodeError:
-            continue
-    return None
-
-
 def _fiscal_period_from_identity(identity: Mapping[str, str]) -> str:
     for key in ("fiscal_period", "fiscalPeriod"):
         val = str(identity.get(key, "") or "").strip()
@@ -181,9 +148,9 @@ def _archive_member_priority(name: str) -> int:
     """Prefer DART's consolidated statement member when present."""
     normalized = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if re.search(r"_00761(?:\.|$)", normalized):
-        return 3  # pragma: no cover
+        return 3
     if re.search(r"_00760(?:\.|$)", normalized):
-        return 1  # pragma: no cover
+        return 1
     return 2
 
 
@@ -201,7 +168,8 @@ def parse_legacy_filing_archive(
             infos = zf.infolist()
     except zipfile.BadZipFile:
         return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("bad_zip",), document_hash=document_hash)
-    except Exception:
+    except (OSError, RuntimeError):
+        # reason: adapter boundary — hostile archives fail in implementation-specific ways; treat as bad zip.
         return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("bad_zip",), document_hash=document_hash)
     if len(infos) > _MAX_MEMBERS:
         return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("too_many_members",), document_hash=document_hash)
@@ -213,7 +181,7 @@ def parse_legacy_filing_archive(
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("duplicate_member",), document_hash=document_hash)
         seen.add(name)
         if info.is_dir():
-            continue  # pragma: no cover
+            continue
         if _is_unsafe_name(name):
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("unsafe_member_path",), document_hash=document_hash)
         is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
@@ -299,12 +267,7 @@ def parse_legacy_filing_archive(
     selected: dict[str, tuple[tuple[int, float, int, int], dict[str, Any]]] = {}
     for position, (member_priority, source_priority, record) in enumerate(candidates):
         fact = str(record.get("fact") or "").strip()
-        if not fact:
-            continue  # pragma: no cover
-        try:
-            magnitude = abs(float(str(record.get("value"))))
-        except (TypeError, ValueError):  # pragma: no cover
-            magnitude = 0.0
+        magnitude = abs(float(str(record.get("value"))))
         # Structured facts are already tied to an account/value pair.  Among
         # tolerant table candidates, magnitude separates full-KRW rows from
         # the compact thousand/million-KRW renderings; member priority then
@@ -321,40 +284,6 @@ def parse_legacy_filing_archive(
             return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=tuple(diagnostics), document_hash=document_hash)
         return LegacyFilingParseResult(records=(), status="extraction_failed", diagnostics=("extraction_failed",), document_hash=document_hash)
     return LegacyFilingParseResult(records=tuple(records), status="ok", diagnostics=tuple(diagnostics), document_hash=document_hash)
-
-
-class _LegacyTableParser(HTMLParser):
-    """Tolerant table reader for DART's non-XML pseudo-tags."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.table_index = -1
-        self.current_row: list[str] | None = None
-        self.current_cell: list[str] | None = None
-        self.tables: dict[int, list[list[str]]] = {}
-
-    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
-        name = tag.upper()
-        if name == "TABLE":
-            self.table_index += 1
-            self.tables[self.table_index] = []
-        elif name == "TR":
-            self.current_row = []
-        elif name in {"TD", "TH"} and self.current_row is not None:
-            self.current_cell = []
-
-    def handle_data(self, data: str) -> None:
-        if self.current_cell is not None:
-            self.current_cell.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        name = tag.upper()
-        if name in {"TD", "TH"} and self.current_row is not None and self.current_cell is not None:
-            self.current_row.append(" ".join("".join(self.current_cell).split()))
-            self.current_cell = None
-        elif name == "TR" and self.current_row is not None:
-            self.tables.setdefault(self.table_index, []).append(self.current_row)
-            self.current_row = None
 
 
 def _parse_legacy_amount(value: str) -> float | None:
@@ -379,10 +308,9 @@ def _extract_legacy_tables(
     fiscal_period: str,
     document_hash: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    parser = _LegacyTableParser()
-    parser.feed(text)
+    tables = _extract_tables_shared(text)
     candidates: dict[str, list[tuple[int, int, float]]] = {}
-    for table_index, rows in parser.tables.items():
+    for table_index, rows in enumerate(tables):
         table_facts: set[str] = set()
         for row in rows:
             if not row:
@@ -511,7 +439,8 @@ def _extract_records(
             # Try regex around this element's serialized text.
             try:
                 blob = ElementTree.tostring(elem, encoding="unicode")
-            except Exception:
+            except (ElementTree.ParseError, ValueError, TypeError):
+                # reason: adapter boundary — hostile element trees may not serialize; treat as missing value.
                 blob = ""
             m = _NUMBER_RE.search(blob)
             if not m:
@@ -531,7 +460,8 @@ def _extract_records(
             # Look for unit markers in blob.
             try:
                 blob_u = ElementTree.tostring(elem, encoding="unicode")
-            except Exception:
+            except (ElementTree.ParseError, ValueError, TypeError):
+                # reason: adapter boundary — hostile element trees may not serialize; treat unit as missing.
                 blob_u = ""
             if "KRW" in blob_u or "원" in blob_u:
                 unit = "KRW"

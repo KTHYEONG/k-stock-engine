@@ -9,6 +9,8 @@ from pathlib import Path
 
 from src.data.collection import dart_fact_scoped_payload
 from src.data.dart_documents import DartDocumentStore
+from src.data.evidence_sources import DART_DOCUMENT_SOURCE
+from src.data.receipt_catalog import ReceiptCatalog
 from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRawPayload
 from src.integrations.quota import ProviderQuotaStateStore
 
@@ -64,11 +66,11 @@ def ingest_remote_bronze(*, inbox_bronze: Path, bronze_root: Path, writer: Scope
     """
     tally = _Tally()
     documents = 0
-    document_store = DartDocumentStore(bronze_root)
-    for directory in sorted((inbox_bronze / "dart_documents").glob("*")) if (inbox_bronze / "dart_documents").is_dir() else []:
+    document_store = DartDocumentStore(bronze_root, catalog=ReceiptCatalog(bronze_root / "catalog"))
+    for directory in sorted((inbox_bronze / DART_DOCUMENT_SOURCE).glob("*")) if (inbox_bronze / DART_DOCUMENT_SOURCE).is_dir() else []:
         meta = _read_receipt(directory)
         payload_path = directory / "payload.zip"
-        name = f"dart_documents/{directory.name}"
+        name = f"{DART_DOCUMENT_SOURCE}/{directory.name}"
         if meta is None or not payload_path.is_file():
             continue
         raw = payload_path.read_bytes()

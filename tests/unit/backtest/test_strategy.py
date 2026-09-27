@@ -36,17 +36,17 @@ def _snapshot() -> PortfolioSnapshot:
 
 
 def test_targets_rejects_bad_weights() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="above 1"):
         Targets(weights={0: 0.7, 1: 0.5})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite non-negative"):
         Targets(weights={0: -0.1})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite non-negative"):
         Targets(weights={0: float("nan")})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite non-negative"):
         Targets(weights={0: float("inf")})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite non-negative"):
         Targets(weights={0: True})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="finite non-negative"):
         Targets(weights={0: "0.5"})
     assert Targets(weights={0: 0.5, 1: 0.5}).weights == {0: 0.5, 1: 0.5}
     assert Targets(weights={}).weights == {}
@@ -66,6 +66,21 @@ def test_equal_weight_liquid_respects_liquidity_floor(tmp_path: Any) -> None:
     )
     strategy = EqualWeightLiquid(min_adtv20_krw=1_000_000_000, max_names=10)
     assert strategy.decide(view, _snapshot()).weights == {1: 0.5, 2: 0.5}
+
+
+def test_equal_weight_liquid_skips_names_without_defined_volatility(tmp_path: Any) -> None:
+    day = date(2020, 1, 6)
+    view = _view(
+        tmp_path,
+        day,
+        [
+            _mrow(day, "KRX:A", adtv20=2_000_000_000.0, ret_vol60=None),
+            _mrow(day, "KRX:B", adtv20=2_000_000_000.0, ret_vol60=0.02),
+        ],
+        t=0,
+    )
+    strategy = EqualWeightLiquid(min_adtv20_krw=1_000_000_000, max_names=10)
+    assert strategy.decide(view, _snapshot()).weights == {1: 1.0}
 
 
 def test_equal_weight_liquid_selects_top_names_and_empty(tmp_path: Any) -> None:
@@ -112,11 +127,11 @@ def test_equal_weight_liquid_rebalances_monthly(tmp_path: Any) -> None:
 
 
 def test_equal_weight_liquid_rejects_bad_params() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="min_adtv20_krw"):
         EqualWeightLiquid(min_adtv20_krw=-1, max_names=5)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="max_names"):
         EqualWeightLiquid(min_adtv20_krw=0, max_names=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="min_adtv20_krw"):
         EqualWeightLiquid(min_adtv20_krw=True, max_names=5)
 
 

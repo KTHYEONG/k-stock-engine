@@ -14,7 +14,7 @@ from src.data.financial_quality import (
     load_latest_financial_quality,
     materialize_financial_quality,
 )
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 
 def _facts(*, company_id: str, period: str, available_at: datetime, missing: frozenset[str] = frozenset()) -> list[dict[str, object]]:
@@ -273,7 +273,7 @@ def test_quarantine_events_accept_datetime_and_reject_bad_shapes() -> None:
     import pytest
 
     from src.data.financial_quality import quarantine_events
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     available = datetime(2020, 3, 31, 0, 0, tzinfo=UTC)
     published = available - timedelta(days=1)
@@ -372,3 +372,76 @@ def test_financial_quality_materialization_and_loader_boundaries(tmp_path) -> No
     loaded = load_latest_financial_quality(root=root, decision_time=available)
     assert loaded.equals(quality)
     assert path.is_dir()
+
+
+def test_financial_quality_policy_and_event_guards_reject_bad_contracts() -> None:
+    import pytest
+
+    from src.data.financial_quality import (
+        FinancialQualityEvent,
+        FinancialQualityPolicy,
+        _as_utc,
+        _fiscal_key,
+        build_financial_quality_events,
+        eligible_companies_from_quality,
+    )
+
+    available = datetime(2024, 5, 1, tzinfo=UTC)
+    naive = available.replace(tzinfo=None)
+    with pytest.raises(ValueError, match="required facts"):
+        FinancialQualityPolicy(version="v", required_facts=())
+    with pytest.raises(ValueError, match="filing and reason"):
+        FinancialQualityEvent("005930", "2024Q1", "", available, available, "  ")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        FinancialQualityEvent("005930", "2024Q1", "f", naive, available, "missing")
+    with pytest.raises(ValueError, match="precede publication"):
+        FinancialQualityEvent("005930", "2024Q1", "f", available, available - timedelta(days=1), "missing")
+    assert _fiscal_key("bogus") == (-1, -1)
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        _as_utc(naive)
+    facts = pl.DataFrame({"company_id": ["005930"]})
+    with pytest.raises(PITDataError, match="lacks columns"):
+        build_financial_quality_events(facts, unresolved_events=(), decision_time=available)
+    rows = pl.DataFrame({"company_id": ["005930"]})
+    with pytest.raises(PITDataError, match="lack columns"):
+        eligible_companies_from_quality(rows, decision_time=available, company_ids={"005930"})
+    with pytest.raises(PITDataError, match="timezone-aware"):
+        eligible_companies_from_quality(rows, decision_time=naive, company_ids={"005930"})
+
+
+def test_financial_quality_skips_malformed_rows_without_failing() -> None:
+    import polars as pl
+
+    from src.data.financial_quality import build_financial_quality_events
+
+    available = datetime(2024, 5, 1, tzinfo=UTC)
+    frame = pl.DataFrame(
+        {
+            "company_id": ["", "005930"],
+            "fiscal_period": ["2024Q1", "2024Q1"],
+            "filing_id": ["F1", "F2"],
+            "fact": ["sales", "sales"],
+            "published_at": [available, available],
+            "available_at": [available, available],
+            "value": ["not-a-number", "also-bad"],
+            "unit": ["KRW", "KRW"],
+            "consolidated": [True, True],
+        },
+        schema_overrides={"published_at": pl.Datetime(time_zone="UTC"), "available_at": pl.Datetime(time_zone="UTC")},
+    )
+    out = build_financial_quality_events(frame, unresolved_events=(), decision_time=available)
+    assert out.is_empty()
+
+
+def test_build_financial_quality_dataset_rejects_bad_decision_time(tmp_path) -> None:
+    from tests.fixtures import scope_runtime
+
+    from src.data.financial_quality import build_financial_quality_dataset
+
+    runtime = scope_runtime(tmp_path)
+    for value, message in (("not-a-date", "ISO-8601"), ("2020-04-01T00:00:00", "timezone-aware")):
+        with pytest.raises(PITDataError, match=message):
+            build_financial_quality_dataset(
+                runtime, facts_dataset_id="financial_facts_0123456789abcdef", decision_time=value,
+                quarantine_file=None, unresolved_events_file=None,
+            )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.data.industry_ksic_map import learn_ksic_industry_mapping
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 
 def test_lookup_maps_unanimous_code_with_distinct_ticker_support() -> None:

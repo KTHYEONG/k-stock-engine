@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_COLLECTOR_ROLLOUT",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_COLLECTOR_ROLLOUT",
+      "domain": "data",
+      "title": "Collector rebuild real-data rollout",
+      "why": "The catalog-driven collector had passed code checks but had not been applied to the real Bronze data or the KIS 2026 gap.",
+      "resolution": "Indexed 227,709 Bronze pages into catalog v2, passed the three parity gates, collected KIS 2026 through range-planned jobs, refreshed the flow datasets and deleted 19,549 unusable investor-flow pages.",
+      "impact": "LS Silver builds in 58s instead of scanning 8.9GB, and the union now has 2026 flow with 2,426 cells still missing.",
+      "caveat": "Corporate-action and disclosure readers still scan Bronze directories, so their unusable blobs were kept."
+    },
+    {
+      "task_id": "TASK_COLLECTOR_REBUILD",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_COLLECTOR_REBUILD",
+      "domain": "data",
+      "title": "Catalog-driven collector rebuild (C1-C4)",
+      "why": "Bronze inputs were found by directory scans with per-page sniffing, so collected data could be unusable for Silver and builds read 8.9GB each time.",
+      "resolution": "Catalog v2 with blobs and answered ranges, one contract-validating Bronze writer, raw-response collectors, Silver-derived range-planned LS/KIS jobs, and catalog-selected Silver inputs.",
+      "impact": "Planning reads only the catalog, each stored page is guaranteed Silver-readable, and KIS 2026 collection can resume without refetching.",
+      "caveat": "Real-data steps (index-bronze, LS/KIS Silver parity gates, KIS 2026 collection) are not yet run; DART/corporate-action readers still scan directories."
+    },
+    {
       "task_id": "TASK_REFACTOR_R4_DATASET_CONTRACT",
       "date": "2026-09-25",
       "adr_id": "ADR_20260925_REFACTOR_R4_DATASET_CONTRACT",

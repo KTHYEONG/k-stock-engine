@@ -19,9 +19,14 @@ Post-development protocol for task finalization, compact decision recording, and
    - Automatically updates single ledger: `docs/decisions/task_index.json` and `docs/code_map.json`.
    - Keep each field strictly to 1 concise sentence to preserve token efficiency for future sessions.
 
-2. **Targeted Artifact Cleanup**:
-   - `sync_task.py` purges ONLY the completed task's matching temporary spec (`docs/specs/*<TASK_ID>*_spec.md`), task-associated `scratch/` probe files, and task-associated `tmp/` test roots, while strictly preserving all other specs, scratch files, and persistent logs.
-   - Updates decision records ready for the downstream commit phase without leaving temporary task clutter.
+2. **Complete Temporary Artifact Cleanup**:
+   - `sync_task.py` executes full post-task cleanup by default:
+     - Purges completed temporary specs (`docs/specs/*.md`, `*_contract.json`).
+     - Clears all temporary scratch probe scripts and caches under `scratch/` (preserving `.gitignore`).
+     - Clears all test coverage and runner artifacts under `tmp/` (preserving `.gitignore`).
+     - Wipes dangling `.tmp` and `.bak` files across the workspace.
+   - If specific specs must be preserved, pass `--keep-specs <path...>`. If only specific specs should be removed, pass `--remove-specs <path...>`.
+   - Prepares clean decision records ready for the downstream atomic commit phase without leaving temporary clutter.
 
 ## Output
 
@@ -29,4 +34,4 @@ Keep chat output ultra-compact (1-2 lines). Retain English keys/badges while con
 
 ### 🧹 [SYNC] <Task Title>
 - **Registry Updated**: `task_index.json` (<ADR_ID>) / `code_map.json`
-- **Cleanup Completed**: 태스크 임시 스펙 및 scratch 산출물 정리 완료 (커밋 대기)
+- **Cleanup Completed**: 임시 스펙(`docs/specs/`), `scratch/`, `tmp/` 산출물 정리 완료 (커밋 대기)

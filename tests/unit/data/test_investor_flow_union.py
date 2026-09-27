@@ -122,7 +122,7 @@ def test_materialize_rejects_conflicting_key(tmp_path: Path) -> None:
     """A (session, ticker) key in both inputs fails closed without writing."""
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     ls_path, kis_path, silver = _write_inputs(
         tmp_path,
@@ -180,7 +180,7 @@ def test_materialize_rejects_differing_existing_dataset(tmp_path: Path) -> None:
     """A stale directory at the computed id is never silently overwritten."""
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     ls_path, kis_path, silver = _write_inputs(
         tmp_path,
@@ -202,7 +202,7 @@ def test_materialize_rejects_corrupt_input_partition(tmp_path: Path) -> None:
     """A tampered LS partition hash fails closed before any output is written."""
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     ls_path, kis_path, silver = _write_inputs(
         tmp_path,
@@ -238,7 +238,7 @@ def test_materialize_rejects_unreadable_existing_manifest(tmp_path: Path) -> Non
     """A directory at the computed id without a manifest fails closed."""
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     ls_path, kis_path, silver = _write_inputs(
         tmp_path,
@@ -258,7 +258,7 @@ def test_union_read_input_boundaries_and_empty_sides(tmp_path: Path, monkeypatch
 
     from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
     from src.data.investor_flow_union import _read_input, materialize_investor_flow_union
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
     import src.data.investor_flow_union as union_module
 
     ls_path, kis_path, silver = _write_inputs(

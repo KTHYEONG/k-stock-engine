@@ -13,8 +13,8 @@ from typing import Any, cast
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.data.datasets import dataset_partition_paths, load_manifest
-from src.data.schemas import PITDataError
 
 _LOG = logging.getLogger(__name__)
 

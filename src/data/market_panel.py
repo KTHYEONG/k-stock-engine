@@ -15,6 +15,7 @@ from typing import Any
 import polars as pl
 
 from src.core.market_rules import KrxMarket, KrxMarketRules
+from src.core.pit import PITDataError
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
@@ -23,7 +24,6 @@ from src.data.datasets import (
     load_manifest,
     publish_dataset,
 )
-from src.data.schemas import PITDataError
 
 POLICY_VERSION = "krx-market-panel-v2"
 

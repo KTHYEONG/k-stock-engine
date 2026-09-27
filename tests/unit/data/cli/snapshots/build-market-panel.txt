@@ -1,0 +1,15 @@
+usage: cli.py build-market-panel [-h] [--scope-config SCOPE_CONFIG]
+                                 [--data-root DATA_ROOT]
+                                 [--daily-market-dataset-id DAILY_MARKET_DATASET_ID]
+                                 [--universe-dataset-id UNIVERSE_DATASET_ID]
+                                 [--rules RULES]
+                                 [--instrument-buckets INSTRUMENT_BUCKETS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --daily-market-dataset-id DAILY_MARKET_DATASET_ID
+  --universe-dataset-id UNIVERSE_DATASET_ID
+  --rules RULES
+  --instrument-buckets INSTRUMENT_BUCKETS

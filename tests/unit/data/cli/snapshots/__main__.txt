@@ -1,0 +1,69 @@
+usage: cli.py [-h]
+              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-facts,collect-dividend-decisions,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+              ...
+
+PIT dataset foundation CLI
+
+positional arguments:
+  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-facts,collect-dividend-decisions,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+    normalize-dart-facts
+                        Incremental DART fact refresh
+    audit-ordinary-universe-prices
+                        Audit raw-price availability for the ordinary-share
+                        universe
+    scope-info          Show resolved scope and workspace roots
+    init-workspace      Create scope-namespaced workspace directories
+    index-bronze        Register and classify every stored Bronze payload in
+                        the catalog
+    collect-scoped      Persist scoped raw payloads to Bronze and catalog
+    collect-krx-daily-market
+                        Collect KRX daily-market pages for completed sessions
+    collect-krx-security-master
+                        Collect KRX security-master snapshots for completed
+                        sessions
+    collect-ls-investor-flow
+                        Collect range-planned LS investor-flow windows
+    collect-kis-investor-flow
+                        Collect range-planned KIS investor-flow pages
+    collect-dart-disclosures
+                        Collect market-wide DART disclosure windows
+    collect-dart-facts  Collect DART periodic-report facts for eligible
+                        filings
+    collect-dividend-decisions
+                        Collect DART cash-dividend decision archives
+    build-investor-flow-silver
+                        Build Silver LS investor-flow dataset from raw rows
+    build-daily-market-silver
+                        Build Silver daily-market dataset with KRX base prices
+    build-ordinary-universe
+                        Build the point-in-time ordinary-share universe
+    build-market-panel  Build decision-safe Gold market panel
+    build-reference-benchmarks
+                        Build frictionless Gold reference benchmarks
+    verify-datasets     Verify current or all scoped datasets
+    prune-datasets      Plan or apply removal of unreferenced datasets
+    refresh-scope       Refresh the whole scope (collect, build, verify,
+                        register)
+    build-investor-flow-kis-supplement
+                        Build the provider-tagged KIS supplement for the LS
+                        gap
+    build-investor-flow-union
+                        Union certified LS flow and its KIS supplement into
+                        one dataset
+    build-financial-quality
+                        Build certified financial-quality evidence from facts
+                        and quarantine
+    build-dividend-events
+                        Build Silver cash-dividend events from dated decision
+                        filings
+    collect-industry-classification
+                        Collect current KIS industry classifications to Bronze
+    collect-stock-classification
+                        Collect current KIS KSIC stock classifications to
+                        Bronze
+    build-industry-classification-silver
+                        Build the certified industry classification Silver
+                        snapshot
+
+options:
+  -h, --help            show this help message and exit

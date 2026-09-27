@@ -1,8 +1,6 @@
 """KIS transport-only client for active integrations."""
 from __future__ import annotations
 
-import json
-import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -11,7 +9,12 @@ from typing import Any
 
 import requests
 
-from src.core.paths import PROJECT_ROOT
+from src.config.providers import KisPolicy
+from src.config.runtime import load_runtime_config
+from src.config.secrets import read_secret
+from src.core.market_rules import KrxMarket, KrxMarketRules
+from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
+from src.integrations.transport import HttpTransport, RetryPolicy, TokenCache
 
 
 @dataclass
@@ -24,24 +27,25 @@ class KisCredentials:
     base_url: str | None = None
 
     @classmethod
-    def from_env(cls, env: str | None = None) -> KisCredentials:
-        app_key = os.getenv("KIS_APP_KEY", "").strip()
-        app_secret = os.getenv("KIS_APP_SECRET", "").strip()
-        account_raw = os.getenv("KIS_ACCOUNT_NO", "").strip()
-        prdt = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "").strip()
-        env_val = env if env is not None else os.getenv("KIS_ENV", "real")
+    def from_env(cls, policy: KisPolicy | None = None, *, env: str | None = None) -> KisCredentials:
+        """Read KIS credentials using the env names declared in ``policy``."""
+        from src.config.providers import load_provider_policy
+
+        resolved = policy if policy is not None else load_provider_policy(load_runtime_config()).kis
+        app_key = read_secret(resolved.app_key_env).strip()
+        app_secret = read_secret(resolved.app_secret_env).strip()
+        account_raw = read_secret(resolved.account_no_env).strip()
+        prdt = read_secret(resolved.account_product_code_env, default="").strip()
+        env_val = env if env is not None else read_secret(resolved.env_env, default="real")
         target_env = env_val.strip().lower() if env_val else "real"
-        base_url = os.getenv("KIS_BASE_URL", "").strip() or None
 
         if "-" in account_raw and not prdt:
             acc, parsed_prdt = account_raw.split("-", 1)
             account_raw = acc
             prdt = parsed_prdt
 
-        if not app_key or not app_secret:
-            raise ValueError("KIS_APP_KEY/KIS_APP_SECRET is required.")
         if not account_raw or not prdt:
-            raise ValueError("KIS_ACCOUNT_NO and KIS_ACCOUNT_PRODUCT_CODE are required.")
+            raise ValueError("KIS account number and product code are required.")
 
         return cls(
             app_key=app_key,
@@ -49,8 +53,17 @@ class KisCredentials:
             account_no=account_raw,
             account_product_code=prdt,
             env=target_env,
-            base_url=base_url,
         )
+
+
+def _default_kis_policy() -> KisPolicy | None:
+    try:
+        from src.config.providers import load_provider_policy
+
+        return load_provider_policy(load_runtime_config()).kis
+    except Exception:  # noqa: BLE001
+        # reason: adapter boundary — client must stay constructible in tests without runtime config.
+        return None
 
 
 class KisClient:
@@ -64,6 +77,10 @@ class KisClient:
         credentials: KisCredentials,
         timeout: int = 15,
         retry: int = 2,
+        *,
+        token_cache_dir: Path | None = None,
+        policy: KisPolicy | None = None,
+        min_interval_seconds: float | None = None,
     ) -> None:
         self.creds = credentials
         self.timeout = timeout
@@ -74,14 +91,43 @@ class KisClient:
         )
         self._access_token: str | None = None
         self._token_expire_at: datetime | None = None
-        self._token_cache_path = Path(PROJECT_ROOT) / "logs" / f"kis_token_{self.creds.env}.json"
+        resolved_policy = policy if policy is not None else _default_kis_policy()
+        if min_interval_seconds is not None:
+            pace = float(min_interval_seconds)
+        elif resolved_policy is not None:
+            pace = float(resolved_policy.min_interval_seconds)
+        else:
+            pace = 0.0
+        max_attempts = int(resolved_policy.max_attempts) if resolved_policy is not None else int(retry) + 1
+        self._retryable_codes: tuple[str, ...] = (
+            tuple(resolved_policy.retryable_msg_codes) if resolved_policy is not None else ()
+        )
+        cache_dir = token_cache_dir if token_cache_dir is not None else load_runtime_config().logs_root
+        self._token_cache_path = Path(cache_dir) / f"kis_token_{self.creds.env}.json"
+        self.token_cache = TokenCache(cache_dir, provider="kis", env=self.creds.env)
+        self._transport = HttpTransport(
+            provider="KIS",
+            base_url=self.base_url,
+            min_interval_seconds=pace,
+            retry=RetryPolicy(max_attempts=max(1, max_attempts)),
+            quota=None,
+            timeout_seconds=float(timeout),
+            session=self.session,
+            sleep=lambda seconds: time.sleep(seconds),
+            monotonic=lambda: time.monotonic(),
+        )
+
+    def _sync_session(self) -> None:
+        self._transport._session = self.session
 
     def _load_cached_token(self) -> None:
-        if not self._token_cache_path.exists():
-            return
         try:
+            if not self._token_cache_path.exists():
+                return
             if self._token_cache_path.stat().st_mode & 0o077:
                 return
+            import json
+
             payload = json.loads(self._token_cache_path.read_text(encoding="utf-8"))
             token = payload.get("access_token")
             expire_at = payload.get("expire_at")
@@ -92,39 +138,38 @@ class KisClient:
                 return
             self._access_token = token
             self._token_expire_at = dt_exp
-        except Exception:
+        except (OSError, ValueError):
+            # reason: adapter boundary — a corrupt token cache must read as a miss, never crash collection.
             return
 
     def _save_cached_token(self, token: str, expire_at: datetime) -> None:
+        import contextlib
+        import json
+        import os
+        import threading
+
         self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "access_token": token,
-            "expire_at": expire_at.isoformat(),
-        }
-        temp_path = self._token_cache_path.with_suffix(".tmp")
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        data = {"access_token": token, "expire_at": expire_at.isoformat()}
+        tmp_path = self._token_cache_path.parent / f".{self._token_cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(data, ensure_ascii=False))
-            os.replace(temp_path, self._token_cache_path)
+            os.replace(tmp_path, self._token_cache_path)
             self._token_cache_path.chmod(0o600)
         finally:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
 
     def _request_new_token(self) -> str:
         url = f"{self.base_url}/oauth2/tokenP"
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self.creds.app_key,
-            "appsecret": self.creds.app_secret,
-        }
+        body = {"grant_type": "client_credentials", "appkey": self.creds.app_key, "appsecret": self.creds.app_secret}
         resp = self.session.post(url, json=body, timeout=self.timeout)
         resp.raise_for_status()
         payload = resp.json()
         raw_token = payload.get("access_token")
         if not raw_token:
-            raise RuntimeError(f"Failed to issue token: {payload}")
+            raise ProviderTerminalError(f"Failed to issue token: {payload}", provider="KIS", endpoint="oauth2/tokenP")
         token = str(raw_token)
         expires_in = int(payload.get("expires_in", 86400))
         expire_at = datetime.now() + timedelta(seconds=max(expires_in - 120, 60))
@@ -165,6 +210,17 @@ class KisClient:
             headers["hashkey"] = hashkey
         return headers
 
+    def _classify_business(self, payload: dict[str, Any], *, endpoint: str) -> None:
+        rt_cd = payload.get("rt_cd")
+        if rt_cd in (None, "0"):
+            return
+        msg = str(payload.get("msg1", "Unknown KIS API error"))
+        code = str(payload.get("msg_cd", ""))
+        for retryable in self._retryable_codes:
+            if (code and (code == retryable or code.startswith(retryable))) or (msg and msg.startswith(retryable)):
+                raise ProviderRetryableError(f"KIS API error ({rt_cd}): {msg}", provider="KIS", endpoint=endpoint)
+        raise ProviderTerminalError(f"KIS API error ({rt_cd}): {msg}", provider="KIS", endpoint=endpoint)
+
     def _call(
         self,
         method: str,
@@ -175,49 +231,39 @@ class KisClient:
         include_auth: bool = True,
         use_hashkey: bool = False,
     ) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
         request_body = body or {}
         hashkey = None
         if use_hashkey and request_body:
             hashkey = self.get_hashkey(request_body)
-        last_error: Exception | None = None
-        for attempt in range(self.retry + 1):
+        headers = self._headers(tr_id=tr_id, include_auth=include_auth, hashkey=hashkey)
+        parsed: list[dict[str, Any]] = []
+        endpoint = path
+
+        def _classify(response: requests.Response) -> None:
             try:
-                resp = self.session.request(
-                    method=method.upper(),
-                    url=url,
-                    headers=self._headers(tr_id=tr_id, include_auth=include_auth, hashkey=hashkey),
-                    params=params,
-                    json=request_body if request_body else None,
-                    timeout=self.timeout,
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-                if not isinstance(payload, dict):
-                    raise RuntimeError(f"KIS response must be an object: {payload}")
-                rt_cd = payload.get("rt_cd")
-                if rt_cd not in (None, "0"):
-                    msg = payload.get("msg1", "Unknown KIS API error")
-                    raise RuntimeError(f"KIS API error ({rt_cd}): {msg}")
-                return payload
-            except Exception as exc:  # noqa: PERF203
-                last_error = exc
-                if attempt < self.retry:
-                    time.sleep(0.6 * (attempt + 1))
-                    continue
-                raise
-        raise RuntimeError(f"KIS API call failed: {last_error}")
+                payload = response.json()
+            except ValueError as exc:
+                raise ProviderRetryableError(
+                    f"KIS transient invalid JSON for {endpoint}", provider="KIS", endpoint=endpoint
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ProviderTerminalError(f"KIS response must be an object: {payload}", provider="KIS", endpoint=endpoint)
+            self._classify_business(payload, endpoint=endpoint)
+            parsed.append(payload)
+
+        self._sync_session()
+        str_params = {str(k): str(v) for k, v in (params or {}).items()}
+        if method.upper() == "GET":
+            self._transport.get(endpoint, str_params, headers=headers, classify=_classify)
+        else:
+            self._transport.post(endpoint, {str(k): v for k, v in request_body.items()}, headers=headers, classify=_classify)
+        return parsed[0]
 
     def get_hashkey(self, data: dict[str, Any]) -> str:
-        payload = self._call(
-            method="POST",
-            path="/uapi/hashkey",
-            body=data,
-            include_auth=False,
-        )
+        payload = self._call(method="POST", path="/uapi/hashkey", body=data, include_auth=False)
         hashkey = payload.get("HASH")
         if not hashkey:
-            raise RuntimeError(f"Failed to get hashkey: {payload}")
+            raise ProviderTerminalError(f"Failed to get hashkey: {payload}", provider="KIS", endpoint="/uapi/hashkey")
         return str(hashkey)
 
     def inquire_price(self, symbol: str) -> dict[str, Any]:
@@ -227,42 +273,31 @@ class KisClient:
             method="GET",
             path="/uapi/domestic-stock/v1/quotations/inquire-price",
             tr_id="FHKST01010100",
-            params={
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": symbol,
-            },
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol},
         )
         out = payload.get("output", {})
         if not isinstance(out, dict):
-            raise RuntimeError(f"KIS inquire_price malformed output: {payload}")
+            raise ProviderTerminalError(f"KIS inquire_price malformed output: {payload}", provider="KIS", endpoint="inquire-price")
         return out
 
     def search_stock_info(self, symbol: str) -> dict[str, Any]:
-        """Return KIS's stock-basic-information output (``CTPF1002R``) for one ticker.
-
-        Includes the KSIC code/name and listing/abolition dates for delisted
-        instruments, which the current-quote endpoint cannot describe.
-        Transport-only: no field is trimmed or renamed.
-        """
+        """Return KIS's stock-basic-information output (``CTPF1002R``) for one ticker."""
         if not symbol or not symbol.strip():
             raise ValueError("symbol is required")
         payload = self._call(
             method="GET",
             path="/uapi/domestic-stock/v1/quotations/search-stock-info",
             tr_id="CTPF1002R",
-            params={
-                "PRDT_TYPE_CD": "300",
-                "PDNO": symbol,
-            },
+            params={"PRDT_TYPE_CD": "300", "PDNO": symbol},
         )
         out = payload.get("output", {})
         if not isinstance(out, dict):
-            raise RuntimeError(f"KIS search-stock-info malformed output: {payload}")
+            raise ProviderTerminalError(
+                f"KIS search-stock-info malformed output: {payload}", provider="KIS", endpoint="search-stock-info"
+            )
         return out
 
-    def inquire_investor_trade_by_stock_daily(
-        self, symbol: str, anchor: date
-    ) -> tuple[dict[str, Any], ...]:
+    def inquire_investor_trade_by_stock_daily(self, symbol: str, anchor: date) -> tuple[dict[str, Any], ...]:
         if not symbol or not symbol.strip():
             raise ValueError("symbol is required")
         if not isinstance(anchor, date):
@@ -281,7 +316,7 @@ class KisClient:
         )
         raw = payload.get("output2", [])
         if not isinstance(raw, list):
-            raise RuntimeError("KIS investor flow output2 must be a list")
+            raise ProviderTerminalError("KIS investor flow output2 must be a list", provider="KIS", endpoint="investor-flow")
         return tuple(item for item in raw if isinstance(item, dict))
 
     def inquire_balance(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -307,9 +342,9 @@ class KisClient:
         o1 = payload.get("output1", [])
         o2 = payload.get("output2", [{}])
         if not isinstance(o1, list):
-            raise RuntimeError(f"KIS inquire_balance output1 malformed: {payload}")
+            raise ProviderTerminalError(f"KIS inquire_balance output1 malformed: {payload}", provider="KIS", endpoint="inquire-balance")
         if not isinstance(o2, list):
-            raise RuntimeError(f"KIS inquire_balance output2 malformed: {payload}")
+            raise ProviderTerminalError(f"KIS inquire_balance output2 malformed: {payload}", provider="KIS", endpoint="inquire-balance")
         return o1 or [], o2[0] if o2 else {}
 
     def place_order(
@@ -320,6 +355,10 @@ class KisClient:
         price: float | None = None,
         order_type: str = "market",
         exchange_code: str = "KRX",
+        *,
+        market: KrxMarket,
+        session: date,
+        rules: KrxMarketRules,
     ) -> dict[str, Any]:
         if qty <= 0:
             raise ValueError("qty must be > 0")
@@ -334,8 +373,10 @@ class KisClient:
         elif order_type.lower() == "limit":
             if price is None or price <= 0:
                 raise ValueError("limit order requires positive price")
+            rounded = round(price)
+            tick = rules.tick_size(session=session, market=market, price=rounded)
             ord_dvsn = "00"
-            ord_unpr = str(KisClient.round_to_krx_tick_size(price))
+            ord_unpr = str((rounded // tick) * tick)
         else:
             raise ValueError("order_type must be 'market' or 'limit'")
         if self.creds.env.startswith("demo") or self.creds.env.startswith("v"):
@@ -351,13 +392,7 @@ class KisClient:
             "ORD_UNPR": ord_unpr,
             "EXCG_ID_DVSN_CD": exchange_code,
         }
-        return self._call(
-            method="POST",
-            path="/uapi/domestic-stock/v1/trading/order-cash",
-            tr_id=tr_id,
-            body=body,
-            use_hashkey=True,
-        )
+        return self._call(method="POST", path="/uapi/domestic-stock/v1/trading/order-cash", tr_id=tr_id, body=body, use_hashkey=True)
 
     @staticmethod
     def parse_positions(output1: list[dict[str, Any]]) -> dict[str, int]:
@@ -397,11 +432,7 @@ class KisClient:
 
     @staticmethod
     def extract_cash(output2: dict[str, Any]) -> float:
-        for key in [
-            "dnca_tot_amt",
-            "nxdy_excc_amt",
-            "prvs_rcdl_excc_amt",
-        ]:
+        for key in ["dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt"]:
             if key in output2:
                 try:
                     val = float(output2[key])
@@ -413,25 +444,16 @@ class KisClient:
 
     @staticmethod
     def extract_total_equity(output2: dict[str, Any]) -> float:
-        for key in [
-            "tot_evlu_amt",
-            "tot_evlu_pfls_amt",
-            "nass_amt",
-            "total_eval_amount",
-        ]:
+        for key in ["tot_evlu_amt", "tot_evlu_pfls_amt", "nass_amt", "total_eval_amount"]:
             if key in output2:
                 try:
                     return float(output2[key])
-                except Exception:  # noqa: S112
+                except (ValueError, TypeError):
+                    # reason: adapter boundary — vendor numeric fields vary; unparseable values read as absent.
                     continue
         return 0.0
 
-    def inquire_psbl_order(
-        self,
-        symbol: str,
-        price: float = 0.0,
-        ord_dvsn: str = "01",
-    ) -> dict[str, Any]:
+    def inquire_psbl_order(self, symbol: str, price: float = 0.0, ord_dvsn: str = "01") -> dict[str, Any]:
         if not symbol or not symbol.strip():
             raise ValueError("symbol is required")
         is_demo = self.creds.env.startswith("demo") or self.creds.env.startswith("v")
@@ -453,7 +475,7 @@ class KisClient:
         )
         out = payload.get("output", {})
         if not isinstance(out, dict):
-            raise RuntimeError(f"KIS inquire_psbl_order malformed output: {payload}")
+            raise ProviderTerminalError(f"KIS inquire_psbl_order malformed output: {payload}", provider="KIS", endpoint="inquire-psbl-order")
         return out
 
     @staticmethod
@@ -473,7 +495,8 @@ class KisClient:
             if key in price_output:
                 try:
                     return float(price_output[key])
-                except Exception:  # noqa: S112
+                except (ValueError, TypeError):
+                    # reason: adapter boundary — vendor numeric fields vary; unparseable values read as absent.
                     continue
         return 0.0
 
@@ -487,24 +510,3 @@ class KisClient:
         except (ValueError, TypeError) as exc:
             raise ValueError(f"invalid limit price payload: {price_output}") from exc
         return mxpr, llam
-
-    @staticmethod
-    def round_to_krx_tick_size(price: float) -> int:
-        if not isinstance(price, (int, float)) or price <= 0:
-            raise ValueError("price must be positive")
-        p = round(price)
-        if p < 2000:
-            tick = 1
-        elif p < 5000:
-            tick = 5
-        elif p < 20000:
-            tick = 10
-        elif p < 50000:
-            tick = 50
-        elif p < 200000:
-            tick = 100
-        elif p < 500000:
-            tick = 500
-        else:
-            tick = 1000
-        return (p // tick) * tick

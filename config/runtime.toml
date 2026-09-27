@@ -1,0 +1,7 @@
+data_root = "data"
+default_scope = "config/research/kr_swing_2019_v1.toml"
+logs_root = "logs"
+market_rules = "config/market/krx_market_rules.toml"
+reference_benchmarks = "config/data/reference_benchmarks.toml"
+engine = "config/backtest/default_engine.toml"
+strategies_root = "config/strategy"

@@ -133,21 +133,43 @@ def test_canonical_scope_enables_flow_and_industry() -> None:
     assert scope.features.industry_enabled is True
 
 
-def test_budget_headroom_is_validated() -> None:
-    from pydantic import ValidationError
+def test_collection_section_is_rejected_with_config_error(tmp_path: Path) -> None:
+    from src.config.errors import ConfigError
+    from src.data.research_scope import load_research_scope
 
-    from src.data.research_scope import ResearchScope
+    raw = CANONICAL.read_text(encoding="utf-8")
+    legacy = tmp_path / "legacy.toml"
+    legacy.write_text(raw + '\n[collection]\ndart_daily_budget = 16000\ndart_batch_identities = 500\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="providers\\.toml"):
+        load_research_scope(legacy)
 
-    with pytest.raises(ValidationError):
-        ResearchScope.model_validate(_scope_payload(**{"collection.dart_batch_identities": 0}))
-    with pytest.raises(ValidationError):
-        ResearchScope.model_validate(_scope_payload(**{"collection.dart_daily_budget": 20000}))
-    with pytest.raises(ValidationError):
-        ResearchScope.model_validate(_scope_payload(**{"collection.dart_daily_budget": 25000}))
-    with pytest.raises(ValidationError):
-        ResearchScope.model_validate(
-            _scope_payload(**{"collection.dart_daily_budget": 400, "collection.dart_daily_reserve": 400})
-        )
+
+def test_scope_hash_excludes_throughput_and_matches_pinned_literal() -> None:
+    import hashlib
+    import json
+
+    scope = _load_canonical()
+    payload = {
+        "development_end": "2022-12-31",
+        "development_start": "2020-01-01",
+        "evidence_start": "2016-01-01",
+        "features": {
+            "fundamental_fiscal_start": "2016Q1",
+            "fundamental_lookback_quarters": 5,
+            "industry_enabled": True,
+            "investor_flow_enabled": True,
+            "price_lookback_sessions": 252,
+        },
+        "forward_start": "2026-01-01",
+        "holdout_end": "2025-12-31",
+        "holdout_start": "2024-01-01",
+        "scope_id": "kr_swing_2019_v1",
+        "validation_end": "2023-12-31",
+        "validation_start": "2023-01-01",
+    }
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert expected == "b3c7907dce7e02d387fc6295b6f611b48b249b43bea1e194a9f134865789de97"
+    assert scope.content_hash == expected
 
 
 def test_invalid_scope_id_fails() -> None:

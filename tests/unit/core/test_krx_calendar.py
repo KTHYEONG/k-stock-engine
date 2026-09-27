@@ -60,3 +60,17 @@ def test_xkrx_calendar_rejects_out_of_range_bounds() -> None:
         xkrx_session_calendar(start=date(1990, 1, 1), end=date(1990, 1, 10))
     with pytest.raises(ValueError, match="outside"):
         xkrx_session_calendar(start=date(2019, 1, 2), end=date(2100, 1, 1))
+
+
+def test_xkrx_calendar_through_is_stable_within_a_year_and_covers_next_year() -> None:
+    from datetime import date
+
+    from src.core.krx_calendar import xkrx_calendar_through
+
+    early = xkrx_calendar_through(date(2026, 1, 2))
+    late = xkrx_calendar_through(date(2026, 12, 30))
+
+    assert early.sessions == late.sessions
+    assert early.sessions[0].date() == date(2000, 1, 4)
+    assert early.sessions[-1].date().year == 2027
+    assert xkrx_calendar_through(date(2027, 1, 4)).sessions[-1].date().year == 2028

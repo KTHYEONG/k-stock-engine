@@ -1,0 +1,11 @@
+usage: cli.py build-investor-flow-union [-h] [--scope-config SCOPE_CONFIG]
+                                        [--data-root DATA_ROOT]
+                                        [--ls-flow-dataset-id LS_FLOW_DATASET_ID]
+                                        [--kis-supplement-dataset-id KIS_SUPPLEMENT_DATASET_ID]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --ls-flow-dataset-id LS_FLOW_DATASET_ID
+  --kis-supplement-dataset-id KIS_SUPPLEMENT_DATASET_ID

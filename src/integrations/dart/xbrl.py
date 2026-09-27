@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 import threading
 import zipfile
@@ -57,36 +56,40 @@ def _is_transport_failure(page: dict[str, Any]) -> bool:
     return any(marker in text for marker in _TRANSPORT_FAILURE_MARKERS)
 
 
+def is_transport_failure_page(page: Mapping[str, Any]) -> bool:
+    """True when one fetched page records a transport failure rather than DART's answer."""
+    return _is_transport_failure(dict(page))
+
+
 class DartXbrlCollector:
     """Filing-identity plus XBRL-facts evidence; missing XBRL blocks certification."""
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str,
         *,
+        min_interval: float,
+        max_workers: int,
         request_json: Any | None = None,
         request_bytes: Any | None = None,
         client: Any | None = None,
-        max_workers: int = 20,
         quota_store: ProviderQuotaStateStore | None = None,
+        quota_provider: str | None = None,
         now: Callable[[], datetime] | None = None,
-        min_interval: float | None = None,
         daily_request_limit: int | None = None,
     ) -> None:
-        key = api_key or os.getenv("OPENDART_API_KEY")
+        key = api_key
         if not key and request_json is None and request_bytes is None and client is None:
-            raise ValueError("OPENDART_API_KEY not found in environment variables")
+            raise ValueError("DART api_key is required")
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError(f"invalid max_workers {max_workers!r}: must be a positive integer")
-        env_workers = os.getenv("OPENDART_MAX_WORKERS")
-        if max_workers == 20 and env_workers and env_workers.isdigit() and int(env_workers) >= 1:
-            max_workers = int(env_workers)
         self._api_key = key
         self._request_json = request_json
         self._request_bytes = request_bytes
         self._client: Any | None = client
         self._max_workers = max_workers
         self._quota_store = quota_store
+        self._quota_provider = quota_provider
         self._now = now
         self._min_interval = min_interval
         if request_json is None and request_bytes is None and key is not None and self._client is None:
@@ -95,6 +98,7 @@ class DartXbrlCollector:
             self._client = DartApiClient(
                 api_key=key,
                 quota_store=quota_store,
+                quota_provider=quota_provider,
                 now=now,
                 min_interval=min_interval,
                 daily_request_limit=daily_request_limit,
@@ -106,6 +110,7 @@ class DartXbrlCollector:
                 api_key=key,
                 request_bytes=request_bytes,
                 quota_store=quota_store,
+                quota_provider=quota_provider,
                 now=now,
                 min_interval=min_interval,
                 daily_request_limit=daily_request_limit,
@@ -118,7 +123,7 @@ class DartXbrlCollector:
             loader = getattr(self._client, "load_corp_code_records", None)
             if loader is not None:
                 return tuple(loader())
-        client = DartApiClient(api_key=self._api_key)
+        client = DartApiClient(api_key=self._api_key, min_interval=self._min_interval)
         return tuple(client.load_corp_code_records())
 
     def fetch_disclosures(self, start: date, end: date, *, corp_codes: tuple[str, ...] | None = None) -> Iterable[dict[str, Any]]:
@@ -264,8 +269,12 @@ class DartXbrlCollector:
                     raw = self._request_json("fnlttSinglAcntAll", dict(request_identity))
                 else:
                     assert self._client is not None
+                    validated = getattr(self._client, "request_validated", None)
+                    if validated is None:
+                        validated = getattr(self._client, "_request_validated", None)
+                    assert validated is not None
                     try:
-                        raw = self._client._request_validated(
+                        raw = validated(
                             "fnlttSinglAcntAll.json",
                             {
                                 "corp_code": identity["corp_code"],
@@ -275,6 +284,7 @@ class DartXbrlCollector:
                             },
                         )
                     except Exception as exc:
+                        # reason: adapter boundary — provider client failures without a status code map to unavailable pages.
                         raise PITDataError(f"missing XBRL facts for {fid}; certification failure") from exc
                 if not isinstance(raw, dict) or not raw or str(raw.get("status") or "") in {"013", "014"}:
                     continue
@@ -376,7 +386,7 @@ class DartXbrlCollector:
 
         Raises:
             PITDataError: the client is unavailable.
-            DartRetryableError: the connection failed or the provider is throttling this host.
+            ProviderRetryableError: the connection failed or the provider is throttling this host.
         """
         if self._client is None:
             raise PITDataError("DART XBRL facts endpoint is not configured")
@@ -398,13 +408,12 @@ class DartXbrlCollector:
         fallback, and any other response failure returns an ``unavailable``
         record preserving the original error text in diagnostics.
         """
-        from src.integrations.dart.client import DartQuotaExhaustedError, DartRetryableError
         from src.integrations.dart.legacy_filing import (
             MAPPING_VERSION,
             map_standardized_account,
             parse_legacy_filing_archive,
         )
-        from src.integrations.quota import ProviderQuotaBlocked
+        from src.integrations.errors import ProviderQuotaExhaustedError, ProviderRetryableError
 
         def _blocked_record(status: str) -> dict[str, Any]:
             return {
@@ -453,7 +462,11 @@ class DartXbrlCollector:
                     raw = self._request_json("fnlttSinglAcntAll", {**identity, "fs_div": fs_div})
                 else:
                     assert self._client is not None
-                    raw = self._client._request_validated(
+                    validated = getattr(self._client, "request_validated", None)
+                    if validated is None:
+                        validated = getattr(self._client, "_request_validated", None)
+                    assert validated is not None
+                    raw = validated(
                         "fnlttSinglAcntAll.json",
                         {
                             "corp_code": identity["corp_code"],
@@ -462,17 +475,18 @@ class DartXbrlCollector:
                             "fs_div": fs_div,
                         },
                     )
-            except Exception as exc:
-                from src.integrations.dart.client import (
-                    DartApiError,
-                    DartQuotaExhaustedError,
-                    DartRetryableError,
-                    DartTerminalError,
+            except Exception as exc:  # noqa: BLE001
+                # reason: adapter boundary — provider client failures without a status code map to unavailable pages.
+                from src.integrations.dart.client import DartApiError
+                from src.integrations.errors import (
+                    ProviderQuotaExhaustedError,
+                    ProviderRetryableError,
+                    ProviderTerminalError,
                 )
 
-                if isinstance(exc, DartQuotaExhaustedError):
+                if isinstance(exc, ProviderQuotaExhaustedError):
                     return _blocked_record(_status_from_error(exc, last_status or "020"))
-                if isinstance(exc, (DartRetryableError, DartTerminalError, DartApiError, PITDataError)):
+                if isinstance(exc, (ProviderRetryableError, ProviderTerminalError, DartApiError, PITDataError)):
                     return _unavailable_record(
                         _status_from_error(exc, last_status or "013"), exc
                     )
@@ -587,12 +601,13 @@ class DartXbrlCollector:
                 raise PITDataError("DART document archive endpoint is not configured")
         except PITDataError:
             raise
-        except DartQuotaExhaustedError:
+        except ProviderQuotaExhaustedError:
             return _blocked_record("020")
-        except (DartRetryableError, ProviderQuotaBlocked) as exc:
+        except ProviderRetryableError as exc:
             # 전송 실패는 청크 전체를 잃게 하지 않고 미완료 페이지로 남겨 회로 차단기가 판단하게 한다.
             return _unavailable_record(last_status or "013", exc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
+            # reason: adapter boundary — archive fetch failures without a provider status cannot be classified.
             raise PITDataError(f"DART document archive failed for {fid}") from exc
         if not isinstance(archive, (bytes, bytearray)) or len(archive) == 0:
             return {

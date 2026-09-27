@@ -16,7 +16,7 @@ from src.data.reference_benchmarks import (
     load_benchmark_definitions,
     materialize_reference_benchmarks,
 )
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 DAY0 = date(2020, 1, 6)
 DAY1 = date(2020, 1, 7)

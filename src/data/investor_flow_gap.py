@@ -1,4 +1,4 @@
-"""Coverage-requirement diff between the Gold market panel and LS Silver flow."""
+"""Coverage-requirement diff between Silver flow targets and LS Silver flow."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ from pathlib import Path
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.data.datasets import dataset_partition_paths, load_manifest
-from src.data.schemas import PITDataError
+from src.data.flow_targets import FlowTargets
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +24,9 @@ class MissingInvestorFlowCells:
     """The exact (ticker, session) cells a certified LS Silver dataset lacks.
 
     Attributes:
-        market_panel_dataset_id: Gold panel that defines which cells require
-            coverage (eligible, tradable sessions).
+        universe_dataset_id: Silver universe the requirement set is pinned to.
+        daily_market_dataset_id: Silver daily market the requirement set is
+            pinned to.
         ls_dataset_id: The LS investor-flow Silver dataset this gap is
             computed against. A supplement built from this result is only
             ever valid for exactly this LS dataset id.
@@ -32,7 +34,8 @@ class MissingInvestorFlowCells:
         total_cells: Sum of every symbol's missing session count.
     """
 
-    market_panel_dataset_id: str
+    universe_dataset_id: str
+    daily_market_dataset_id: str
     ls_dataset_id: str
     symbols: tuple[InvestorFlowGapSymbol, ...]
     total_cells: int
@@ -59,53 +62,35 @@ def _read_verified_partitions(
 
 
 def compute_missing_investor_flow_cells(
-    *, market_panel_path: Path, ls_flow_silver_path: Path
+    *, targets: FlowTargets, ls_flow_silver_path: Path
 ) -> MissingInvestorFlowCells:
-    """Diff the Gold market panel's coverage requirement against certified LS flow.
+    """Diff Silver flow targets against certified LS flow.
 
-    A cell requires investor-flow coverage when its market-panel row is
-    ``eligible`` and ``price_state == "tradable"``. The gap is exactly the
+    A cell requires investor-flow coverage when it is in ``targets`` (eligible
+    ordinary shares on sessions they were tradable). The gap is exactly the
     requirement set minus the LS Silver dataset's ``(ticker, session)`` rows,
-    computed directly from certified data rather than a historical collection
-    plan, so it stays correct regardless of how that plan was built or has
-    since drifted.
+    computed directly from certified data.
 
     Args:
-        market_panel_path: Certified Gold ``market_panel_<id>`` directory.
-        ls_flow_silver_path: Certified Silver ``investor_flow_<id>`` directory
-            (the LS dataset from P0-3).
+        targets: Silver-derived requirement cells pinned to their universe
+            and daily-market dataset ids.
+        ls_flow_silver_path: Certified Silver ``investor_flow_<id>`` directory.
 
     Returns:
-        The missing-cell set, pinned to both input dataset ids.
+        The missing-cell set, pinned to both Silver inputs and the LS id.
 
     Raises:
-        PITDataError: either input's manifest or partition hashes fail
+        PITDataError: the LS input's manifest or partition hashes fail
             certification.
     """
-    panel_dir = Path(market_panel_path)
     ls_dir = Path(ls_flow_silver_path)
-    panel_id, panel_files = _read_verified_partitions(
-        panel_dir, label="market-panel", expected_kind="market_panel"
-    )
     ls_id, ls_files = _read_verified_partitions(
         ls_dir, label="investor-flow", expected_kind="investor_flow_ls"
     )
-    panel_frames: list[pl.DataFrame] = []
-    for file_path in panel_files:
-        candidate = pl.read_parquet(file_path)
-        if {"eligible", "price_state", "session", "instrument_id"}.issubset(candidate.columns):
-            panel_frames.append(candidate)
-    if not panel_frames:
-        raise PITDataError("market panel has no dense partitions")
     requirement = (
-        pl.concat(panel_frames, how="vertical_relaxed")
-        .select(["eligible", "price_state", "session", "instrument_id"])
-        .filter(pl.col("eligible") & (pl.col("price_state") == "tradable"))
-        .select(
-            pl.col("session").cast(pl.Date),
-            pl.col("instrument_id").cast(pl.String).str.split(":").list.last().alias("ticker"),
-        )
-        .unique()
+        targets.cells.select(
+            pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String)
+        ).unique()
     )
     ls_frames: list[pl.DataFrame] = []
     for file_path in ls_files:
@@ -128,7 +113,8 @@ def compute_missing_investor_flow_cells(
         )
     )
     return MissingInvestorFlowCells(
-        market_panel_dataset_id=panel_id,
+        universe_dataset_id=targets.universe_dataset_id,
+        daily_market_dataset_id=targets.daily_market_dataset_id,
         ls_dataset_id=ls_id,
         symbols=symbols,
         total_cells=sum(len(symbol.sessions) for symbol in symbols),
