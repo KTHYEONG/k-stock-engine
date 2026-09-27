@@ -330,7 +330,6 @@ def test_collect_scoped_and_disclosures_commands_persist(tmp_path: Path, capsys:
 
 
 def _seed_dart_scope(tmp_path: Path):  # type: ignore[no-untyped-def]
-    import hashlib
     import json
 
     import polars as pl
@@ -345,11 +344,9 @@ def _seed_dart_scope(tmp_path: Path):  # type: ignore[no-untyped-def]
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
-    bridge_path = (
-        runtime.workspace.bronze_root / "dart_corp_codes" / hashlib.sha256(bridge_raw).hexdigest() / "payload.json"
-    )
-    bridge_path.parent.mkdir(parents=True, exist_ok=True)
-    bridge_path.write_bytes(bridge_raw)
+    from tests.fixtures import seed_corp_code_bridge
+
+    seed_corp_code_bridge(runtime.workspace.bronze_root, bridge_raw)
     published = publish_dataset(
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(
@@ -375,7 +372,7 @@ def test_collect_dart_job_commands_dry_run(tmp_path: Path, capsys: pytest.Captur
     assert summary["pending_left"] > 0
 
     assert main(["collect-dart-facts", *args]) == 2
-    assert "disclosure" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert "periodic filing" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
 
     assert main(["collect-dividend-decisions", *args]) == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
@@ -397,9 +394,16 @@ def test_collect_disclosures_command_runs_with_fake_collector(
         def health_check(self) -> None:
             return None
 
-        def list_disclosures(self, start, end, *, detail_type=None):  # type: ignore[no-untyped-def]
-            assert (start, end, detail_type)[0] <= (start, end, detail_type)[1]
-            return []
+        def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            filt = disclosure_filter if disclosure_filter is not None else detail_type
+            code = getattr(filt, "code", filt)
+            assert start <= end
+            return [
+                {
+                    "rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": "00126380",
+                    "corp_name": "Test", "report_nm": "사업보고서 (2015.12)", "rm": "",
+                }
+            ]
 
     monkeypatch.setattr(
         "src.data.dart_backfill.build_scoped_dart_collector", lambda **_kwargs: _OfflineCollector()

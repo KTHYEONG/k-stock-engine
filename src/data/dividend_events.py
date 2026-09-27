@@ -14,6 +14,8 @@ import polars as pl
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
 from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
+from src.data.evidence_sources import DIVIDEND_DECISION_SOURCE
+from src.data.receipt_catalog import ReceiptCatalog
 from src.integrations.dart.dividend_decision import (
     DividendDecision,
     UndecidedRecordDateError,
@@ -35,29 +37,25 @@ _SCHEMA: dict[str, Any] = {
 }
 
 
-def _load_corp_bridge(bronze_root: Path) -> dict[str, str]:
+def _load_corp_bridge(catalog: ReceiptCatalog) -> dict[str, str]:
     from src.data.jobs.universe import read_corp_code_bridge
 
     try:
-        mapping, _ = read_corp_code_bridge(Path(bronze_root))
+        mapping, _ = read_corp_code_bridge(catalog)
     except PITDataError as exc:
         raise PITDataError(f"invalid dart corp-code bridge: {exc}") from exc
     return mapping
 
 
-def _iter_decision_envelopes(bronze_root: Path) -> list[dict[str, Any]]:
+def _iter_decision_envelopes(catalog: ReceiptCatalog) -> list[dict[str, Any]]:
     envelopes: list[dict[str, Any]] = []
-    for path in sorted((bronze_root / "corporate_actions").glob("*/payload.json")):
+    for blob in catalog.blobs(source=DIVIDEND_DECISION_SOURCE, usable=True):
+        path = Path(blob.payload_path)
         try:
             raw = path.read_bytes()
         except OSError as exc:
             raise PITDataError(f"dividend-decision Bronze payload is unreadable: {path}") from exc
-        expected_hash = path.parent.name
-        if (
-            len(expected_hash) != 64
-            or any(character not in "0123456789abcdef" for character in expected_hash)
-            or hashlib.sha256(raw).hexdigest() != expected_hash
-        ):
+        if hashlib.sha256(raw).hexdigest() != blob.content_hash:
             raise PITDataError(f"dividend-decision Bronze hash mismatch: {path}")
         if raw.lstrip()[:2] == b"PK":
             continue
@@ -141,18 +139,20 @@ def _resolve_available_at(received_on: date, *, calendar: SessionCalendar) -> da
 
 
 def materialize_dividend_events(
-    *, bronze_root: Path, universe_root: Path, silver_root: Path, calendar: SessionCalendar
+    *, catalog: ReceiptCatalog, silver_root: Path, calendar: SessionCalendar
 ) -> Path:
     """Build and publish ``dividend_events_<hash16>`` from decision filings."""
 
-    _ = Path(universe_root)
     if len(calendar.sessions) < 2:
         raise PITDataError("dividend events require at least two certified sessions")
-    bridge_root = Path(bronze_root)
-    bridge = _load_corp_bridge(bridge_root)
-    bridge_paths = sorted((bridge_root / "dart_corp_codes").glob("*/payload.json"))
-    bridge_receipt_hash = bridge_paths[-1].parent.name if bridge_paths else ""
-    envelopes = _iter_decision_envelopes(bridge_root)
+    bridge = _load_corp_bridge(catalog)
+    try:
+        from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
+
+        _, bridge_receipt_hash = _read_bridge(catalog)
+    except PITDataError:  # pragma: no cover - missing bridge preview fallback
+        bridge_receipt_hash = ""
+    envelopes = _iter_decision_envelopes(catalog)
     envelope_hashes = [
         hashlib.sha256(
             json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")

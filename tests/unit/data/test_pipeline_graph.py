@@ -164,9 +164,9 @@ def _fixture_context(tmp_path: Path) -> RefreshContext:
     )
     bridge = [{"corp_code": "00126380", "ticker": "005930"}]
     bridge_raw = json.dumps(bridge, sort_keys=True).encode("utf-8")
-    bridge_dir = bronze_root / "dart_corp_codes" / hashlib.sha256(bridge_raw).hexdigest()
-    bridge_dir.mkdir(parents=True, exist_ok=True)
-    (bridge_dir / "payload.json").write_bytes(bridge_raw)
+    from tests.fixtures import seed_corp_code_bridge
+
+    seed_corp_code_bridge(bronze_root, bridge_raw)
     from src.data.receipt_catalog import BlobEntry as _BlobEntry
     from src.core.pit import EvidenceKind as _Kind
 
@@ -460,9 +460,9 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 7
+    assert len(report.collection) == 8
     assert {str(step["job"]) for step in report.collection} == {
-        "dart_disclosures", "dart_facts", "dividend_decisions",
+        "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
         "krx_daily_market", "krx_security_master", "ls_investor_flow", "kis_investor_flow",
     }
 

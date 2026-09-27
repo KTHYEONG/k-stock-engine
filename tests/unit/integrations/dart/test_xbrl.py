@@ -535,24 +535,21 @@ def test_fetch_one_financial_fact_source_isolates_malformed_response() -> None:
 
 
 def test_filing_identities_from_bronze_maps_report_kind_to_fiscal_period(tmp_path) -> None:
-    import json
     from datetime import date
 
-    from src.integrations.dart.xbrl import DartXbrlCollector
+    from src.data.dart_disclosures import DisclosureRecord, periodic_filing_identities
 
-    page_dir = tmp_path / "disclosures" / "p1"
-    page_dir.mkdir(parents=True)
     records = [
-        {"rcept_dt": "20160516", "report_nm": "분기보고서 (2016.03)", "corp_code": "00126380", "rcept_no": "20160516000001"},
-        {"rcept_dt": "20160816", "report_nm": "반기보고서 (2016.06)", "corp_code": "00126380", "rcept_no": "20160816000002"},
-        {"rcept_dt": "20161115", "report_nm": "분기보고서 (2016.09)", "corp_code": "00126380", "rcept_no": "20161115000003"},
-        {"rcept_dt": "20170331", "report_nm": "사업보고서 (2016.12)", "corp_code": "00126380", "rcept_no": "20170331000004"},
-        {"rcept_dt": "20170331", "report_nm": "감사보고서 (2016.12)", "corp_code": "00126380", "rcept_no": "20170331000005"},
+        DisclosureRecord(corp_code="00126380", rcept_no="20160516000001", rcept_dt=date(2016, 5, 16), report_nm="분기보고서 (2016.03)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20160816000002", rcept_dt=date(2016, 8, 16), report_nm="반기보고서 (2016.06)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20161115000003", rcept_dt=date(2016, 11, 15), report_nm="분기보고서 (2016.09)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20170331000004", rcept_dt=date(2017, 3, 31), report_nm="사업보고서 (2016.12)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20170331000005", rcept_dt=date(2017, 3, 31), report_nm="감사보고서 (2016.12)"),
     ]
-    (page_dir / "payload.json").write_text(json.dumps({"corp_code": "00126380", "records": records}), encoding="utf-8")
 
-    identities = DartXbrlCollector.filing_identities_from_bronze(
-        tmp_path, start=date(2016, 1, 1), end=date(2017, 12, 31), ticker_by_corp_code={"00126380": "005930"}
+    identities = periodic_filing_identities(
+        records, start=date(2016, 1, 1), end=date(2017, 12, 31),
+        ticker_by_corp_code={"00126380": "005930"}, required_periods=None, corp_codes=None,
     )
 
     assert {(i["reprt_code"], i["fiscal_period"]) for i in identities} == {
@@ -741,42 +738,18 @@ def test_normalize_dart_financial_facts_accepts_opendart_standard_records() -> N
 
 
 def test_filing_identities_from_bronze_multi_receipt(tmp_path: Any) -> None:
-    import json
     from datetime import date
-    from pathlib import Path
-    from src.integrations.dart.xbrl import DartXbrlCollector
 
-    bronze_root = Path(tmp_path) / "bronze"
-    receipt1_dir = bronze_root / "disclosures" / "receipt1"
-    receipt2_dir = bronze_root / "disclosures" / "receipt2"
-    receipt1_dir.mkdir(parents=True, exist_ok=True)
-    receipt2_dir.mkdir(parents=True, exist_ok=True)
+    from src.data.dart_disclosures import DisclosureRecord, periodic_filing_identities
 
-    payload1 = {
-        "records": [
-            {
-                "rcept_no": "20150515001111",
-                "corp_code": "00126380",
-                "report_nm": "분기보고서 (2015.03)",
-                "rcept_dt": "20150515",
-            }
-        ]
-    }
-    payload2 = {
-        "records": [
-            {
-                "rcept_no": "20150817002222",
-                "corp_code": "00126380",
-                "report_nm": "반기보고서 (2015.06)",
-                "rcept_dt": "20150817",
-            }
-        ]
-    }
-    (receipt1_dir / "payload.json").write_text(json.dumps(payload1), encoding="utf-8")
-    (receipt2_dir / "payload.json").write_text(json.dumps(payload2), encoding="utf-8")
+    records = [
+        DisclosureRecord(corp_code="00126380", rcept_no="20150515001111", rcept_dt=date(2015, 5, 15), report_nm="분기보고서 (2015.03)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20150817002222", rcept_dt=date(2015, 8, 17), report_nm="반기보고서 (2015.06)"),
+    ]
 
-    identities = DartXbrlCollector.filing_identities_from_bronze(
-        bronze_root, start=date(2015, 1, 1), end=date(2015, 12, 31)
+    identities = periodic_filing_identities(
+        records, start=date(2015, 1, 1), end=date(2015, 12, 31),
+        ticker_by_corp_code=None, required_periods=None, corp_codes=None,
     )
     assert len(identities) == 2
     fids = {item["filing_id"] for item in identities}
@@ -786,15 +759,19 @@ def test_filing_identities_from_bronze_multi_receipt(tmp_path: Any) -> None:
 
 
 def test_filing_identities_attach_frozen_ticker_and_required_period_only(tmp_path) -> None:
-    import json
     from datetime import date
-    from src.integrations.dart.xbrl import DartXbrlCollector
 
-    path = tmp_path / "bronze" / "disclosures" / "r1"
-    path.mkdir(parents=True)
-    path.joinpath("payload.json").write_text(json.dumps({"records": [{"rcept_no": "20150515000001", "corp_code": "00126380", "report_nm": "분기보고서 (2015.03)", "rcept_dt": "20150515"}, {"rcept_no": "20151115000002", "corp_code": "00126380", "report_nm": "분기보고서 (2015.09)", "rcept_dt": "20151115"}]}), encoding="utf-8")
+    from src.data.dart_disclosures import DisclosureRecord, periodic_filing_identities
 
-    rows = DartXbrlCollector.filing_identities_from_bronze(tmp_path / "bronze", start=date(2015, 1, 1), end=date(2015, 12, 31), ticker_by_corp_code={"00126380": "005930"}, required_periods=frozenset({"2015Q1"}))
+    records = [
+        DisclosureRecord(corp_code="00126380", rcept_no="20150515000001", rcept_dt=date(2015, 5, 15), report_nm="분기보고서 (2015.03)"),
+        DisclosureRecord(corp_code="00126380", rcept_no="20151115000002", rcept_dt=date(2015, 11, 15), report_nm="분기보고서 (2015.09)"),
+    ]
+
+    rows = periodic_filing_identities(
+        records, start=date(2015, 1, 1), end=date(2015, 12, 31),
+        ticker_by_corp_code={"00126380": "005930"}, required_periods=frozenset({"2015Q1"}), corp_codes=None,
+    )
 
     assert len(rows) == 1
     assert rows[0]["ticker"] == "005930"
@@ -1269,14 +1246,20 @@ def test_collector_delegates_listing_and_archive_fetch_to_the_client() -> None:
     from src.integrations.dart.xbrl import DartXbrlCollector
 
     class _Client:
-        def list_disclosures(self, start, end, *, detail_type=None):
-            return [{"rcept_no": "1", "detail_type": detail_type, "start": start.isoformat(), "end": end.isoformat()}]
+        def list_disclosures(self, start, end, *, disclosure_filter=None):
+            code = getattr(disclosure_filter, "code", disclosure_filter)
+            return [{"rcept_no": "1", "detail_type": code, "start": start.isoformat(), "end": end.isoformat()}]
 
         def fetch_document_archive(self, rcept_no):
             return bytearray(f"zip:{rcept_no}".encode())
 
+    from src.config.providers import DisclosureFilter
+
     collector = DartXbrlCollector(max_workers=1, min_interval=0.0, api_key="k", client=_Client())
-    assert collector.list_disclosures(date(2020, 1, 1), date(2020, 1, 31), detail_type="I001") == [
+    assert collector.list_disclosures(
+        date(2020, 1, 1), date(2020, 1, 31),
+        disclosure_filter=DisclosureFilter(code="I001", parameter="pblntf_detail_ty"),
+    ) == [
         {"rcept_no": "1", "detail_type": "I001", "start": "2020-01-01", "end": "2020-01-31"}
     ]
     assert collector.fetch_document_archive("20200101000001") == b"zip:20200101000001"
@@ -1335,43 +1318,25 @@ def test_dart_status_800_and_900_count_toward_the_circuit_breaker() -> None:
     assert not _is_transport_failure({"source_kind": "opendart_standard", "diagnostics": ()})
 
 def test_dart_xbrl_env_workers_and_filing_identity_filter(monkeypatch, tmp_path: Path) -> None:
-    import json
     from datetime import date
 
+    from src.data.dart_disclosures import DisclosureRecord, periodic_filing_identities
     from src.integrations.dart.xbrl import DartXbrlCollector
 
     monkeypatch.setenv("OPENDART_MAX_WORKERS", "3")
     collector = DartXbrlCollector(max_workers=1, min_interval=0.0, api_key="key", request_json=lambda *_: {})
     assert collector._max_workers == 1
-    disclosures = tmp_path / "disclosures" / "one"
-    disclosures.mkdir(parents=True)
-    (disclosures / "payload.json").write_text(
-        json.dumps(
-            {
-                "corp_code": "001",
-                "records": [
-                    {
-                        "rcept_dt": "20260306",
-                        "corp_code": "001",
-                        "report_nm": "(2025.12) 사업보고서",
-                        "bsns_year": "2025",
-                        "reprt_code": "11011",
-                        "rcept_no": "r1",
-                    },
-                    {"rcept_dt": "bad"},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    other = tmp_path / "disclosures" / "other"
-    other.mkdir()
-    (other / "payload.json").write_text(json.dumps({"corp_code": "002", "records": []}), encoding="utf-8")
-    assert DartXbrlCollector.filing_identities_from_bronze(
-        tmp_path,
+    records = [
+        DisclosureRecord(corp_code="001", rcept_no="r1", rcept_dt=date(2026, 3, 6), report_nm="(2025.12) 사업보고서"),
+        DisclosureRecord(corp_code="002", rcept_no="r2", rcept_dt=date(2026, 3, 6), report_nm="(2025.12) 사업보고서"),
+    ]
+    assert periodic_filing_identities(
+        records,
         start=date(2026, 1, 1),
         end=date(2026, 12, 31),
-        corp_codes=("001",),
+        ticker_by_corp_code=None,
+        required_periods=None,
+        corp_codes=frozenset({"001"}),
     ) == ({
         "corp_code": "001",
         "filing_id": "r1",

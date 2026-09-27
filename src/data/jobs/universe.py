@@ -14,6 +14,7 @@ from pathlib import Path
 from src.core.pit import PITDataError
 from src.data.dataset_registry import DatasetRegistry
 from src.data.jobs.runner import JobContext
+from src.data.receipt_catalog import ReceiptCatalog
 from src.integrations.dart.client import DartCorpCodeRecord
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "eligible_tickers",
     "index_corp_codes",
     "read_corp_code_bridge",
+    "read_corp_code_bridge_rows",
 ]
 
 _TICKER_PATTERN = r"^\d{6}$"
@@ -59,29 +61,38 @@ def eligible_tickers(ctx: JobContext) -> frozenset[str]:
     return cleaned
 
 
-def read_corp_code_bridge(bronze_root: Path) -> tuple[dict[str, str], str]:
-    """Corp-code to ticker mapping and receipt hash from the frozen Bronze receipt.
+def read_corp_code_bridge(catalog: ReceiptCatalog) -> tuple[dict[str, str], str]:
+    """Corp-code to ticker mapping from the latest ``dart_corp_codes`` catalog receipt.
 
     Returns:
-        Mapping and the content hash addressing the retained receipt.
+        The mapping and the content hash of the receipt it came from.
 
     Raises:
-        PITDataError: the bridge is missing, unreadable, tampered, or empty, or
-            one corp code maps to several tickers.
+        PITDataError: no receipt, a hash mismatch, a malformed payload, or one
+            corp code mapped to several tickers.
     """
-    root = Path(bronze_root)
-    payloads = sorted((root / "dart_corp_codes").glob("*/payload.json")) if (root / "dart_corp_codes").exists() else []
-    if not payloads:
+    _, mapping, receipt_hash = read_corp_code_bridge_rows(catalog)
+    return mapping, receipt_hash
+
+
+def read_corp_code_bridge_rows(
+    catalog: ReceiptCatalog,
+) -> tuple[list[dict[str, str]], dict[str, str], str]:
+    """Bridge rows, their corp-code mapping and the receipt hash, from one catalog read.
+
+    Raises:
+        PITDataError: as for :func:`read_corp_code_bridge`.
+    """
+    from src.data.evidence_sources import DART_CORP_CODES_SOURCE
+
+    entry = catalog.latest(source=DART_CORP_CODES_SOURCE, natural_keys={"dart_corp_codes"}).get("dart_corp_codes")
+    if entry is None:
         raise PITDataError("ticker bridge missing: no retained dart_corp_codes receipt")
-    payload_path = payloads[-1]
-    receipt_hash = payload_path.parent.name
-    if len(receipt_hash) != 64 or any(character not in "0123456789abcdef" for character in receipt_hash):
-        raise PITDataError("ticker bridge receipt hash is invalid")
     try:
-        raw = payload_path.read_bytes()
+        raw = Path(entry.payload_path).read_bytes()
     except OSError as exc:
         raise PITDataError("ticker bridge payload is unreadable") from exc
-    if hashlib.sha256(raw).hexdigest() != receipt_hash:
+    if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError("ticker bridge payload hash mismatch")
     try:
         decoded = json.loads(raw)
@@ -89,6 +100,7 @@ def read_corp_code_bridge(bronze_root: Path) -> tuple[dict[str, str], str]:
         raise PITDataError("ticker bridge payload is invalid") from exc
     if not isinstance(decoded, list):
         raise PITDataError("ticker bridge payload must be a list")
+    rows: list[dict[str, str]] = []
     mapping: dict[str, str] = {}
     for row in decoded:
         if not isinstance(row, dict):
@@ -101,14 +113,15 @@ def read_corp_code_bridge(bronze_root: Path) -> tuple[dict[str, str], str]:
         if previous is not None and previous != ticker:
             raise PITDataError(f"ticker bridge corp_code maps to multiple tickers: {corp_code}")
         mapping[corp_code] = ticker
+        rows.append({"corp_code": corp_code, "corp_name": str(row.get("corp_name") or "").strip(), "ticker": ticker})
     if not mapping:
         raise PITDataError("ticker bridge payload is empty")
-    return mapping, receipt_hash
+    return rows, mapping, entry.content_hash
 
 
 def corp_code_bridge(ctx: JobContext) -> Mapping[str, str]:
     """Corp-code to ticker mapping from the frozen Bronze receipt."""
-    mapping, _ = read_corp_code_bridge(ctx.runtime.workspace.bronze_root)
+    mapping, _ = read_corp_code_bridge(ctx.catalog)
     return mapping
 
 

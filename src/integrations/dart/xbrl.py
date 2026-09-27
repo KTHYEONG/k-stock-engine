@@ -2,19 +2,17 @@
 from __future__ import annotations
 
 import io
-import json
-import re
 import threading
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.core.pit import PITDataError
 
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
+    from src.config.providers import DisclosureFilter
     from src.integrations.dart.client import DartCorpCodeRecord
     from src.integrations.quota import ProviderQuotaStateStore
 
@@ -30,12 +28,6 @@ _REQUIRED_FACTS: tuple[str, ...] = (
     "operating_cash_flow",
     "capex",
 )
-_REPORT_CODE_BY_KIND = {
-    "사업보고서": "11011",
-    "반기보고서": "11012",
-    "분기보고서": None,
-}
-_PERIOD = re.compile(r"\((\d{4})\.(\d{2})\)")
 REPRT_QUARTER = {"11013": "Q1", "11012": "Q2", "11014": "Q3", "11011": "Q4"}
 
 
@@ -146,93 +138,6 @@ class DartXbrlCollector:
         if not pages:
             raise PITDataError("DART disclosures response is empty; certification blocked")
         return tuple(pages)
-
-    @staticmethod
-    def filing_identities_from_bronze(
-        bronze_root: Path | str,
-        *,
-        start: date,
-        end: date,
-        ticker_by_corp_code: Mapping[str, str] | None = None,
-        required_periods: frozenset[str] | None = None,
-        corp_codes: frozenset[str] | tuple[str, ...] | None = None,
-    ) -> tuple[dict[str, str], ...]:
-        """Select only periodic financial filings with complete OpenDART account identity."""
-        paths = sorted((Path(bronze_root) / "disclosures").glob("*/payload.json"))
-        if not paths:
-            raise PITDataError("expected exactly one retained disclosure Bronze receipt")
-        target_codes = frozenset(corp_codes) if corp_codes is not None else None
-        identities: list[dict[str, str]] = []
-        for payload_path in paths:
-            try:
-                payload = json.loads(payload_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise PITDataError("retained disclosure Bronze receipt is unreadable") from exc
-            if target_codes is not None:
-                p_corp = str((payload.get("corp_code") if isinstance(payload, dict) else None) or "").strip()
-                if p_corp and p_corp not in target_codes:
-                    continue
-            records = payload.get("records") if isinstance(payload, dict) else None
-            if not isinstance(records, list):
-                continue
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                receipt_day = str(record.get("rcept_dt") or "").strip()
-                if len(receipt_day) != 8 or not receipt_day.isdigit():
-                    continue
-                receipt_date = date(int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:]))
-                if not start <= receipt_date <= end:
-                    continue
-                name = str(record.get("report_nm") or "")
-                matched = _PERIOD.search(name)
-                corp_code = str(record.get("corp_code") or "").strip()
-                filing_id = str(record.get("rcept_no") or "").strip()
-                if not matched or not corp_code or not filing_id:
-                    continue
-                year, month = matched.groups()
-                if "사업보고서" in name:
-                    report_code = _REPORT_CODE_BY_KIND["사업보고서"]
-                elif "반기보고서" in name:
-                    report_code = _REPORT_CODE_BY_KIND["반기보고서"]
-                elif "분기보고서" in name and month == "03":
-                    report_code = "11013"
-                elif "분기보고서" in name and month == "09":
-                    report_code = "11014"
-                else:
-                    continue
-                try:
-                    published_at = date(
-                        int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:])
-                    ).isoformat()
-                except ValueError:
-                    continue
-                quarter = REPRT_QUARTER.get(str(report_code), "")
-                fiscal_period = f"{year}{quarter}" if quarter else ""
-                if required_periods is not None and fiscal_period not in required_periods:
-                    continue
-                entry: dict[str, str] = {
-                    "corp_code": corp_code,
-                    "filing_id": filing_id,
-                    "rcept_no": filing_id,
-                    "biz_year": year,
-                    "reprt_code": str(report_code),
-                    "fs_div": "CFS",
-                    "published_at": published_at,
-                    "correction_of": str(record.get("rm") or "").strip(),
-                }
-                if fiscal_period:
-                    entry["fiscal_period"] = fiscal_period
-                if ticker_by_corp_code is not None:
-                    ticker = ticker_by_corp_code.get(corp_code)
-                    if ticker is None:
-                        continue
-                    entry["ticker"] = str(ticker)
-                identities.append(entry)
-        unique: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
-        for identity in identities:
-            unique[tuple(sorted(identity.items()))] = identity
-        return tuple(unique.values())
 
     def fetch_xbrl_facts(self, filing_ids: tuple[Any, ...]) -> Iterable[dict[str, Any]]:
         if not filing_ids:
@@ -361,15 +266,15 @@ class DartXbrlCollector:
         pages = [p for p in results if p is not None and not (self.aborted and _is_transport_failure(p))]
         return iter(tuple(pages))
 
-    def list_disclosures(self, start: date, end: date, *, detail_type: str | None = None) -> list[dict[str, str]]:
-        """List market-wide disclosures in a window, optionally narrowed to one DART detail type.
+    def list_disclosures(self, start: date, end: date, *, disclosure_filter: DisclosureFilter | None = None) -> list[dict[str, str]]:
+        """List market-wide disclosures in a window, optionally narrowed to one DART filter.
 
         Raises:
             PITDataError: the client is unavailable.
         """
         if self._client is None:
             raise PITDataError("DART disclosures endpoint is not configured")
-        return list(self._client.list_disclosures(start, end, detail_type=detail_type))
+        return list(self._client.list_disclosures(start, end, disclosure_filter=disclosure_filter))
 
     def fetch_document_archive(self, rcept_no: str) -> bytes:
         """Fetch the ``document.xml`` ZIP for one receipt through the ledgered client.
