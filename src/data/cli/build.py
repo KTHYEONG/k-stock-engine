@@ -349,7 +349,7 @@ def _run_dividends(args: argparse.Namespace) -> Mapping[str, object]:
 
     runtime = scoped_runtime(args)
     path = materialize_dividend_events(
-        bronze_root=runtime.workspace.bronze_root, universe_root=runtime.workspace.silver_root,
+        catalog=scoped_catalog(runtime),
         silver_root=runtime.workspace.silver_root, calendar=xkrx_calendar_through(datetime.now(KRX_TZ).date()),
     )
     register_dataset(runtime, "dividend_events", path.name)

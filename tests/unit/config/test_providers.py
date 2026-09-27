@@ -134,6 +134,71 @@ def _dart_kwargs(provider):  # type: ignore[no-untyped-def]
     }
 
 
+def test_disclosure_type_code_maps_to_pblntf_ty() -> None:
+    from src.config.providers import DartPolicy
+
+    provider = _policy()
+    policy = DartPolicy(**{**_dart_kwargs(provider), "disclosure_types": ["A"]})
+
+    (single,) = policy.disclosure_filters
+
+    assert (single.code, single.parameter) == ("A", "pblntf_ty")
+
+
+def test_disclosure_detail_code_maps_to_pblntf_detail_ty() -> None:
+    from src.config.providers import DartPolicy
+
+    provider = _policy()
+    policy = DartPolicy(**{**_dart_kwargs(provider), "disclosure_types": ["I001"]})
+
+    (single,) = policy.disclosure_filters
+
+    assert (single.code, single.parameter) == ("I001", "pblntf_detail_ty")
+
+
+def test_malformed_disclosure_code_rejected() -> None:
+    import pytest
+
+    from src.config import ConfigError, load_provider_policy, load_runtime_config
+    from src.config.providers import DartPolicy
+    from src.config.runtime import RuntimeConfig
+
+    provider = _policy()
+    import pydantic
+
+    for bad in ("A1", "a"):
+        with pytest.raises((ConfigError, pydantic.ValidationError)):
+            DartPolicy(**{**_dart_kwargs(provider), "disclosure_types": [bad]})
+
+    runtime = load_runtime_config()
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path(tmp)
+        (tmp_root / "config").mkdir()
+        lines = ["[dart]", "disclosure_types = ['A1']", "circuit_threshold = 3",
+                 "requests_per_identity = 3", "batch_identities = 500"]
+        (tmp_root / "config" / "providers.toml").write_text("\n".join(lines), encoding="utf-8")
+        with pytest.raises(ConfigError):
+            load_provider_policy(RuntimeConfig(**{**runtime.model_dump(), "repo_root": tmp_root}))
+
+
+def test_corp_codes_max_age_defaults_to_30_days() -> None:
+    assert _policy().dart.corp_codes_max_age_days == 30
+
+
+def test_disclosure_filter_helper_rejects_malformed_code() -> None:
+    import pytest
+
+    from src.config import ConfigError
+    from src.config.providers import disclosure_filter_for_code
+
+    with pytest.raises(ConfigError):
+        disclosure_filter_for_code("A1")
+
+
 def test_invalid_provider_policy_fails_closed() -> None:
     import pydantic
 

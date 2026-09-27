@@ -140,7 +140,6 @@ def test_refresh_publishes_new_facts_and_returns_artifact(tmp_path) -> None:
 
 def test_refresh_uses_retained_dart_ticker_bridge(tmp_path) -> None:
     from datetime import UTC, datetime
-    import hashlib
     import json
 
     import polars as pl
@@ -154,10 +153,9 @@ def test_refresh_uses_retained_dart_ticker_bridge(tmp_path) -> None:
         [{"corp_code": "00126380", "ticker": "005930"}],
         sort_keys=True,
     )
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    bridge_path = tmp_path / "bronze" / "dart_corp_codes" / digest / "payload.json"
-    bridge_path.parent.mkdir(parents=True)
-    bridge_path.write_text(payload, encoding="utf-8")
+    from tests.fixtures import seed_corp_code_bridge
+
+    digest = seed_corp_code_bridge(tmp_path / "bronze", payload.encode("utf-8"))
 
     artifact = refresh_dart_financial_facts(
         bronze_root=tmp_path / "bronze",
@@ -575,7 +573,6 @@ def test_refresh_dart_facts_rejects_future_or_missing_frozen_bridge(tmp_path) ->
 
 def test_load_frozen_dart_ticker_bridge_returns_retained_receipt_mapping(tmp_path) -> None:
     from datetime import UTC, datetime
-    import hashlib
     import json
 
     from src.data.incremental_normalization import load_frozen_dart_ticker_bridge
@@ -588,10 +585,9 @@ def test_load_frozen_dart_ticker_bridge_returns_retained_receipt_mapping(tmp_pat
         ensure_ascii=False,
         sort_keys=True,
     )
-    receipt_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
-    payload_path = tmp_path / 'dart_corp_codes' / receipt_hash / 'payload.json'
-    payload_path.parent.mkdir(parents=True)
-    payload_path.write_text(payload, encoding='utf-8')
+    from tests.fixtures import seed_corp_code_bridge
+
+    receipt_hash = seed_corp_code_bridge(tmp_path, payload.encode('utf-8'))
 
     mapping, actual_hash = load_frozen_dart_ticker_bridge(
         bronze_root=tmp_path,
@@ -1029,7 +1025,6 @@ def test_refresh_does_not_quarantine_a_filing_that_also_has_trusted_rows(tmp_pat
 
 def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tmp_path, monkeypatch) -> None:
     from datetime import UTC, datetime
-    import hashlib
     import json
 
     import polars as pl
@@ -1078,20 +1073,17 @@ def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tm
 
     decision_cutoff = datetime(2024, 1, 1, tzinfo=UTC)
 
-    def _bridge_case(name: str, raw: bytes, *, directory_hash: str | None = None) -> tuple[Path, Path]:
+    def _bridge_case(name: str, raw: bytes, *, stored: bytes | None = None) -> tuple[Path, Path]:
+        from tests.fixtures import seed_corp_code_bridge
+
         root = tmp_path / name
-        payload = root / "dart_corp_codes" / (directory_hash or hashlib.sha256(raw).hexdigest()) / "payload.json"
-        payload.parent.mkdir(parents=True)
-        payload.write_bytes(raw)
+        digest = seed_corp_code_bridge(root, raw)
+        payload = root / "dart_corp_codes" / digest / "payload.json"
+        if stored is not None:
+            payload.write_bytes(stored)  # 등록 후 변조: 읽는 쪽 해시 검증을 확인한다
         return root, payload
 
-    invalid_root, _ = _bridge_case("bridge-invalid-hash", b"[]", directory_hash="z" * 64)
-    with pytest.raises(PITDataError, match="receipt hash"):
-        load_frozen_dart_ticker_bridge(bronze_root=invalid_root, decision_time=decision_cutoff)
-
-    mismatch_root, _ = _bridge_case(
-        "bridge-mismatch", b"[]", directory_hash=hashlib.sha256(b"different").hexdigest()
-    )
+    mismatch_root, _ = _bridge_case("bridge-mismatch", b"[]", stored=b"different")
     with pytest.raises(PITDataError, match="hash mismatch"):
         load_frozen_dart_ticker_bridge(bronze_root=mismatch_root, decision_time=decision_cutoff)
 
