@@ -121,13 +121,13 @@ flowchart TD
 ## 6. Architecture Layer Contracts
 
 ```text
-Layer 4: [CLI & Orchestrators]  -->  src/backtest/cli.py, src/data/cli.py
+Layer 4: [CLI & Orchestrators]  -->  src/backtest/cli.py, src/data/cli/
    ↓ (downward only)
 Layer 3: [Domain Engines]        -->  src/backtest/, src/execution/, src/data/
    ↓ (downward only)
-Layer 2: [Integrations]          -->  src/integrations/ (dart, kis, quota ledger)
+Layer 2: [Integrations]          -->  src/integrations/ (dart, kis, krx, ls, quota ledger)
    ↓ (downward only)
-Layer 1: [Storage Adapters]      -->  src/storage/ (parquet_datasets, manifest)
+Layer 1: [Config]                -->  src/config/ (provider policy, scope TOML)
    ↓ (downward only)
 Layer 0: [Pure Core Contracts]   -->  src/core/ (time, pit, market_rules, instruments)
 ```
@@ -136,7 +136,7 @@ Layer 0: [Pure Core Contracts]   -->  src/core/ (time, pit, market_rules, instru
 
 ```bash
 # 아키텍처 계층 의존성 및 순수 도메인 불변식 정적 검증
-uv run pytest tests/unit/core/test_package_dependency_boundaries.py tests/unit/core/test_architecture_consolidation.py
+uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 ```
 
 ---

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -10,10 +11,10 @@ from typing import Any
 
 import polars as pl
 
-from src.data.bronze_aggregation import discover_verified_bronze_receipts
+from src.core.pit import PITDataError
 from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.industry_ksic_map import learn_ksic_industry_mapping
-from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
+from src.data.receipt_catalog import ReceiptCatalog
 
 POLICY_VERSION = "kis-industry-classification-v2"
 
@@ -97,11 +98,11 @@ def _parse_stock_record(record: dict[str, Any], payload_path: Path) -> tuple[str
 
 
 def materialize_industry_classification_silver(
-    *, bronze_root: Path, silver_root: Path, symbols: frozenset[str] | None = None
+    *, catalog: ReceiptCatalog, silver_root: Path, symbols: frozenset[str] | None = None
 ) -> IndustryClassificationResult:
     """Build one row per ticker from two current-state KIS evidence streams.
 
-    Both streams live under ``EvidenceKind.INDUSTRY`` and are told apart by the
+    Both streams are usable ``kis_industry`` blobs told apart by the
     payload ``endpoint``: ``inquire-price`` (an observed industry name) and
     ``search-stock-info`` (KSIC code, KSIC name, listing-abolition date). A
     ticker's ``industry_name`` is the observed value when present; otherwise it
@@ -115,12 +116,11 @@ def materialize_industry_classification_silver(
     different industry for its KSIC code. The observed value always wins.
 
     Args:
-        bronze_root: Scope Bronze root holding certified ``INDUSTRY`` receipts.
+        catalog: Scope receipt catalog holding usable ``kis_industry`` blobs.
         silver_root: Scope Silver root receiving ``industry_<hash16>/``.
         symbols: Optionally restricts which tickers' Bronze evidence is
             considered (for incremental/targeted rebuilds); ``None`` means
-            "use every certified ``INDUSTRY`` receipt found under
-            ``bronze_root``."
+            "use every usable ``kis_industry`` blob."
 
     Returns:
         The snapshot result; ``rows`` equals the number of tickers covered,
@@ -130,36 +130,41 @@ def materialize_industry_classification_silver(
 
     Raises:
         PITDataError: hash-verification failure of any considered Bronze
-            receipt, malformed certified payload, an unknown industry
+            blob, malformed certified payload, an unknown industry
             endpoint, no considered evidence, or an existing dataset with
             different content. ``symbols`` provided but empty is also
             rejected.
     """
     if symbols is not None and not symbols:
         raise PITDataError("industry classification requires a non-empty symbol filter")
-    grouped = discover_verified_bronze_receipts(
-        bronze_root=Path(bronze_root), kinds=frozenset({EvidenceKind.INDUSTRY})
-    )
-    receipts = grouped.get(EvidenceKind.INDUSTRY, ())
-    quote_parsed: list[tuple[BronzeReceipt, str, datetime, str, str]] = []
-    stock_parsed: list[tuple[BronzeReceipt, str, datetime, str, str, date | None]] = []
-    for receipt in receipts:
-        payload = _load_payload(receipt.payload_path)
+    blobs = list(catalog.blobs(source="kis_industry", usable=True))
+    if not blobs:
+        raise PITDataError("no certified INDUSTRY Bronze evidence found")
+    quote_parsed: list[tuple[str, str, datetime, str, str]] = []
+    stock_parsed: list[tuple[str, str, datetime, str, str, date | None]] = []
+    for entry in blobs:
+        try:
+            raw = Path(entry.payload_path).read_bytes()
+        except OSError as exc:
+            raise PITDataError(f"industry Bronze payload is unreadable: {entry.payload_path}") from exc
+        if hashlib.sha256(raw).hexdigest() != entry.content_hash:
+            raise PITDataError(f"industry Bronze hash mismatch: {entry.payload_path}")
+        payload = _load_payload(Path(entry.payload_path))
         endpoint = payload.get("endpoint")
         if endpoint == "inquire-price":
-            symbol, collected_at = _parse_symbol_and_time(payload, receipt.payload_path)
+            symbol, collected_at = _parse_symbol_and_time(payload, Path(entry.payload_path))
             industry, market = _parse_quote_record(
-                _parse_records(payload, receipt.payload_path), receipt.payload_path
+                _parse_records(payload, Path(entry.payload_path)), Path(entry.payload_path)
             )
-            quote_parsed.append((receipt, symbol, collected_at, industry, market))
+            quote_parsed.append((entry.content_hash, symbol, collected_at, industry, market))
         elif endpoint == "search-stock-info":
-            symbol, collected_at = _parse_symbol_and_time(payload, receipt.payload_path)
+            symbol, collected_at = _parse_symbol_and_time(payload, Path(entry.payload_path))
             ksic_code, ksic_name, delisted_on = _parse_stock_record(
-                _parse_records(payload, receipt.payload_path), receipt.payload_path
+                _parse_records(payload, Path(entry.payload_path)), Path(entry.payload_path)
             )
-            stock_parsed.append((receipt, symbol, collected_at, ksic_code, ksic_name, delisted_on))
+            stock_parsed.append((entry.content_hash, symbol, collected_at, ksic_code, ksic_name, delisted_on))
         else:
-            raise PITDataError(f"unknown KIS industry endpoint in {receipt.payload_path}")
+            raise PITDataError(f"unknown KIS industry endpoint in {entry.payload_path}")
     if symbols is not None:
         selected = set(symbols)
         quote_filtered = [entry for entry in quote_parsed if entry[1] in selected]
@@ -173,19 +178,19 @@ def materialize_industry_classification_silver(
     if not quote_parsed and not stock_parsed:
         raise PITDataError("no certified INDUSTRY Bronze evidence found")
     considered = sorted(
-        [receipt.content_hash for receipt, *_ in quote_parsed]
-        + [receipt.content_hash for receipt, *_ in stock_parsed]
+        [content_hash for content_hash, *_ in quote_parsed]
+        + [content_hash for content_hash, *_ in stock_parsed]
     )
     quote_best: dict[str, tuple[datetime, str, str, str]] = {}
-    for receipt, symbol, collected_at, industry, market in quote_parsed:
+    for content_hash, symbol, collected_at, industry, market in quote_parsed:
         known = quote_best.get(symbol)
-        if known is None or (collected_at, receipt.content_hash) > (known[0], known[1]):
-            quote_best[symbol] = (collected_at, receipt.content_hash, industry, market)
+        if known is None or (collected_at, content_hash) > (known[0], known[1]):
+            quote_best[symbol] = (collected_at, content_hash, industry, market)
     stock_best: dict[str, tuple[datetime, str, str, str, date | None]] = {}
-    for receipt, symbol, collected_at, ksic_code, ksic_name, delisted_on in stock_parsed:
+    for content_hash, symbol, collected_at, ksic_code, ksic_name, delisted_on in stock_parsed:
         known_stock = stock_best.get(symbol)
-        if known_stock is None or (collected_at, receipt.content_hash) > (known_stock[0], known_stock[1]):
-            stock_best[symbol] = (collected_at, receipt.content_hash, ksic_code, ksic_name, delisted_on)
+        if known_stock is None or (collected_at, content_hash) > (known_stock[0], known_stock[1]):
+            stock_best[symbol] = (collected_at, content_hash, ksic_code, ksic_name, delisted_on)
     both_observations = [
         (ticker, stock_best[ticker][2], quote_best[ticker][2])
         for ticker in sorted(quote_best)

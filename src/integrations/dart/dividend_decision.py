@@ -7,9 +7,10 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import date
-from html.parser import HTMLParser
 
 from src.core.pit import PITDataError
+from src.integrations.dart.html_tables import decode_member as _decode_member
+from src.integrations.dart.html_tables import extract_tables as _extract_tables_shared
 
 __all__ = [
     "DividendDecision", "UndecidedRecordDateError", "is_dividend_decision_title", "parse_dividend_decision"]
@@ -63,50 +64,8 @@ def is_dividend_decision_title(report_nm: str) -> bool:
     return normalized in {"현금ㆍ현물배당결정", "현금배당결정"}
 
 
-class _TableParser(HTMLParser):
-    """Tolerant table reader for DART's non-XML decision forms."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.tables: list[list[list[str]]] = []
-        self._current_table: list[list[str]] | None = None
-        self._current_row: list[str] | None = None
-        self._current_cell: list[str] | None = None
-
-    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
-        name = tag.upper()
-        if name == "TABLE":
-            self._current_table = []
-            self.tables.append(self._current_table)
-        elif name == "TR":
-            self._current_row = []
-        elif name in {"TD", "TH"} and self._current_row is not None:
-            self._current_cell = []
-
-    def handle_data(self, data: str) -> None:
-        if self._current_cell is not None:
-            self._current_cell.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        name = tag.upper()
-        if name in {"TD", "TH"} and self._current_row is not None and self._current_cell is not None:
-            self._current_row.append(" ".join("".join(self._current_cell).split()))
-            self._current_cell = None
-        elif name == "TR" and self._current_row is not None:
-            if self._current_table is None:
-                self._current_table = []
-                self.tables.append(self._current_table)
-            self._current_table.append(self._current_row)
-            self._current_row = None
-
-
-def _decode_member(raw: bytes) -> str | None:
-    for codec in ("utf-8", "cp949"):
-        try:
-            return raw.decode(codec).lstrip("\ufeff")
-        except UnicodeDecodeError:
-            continue
-    return None  # pragma: no cover - cp949 maps nearly all byte values
+def _extract_tables(text: str) -> list[list[list[str]]]:
+    return _extract_tables_shared(text)
 
 
 def _parse_date_token(text: str) -> date | None:
@@ -124,12 +83,6 @@ def _parse_date_token(text: str) -> date | None:
 
 def _cell_has_date(text: str) -> bool:
     return _parse_date_token(text) is not None
-
-
-def _extract_tables(text: str) -> list[list[list[str]]]:
-    parser = _TableParser()
-    parser.feed(text)
-    return [table for table in parser.tables if table]
 
 
 def _flatten(tables: list[list[list[str]]]) -> list[list[str]]:
@@ -292,7 +245,8 @@ def parse_dividend_decision(
         buf = io.BytesIO(archive_bytes)
         with zipfile.ZipFile(buf) as zf:
             infos = zf.infolist()
-    except Exception as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        # reason: adapter boundary — hostile archives fail in implementation-specific ways; fail closed.
         raise PITDataError("unreadable dividend-decision archive; certification blocked") from exc
     if len(infos) > _MAX_MEMBERS:
         raise PITDataError("dividend-decision archive has too many members; certification blocked")

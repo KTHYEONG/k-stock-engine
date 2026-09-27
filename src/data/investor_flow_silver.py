@@ -1,4 +1,4 @@
-"""Silver investor-flow dataset built from hash-verified raw LS t1702 rows."""
+"""Silver investor-flow dataset built from catalog-selected LS t1702 rows."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Any
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
 from src.data.datasets import (
     DatasetIdentity,
@@ -24,9 +25,9 @@ from src.data.datasets import (
     resolve_bronze_digest,
     universe_sessions,
 )
-from src.data.schemas import PITDataError
+from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
-POLICY_VERSION = "ls-t1702-net-shares-v1"
+POLICY_VERSION = "ls-t1702-net-shares-v2"
 
 _LOG = logging.getLogger(__name__)
 
@@ -42,7 +43,6 @@ _SUBGROUP_COLUMNS: tuple[str, ...] = (
     "tjj0010_net_shares",
     "tjj0011_net_shares",
 )
-_NEGATIVE_STATUSES: frozenset[str] = frozenset({"provider_error", "missing_sessions"})
 _PAGE_BATCH = 1000
 _SHARD_SCHEMA: dict[str, Any] = {
     "session": pl.Date,
@@ -94,9 +94,6 @@ class InvestorFlowSilverResult:
     rows: int
     tickers: int
     raw_pages: int
-    ignored_records_only_pages: int
-    foreign_provider_pages: int
-    negative_cells: int
     conflict_cells: int
     identity_violation_cells: int
     unavailable_tail_cells: int
@@ -153,75 +150,70 @@ def _check_identities(groups: dict[str, int]) -> None:
         raise PITDataError("LS investor flow violates zero-sum identity")
 
 
-def _parse_page(path: Path, sessions: frozenset[date]) -> tuple[str, str, str, Any]:
-    raw = path.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != path.parent.name:
-        raise PITDataError(f"investor-flow Bronze hash mismatch: {path}")
+def _parse_blob(entry: BlobEntry, sessions: frozenset[date]) -> tuple[str, str, Any]:
+    try:
+        raw = Path(entry.payload_path).read_bytes()
+    except OSError as exc:
+        raise PITDataError(f"investor-flow Bronze payload is unreadable: {entry.payload_path}") from exc
+    if hashlib.sha256(raw).hexdigest() != entry.content_hash:
+        raise PITDataError(f"investor-flow Bronze hash mismatch: {entry.payload_path}")
     try:
         payload = json.loads(raw)
     except ValueError as exc:
-        raise PITDataError(f"invalid investor-flow Bronze JSON: {path}") from exc
+        raise PITDataError(f"invalid investor-flow Bronze JSON: {entry.payload_path}") from exc
     if not isinstance(payload, dict):
-        raise PITDataError(f"invalid investor-flow Bronze root: {path}")
-    page_hash = path.parent.name
+        raise PITDataError(f"invalid investor-flow Bronze root: {entry.payload_path}")
+    page_hash = entry.content_hash
     provider = payload.get("provider")
     if not isinstance(provider, str) or not provider.strip():
-        raise PITDataError(f"investor-flow Bronze page lacks provider label: {path}")
+        raise PITDataError(f"investor-flow Bronze page lacks provider label: {entry.payload_path}")
     if provider.strip().upper() != "LS":
-        return ("foreign_provider", page_hash, "", [])
+        raise PITDataError(f"investor-flow Bronze page is not LS: {entry.payload_path}")
     rows = payload.get("rows")
     query = payload.get("query")
     query_map = query if isinstance(query, dict) else {}
     symbol = str(query_map.get("symbol") or "").strip()
-    if isinstance(rows, list) and rows:
-        if not symbol:
-            raise PITDataError(f"LS investor flow raw page lacks query symbol: {path}")
-        start = _parse_query_bound(query_map.get("start"), label="start")
-        end = _parse_query_bound(query_map.get("end"), label="end")
-        cells: list[tuple[date, tuple[int, ...], int, int, int]] = []
-        dateless_rows = 0
-        violations: list[date] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                raise PITDataError(f"LS investor flow row must be an object: {path}")
-            if str(row.get("date") or "").strip() == "":
-                # 공급처가 붙이는 날짜 없는 부가 행: 수급값이 전부 0일 때만 정보 없음으로 건너뛴다.
-                if any(_parse_share_int(row, code) != 0 for code in _GROUP_CODES):
-                    raise PITDataError(f"LS investor flow dateless row carries flow values: {path}")
-                dateless_rows += 1
-                continue
-            session = _parse_row_date(row.get("date"))
-            if session < start or session > end:
-                continue
-            if session not in sessions:
-                raise PITDataError(f"LS investor flow session outside certified calendar: {session}")
-            groups = {code: _parse_share_int(row, code) for code in _GROUP_CODES}
-            try:
-                _check_identities(groups)
-            except PITDataError:
-                # 공급처 집계 오류 행은 셀 단위로 격리한다(값 추정·보정 금지).
-                violations.append(session)
-                continue
-            cells.append((
-                session,
-                tuple(groups[code] for code in _GROUP_CODES),
-                _parse_share_int(row, "close"),
-                _parse_share_int(row, "volume"),
-                _parse_share_int(row, "value"),
-            ))
-        return ("raw", page_hash, symbol, (cells, dateless_rows, violations))
-    status = str(payload.get("status") or "").strip()
-    if status in _NEGATIVE_STATUSES:
-        key = "sessions" if status == "provider_error" else "missing_sessions"
-        items = payload.get(key)
-        listed = [str(item) for item in items] if isinstance(items, list) else []
-        return (status, page_hash, str(payload.get("symbol") or "").strip(), listed)
-    return ("ignored", page_hash, "", [])
+    if not isinstance(rows, list) or not rows:
+        raise PITDataError(f"LS investor flow page carries no rows: {entry.payload_path}")
+    if not symbol:
+        raise PITDataError(f"LS investor flow raw page lacks query symbol: {entry.payload_path}")
+    start = _parse_query_bound(query_map.get("start"), label="start")
+    end = _parse_query_bound(query_map.get("end"), label="end")
+    cells: list[tuple[date, tuple[int, ...], int, int, int]] = []
+    dateless_rows = 0
+    violations: list[date] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise PITDataError(f"LS investor flow row must be an object: {entry.payload_path}")
+        if str(row.get("date") or "").strip() == "":
+            if any(_parse_share_int(row, code) != 0 for code in _GROUP_CODES):
+                raise PITDataError(f"LS investor flow dateless row carries flow values: {entry.payload_path}")
+            dateless_rows += 1
+            continue
+        session = _parse_row_date(row.get("date"))
+        if session < start or session > end:
+            continue
+        if session not in sessions:
+            raise PITDataError(f"LS investor flow session outside certified calendar: {session}")
+        groups = {code: _parse_share_int(row, code) for code in _GROUP_CODES}
+        try:
+            _check_identities(groups)
+        except PITDataError:
+            violations.append(session)
+            continue
+        cells.append((
+            session,
+            tuple(groups[code] for code in _GROUP_CODES),
+            _parse_share_int(row, "close"),
+            _parse_share_int(row, "volume"),
+            _parse_share_int(row, "value"),
+        ))
+    return (page_hash, symbol, (cells, dateless_rows, violations))
 
 
 def materialize_investor_flow_silver(
     *,
-    bronze_root: Path,
+    catalog: ReceiptCatalog,
     universe_root: Path,
     silver_root: Path,
     policy: InvestorFlowSilverPolicy = InvestorFlowSilverPolicy(),  # noqa: B008
@@ -229,7 +221,7 @@ def materialize_investor_flow_silver(
     universe_dataset_id: str | None = None,
     bronze_flow_digest: str | None = None,
 ) -> InvestorFlowSilverResult:
-    """Build an immutable Silver investor-flow dataset from raw LS t1702 rows."""
+    """Build an immutable Silver investor-flow dataset from catalog LS blobs."""
 
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise PITDataError("workers must be a positive integer")
@@ -251,12 +243,11 @@ def materialize_investor_flow_silver(
         universe_dataset_id = candidates[0].name
     universe_dataset_id, calendar = universe_sessions(root, universe_dataset_id, allow_legacy=False)
     session_set = frozenset(calendar)
-    page_paths = sorted((Path(bronze_root) / "investor_flow").glob("*/payload.json"))
+    blobs = list(catalog.blobs(source="ls_investor_flow", usable=True))
+    if not blobs:
+        raise PITDataError("no usable LS investor-flow Bronze blobs found")
     raw_hashes: list[str] = []
     bronze_page_hashes: list[str] = []
-    ignored_records_only_pages = 0
-    foreign_provider_pages = 0
-    negative_keys: set[tuple[str, str]] = set()
     violation_keys: set[tuple[str, str]] = set()
     dateless_rows = 0
     parsed_pages = 0
@@ -266,44 +257,34 @@ def materialize_investor_flow_silver(
     conflict_cells = 0
     unavailable_tail_cells = 0
     retail_exceeds_volume_rows = 0
-    negative_cells = 0
     total_rows = 0
     tickers: set[str] = set()
 
     with tempfile.TemporaryDirectory(prefix="investor-flow-silver-") as temporary:
         shard_dir = Path(temporary)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for offset in range(0, len(page_paths), _PAGE_BATCH):
-                batch = page_paths[offset : offset + _PAGE_BATCH]
+            for offset in range(0, len(blobs), _PAGE_BATCH):
+                batch = blobs[offset : offset + _PAGE_BATCH]
                 columns: dict[str, list[Any]] = {name: [] for name in _SHARD_SCHEMA}
-                for kind, page_hash, symbol, content in pool.map(
-                    _parse_page, batch, [session_set] * len(batch)
+                for page_hash, symbol, content in pool.map(
+                    _parse_blob, batch, [session_set] * len(batch)
                 ):
                     parsed_pages += 1
-                    if kind in {"raw", "provider_error", "missing_sessions"}:
-                        bronze_page_hashes.append(page_hash)
-                    if kind == "raw":
-                        raw_hashes.append(page_hash)
-                        cells, page_dateless, page_violations = content
-                        dateless_rows += page_dateless
-                        violation_keys.update((day.isoformat(), symbol) for day in page_violations)
-                        for session, groups, close, volume, value in cells:
-                            columns["session"].append(session)
-                            columns["ticker"].append(symbol)
-                            for code, amount in zip(_GROUP_CODES, groups, strict=True):
-                                columns[code].append(amount)
-                            columns["ls_close"].append(close)
-                            columns["ls_volume"].append(volume)
-                            columns["ls_value_mkrw"].append(value)
-                            columns["source_hash"].append(page_hash)
-                        parsed_rows += len(cells)
-                    elif kind == "foreign_provider":
-                        foreign_provider_pages += 1
-                    elif kind == "ignored":
-                        ignored_records_only_pages += 1
-                    else:
-                        for listed_session in content:
-                            negative_keys.add((listed_session, symbol))
+                    bronze_page_hashes.append(page_hash)
+                    raw_hashes.append(page_hash)
+                    cells, page_dateless, page_violations = content
+                    dateless_rows += page_dateless
+                    violation_keys.update((day.isoformat(), symbol) for day in page_violations)
+                    for session, groups, close, volume, value in cells:
+                        columns["session"].append(session)
+                        columns["ticker"].append(symbol)
+                        for code, amount in zip(_GROUP_CODES, groups, strict=True):
+                            columns[code].append(amount)
+                        columns["ls_close"].append(close)
+                        columns["ls_volume"].append(volume)
+                        columns["ls_value_mkrw"].append(value)
+                        columns["source_hash"].append(page_hash)
+                    parsed_rows += len(cells)
                 if columns["session"]:
                     pl.DataFrame(columns, schema=_SHARD_SCHEMA).write_parquet(
                         shard_dir / f"shard-{offset:07d}.parquet"
@@ -311,7 +292,7 @@ def materialize_investor_flow_silver(
                 _LOG.info(
                     "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d",
                     parsed_pages,
-                    len(page_paths),
+                    len(blobs),
                     parsed_rows,
                 )
 
@@ -319,13 +300,6 @@ def materialize_investor_flow_silver(
             {
                 "session": [date.fromisoformat(day) for day, _ in violation_keys],
                 "ticker": [ticker for _, ticker in violation_keys],
-            },
-            schema={"session": pl.Date, "ticker": pl.String},
-        )
-        negatives = pl.DataFrame(
-            {
-                "session": [date.fromisoformat(day) for day, _ in negative_keys],
-                "ticker": [ticker for _, ticker in negative_keys],
             },
             schema={"session": pl.Date, "ticker": pl.String},
         )
@@ -342,9 +316,7 @@ def materialize_investor_flow_silver(
         )
         shards = sorted(shard_dir.glob("shard-*.parquet"))
         for year in sorted({session.year for session in calendar}):
-            year_negatives = negatives.filter(pl.col("session").dt.year() == year)
             if not shards:
-                negative_cells += year_negatives.height
                 continue
             cells = (
                 pl.scan_parquet(shards)
@@ -352,9 +324,6 @@ def materialize_investor_flow_silver(
                 .collect()
                 .join(violations, on=["session", "ticker"], how="anti")
             )
-            negative_cells += year_negatives.join(
-                cells.select("session", "ticker"), on=["session", "ticker"], how="anti"
-            ).height
             grouped = (
                 cells.sort("source_hash")
                 .group_by(["session", "ticker"], maintain_order=True)
@@ -420,9 +389,6 @@ def materialize_investor_flow_silver(
             "universe_dataset_id": universe_dataset_id,
             "partitions": partition_details,
             "raw_pages": len(raw_hashes),
-            "ignored_records_only_pages": ignored_records_only_pages,
-            "foreign_provider_pages": foreign_provider_pages,
-            "negative_cells": negative_cells,
             "conflict_cells": conflict_cells,
             "identity_violation_cells": len(violation_keys),
             "identity_violation_keys": sorted(f"{day}:{ticker}" for day, ticker in violation_keys),
@@ -438,9 +404,6 @@ def materialize_investor_flow_silver(
         rows=total_rows,
         tickers=len(tickers),
         raw_pages=len(raw_hashes),
-        ignored_records_only_pages=ignored_records_only_pages,
-        foreign_provider_pages=foreign_provider_pages,
-        negative_cells=negative_cells,
         conflict_cells=conflict_cells,
         identity_violation_cells=len(violation_keys),
         unavailable_tail_cells=unavailable_tail_cells,

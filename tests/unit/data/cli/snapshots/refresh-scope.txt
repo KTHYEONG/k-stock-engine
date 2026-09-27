@@ -1,0 +1,9 @@
+usage: cli.py refresh-scope [-h] [--scope-config SCOPE_CONFIG]
+                            [--data-root DATA_ROOT] [--collect] [--dry-run]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --collect             Run collection jobs before building
+  --dry-run             Report stale nodes and pending counts only

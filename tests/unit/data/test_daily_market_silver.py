@@ -13,7 +13,8 @@ import pytest
 from src.core.time import KRX_TZ
 from src.data.daily_market_silver import POLICY_VERSION, DailyMarketSilverPolicy, materialize_daily_market_silver
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
-from src.data.schemas import PITDataError
+from tests.fixtures import seed_receipts
+from src.core.pit import PITDataError
 
 DAY1 = date(2026, 3, 4)
 DAY2 = date(2026, 3, 5)
@@ -80,18 +81,21 @@ def _publish(
     digest = hashlib.sha256(raw).hexdigest()
     payload_path = payload_dir / f"{session.isoformat()}.json"
     payload_path.write_bytes(raw)
-    ReceiptCatalog(catalog_root).publish([
-        ReceiptIndexEntry(
-            source="krx_daily_market",
-            natural_key=session.isoformat(),
-            as_of=session if as_of is None else as_of,
-            fiscal_period=None,
-            status=status,
-            content_hash=digest,
-            retrieved_at=datetime(2026, 3, 7, tzinfo=UTC),
-            payload_path=payload_path,
-        )
-    ])
+    seed_receipts(
+        ReceiptCatalog(catalog_root),
+        [
+            ReceiptIndexEntry(
+                source="krx_daily_market",
+                natural_key=session.isoformat(),
+                as_of=session if as_of is None else as_of,
+                fiscal_period=None,
+                status=status,
+                content_hash=digest,
+                retrieved_at=datetime(2026, 3, 7, tzinfo=UTC),
+                payload_path=payload_path,
+            )
+        ],
+    )
     return digest
 
 

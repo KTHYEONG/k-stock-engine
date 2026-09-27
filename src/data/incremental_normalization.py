@@ -10,6 +10,7 @@ from typing import Final
 
 import polars as pl
 
+from src.core.pit import EvidenceKind, PITDataError
 from src.core.time import SessionCalendar
 from src.data.datasets import (
     DatasetIdentity,
@@ -26,7 +27,6 @@ from src.data.normalization import (
     QuarantinedFiling,
     normalize_dart_financial_facts_with_quarantine,
 )
-from src.data.schemas import EvidenceKind, PITDataError
 
 AVAILABILITY_POLICY: Final = "next-session-after-effective-receipt-v2"
 
@@ -224,42 +224,10 @@ def _merge_fact_frames(existing: pl.DataFrame | None, new: pl.DataFrame) -> pl.D
 def load_frozen_dart_ticker_bridge(
     *, bronze_root: Path, decision_time: datetime
 ) -> tuple[dict[str, str], str]:
+    from src.data.jobs.universe import read_corp_code_bridge
+
     _ = decision_time
-    bridge_dir = Path(bronze_root) / "dart_corp_codes"
-    payloads = sorted(bridge_dir.glob("*/payload.json")) if bridge_dir.exists() else []
-    if not payloads:
-        raise PITDataError("ticker bridge missing: no retained dart_corp_codes receipt")
-    payload_path = payloads[-1]
-    receipt_hash = payload_path.parent.name
-    if len(receipt_hash) != 64 or any(character not in "0123456789abcdef" for character in receipt_hash):
-        raise PITDataError("ticker bridge receipt hash is invalid")
-    try:
-        raw_bytes = payload_path.read_bytes()
-    except OSError as exc:
-        raise PITDataError("ticker bridge payload is unreadable") from exc
-    if hashlib.sha256(raw_bytes).hexdigest() != receipt_hash:
-        raise PITDataError("ticker bridge payload hash mismatch")
-    try:
-        raw = json.loads(raw_bytes)
-    except (TypeError, ValueError) as exc:
-        raise PITDataError("ticker bridge payload is invalid") from exc
-    if not isinstance(raw, list):
-        raise PITDataError("ticker bridge payload must be a list")
-    mapping: dict[str, str] = {}
-    for row in raw:
-        if not isinstance(row, dict):
-            raise PITDataError("ticker bridge row must be an object")
-        corp_code = str(row.get("corp_code") or "").strip()
-        ticker = str(row.get("ticker") or "").strip()
-        if not corp_code or not ticker:
-            raise PITDataError("ticker bridge row lacks corp_code or ticker")
-        previous = mapping.get(corp_code)
-        if previous is not None and previous != ticker:
-            raise PITDataError(f"ticker bridge corp_code maps to multiple tickers: {corp_code}")
-        mapping[corp_code] = ticker
-    if not mapping:
-        raise PITDataError("ticker bridge payload is empty")
-    return mapping, receipt_hash
+    return read_corp_code_bridge(Path(bronze_root))
 
 
 def _quarantine_to_json_record(record: QuarantinedFiling) -> dict[str, str]:
@@ -510,6 +478,9 @@ def refresh_dart_financial_facts(
             "quarantined_filings": len(quarantined),
             "trusted_source_kinds": trusted_kinds,
             "content_sha64": output_hash,
+            # 품질 빌드가 이 팩트와 같은 격리 목록을 쓰는지 검증할 수 있도록 파일명과 해시를 남긴다.
+            "quarantine_file": quarantine_path.name,
+            "quarantine_sha256": hashlib.sha256(quarantine_path.read_bytes()).hexdigest(),
         },
     )
     artifact = DartFactRefreshArtifact(
@@ -541,3 +512,33 @@ def refresh_dart_financial_facts(
         encoding="utf-8",
     )
     return artifact
+
+
+def normalize_dart_facts(
+    bronze_root: Path,
+    silver_root: Path,
+    artifact_root: Path,
+    decision_time: datetime,
+    batch_size: int = 500,
+    superseded_receipts: Path | None = None,
+    disclosures_dataset_id: str | None = None,
+    financial_facts_dataset_id: str | None = None,
+) -> dict[str, object]:
+    """Incremental DART fact refresh entry point for the normalize-dart-facts command."""
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+
+    artifact = refresh_dart_financial_facts(
+        bronze_root=Path(bronze_root),
+        silver_root=Path(silver_root),
+        artifact_root=Path(artifact_root),
+        decision_time=decision_time,
+        calendar=xkrx_calendar_through(decision_time.astimezone(KRX_TZ).date()),
+        batch_size=int(batch_size),
+        superseded_receipt_hashes=frozenset(str(h) for h in json.loads(Path(superseded_receipts).read_text(encoding="utf-8")))
+        if superseded_receipts is not None
+        else frozenset(),
+        disclosures_dataset_id=disclosures_dataset_id,
+        financial_facts_dataset_id=financial_facts_dataset_id,
+    )
+    return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count, "quarantined_filings": artifact.quarantined_filings, "quarantine_path": artifact.quarantine_path, "dataset_path": artifact.dataset_path}

@@ -48,7 +48,7 @@ class Strategy(Protocol):
 
 
 class EqualWeightLiquid(Strategy):
-    """Baseline: equal weights over eligible instruments whose decision-day adtv20 ≥ ``min_adtv20_krw``, rebalanced on the first session of each month."""
+    """Baseline: equal weights over eligible instruments whose decision-day adtv20 ≥ ``min_adtv20_krw`` and whose 60-session volatility is defined, rebalanced on the first session of each month."""
 
     def __init__(self, *, min_adtv20_krw: int, max_names: int) -> None:
         if isinstance(min_adtv20_krw, bool) or not isinstance(min_adtv20_krw, int) or min_adtv20_krw < 0:
@@ -77,12 +77,13 @@ class EqualWeightLiquid(Strategy):
         t = view.t
         eligible = view.field("eligible")[t]
         adtv = view.field("adtv20")[t]
+        vol = view.field("ret_vol60")[t]
         # Instrument ids are ascending, so an ascending index tiebreak is an id tiebreak.
         ranked = sorted(
             (
                 n
                 for n in range(len(eligible))
-                if eligible[n] and math.isfinite(adtv[n]) and adtv[n] >= self._min_adtv20_krw
+                if eligible[n] and math.isfinite(adtv[n]) and adtv[n] >= self._min_adtv20_krw and math.isfinite(vol[n])
             ),
             key=lambda n: (-float(adtv[n]), n),
         )

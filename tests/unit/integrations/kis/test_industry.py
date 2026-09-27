@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.core.pit import EvidenceKind, PITDataError
+from src.core.pit import PITDataError
 from src.integrations.kis.industry import KisIndustryCollector, KisStockClassificationCollector
 
 RETRIEVED_AT = datetime(2024, 1, 3, 9, 0, tzinfo=UTC)
@@ -76,7 +76,7 @@ def test_fetch_rejects_empty_industry_field(tmp_path) -> None:
     assert not (bronze_root / "industry").exists()
 
 
-def test_fetch_writes_one_industry_receipt_per_symbol(tmp_path) -> None:
+def test_fetch_returns_one_page_per_symbol_without_writing(tmp_path) -> None:
     outputs = {
         "005930": _output("전기·전자", "KOSPI"),
         "000660": _output("전기·전자", "KOSPI"),
@@ -91,25 +91,21 @@ def test_fetch_writes_one_industry_receipt_per_symbol(tmp_path) -> None:
     )
 
     assert [page["symbol"] for page in pages] == ["005930", "000660", "035420"]
-    found = _receipts(bronze_root)
-    assert len(found) == 3
-    for meta, payload in found:
-        assert meta["kind"] == EvidenceKind.INDUSTRY.value
-        assert meta["source_path"].startswith(f"KIS:inquire-price:{payload['symbol']}:2024-01-03")
+    assert list(bronze_root.rglob("*")) == []
 
 
-def test_fetch_persists_raw_output_verbatim(tmp_path) -> None:
+def test_fetch_returns_raw_output_verbatim_without_writing(tmp_path) -> None:
     raw = _output("전기·전자", "KOSPI", iscd_stat_cls_code="11", another_raw_field="raw-value")
     bronze_root = tmp_path / "bronze"
 
-    tuple(
+    pages = tuple(
         KisIndustryCollector(("005930",), client=_StubClient({"005930": raw})).fetch_industry_classification(
             bronze_root=bronze_root, retrieved_at=RETRIEVED_AT
         )
     )
 
-    (meta, payload) = _receipts(bronze_root)[0]
-    assert payload["output"] == raw
+    assert pages[0]["output"] == raw
+    assert list(bronze_root.rglob("*")) == []
 
 
 def test_collector_rejects_empty_universe() -> None:
@@ -195,21 +191,19 @@ def test_fetch_stock_classification_rejects_malformed_abolition_date(tmp_path) -
         assert not (bronze_root / "industry").exists()
 
 
-def test_fetch_stock_classification_persists_discriminated_evidence(tmp_path) -> None:
+def test_fetch_stock_classification_returns_evidence_without_writing(tmp_path) -> None:
     raw = _stock_output("032604", "통신 및 방송 장비 제조업", "", idx_bztp_scls_cd_name="old-sector")
     bronze_root = tmp_path / "bronze"
 
-    tuple(
+    pages = tuple(
         KisStockClassificationCollector(("005930",), client=_StockStubClient({"005930": raw})).fetch_stock_classification(
             bronze_root=bronze_root, retrieved_at=RETRIEVED_AT
         )
     )
 
-    (meta, payload) = _receipts(bronze_root)[0]
-    assert payload["endpoint"] == "search-stock-info"
-    assert payload["output"] == raw
-    assert meta["kind"] == EvidenceKind.INDUSTRY.value
-    assert meta["source_path"].startswith("KIS:search-stock-info:005930:2024-01-03")
+    assert pages[0]["endpoint"] == "search-stock-info"
+    assert pages[0]["output"] == raw
+    assert list(bronze_root.rglob("*")) == []
 
 
 def test_fetch_stock_classification_wraps_transport_failure(tmp_path) -> None:
@@ -226,3 +220,29 @@ def test_stock_collector_rejects_empty_universe() -> None:
         KisStockClassificationCollector(())
     with pytest.raises(ValueError, match="at least one symbol"):
         KisStockClassificationCollector(("   ",))
+
+
+def test_fetch_propagates_provider_error_unwrapped(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.errors import ProviderRetryableError
+
+    with pytest.raises(ProviderRetryableError, match="down"):
+        tuple(
+            KisIndustryCollector(
+                ("005930",), client=_StubClient({"005930": ProviderRetryableError("down")})
+            ).fetch_industry_classification(bronze_root=tmp_path / "bronze")
+        )
+
+
+def test_fetch_stock_propagates_provider_error_unwrapped(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.errors import ProviderTerminalError
+
+    with pytest.raises(ProviderTerminalError, match="bad"):
+        tuple(
+            KisStockClassificationCollector(
+                ("005930",), client=_StockStubClient({"005930": ProviderTerminalError("bad")})
+            ).fetch_stock_classification(bronze_root=tmp_path / "bronze")
+        )

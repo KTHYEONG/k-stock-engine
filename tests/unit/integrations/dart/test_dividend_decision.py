@@ -80,7 +80,7 @@ def test_parse_dividend_decision_reads_current_layout() -> None:
 def test_parse_dividend_decision_missing_dps_fails_closed() -> None:
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
     from src.integrations.dart.dividend_decision import parse_dividend_decision
 
     html = (
@@ -161,7 +161,7 @@ def test_parse_dividend_decision_flags_correction_marker() -> None:
 def test_parse_dividend_decision_rejects_unreadable_or_deless_archive() -> None:
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
     from src.integrations.dart.dividend_decision import parse_dividend_decision
 
     with pytest.raises(PITDataError):
@@ -211,7 +211,7 @@ def test_parse_dividend_decision_rejects_unreadable_or_deless_archive() -> None:
 def test_parse_dividend_decision_rejects_unsafe_or_oversized_archives() -> None:
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
     from src.integrations.dart.dividend_decision import parse_dividend_decision
 
     with pytest.raises(PITDataError, match="unsafe"):
@@ -336,7 +336,7 @@ def test_parse_dividend_decision_absent_pay_row_means_undecided() -> None:
 def test_parse_dividend_decision_rejects_malformed_dates() -> None:
     import pytest
 
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
     from src.integrations.dart.dividend_decision import parse_dividend_decision
 
     bad_record = (

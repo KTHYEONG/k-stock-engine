@@ -6,9 +6,9 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
 
+from src.core.pit import PITDataError
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from src.data.research_scope import ResearchScope
-from src.data.schemas import PITDataError
 
 __all__ = [
     "CoverageRequirement",

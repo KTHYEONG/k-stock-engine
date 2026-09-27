@@ -14,7 +14,7 @@ from polars.testing import assert_frame_equal
 from src.core.market_rules import load_krx_market_rules
 from src.core.time import KRX_TZ
 from src.data.market_panel import MarketPanelPolicy, materialize_market_panel
-from src.data.schemas import PITDataError
+from src.core.pit import PITDataError
 
 RULES = load_krx_market_rules(Path("config/market/krx_market_rules.toml"))
 

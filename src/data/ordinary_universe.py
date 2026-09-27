@@ -12,10 +12,10 @@ from typing import Any
 
 import polars as pl
 
+from src.core.pit import BronzeReceipt, EvidenceKind, PITDataError
 from src.core.time import KRX_TZ
 from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
-from src.data.schemas import BronzeReceipt, EvidenceKind, PITDataError
 
 POLICY_VERSION = "krx-ordinary-equity-v1"
 _MARKETS = frozenset({"KOSPI", "KOSDAQ"})
@@ -170,41 +170,6 @@ def build_ordinary_universe(
     return tuple(by_day[day] for day in sorted(requested))
 
 
-def dated_master_receipts(bronze_root: Path, *, sessions: Iterable[date]) -> tuple[BronzeReceipt, ...]:
-    """Select requested dated pages using receipt metadata before opening payloads."""
-
-    requested = frozenset(sessions)
-    receipts: list[BronzeReceipt] = []
-    for metadata_path in sorted((Path(bronze_root) / EvidenceKind.SECURITY_MASTER.value).glob("*/receipt.json")):
-        try:
-            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-            label = str(meta["source_path"])
-            match = _DATED_SOURCE.fullmatch(label)
-            if match is None or date.fromisoformat(match.group(1)) not in requested:
-                continue
-            if meta["kind"] != EvidenceKind.SECURITY_MASTER.value:
-                raise PITDataError("security_master receipt kind mismatch")
-            content_hash = str(meta["content_hash"])
-            if content_hash != metadata_path.parent.name:
-                raise PITDataError("security_master receipt path/hash mismatch")
-            receipts.append(
-                BronzeReceipt(
-                    kind=EvidenceKind.SECURITY_MASTER,
-                    content_hash=content_hash,
-                    source_path=label,
-                    retrieved_at=datetime.fromisoformat(meta["retrieved_at"]),
-                    ingested_at=datetime.fromisoformat(meta["ingested_at"]),
-                    payload_path=metadata_path.parent / "payload.json",
-                    metadata_path=metadata_path,
-                )
-            )
-        except PITDataError:
-            raise
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise PITDataError(f"invalid security_master receipt: {metadata_path}") from exc
-    return tuple(sorted(receipts, key=lambda receipt: receipt.source_path))
-
-
 def catalog_master_receipts(
     catalog: ReceiptCatalog, *, sessions: Iterable[date]
 ) -> tuple[BronzeReceipt, ...]:
@@ -293,32 +258,24 @@ def write_ordinary_universe_silver(
     return published.path
 
 
-def materialize_ordinary_universe_from_bronze(
-    *, bronze_root: Path, sessions: Iterable[date], silver_root: Path
-) -> Path:
-    """Select exact dated Bronze pages and publish a source-bound dataset."""
-
-    requested = frozenset(sessions)
-    if not requested:
-        raise PITDataError("ordinary universe requires requested sessions")
-    receipts = dated_master_receipts(bronze_root, sessions=requested)
-    labels = [date.fromisoformat(receipt.source_path.rsplit(":", 1)[1]) for receipt in receipts]
-    if len(labels) != len(set(labels)):
-        raise PITDataError("ambiguous security_master snapshot date")
-    missing = requested - set(labels)
-    if missing:
-        raise PITDataError(f"missing security_master snapshot for {min(missing)}")
-    return write_ordinary_universe_silver(
-        (ordinary_universe_snapshot(receipt) for receipt in receipts), root=silver_root
-    )
-
-
 def catalog_master_sessions(catalog: ReceiptCatalog) -> tuple[date, ...]:
-    """Return all dated successful security-master sessions in the catalog."""
+    """Return dated successful security-master sessions that were actual trading days.
 
+    KRX serves a master snapshot on any date, including exchange holidays, so a
+    snapshot alone does not prove a session. A date on which the daily-market
+    endpoint answered "no data" (status ``empty``) is a closure confirmed by the
+    exchange itself, and is excluded; ``exchange_calendars`` can lag KRX
+    calendar changes (for example a newly designated holiday).
+    """
+
+    closed = {
+        entry.as_of
+        for entry in catalog.entries(source="krx_daily_market")
+        if entry.status is EvidenceStatus.EMPTY and entry.as_of is not None
+    }
     sessions: set[date] = set()
     for entry in catalog.entries(source="krx_security_master"):
-        if entry.status is EvidenceStatus.SUCCESS and entry.as_of is not None:
+        if entry.status is EvidenceStatus.SUCCESS and entry.as_of is not None and entry.as_of not in closed:
             sessions.add(entry.as_of)
     if not sessions:
         raise PITDataError("no certified security_master snapshots found")

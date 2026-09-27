@@ -148,32 +148,59 @@ def _update_index(source_file: str, test_file: str | None, doc_file: str | None)
 EXCLUDED_DIRS = frozenset({".git", ".venv", ".mypy_cache", ".ruff_cache", "__pycache__", "node_modules"})
 
 
-def _clean_scratch_dir(task_id: str | None = None, purge_all: bool = False) -> int:
+def _wipe_temp_artifacts() -> int:
+    count = 0
+    for root, dirs, files in os.walk("."):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        for f in files:
+            if f.endswith((".tmp", ".bak")):
+                fpath = os.path.join(root, f)
+                try:
+                    os.remove(fpath)
+                    count += 1
+                except OSError:
+                    pass
+    return count
+
+
+def _clean_scratch_dir(purge_all: bool = True, task_id: str | None = None) -> int:
     scratch_dir = "scratch"
     if not os.path.exists(scratch_dir):
         return 0
-    target_pattern = task_id.lower().replace("task_", "").strip() if task_id and not purge_all else None
-    if not purge_all and not target_pattern:
-        return 0
-    regex = (
-        re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(target_pattern)}(?:[^a-zA-Z0-9]|$)")
-        if target_pattern
-        else None
-    )
     count = 0
+    if purge_all:
+        for entry in os.listdir(scratch_dir):
+            if entry == ".gitignore":
+                continue
+            epath = os.path.join(scratch_dir, entry)
+            try:
+                if os.path.isdir(epath):
+                    for _, _, files in os.walk(epath):
+                        count += len(files)
+                    shutil.rmtree(epath, ignore_errors=True)
+                    count += 1
+                else:
+                    os.remove(epath)
+                    count += 1
+            except OSError:
+                pass
+        return count
+
+    target_pattern = task_id.lower().replace("task_", "").strip() if task_id else None
+    if not target_pattern:
+        return 0
+    regex = re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(target_pattern)}(?:[^a-zA-Z0-9]|$)")
     for root, dirs, files in os.walk(scratch_dir, topdown=False):
         for f in files:
             if f == ".gitignore":
                 continue
-            if not purge_all and regex:
-                if not regex.search(f.lower()):
-                    continue
-            fpath = os.path.join(root, f)
-            try:
-                os.remove(fpath)
-                count += 1
-            except OSError:
-                pass
+            if regex.search(f.lower()):
+                fpath = os.path.join(root, f)
+                try:
+                    os.remove(fpath)
+                    count += 1
+                except OSError:
+                    pass
         for d in dirs:
             dpath = os.path.join(root, d)
             with contextlib.suppress(OSError):
@@ -182,37 +209,26 @@ def _clean_scratch_dir(task_id: str | None = None, purge_all: bool = False) -> i
     return count
 
 
-def _clean_tmp_dir(task_id: str | None = None, purge_all: bool = False) -> int:
+def _clean_tmp_dir() -> int:
     tmp_dir = "tmp"
     if not os.path.exists(tmp_dir):
         return 0
-    target_pattern = task_id.lower().replace("task_", "").strip() if task_id and not purge_all else None
-    if not purge_all and not target_pattern:
-        return 0
-    regex = (
-        re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(target_pattern)}(?:[^a-zA-Z0-9]|$)")
-        if target_pattern
-        else None
-    )
     count = 0
-    for root, dirs, files in os.walk(tmp_dir, topdown=False):
-        for f in files:
-            if f == ".gitignore":
-                continue
-            if not purge_all:
-                if not (regex and regex.search(f.lower())):
-                    continue
-            fpath = os.path.join(root, f)
-            try:
-                os.remove(fpath)
+    for entry in os.listdir(tmp_dir):
+        if entry == ".gitignore":
+            continue
+        epath = os.path.join(tmp_dir, entry)
+        try:
+            if os.path.isdir(epath):
+                for _, _, files in os.walk(epath):
+                    count += len(files)
+                shutil.rmtree(epath, ignore_errors=True)
                 count += 1
-            except OSError:
-                pass
-        for d in dirs:
-            dpath = os.path.join(root, d)
-            with contextlib.suppress(OSError):
-                if not os.listdir(dpath):
-                    os.rmdir(dpath)
+            else:
+                os.remove(epath)
+                count += 1
+        except OSError:
+            pass
     return count
 
 
@@ -240,15 +256,20 @@ def _clean_logs_dir() -> int:
 
 def _clean_specs(
     remove_specs: list[str] | None = None,
+    keep_specs: list[str] | None = None,
     task_id: str | None = None,
-    purge_all: bool = False,
+    purge_all: bool = True,
 ) -> int:
     specs_dir = "docs/specs"
     if not _path_exists(specs_dir):
         return 0
 
-    target_prefixes: set[str] = set()
+    count = 0
+    keep_set = set(keep_specs or [])
+
+    # 1. Targeted removal when explicit spec files are provided
     if remove_specs:
+        target_prefixes: set[str] = set()
         for item in remove_specs:
             base = (
                 item.replace(".md", "")
@@ -259,37 +280,57 @@ def _clean_specs(
             )
             if base:
                 target_prefixes.add(base.lower())
-    elif task_id and not purge_all:
-        norm = task_id.lower().replace("task_", "").strip()
-        if norm:
-            target_prefixes.add(norm)
-
-    # Safety guard: Never wipe all specs blindly unless explicitly requested or targeted
-    if not target_prefixes and not purge_all:
-        return 0
-
-    regexes = [
-        re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(p)}(?:[^a-zA-Z0-9]|$)")
-        for p in target_prefixes
-    ]
-
-    count = 0
-    for fname in os.listdir(specs_dir):
-        if fname.endswith((".md", "_contract.json", "contract.json")):
-            if fname == "00_architecture.md":
+        regexes = [
+            re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(p)}(?:[^a-zA-Z0-9]|$)")
+            for p in target_prefixes
+        ]
+        for fname in os.listdir(specs_dir):
+            if fname in keep_set:
                 continue
-            if not purge_all and regexes:
+            if fname.endswith((".md", "_contract.json", "contract.json")):
                 fname_lower = fname.lower()
                 fname_base = fname_lower.replace(".md", "").replace("_contract.json", "").replace("contract.json", "")
-                if not any(r.search(fname_lower) or r.search(fname_base) for r in regexes):
-                    continue
+                if any(r.search(fname_lower) or r.search(fname_base) for r in regexes):
+                    fpath = os.path.join(specs_dir, fname)
+                    try:
+                        os.remove(fpath)
+                        count += 1
+                    except OSError:
+                        pass
+        return count
 
-            fpath = os.path.join(specs_dir, fname)
-            try:
-                os.remove(fpath)
-                count += 1
-            except OSError:
-                pass
+    # 2. Default: purge all temporary specs except keep_set
+    if purge_all:
+        for fname in os.listdir(specs_dir):
+            if fname in keep_set:
+                continue
+            if fname.endswith((".md", "_contract.json", "contract.json")):
+                fpath = os.path.join(specs_dir, fname)
+                try:
+                    os.remove(fpath)
+                    count += 1
+                except OSError:
+                    pass
+        return count
+
+    # 3. Fallback targeted pattern matching with task_id
+    if task_id:
+        norm = task_id.lower().replace("task_", "").strip()
+        if norm:
+            regex = re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(norm)}(?:[^a-zA-Z0-9]|$)")
+            for fname in os.listdir(specs_dir):
+                if fname in keep_set:
+                    continue
+                if fname.endswith((".md", "_contract.json", "contract.json")):
+                    fname_lower = fname.lower()
+                    fname_base = fname_lower.replace(".md", "").replace("_contract.json", "").replace("contract.json", "")
+                    if regex.search(fname_lower) or regex.search(fname_base):
+                        fpath = os.path.join(specs_dir, fname)
+                        try:
+                            os.remove(fpath)
+                            count += 1
+                        except OSError:
+                            pass
     return count
 
 
@@ -307,10 +348,14 @@ def main() -> None:
     parser.add_argument("--failure-reason", default=None, help="Reason why hypothesis failed")
     parser.add_argument("--test", default=None, help="Test file path")
     parser.add_argument("--doc", default=None, help="Architecture doc path")
-    parser.add_argument("--remove-specs", nargs="*", default=[], help="Spec files to remove")
-    parser.add_argument("--purge-all-specs", action="store_true", help="Purge all specs in docs/specs except 00_architecture.md")
-    parser.add_argument("--purge-scratch", action="store_true", help="Purge all files in scratch directory")
-    parser.add_argument("--purge-tmp", action="store_true", help="Purge all files in tmp directory")
+    parser.add_argument("--remove-specs", nargs="*", default=[], help="Specific spec files to remove")
+    parser.add_argument("--keep-specs", nargs="*", default=[], help="Spec files to preserve during cleanup")
+    parser.add_argument("--no-purge-specs", action="store_true", help="Skip spec cleanup")
+    parser.add_argument("--no-purge-scratch", action="store_true", help="Skip scratch directory purge")
+    parser.add_argument("--no-purge-tmp", action="store_true", help="Skip tmp directory purge")
+    parser.add_argument("--purge-all-specs", action="store_true", help="Legacy flag (default behavior)")
+    parser.add_argument("--purge-scratch", action="store_true", help="Legacy flag (default behavior)")
+    parser.add_argument("--purge-tmp", action="store_true", help="Legacy flag (default behavior)")
     parser.add_argument("--wipe-logs", action="store_true", help="Purge logs directory")
     args = parser.parse_args()
 
@@ -321,8 +366,32 @@ def main() -> None:
     source_file = args.source
     test_file = args.test
     if not source_file:
+        if args.remove_specs:
+            for sf_name in args.remove_specs:
+                sf_path = sf_name if os.path.isabs(sf_name) or sf_name.startswith("docs/specs/") else os.path.join("docs/specs", sf_name)
+                if not sf_path.endswith(".md"):
+                    sf_path += ".md"
+                if os.path.exists(sf_path):
+                    with contextlib.suppress(Exception):
+                        content = _read_file(sf_path)
+                        m_tgt = re.search(r"(?m)^##\s+Target:\s*`?([^\n`]+)`?", content)
+                        if m_tgt:
+                            cand_src = m_tgt.group(1).strip()
+                            if cand_src.startswith("src/") and os.path.exists(cand_src):
+                                source_file = cand_src
+                        m_tst = re.search(
+                            r"(?m)^##\s+(?:Test\s+Suite|Invariant\s+Scenarios):\s*`?([^\n`]+)`?",
+                            content,
+                        )
+                        if m_tst and not test_file:
+                            cand_tst = m_tst.group(1).strip()
+                            if cand_tst.startswith("tests/") and os.path.exists(cand_tst):
+                                test_file = cand_tst
+                if source_file:
+                    break
+
         norm_task = args.task.lower().replace("task_", "").strip()
-        if os.path.isdir("docs/specs") and norm_task:
+        if not source_file and os.path.isdir("docs/specs") and norm_task:
             task_regex = re.compile(rf"(?:^|[^a-zA-Z0-9]){re.escape(norm_task)}(?:[^a-zA-Z0-9]|$)")
             for sf_name in os.listdir("docs/specs"):
                 if task_regex.search(sf_name.lower()) and sf_name.endswith(".md"):
@@ -345,29 +414,34 @@ def main() -> None:
                         break
 
         if not source_file:
-            try:
+            with contextlib.suppress(Exception):
                 import subprocess
+
                 diff_res = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    capture_output=True, text=True, timeout=10, check=False
+                    ["git", "status", "--porcelain"],  # noqa: S603, S607
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
                 )
                 for line in diff_res.stdout.splitlines():
                     fp = line[3:].strip()
                     if fp.startswith("src/") and fp.endswith(".py") and os.path.exists(fp):
                         source_file = fp
                         break
-            except Exception:
-                pass
     if not source_file:
         source_file = "src/main.py"
 
     # 1. Spec Cleanup
     try:
-        cleaned = _clean_specs(
-            remove_specs=args.remove_specs,
-            task_id=args.task,
-            purge_all=args.purge_all_specs,
-        )
+        cleaned = 0
+        if not args.no_purge_specs:
+            cleaned = _clean_specs(
+                remove_specs=args.remove_specs,
+                keep_specs=args.keep_specs,
+                task_id=args.task,
+                purge_all=True,
+            )
         if cleaned > 0:
             logs.append(f"Cleaned {cleaned} spec files")
     except Exception as e:
@@ -405,23 +479,31 @@ def main() -> None:
         gen_code_map.main()
 
 
-    # 4. Scratch, Tmp & Logs Wipe
+    # 4. Scratch, Tmp, Temp & Logs Wipe
     try:
-        scratch_wiped = _clean_scratch_dir(task_id=args.task, purge_all=args.purge_scratch)
-        tmp_wiped = _clean_tmp_dir(task_id=args.task, purge_all=args.purge_tmp)
+        wiped_temp = _wipe_temp_artifacts()
+        scratch_wiped = 0 if args.no_purge_scratch else _clean_scratch_dir(purge_all=True, task_id=args.task)
+        tmp_wiped = 0 if args.no_purge_tmp else _clean_tmp_dir()
         logs_wiped = _clean_logs_dir() if args.wipe_logs else 0
-        total_cleaned = scratch_wiped + tmp_wiped + logs_wiped
+        total_cleaned = wiped_temp + scratch_wiped + tmp_wiped + logs_wiped
         if total_cleaned > 0:
-            logs.append(
-                f"Wiped {scratch_wiped} scratch, {tmp_wiped} tmp, {logs_wiped} logs files"
-            )
+            parts = []
+            if wiped_temp > 0:
+                parts.append(f"{wiped_temp} temp")
+            if scratch_wiped > 0:
+                parts.append(f"{scratch_wiped} scratch")
+            if tmp_wiped > 0:
+                parts.append(f"{tmp_wiped} tmp")
+            if logs_wiped > 0:
+                parts.append(f"{logs_wiped} logs")
+            logs.append(f"Wiped {', '.join(parts)} files")
     except Exception as e:
         errors.append(f"Cleanup failed: {e}")
 
     # 5. Summary
     status = "OK" if not errors else "PARTIAL"
     summary = f"### 🏁 [SYNC:{status}] [{adr_id}] | {' | '.join(logs)}"
-    print(summary)
+    print(summary)  # noqa: T201
     if errors:
         sys.exit(1)
 

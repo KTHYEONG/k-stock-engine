@@ -1,0 +1,11 @@
+usage: cli.py build-investor-flow-silver [-h] [--scope-config SCOPE_CONFIG]
+                                         [--data-root DATA_ROOT]
+                                         [--universe-dataset-id UNIVERSE_DATASET_ID]
+                                         [--workers WORKERS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --universe-dataset-id UNIVERSE_DATASET_ID
+  --workers WORKERS

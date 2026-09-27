@@ -13,7 +13,7 @@ from src.data.ordinary_universe_price_audit import (
     audit_ordinary_universe_price_availability,
     plan_investor_flow_from_ordinary_universe,
 )
-from src.data.schemas import EvidenceKind, PITDataError
+from src.core.pit import EvidenceKind, PITDataError
 
 
 def _universe(root: Path) -> Path:

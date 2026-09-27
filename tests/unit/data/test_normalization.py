@@ -8,7 +8,7 @@ def test_normalize_corporate_action_records_preserves_settlement_and_rejects_leg
     import pytest
 
     from src.data.normalization import normalize_corporate_action_records
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     tz = ZoneInfo('Asia/Seoul')
     price_session = datetime(2016, 11, 23, 9, tzinfo=tz)
@@ -29,7 +29,7 @@ def test_normalize_corporate_action_records_requires_evidence_status_migration()
     from zoneinfo import ZoneInfo
     import pytest
     from src.data.normalization import normalize_corporate_action_records
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     session = datetime(2024, 1, 2, 9, tzinfo=ZoneInfo('Asia/Seoul'))
     with pytest.raises(PITDataError, match=r'evidence status.*rebuild'):
@@ -721,7 +721,7 @@ def test_normalize_dart_facts_empty_calendar_fails_closed() -> None:
 
     from src.core.time import SessionCalendar
     from src.data.normalization import normalize_dart_financial_facts_with_quarantine
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     with pytest.raises(PITDataError, match='calendar'):
         normalize_dart_financial_facts_with_quarantine(
@@ -739,7 +739,7 @@ def test_normalize_dart_facts_calendar_ending_before_receipt_fails_closed() -> N
 
     from src.core.time import SessionCalendar
     from src.data.normalization import normalize_dart_financial_facts_with_quarantine
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     with pytest.raises(PITDataError, match='no next KRX session'):
         normalize_dart_financial_facts_with_quarantine(
@@ -824,7 +824,7 @@ def test_normalize_dart_facts_naive_session_fails_closed() -> None:
 
     from src.core.time import SessionCalendar
     from src.data.normalization import normalize_dart_financial_facts_with_quarantine
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     with pytest.raises(PITDataError, match='timezone-aware'):
         normalize_dart_financial_facts_with_quarantine(

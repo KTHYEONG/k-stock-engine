@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Final
 
 import exchange_calendars as xcals
 
@@ -42,8 +43,12 @@ def xkrx_session_calendar(start: date | None = None, end: date | None = None) ->
         raise ValueError(f"end {end} lies outside the XKRX range {first_day}..{last_day}")
     lo = first_day if start is None else start
     hi = last_day if end is None else end
+    return _session_opens(calendar, lo, hi)
+
+
+def _session_opens(calendar: xcals.ExchangeCalendar, lo: date, hi: date) -> SessionCalendar:
     opens: list[object] = []
-    for label in labels:
+    for label in calendar.sessions:
         day = label.date()
         if lo <= day <= hi:
             instant = calendar.session_open(label).to_pydatetime()
@@ -53,3 +58,28 @@ def xkrx_session_calendar(start: date | None = None, end: date | None = None) ->
     if not opens:
         raise ValueError(f"no XKRX session in range {lo}..{hi}")
     return SessionCalendar(tuple(sorted(opens)))  # type: ignore[arg-type]
+
+
+# 고정 시작일: 라이브러리 기본 범위(오늘 기준 전후 롤링)를 쓰면 같은 입력이라도 날마다 달력이 달라진다.
+_STABLE_CALENDAR_START: Final = date(2000, 1, 1)
+
+
+def xkrx_calendar_through(day: date) -> SessionCalendar:
+    """Return XKRX sessions from 2000-01-01 through the end of the year after ``day``.
+
+    Builders record a digest of the calendar they use. ``exchange_calendars``
+    defaults to a window rolling with today's date on both ends, so the same
+    inputs would get a new dataset identity every day. Both bounds here are
+    fixed or year-granular, which keeps identities stable within a year while
+    covering every session a decision on ``day`` can reference (next-session
+    availability, and pay dates up to the end of the following year).
+
+    Args:
+        day: The decision date the build is anchored to (KST calendar date).
+
+    Returns:
+        Strictly increasing session opens in ``[2000-01-01, <day.year + 1>-12-31]``.
+    """
+    horizon = date(day.year + 1, 12, 31)
+    calendar = xcals.get_calendar("XKRX", start=_STABLE_CALENDAR_START.isoformat(), end=horizon.isoformat())
+    return _session_opens(calendar, _STABLE_CALENDAR_START, horizon)

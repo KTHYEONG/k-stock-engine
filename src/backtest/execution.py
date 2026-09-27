@@ -148,11 +148,17 @@ def price_orders(
         if cap_quantity <= 0:
             rejects.append(Reject(order, "capacity"))
             continue
+        vol60 = float(arrays.float_fields["ret_vol60"][prev, n])
+        if not math.isfinite(vol60):
+            # 상장 60세션 미만 등으로 변동성을 알 수 없으면 충격비용을 추정할 수 없다. 값을 임의로 채우지 않고
+            # 해당 주문만 체결하지 않는다(런 전체를 중단하지 않는다).
+            rejects.append(Reject(order, "no_volatility"))
+            continue
         fill_quantity = order.quantity if order.quantity < cap_quantity else cap_quantity
         fraction = impact_fraction(
             notional=float(fill_quantity) * base,
             adtv20=adtv,
-            vol60=float(arrays.float_fields["ret_vol60"][prev, n]),
+            vol60=vol60,
             config=costs,
         )
         adverse = base * (1.0 + fraction) if is_buy else base * (1.0 - fraction)

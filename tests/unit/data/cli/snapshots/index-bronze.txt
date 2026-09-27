@@ -1,0 +1,11 @@
+usage: cli.py index-bronze [-h] [--scope-config SCOPE_CONFIG]
+                           [--data-root DATA_ROOT] [--dry-run]
+                           [--batch-size BATCH_SIZE]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --dry-run             Classify without publishing anything
+  --batch-size BATCH_SIZE
+                        Blobs per catalog revision

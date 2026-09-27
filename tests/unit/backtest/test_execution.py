@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -184,6 +183,30 @@ def test_zero_participation_budget_rejects(tmp_path: Path) -> None:
     )
     assert fills == ()
     assert [reject.reason for reject in rejects] == ["capacity"]
+
+
+def test_undefined_volatility_rejects_only_that_order(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_test",
+        [
+            _mrow(DAY0, "KRX:A", close=10_000, adtv20=1e9, ret_vol60=None),
+            _mrow(DAY0, "KRX:B", close=10_000, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=10_000),
+            _mrow(DAY1, "KRX:B", open=10_000),
+        ],
+    )
+    orders = (
+        Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0),
+        Order(instrument_idx=1, side=Side.BUY, quantity=10, decision_session_idx=0),
+    )
+
+    fills, rejects = price_orders(
+        orders=orders, arrays=arrays, t=1, config=_open_config(), costs=_costs(), rules=_rules()
+    )
+
+    assert [fill.order.instrument_idx for fill in fills] == [1]
+    assert [(reject.order.instrument_idx, reject.reason) for reject in rejects] == [(0, "no_volatility")]
 
 
 def test_stale_order_rejected(tmp_path: Path) -> None:

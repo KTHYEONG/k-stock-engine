@@ -7,6 +7,7 @@ from typing import Any
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
@@ -15,7 +16,6 @@ from src.data.datasets import (
     load_manifest,
     publish_dataset,
 )
-from src.data.schemas import PITDataError
 
 POLICY_VERSION = "investor-flow-ls-kis-union-v1"
 _SCHEMA: dict[str, Any] = {

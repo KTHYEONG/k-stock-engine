@@ -151,10 +151,10 @@ flowchart TD
     classDef l1 fill:#f3f0ff,stroke:#7950f2,stroke-width:2px,color:#3b0764;
     classDef l0 fill:#e7f5ff,stroke:#1971c2,stroke-width:2px,color:#0c4a6e;
 
-    L4["Layer 4: CLI 진입점 & 오케스트레이션 (src/backtest/cli.py, src/data/cli.py)"]:::l4
+    L4["Layer 4: CLI 진입점 & 오케스트레이션 (src/backtest/cli.py, src/data/cli/)"]:::l4
     L3["Layer 3: 도메인 서비스 & 백테스트 (src/backtest/, src/execution/, src/data/)"]:::l3
     L2["Layer 2: 외부 연동 어댑터 & 쿼터 원장 (src/integrations/)"]:::l2
-    L1["Layer 1: 저장소 영속화 계층 (src/storage/)"]:::l1
+    L1["Layer 1: 설정 계약 (src/config/)"]:::l1
     L0["Layer 0: 코어 스키마, 시간, 시장 규칙 (src/core/)"]:::l0
 
     L4 --> L3
@@ -166,10 +166,11 @@ flowchart TD
 
 ### 5.1 계층 위계 및 허용 의존성
 * `src/core`: 순수 도메인 모델, 시간 계약(`KRX_TZ`), KRX 캘린더, 호가 단위 및 거래세 규칙. 어떤 외부 모듈도 참조하지 않음.
-* `src/storage`: Parquet I/O 및 데이터셋 매니페스트 관리. `core`에만 의존.
-* `src/integrations`: 외부 API 전송 어댑터 및 `ProviderQuotaStateStore`. `core`와 `storage`에만 의존.
-* `src/data`: 수집, 영수증 카탈로그, 정규화, 패널 빌더. `core`, `storage`, `integrations`에 의존.
-* `src/execution` & `src/backtest`: 주문 검증, T+1 시가 체결, 정수 원장. `core`, `storage`, `data`에 의존.
+* `src/config`: 프로바이더 정책, 스코프 TOML. `core`에만 의존.
+* `src/integrations`: 외부 API 전송 어댑터 및 `ProviderQuotaStateStore`. `core`와 `config`에만 의존.
+* `src/data`: 수집, 영수증 카탈로그, 정규화, 패널 빌더. `core`, `config`, `integrations`에 의존.
+* `src/execution`: 주문 검증, T+1 시가 체결, 정수 원장. `core`에만 의존.
+* `src/backtest`: 전략과 백테스트 엔진. `core`, `config`, `data`에 의존.
 
 ### 5.2 Python AST 기반 기계적 불변식 강제
 코드베이스의 모든 `import` 구문은 정적 AST 파서에 의해 전수 검사되며, 허용되지 않은 참조나 `legacy/` 패키지 침범 시 테스트가 즉시 실패합니다:

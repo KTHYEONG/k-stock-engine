@@ -1,0 +1,8 @@
+usage: cli.py collect-scoped [-h] [--scope-config SCOPE_CONFIG]
+                             [--data-root DATA_ROOT] --payloads PAYLOADS
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --payloads PAYLOADS

@@ -1,0 +1,3 @@
+# Baseline strategy: equal weights over eligible names whose 20-session ADTV clears the floor.
+min_adtv20_krw = 1_000_000_000
+max_names = 30

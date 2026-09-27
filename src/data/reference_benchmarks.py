@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import polars as pl
 
+from src.core.pit import PITDataError
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
@@ -19,7 +20,6 @@ from src.data.datasets import (
     load_manifest,
     publish_dataset,
 )
-from src.data.schemas import PITDataError
 
 DEFINITIONS_VERSION = "reference-benchmarks-v1"
 

@@ -76,12 +76,12 @@ def test_worker_resumes_from_its_done_list(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_worker_stops_when_daily_budget_is_spent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.integrations.dart.client import dart_quota_provider
+    from src.integrations.dart.client import dart_ledger_for_key
     from src.integrations.quota import ProviderQuotaStateStore
 
     _job(tmp_path, 10, budget=100)
     monkeypatch.setenv("KEY_X", "secret")
-    ProviderQuotaStateStore(tmp_path / "state").add_attempts(provider=dart_quota_provider("secret"), endpoint="x", day="2026-09-24", count=95)
+    ProviderQuotaStateStore(tmp_path / "state").add_attempts(provider=dart_ledger_for_key(key_env="KEY_X", primary_key_env="KEY_X", api_key="secret"), endpoint="x", day="2026-09-24", count=95)
 
     result = _run(tmp_path, monkeypatch, _collect_factory(tmp_path), _Collector(healthy=False))
 
@@ -176,7 +176,7 @@ def test_worker_with_nothing_pending_marks_complete_without_health_check(tmp_pat
 
 
 def test_worker_stops_mid_run_when_the_ledger_runs_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.integrations.dart.client import dart_quota_provider
+    from src.integrations.dart.client import dart_ledger_for_key
     from src.integrations.quota import ProviderQuotaStateStore
 
     _job(tmp_path, 20, budget=60)
@@ -185,7 +185,7 @@ def test_worker_stops_mid_run_when_the_ledger_runs_out(tmp_path: Path, monkeypat
 
     def spending(*, identities: tuple[dict[str, str], ...], **kwargs: Any) -> SimpleNamespace:
         ProviderQuotaStateStore(tmp_path / "state").add_attempts(
-            provider=dart_quota_provider("secret"), endpoint="x", day="2026-09-24", count=3 * len(identities)
+            provider=dart_ledger_for_key(key_env="KEY_X", primary_key_env="KEY_X", api_key="secret"), endpoint="x", day="2026-09-24", count=3 * len(identities)
         )
         return inner(identities=identities, **kwargs)
 
@@ -193,3 +193,126 @@ def test_worker_stops_mid_run_when_the_ledger_runs_out(tmp_path: Path, monkeypat
 
     assert result.status == "budget_exhausted"
     assert 0 < result.done_total < 20
+
+
+def _seed_named_scope(tmp_path: Path) -> Path:
+    import hashlib
+
+    import polars as pl
+
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(
+        scope_config=Path("config/research/kr_swing_2019_v1.toml"), data_root=tmp_path / "data"
+    )
+    bridge_raw = json.dumps(
+        [{"ticker": "005930", "corp_code": "00126380", "corp_name": "Test Co"}],
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    bridge_path = (
+        runtime.workspace.bronze_root / "dart_corp_codes" / hashlib.sha256(bridge_raw).hexdigest() / "payload.json"
+    )
+    bridge_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge_path.write_bytes(bridge_raw)
+    published = publish_dataset(
+        layer_root=runtime.workspace.silver_root,
+        identity=DatasetIdentity(
+            kind="ordinary_universe", layer=DatasetLayer.SILVER, policy_version="test-v1", inputs={}, params={}
+        ),
+        partitions={"part.parquet": pl.DataFrame({"ticker": ["005930"], "eligible": [True]})},
+    )
+    DatasetRegistry(runtime.workspace.state_root).register("ordinary_universe", published.dataset_id)
+    return tmp_path / "data"
+
+
+def _named_job(tmp_path: Path, *, job: str = "dart_disclosures", dry_run: bool = False, key_env: str = "OPENDART_API_KEY_2", **extra: Any) -> None:
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    provider = load_provider_policy(load_runtime_config())
+    payload: dict[str, Any] = {
+        "job": job,
+        "scope_id": scope.scope_id,
+        "scope": scope.model_dump(mode="json"),
+        "provider_policy": provider.model_dump(mode="json"),
+        "data_root": str(tmp_path / "data"),
+        "key_env": key_env,
+        "primary_key_env": provider.primary_key_env,
+        "chunk": 500,
+        "max_chunks": None,
+        "dry_run": dry_run,
+    }
+    payload.update(extra)
+    (tmp_path / "job.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+class _NamedCollector:
+    def __init__(self, api_key: str, **_kwargs: Any) -> None:
+        self.api_key = api_key
+
+    def health_check(self) -> None:
+        return None
+
+    def list_disclosures(self, start: object, end: object, *, detail_type: object = None) -> list[dict[str, str]]:
+        return []
+
+
+def test_named_job_dry_run_plans_without_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.remote_dart_worker import run_named_job
+
+    _seed_named_scope(tmp_path)
+    _named_job(tmp_path, dry_run=True)
+    monkeypatch.setenv("OPENDART_API_KEY_2", "secret")
+
+    result = run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+
+    assert result.status == "dry_run"
+    assert result.pending_left > 0
+    assert result.requests_today == 0
+    assert not (tmp_path / "COMPLETE").exists()
+    assert json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))["status"] == "dry_run"
+
+
+def test_named_job_runs_disclosures_through_shared_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.remote_dart_worker import run_named_job
+
+    _seed_named_scope(tmp_path)
+    _named_job(tmp_path)
+    monkeypatch.setenv("OPENDART_API_KEY_2", "secret")
+    monkeypatch.setattr("src.integrations.dart.xbrl.DartXbrlCollector", _NamedCollector)
+
+    result = run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+
+    assert (result.status, result.done_total, result.pending_left) == ("complete", result.done_total, 0)
+    assert result.done_total > 0
+    assert (tmp_path / "COMPLETE").is_file()
+
+
+def test_named_job_rejects_bad_job_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.remote_dart_worker import run_named_job
+
+    with pytest.raises(PITDataError, match="job file is missing"):
+        run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+    (tmp_path / "job.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(PITDataError, match="job file is invalid"):
+        run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+
+    _seed_named_scope(tmp_path)
+    _named_job(tmp_path, job="nope")
+    monkeypatch.setenv("OPENDART_API_KEY_2", "secret")
+    with pytest.raises(PITDataError, match="unknown DART job"):
+        run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+
+    _named_job(tmp_path)
+    monkeypatch.delenv("OPENDART_API_KEY_2", raising=False)
+    with pytest.raises(PITDataError, match="not set"):
+        run_named_job(root=tmp_path, key_env="OPENDART_API_KEY_2")
+
+    _named_job(tmp_path, key_env="MISSING_KEY")
+    monkeypatch.setenv("MISSING_KEY", "secret")
+    with pytest.raises(PITDataError, match="no declared policy"):
+        run_named_job(root=tmp_path, key_env="MISSING_KEY")

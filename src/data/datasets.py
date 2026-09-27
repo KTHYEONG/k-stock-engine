@@ -18,6 +18,7 @@ from typing import Final, cast
 
 import polars as pl
 
+from src.core.digest import dataset_digest as dataset_digest
 from src.core.pit import PITDataError
 
 MANIFEST_NAME: Final = "manifest.json"
@@ -500,13 +501,6 @@ def read_dataset_compat(
         return pl.LazyFrame()
     frame = pl.scan_parquet([str(path) for path in paths], hive_partitioning=True)
     return frame if columns is None else frame.select(*columns)
-
-
-def dataset_digest(values: Sequence[str]) -> str:
-    """Return a stable Bronze-style digest for a set of source identities."""
-
-    normalized = sorted(dict.fromkeys(str(value) for value in values))
-    return f"bronze:{hashlib.sha256(chr(0).join(normalized).encode('utf-8')).hexdigest()}"
 
 
 def resolve_bronze_digest(

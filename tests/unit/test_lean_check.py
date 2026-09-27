@@ -44,8 +44,9 @@ def test_find_test_files_direct_convention(tmp_path: Path, monkeypatch) -> None:
     test_file = tests_dir / "test_matcher.py"
     test_file.write_text("def test_match(): pass\n", encoding="utf-8")
 
-    matched = lean_check._find_test_files(["src/mhs/engine/matcher.py"])
+    matched, unmapped = lean_check._find_test_files(["src/mhs/engine/matcher.py"])
     assert "tests/unit/mhs/engine/test_matcher.py" in matched
+    assert unmapped == []
 
 
 def test_find_test_files_spec_markdown(tmp_path: Path, monkeypatch) -> None:
@@ -61,8 +62,9 @@ def test_find_test_files_spec_markdown(tmp_path: Path, monkeypatch) -> None:
         encoding="utf-8",
     )
 
-    matched = lean_check._find_test_files([], spec_path=str(spec_file))
+    matched, unmapped = lean_check._find_test_files([], spec_path=str(spec_file))
     assert "tests/unit/test_spec_feature.py" in matched
+    assert unmapped == []
 
 
 def test_available_memory_gb_returns_positive_float() -> None:
@@ -98,8 +100,9 @@ def test_find_test_files_spec_markdown_invariant_scenarios(tmp_path: Path, monke
         encoding="utf-8",
     )
 
-    matched = lean_check._find_test_files([], spec_path=str(spec_file))
+    matched, unmapped = lean_check._find_test_files([], spec_path=str(spec_file))
     assert "tests/unit/test_invariant_feature.py" in matched
+    assert unmapped == []
 
 
 def test_check_pre_impl_spec_valid(tmp_path: Path, monkeypatch) -> None:
@@ -150,3 +153,21 @@ def test_check_pre_impl_spec_invalid_anchor_and_missing_caller(tmp_path: Path, m
     assert any("Wiring anchor 'missing_anchor' not found" in e for e in errors)
     assert any("Test suite directory does not exist" in e for e in errors)
 
+def test_find_test_files_nested_package_mapping(tmp_path: Path, monkeypatch) -> None:
+    """src/data/cli/build.py maps to tests/unit/data/cli/test_build.py."""
+    monkeypatch.chdir(tmp_path)
+    nested = tmp_path / "tests" / "unit" / "data" / "cli"
+    nested.mkdir(parents=True)
+    (nested / "test_build.py").write_text("def test_build(): pass\n", encoding="utf-8")
+
+    matched, unmapped = lean_check._find_test_files(["src/data/cli/build.py"])
+    assert "tests/unit/data/cli/test_build.py" in matched
+    assert unmapped == []
+
+
+def test_find_test_files_unmapped_module_is_reported(tmp_path: Path, monkeypatch) -> None:
+    """A module without tests appears in the unmapped diagnostics."""
+    monkeypatch.chdir(tmp_path)
+    matched, unmapped = lean_check._find_test_files(["src/data/cli/phantom.py"])
+    assert matched == []
+    assert unmapped == ["src/data/cli/phantom.py"]

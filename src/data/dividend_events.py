@@ -21,7 +21,6 @@ from src.integrations.dart.dividend_decision import (
 )
 
 POLICY_VERSION = "dividend-events-v2"
-DIVIDEND_DECISION_SOURCE = "opendart:dividend_decision"
 _SCHEMA: dict[str, Any] = {
     "instrument_id": pl.String,
     "ticker": pl.String,
@@ -37,35 +36,12 @@ _SCHEMA: dict[str, Any] = {
 
 
 def _load_corp_bridge(bronze_root: Path) -> dict[str, str]:
-    paths = sorted((bronze_root / "dart_corp_codes").glob("*/payload.json"))
-    if not paths:
-        raise PITDataError("dart corp-code bridge is missing; certification blocked")
+    from src.data.jobs.universe import read_corp_code_bridge
+
     try:
-        raw = paths[-1].read_bytes()
-    except OSError as exc:
-        raise PITDataError("invalid dart corp-code bridge payload; certification blocked") from exc
-    if hashlib.sha256(raw).hexdigest() != paths[-1].parent.name:
-        raise PITDataError("dart corp-code bridge hash mismatch; certification blocked")
-    try:
-        payload = json.loads(raw)
-    except ValueError as exc:
-        raise PITDataError("invalid dart corp-code bridge payload; certification blocked") from exc
-    if not isinstance(payload, list):
-        raise PITDataError("invalid dart corp-code bridge payload; certification blocked")
-    mapping: dict[str, str] = {}
-    for row in payload:
-        if not isinstance(row, dict):
-            continue
-        ticker = str(row.get("ticker") or "").strip()
-        corp = str(row.get("corp_code") or "").strip()
-        if not ticker or not corp:
-            continue
-        previous = mapping.get(corp)
-        if previous is not None and previous != ticker:
-            raise PITDataError(f"corp code {corp} maps to multiple tickers; certification blocked")
-        mapping[corp] = ticker
-    if not mapping:
-        raise PITDataError("dart corp-code bridge is empty; certification blocked")
+        mapping, _ = read_corp_code_bridge(Path(bronze_root))
+    except PITDataError as exc:
+        raise PITDataError(f"invalid dart corp-code bridge: {exc}") from exc
     return mapping
 
 

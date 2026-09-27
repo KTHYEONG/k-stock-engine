@@ -9,7 +9,7 @@ def test_refresh_dart_facts_rejects_tampered_receipt_before_publish(tmp_path) ->
     from datetime import UTC, datetime
     import pytest
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     receipt_dir = tmp_path / 'bronze' / 'financial_facts' / 'bad'
     receipt_dir.mkdir(parents=True)
@@ -202,7 +202,7 @@ def test_refresh_rejects_conflicting_duplicate_payloads(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "a", _FACT_PAGE)
@@ -231,7 +231,7 @@ def test_refresh_rejects_missing_payload_before_publish(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     receipt_dir = tmp_path / "bronze" / "financial_facts" / "ghost"
     receipt_dir.mkdir(parents=True)
@@ -257,7 +257,7 @@ def test_refresh_rejects_invalid_batch_size_and_naive_decision_time(tmp_path) ->
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
 
@@ -286,7 +286,7 @@ def test_refresh_rejects_empty_bronze_scope(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     with pytest.raises(PITDataError, match="financial_facts"):
@@ -314,7 +314,7 @@ def test_refresh_rejects_unparseable_payload_with_valid_hash(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     _write_fact_receipt(tmp_path / "bronze", "broken", "not json at all {{")
 
@@ -335,7 +335,7 @@ def test_refresh_rejects_malformed_receipt_metadata(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     cases = {
@@ -396,7 +396,7 @@ def test_refresh_rejects_empty_result_when_no_rows(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "empty", '{"records": []}')
@@ -453,7 +453,7 @@ def test_refresh_rejects_unreadable_or_garbage_receipt(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     unreadable = tmp_path / "unreadable"
@@ -490,7 +490,7 @@ def test_refresh_rejects_receipt_with_bad_ingested_at(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     receipt_dir = tmp_path / "bronze" / "financial_facts" / "r"
     receipt_dir.mkdir(parents=True)
@@ -516,7 +516,7 @@ def test_refresh_maps_publish_failures_to_pit_error(tmp_path, monkeypatch) -> No
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
@@ -564,7 +564,7 @@ def test_refresh_dart_facts_rejects_future_or_missing_frozen_bridge(tmp_path) ->
     import pytest
 
     from src.data.incremental_normalization import load_frozen_dart_ticker_bridge
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     with pytest.raises(PITDataError, match='ticker bridge'):
         load_frozen_dart_ticker_bridge(
@@ -769,7 +769,7 @@ def test_refresh_rejects_unknown_superseded_receipt(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
@@ -884,6 +884,12 @@ def test_refresh_manifest_records_quarantine_exclusion(tmp_path) -> None:
     )
     assert manifest["details"]["quarantined_filings"] == 1
     assert manifest["details"]["trusted_source_kinds"] == ["legacy_document_verified", "opendart_standard"]
+    import hashlib
+    from pathlib import Path
+
+    quarantine = Path(artifact.quarantine_path)
+    assert manifest["details"]["quarantine_file"] == quarantine.name
+    assert manifest["details"]["quarantine_sha256"] == hashlib.sha256(quarantine.read_bytes()).hexdigest()
 
 
 def test_refresh_quarantine_deterministic_and_idempotent(tmp_path) -> None:
@@ -949,7 +955,7 @@ def test_refresh_all_untrusted_input_refused(tmp_path) -> None:
     import pytest
 
     from src.data.incremental_normalization import refresh_dart_financial_facts
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     decision_time = datetime(2016, 12, 30, tzinfo=UTC)
     _write_fact_receipt(tmp_path / "bronze", "leg", _legacy_receipt_payload(filing_id="F2", published="2015-11-16T00:00:00+00:00"))
@@ -1035,7 +1041,7 @@ def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tm
         _validate_fact_frame,
         load_frozen_dart_ticker_bridge,
     )
-    from src.data.schemas import PITDataError
+    from src.core.pit import PITDataError
 
     silver = tmp_path / "silver"
     disclosure = publish_dataset(
