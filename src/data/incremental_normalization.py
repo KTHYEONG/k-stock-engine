@@ -25,6 +25,7 @@ from src.data.datasets import (
 from src.data.normalization import (
     TRUSTED_FACT_SOURCE_KINDS,
     QuarantinedFiling,
+    SessionIndex,
     normalize_dart_financial_facts_with_quarantine,
 )
 
@@ -53,13 +54,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _discover_fact_receipts(bronze_root: Path) -> list[dict[str, object]]:
-    """Latest catalog page of every fact identity, integrity-checked.
+def _discover_fact_receipts(bronze_root: Path, *, verify_payload: bool = True) -> list[dict[str, object]]:
+    """Latest catalog page of every fact identity, with receipt metadata checked.
 
     Only the catalog's latest receipt per natural key is an input. Older pages of
     the same identity stay on disk, but reading them too would let a page that a
     newer one replaced (a legacy fallback, a re-fetch) leak into Silver and
     conflict with its successor.
+
+    Args:
+        bronze_root: Bronze root containing the receipt catalog.
+        verify_payload: When True every payload is hashed and compared with its receipt. Callers that
+            read each payload themselves pass False and must verify the bytes they read.
+
+    Returns:
+        Receipt metadata ordered by retrieval time and content hash.
+
+    Raises:
+        PITDataError: Missing catalog evidence, a malformed receipt, a kind mismatch or, when
+            ``verify_payload`` is True, a missing or altered payload.
     """
     from src.data.receipt_catalog import ReceiptCatalog
 
@@ -107,12 +120,15 @@ def _discover_fact_receipts(bronze_root: Path) -> list[dict[str, object]]:
             ingested_at = datetime.fromisoformat(str(meta["ingested_at"]))
         except (KeyError, ValueError) as exc:
             raise PITDataError(f"malformed Bronze receipt {receipt_path}") from exc
-        try:
-            computed = _sha256_file(payload_path)
-        except OSError as exc:
-            raise PITDataError(f"missing Bronze payload for {receipt_path}") from exc
-        if computed != content_hash:
-            raise PITDataError(f"hash mismatch for Bronze payload {payload_path}")
+        if verify_payload:
+            try:
+                computed = _sha256_file(payload_path)
+            except OSError as exc:
+                raise PITDataError(f"missing Bronze payload for {receipt_path}") from exc
+            if computed != content_hash:
+                raise PITDataError(f"hash mismatch for Bronze payload {payload_path}")
+        elif not payload_path.is_file():
+            raise PITDataError(f"missing Bronze payload for {receipt_path}")
         verified.append(
             {
                 "content_hash": content_hash,
@@ -363,7 +379,8 @@ def refresh_dart_financial_facts(
     if int(batch_size) < 1:
         raise PITDataError("batch_size must be positive")
     bound = int(batch_size)
-    receipts = _discover_fact_receipts(Path(bronze_root))
+    receipts = _discover_fact_receipts(Path(bronze_root), verify_payload=False)
+    session_index = SessionIndex.from_calendar(calendar)
     from src.data.receipt_catalog import ReceiptCatalog as _Catalog
 
     stored_catalog = _Catalog(Path(bronze_root) / "catalog")
@@ -401,8 +418,14 @@ def refresh_dart_financial_facts(
         batch_frames: list[pl.DataFrame] = []
         for item in batch:
             try:
-                payload = json.loads(Path(str(item["payload_path"])).read_bytes())
-            except (OSError, ValueError) as exc:
+                raw_bytes = Path(str(item["payload_path"])).read_bytes()
+            except OSError as exc:
+                raise PITDataError(f"invalid Bronze payload for financial_facts: {exc}") from exc
+            if hashlib.sha256(raw_bytes).hexdigest() != str(item["content_hash"]):
+                raise PITDataError(f"hash mismatch for Bronze payload {item['payload_path']}")
+            try:
+                payload = json.loads(raw_bytes)
+            except ValueError as exc:
                 raise PITDataError(f"invalid Bronze payload for financial_facts: {exc}") from exc
             page: object = {"records": payload} if isinstance(payload, list) else payload
             frame, batch_quarantine = normalize_dart_financial_facts_with_quarantine(
@@ -414,6 +437,7 @@ def refresh_dart_financial_facts(
                 ticker_by_corp_code=bridge,
                 bridge_receipt_hash=bridge_receipt_hash,
                 trust_document_facts=trust_document_facts,
+                session_index=session_index,
             )
             quarantined_all.extend(batch_quarantine)
             if frame.height > 0:
@@ -441,6 +465,7 @@ def refresh_dart_financial_facts(
             ticker_by_corp_code=bridge,
             bridge_receipt_hash=bridge_receipt_hash,
             trust_document_facts=trust_document_facts,
+            session_index=session_index,
         )
         quarantined_all.extend(empty_quarantine)
     merged = _merge_fact_frames(None, new_rows)

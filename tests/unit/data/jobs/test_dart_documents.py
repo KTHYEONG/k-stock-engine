@@ -219,6 +219,7 @@ def test_reparse_is_streaming_and_idempotent(tmp_path: Path, monkeypatch) -> Non
         entries=_guarded_entries,
         blobs=ctx.catalog.blobs,
         latest=ctx.catalog.latest,
+        root=ctx.catalog.root,
     )
     guard_ctx = _ctx(runtime, _provider())
     object.__setattr__(guard_ctx, "catalog", guarded)
@@ -547,3 +548,244 @@ def test_fetch_skips_legacy_with_usable_archive(tmp_path: Path) -> None:
 
     assert len(DartDocumentReparseJob().pending(ctx)) == 1
     assert DartDocumentFetchJob().pending(ctx) == []
+
+
+def test_reparse_reads_each_archive_without_rescanning_the_catalog(tmp_path: Path, monkeypatch) -> None:
+    from src.data.jobs.dart_documents import DartDocumentReparseJob
+    from src.integrations.dart.document_statements import DocumentParseResult
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe_years(runtime, {TICKER: {2020, 2021, 2022}})
+    ctx = _ctx(runtime, _provider())
+    for idx, year in enumerate(("2020", "2021", "2022")):
+        receipt = _store_archive(ctx, f"PK-archive-{idx}".encode(), f"2020033{idx}00123{idx}")
+        _persist_fact(ctx, _legacy_page(biz_year=year, filing_id=f"2020033{idx}00123{idx}", raw_hash=receipt.content_hash))
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=_verified_statements(), diagnostics=()),
+    )
+    units = DartDocumentReparseJob().pending(ctx)
+    assert len(units) == 3
+
+    blob_calls = 0
+    real_blobs = ctx.catalog.blobs
+
+    def _counted_blobs(*, source):
+        nonlocal blob_calls
+        blob_calls += 1
+        return real_blobs(source=source)
+
+    monkeypatch.setattr(ctx.catalog, "blobs", _counted_blobs)
+    payloads = DartDocumentReparseJob().fetch(ctx, units)
+
+    assert len(payloads) == 3
+    assert blob_calls == 1
+
+
+def test_reparse_skips_an_unreadable_or_unknown_archive(tmp_path: Path, monkeypatch) -> None:
+    from src.data.jobs.dart_documents import DartDocumentReparseJob, _unit_payload
+    from src.data.jobs.runner import JobUnit
+    from src.integrations.dart.document_statements import DocumentParseResult
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe_years(runtime, {TICKER: {2020, 2021}})
+    ctx = _ctx(runtime, _provider())
+    receipt = _store_archive(ctx, b"PK\x03\x04good-bytes", "20210330001234")
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=_verified_statements(), diagnostics=()),
+    )
+    good = JobUnit(
+        source="financial_facts",
+        natural_key=f"{CORP}:2020:11011",
+        payload={**_unit_payload(f"{CORP}:2020:11011", _legacy_page(raw_hash=receipt.content_hash)),
+                 "raw_document_hash": receipt.content_hash},
+        max_requests=1,
+    )
+    unknown = JobUnit(
+        source="financial_facts",
+        natural_key=f"{CORP}:2021:11011",
+        payload={"corp_code": CORP, "biz_year": "2021", "reprt_code": "11011",
+                 "filing_id": "20210330009999", "rcept_no": "20210330009999",
+                 "fs_div": "CFS", "published_at": "", "ticker": TICKER,
+                 "fiscal_period": "", "raw_document_hash": "0" * 64},
+        max_requests=1,
+    )
+    payloads = DartDocumentReparseJob().fetch(ctx, [good, unknown])
+
+    assert len(payloads) == 1
+
+
+def test_reparse_single_unit_fetches_share_one_blob_scan(tmp_path: Path, monkeypatch) -> None:
+    """Units fetched one at a time share a single per-instance blob scan."""
+    from src.data.jobs.dart_documents import DartDocumentReparseJob
+    from src.integrations.dart.document_statements import DocumentParseResult
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe_years(runtime, {TICKER: {2020, 2021, 2022}})
+    ctx = _ctx(runtime, _provider())
+    for idx, year in enumerate(("2020", "2021", "2022")):
+        receipt = _store_archive(ctx, f"PK-archive-{idx}".encode(), f"2020033{idx}00123{idx}")
+        _persist_fact(ctx, _legacy_page(biz_year=year, filing_id=f"2020033{idx}00123{idx}", raw_hash=receipt.content_hash))
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=_verified_statements(), diagnostics=()),
+    )
+    job = DartDocumentReparseJob()
+    units = job.pending(ctx)
+    assert len(units) == 3
+    blob_calls = 0
+    real_blobs = ctx.catalog.blobs
+
+    def _counted_blobs(*, source):
+        nonlocal blob_calls
+        blob_calls += 1
+        return real_blobs(source=source)
+
+    monkeypatch.setattr(ctx.catalog, "blobs", _counted_blobs)
+    payloads = []
+    for unit in units:
+        payloads.extend(job.fetch(ctx, [unit]))
+    assert len(payloads) == 3
+    assert blob_calls == 1
+
+
+def test_reparse_new_instance_sees_newly_registered_blob(tmp_path: Path, monkeypatch) -> None:
+    """A second job instance rebuilds its mapping and finds a later blob."""
+    from src.data.jobs.dart_documents import DartDocumentReparseJob
+    from src.integrations.dart.document_statements import DocumentParseResult
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe_years(runtime, {TICKER: {2020, 2021}})
+    ctx = _ctx(runtime, _provider())
+    receipt = _store_archive(ctx, b"PK\x03\x04first", "20210330001234")
+    _persist_fact(ctx, _legacy_page(filing_id="20210330001234", raw_hash=receipt.content_hash))
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=_verified_statements(), diagnostics=()),
+    )
+    first = DartDocumentReparseJob()
+    assert len(first.fetch(ctx, first.pending(ctx))) == 1
+    second_receipt = _store_archive(ctx, b"PK\x03\x04second", "20210330009999")
+    _persist_fact(ctx, _legacy_page(biz_year="2021", filing_id="20210330009999", raw_hash=second_receipt.content_hash))
+    second = DartDocumentReparseJob()
+    units = [unit for unit in second.pending(ctx) if unit.natural_key == f"{CORP}:2021:11011"]
+    assert units
+    assert len(second.fetch(ctx, units)) == 1
+
+
+def _verified_old_page(*, biz_year: str, filing_id: str, raw_hash: str) -> dict:
+    return {
+        "source_kind": "document_verified",
+        "parser_version": "v0-old",
+        "status": "013",
+        "identity": {"corp_code": CORP, "biz_year": biz_year, "reprt_code": "11011",
+                     "filing_id": filing_id, "rcept_no": filing_id, "fs_div": "CFS",
+                     "published_at": "2022-03-30"},
+        "records": [],
+        "mapping_version": "dart-fact-map-v1",
+        "diagnostics": (),
+        "raw_document_hash": raw_hash,
+        "corp_code": CORP, "biz_year": biz_year, "reprt_code": "11011",
+        "filing_id": filing_id, "rcept_no": filing_id, "fs_div": "CFS", "published_at": "2022-03-30",
+    }
+
+
+def _standard_ignored_page(*, biz_year: str, filing_id: str, raw_hash: str | None) -> dict:
+    return {
+        "source_kind": "opendart_standard",
+        "status": "000",
+        "identity": {"corp_code": CORP, "biz_year": biz_year, "reprt_code": "11011",
+                     "filing_id": filing_id, "rcept_no": filing_id},
+        "records": [{"fact": "sales"}],
+        "mapping_version": "test-v1",
+        "diagnostics": (),
+        "raw_document_hash": raw_hash,
+        "corp_code": CORP, "biz_year": biz_year, "reprt_code": "11011",
+        "filing_id": filing_id, "rcept_no": filing_id, "fs_div": "CFS", "published_at": "2022-03-30",
+    }
+
+
+def _mixed_catalog_ctx(tmp_path: Path):
+    from src.integrations.dart.document_statements import (
+        DocumentParseResult,
+        document_verified_page,
+    )
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe_years(runtime, {TICKER: {2020, 2021, 2022}})
+    ctx = _ctx(runtime, _provider())
+    _write_disclosure_page(
+        runtime.workspace.bronze_root,
+        {"records": [_disclosure_record("20210330001234", "20210330", "사업보고서 (2020.12)"),
+                      _disclosure_record("20220330001234", "20220330", "사업보고서 (2021.12)")],
+         "start": "2019-01-01", "end": "2022-12-31", "corp_code": CORP},
+    )
+    usable_a = _store_archive(ctx, b"PK\x03\x04usable-a", "20210330001234")
+    usable_c = _store_archive(ctx, b"PK\x03\x04usable-c", "20220330001111")
+    usable_current = _store_archive(ctx, b"PK\x03\x04usable-current", "20210330002222")
+    _persist_fact(ctx, _legacy_page(filing_id="20210330001234", raw_hash=usable_a.content_hash))
+    _persist_fact(ctx, _legacy_page(biz_year="2021", filing_id="20220330009999", raw_hash=None))
+    _persist_fact(ctx, _verified_old_page(biz_year="2022", filing_id="20220330001111",
+                                          raw_hash=usable_c.content_hash))
+    _persist_fact(ctx, _standard_ignored_page(biz_year="2023", filing_id="20230330001111",
+                                              raw_hash=usable_a.content_hash))
+    current_page = dict(
+        document_verified_page(
+            identity={"corp_code": CORP, "biz_year": "2020", "reprt_code": "11014",
+                      "filing_id": "20210330002222", "rcept_no": "20210330002222",
+                      "fs_div": "CFS", "published_at": "2021-03-30", "ticker": TICKER},
+            result=DocumentParseResult(statements=_verified_statements(), diagnostics=()),
+            document_hash=usable_current.content_hash,
+        )
+    )
+    _persist_fact(ctx, current_page)
+    not_found = _legacy_page(biz_year="2020", reprt_code="11013", filing_id="20210330003333",
+                             raw_hash=None)
+    not_found["diagnostics"] = ("document_not_found",)
+    _persist_fact(ctx, not_found)
+    return ctx
+
+
+def test_planning_identical_with_cold_and_warm_cache(tmp_path: Path) -> None:
+    """Cold and warm caches plan the same units as the pre-cache expectations."""
+    from src.data.jobs.dart_documents import DartDocumentFetchJob, DartDocumentReparseJob
+
+    ctx = _mixed_catalog_ctx(tmp_path)
+    expected_reparse = [f"{CORP}:2020:11011", f"{CORP}:2022:11011"]
+    expected_fetch = [f"{CORP}:2021:11011"]
+    cold_reparse = [unit.natural_key for unit in DartDocumentReparseJob().pending(ctx)]
+    cold_fetch = [unit.natural_key for unit in DartDocumentFetchJob().pending(ctx)]
+    assert cold_reparse == expected_reparse
+    assert cold_fetch == expected_fetch
+    warm_reparse = [unit.natural_key for unit in DartDocumentReparseJob().pending(ctx)]
+    warm_fetch = [unit.natural_key for unit in DartDocumentFetchJob().pending(ctx)]
+    assert warm_reparse == cold_reparse
+    assert warm_fetch == cold_fetch
+
+
+def test_planning_reads_full_pages_only_for_planned_units(tmp_path: Path, monkeypatch) -> None:
+    """With a warm cache, planning reads page files only for emitted units."""
+    from pathlib import Path as _Path
+
+    from src.data.jobs.dart_documents import DartDocumentReparseJob
+
+    ctx = _mixed_catalog_ctx(tmp_path)
+    assert len(DartDocumentReparseJob().pending(ctx)) == 2
+    reads = 0
+    real_read_bytes = _Path.read_bytes
+
+    def _counted_read_bytes(self: _Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        reads += 1
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "read_bytes", _counted_read_bytes)
+    units = DartDocumentReparseJob().pending(ctx)
+    assert [unit.natural_key for unit in units] == [f"{CORP}:2020:11011", f"{CORP}:2022:11011"]
+    assert reads == len(units)

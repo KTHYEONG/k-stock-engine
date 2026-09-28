@@ -1,6 +1,39 @@
 {
   "tasks": [
     {
+      "task_id": "PIPELINE_PERF_REPEATED_SCANS",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_PIPELINE_PERF_REPEATED_SCANS",
+      "domain": "data",
+      "title": "Rollout pipeline performance: repeated scans, page-meta cache, normalization index",
+      "why": "Reparse, benchmark and refresh took about 30 minutes because catalog rows were re-resolved and rescanned per unit, all 98k pages were re-read per command, and the calendar was rebuilt for every page.",
+      "resolution": "Added lexical catalog row paths, a per-instance archive map, a single-scan benchmark, a content-hash page metadata cache, a shared session index and single-read hash verification in refresh.",
+      "impact": "Results stay identical while the reparse, benchmark and refresh stages are expected to drop from about 30 minutes to under 10.",
+      "caveat": "Refresh plan no longer hashes payloads so tampering is detected at build time before publication."
+    },
+    {
+      "task_id": "DART_DOCUMENT_EXCEPTION_HARDENING",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_DART_DOCUMENT_EXCEPTION_HARDENING",
+      "domain": "data",
+      "title": "DART document parser exception hardening",
+      "why": "Documents without XBRL have no independent source, and audits found split income tables, unmapped loss labels, unread current-column and date layouts, and an unchecked gross-profit identity.",
+      "resolution": "Added current-label and spaced-date recognition, explicit non-December fiscal-year diagnostics, plain/comprehensive income table selection, a gross-profit identity gate and fail-closed loss-label sign rules.",
+      "impact": "Recovers income statements and balance sheets of several hundred filings and blocks sign-flipped gross profit from reaching Silver.",
+      "caveat": "Real-data reparse, precision benchmark and refresh-scope are still pending and non-December fiscal-year filings remain withheld."
+    },
+    {
+      "task_id": "DART_DOCUMENT_BODY_SELECTION",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_DART_DOCUMENT_BODY_SELECTION",
+      "domain": "data",
+      "title": "DART document parser body selection and label/period normalization",
+      "why": "Caption tables of body length, dropped label brackets, unmatched 제 N(당) K분기 headers and duplicate prior-period tables made ~34% of verified filings lose IS/CF facts or silently fall back to separate statements.",
+      "resolution": "Bodies are identified by amount rows, labels keep balanced brackets, the period regex accepts quarter digits, one current-period body is selected, parser version bumped to v2, and reparse reads archives from one catalog pass.",
+      "impact": "IS coverage of verified interim filings rises from 66% to at least 79.5% and 15 filings regain consolidated values in place of separate ones.",
+      "caveat": "Real-data reparse, precision benchmark and refresh-scope are still pending, and CFS-to-OFS fallback is unchanged."
+    },
+    {
       "task_id": "TASK_DART_DOCUMENT_ROLLOUT",
       "date": "2026-09-28",
       "adr_id": "ADR_20260928_DART_DOCUMENT_ROLLOUT",

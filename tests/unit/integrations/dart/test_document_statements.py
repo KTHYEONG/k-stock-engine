@@ -286,7 +286,7 @@ def test_q1_single_column_is_emitted_as_quarter() -> None:
 def test_period_mismatch_withholds_document() -> None:
     from src.integrations.dart.document_statements import parse_filing_document
 
-    archive = make_archive({"F.xml": bs_section(when="2017.09.30 현재")})
+    archive = make_archive({"F.xml": bs_section(when="2016.03.31 현재")})
     result = parse_filing_document(archive, reprt_code="11013", biz_year="2017")
 
     assert result.statements is None
@@ -625,7 +625,7 @@ def test_missing_current_column_withholds_kind() -> None:
     from src.integrations.dart.document_statements import parse_filing_document
 
     rows = [
-        ["과목", "당기", "전기"],
+        ["과목", "전기", "전전기"],
         ["자산총계", "1,000", "900"],
         ["부채총계", "400", "350"],
         ["자본총계", "600", "550"],
@@ -897,7 +897,7 @@ def test_income_without_period_header_is_dropped_only() -> None:
 
     body = table(
         [
-            ["과목", "당기", "전기"],
+            ["과목", "전기", "전전기"],
             ["매출액", "1,000", "900"],
             ["영업이익", "100", "90"],
             ["당기순이익", "80", "70"],
@@ -920,7 +920,7 @@ def test_empty_row_never_breaks_fact_extraction() -> None:
         region="(단위 : 원)",
         rows=((), ("과목", "제 35 기"), ("자산총계", "1,000"), ("부채총계", "400"), ("자본총계", "600")),
     )
-    facts, _ = _extract_kind_facts("BS", body, 1, "11011")
+    facts, _, _, _ = _extract_kind_facts("BS", body, 1, "11011")
 
     assert facts["assets"][0] == 1000
 
@@ -932,3 +932,727 @@ def test_archive_level_guards_withhold() -> None:
     assert parse_filing_document(crowded, reprt_code="11011", biz_year="2019").diagnostics == ("too_many_members",)
     escaped = make_archive({"../escape.xml": bs_section()})
     assert parse_filing_document(escaped, reprt_code="11011", biz_year="2019").diagnostics == ("unsafe_member_path",)
+
+
+def _five_row_caption(*, unit: str = "(단위 : 원)") -> str:
+    return table(
+        [
+            ["제 35 기 결산공고", ""],
+            ["2019년 12월 31일 현재", ""],
+            ["주식회사 테스트", ""],
+            ["제 35 기", "제 34 기"],
+            [unit, ""],
+        ]
+    )
+
+
+def _simple_is_body(*, sales: str = "1,000") -> str:
+    return table(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", sales, "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+            ["기타", "1", "2"],
+        ]
+    )
+
+
+def _simple_cf_body() -> str:
+    return table(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["영업활동으로인한현금흐름", "500", "400"],
+            ["유형자산의취득", "(30)", "(20)"],
+            ["기말현금및현금성자산", "100", "90"],
+            ["당기순이익", "20", "10"],
+            ["감가상각비", "5", "4"],
+        ]
+    )
+
+
+def test_caption_table_of_body_length_is_not_the_income_body() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    extra = [para("손익계산서"), _five_row_caption(), _simple_is_body()]
+    archive = make_archive({"F.xml": bs_section(extra=extra)})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+    assert "missing_unit:IS" not in result.diagnostics
+
+
+def test_caption_table_does_not_hide_cash_flow_unit() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    extra = [para("현금흐름표"), _five_row_caption(), _simple_cf_body()]
+    archive = make_archive({"F.xml": bs_section(extra=extra)})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["operating_cash_flow"] == (500, "annual")
+    assert "missing_unit:CF" not in result.diagnostics
+
+
+def test_consolidated_section_verifies_instead_of_falling_back() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    cfs = section(
+        CFS,
+        "연결재무제표",
+        [
+            para("재무상태표"),
+            _five_row_caption(),
+            para("2019년 12월 31일 현재"),
+            table(bs_rows()),
+        ],
+    )
+    ofs = bs_section(
+        rows=bs_rows(assets="2,000", debt="800", equity="1,200", cash="200", prior=("900", "350", "550", "90")),
+    )
+    result = parse_filing_document(make_archive({"F.xml": cfs + ofs}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert result.statements.consolidated is True
+    assert result.statements.unit_multipliers.get("BS") == 1
+    assert facts_by_name(result)["assets"] == (1000, "point_in_time")
+
+
+def test_small_table_without_amounts_never_ends_the_heading() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    filler = table([["안내", "문구"], ["주식회사 테스트", "1건"]])
+    blocks = [para("재무상태표"), para("(단위 : 원)"), para("2019년 12월 31일 현재"), filler, filler, table(bs_rows())]
+    archive = make_archive({"F.xml": flow_section(blocks)})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["assets"] == (1000, "point_in_time")
+
+
+def test_prior_period_table_beside_current_one_is_not_ambiguous() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    prior = table(
+        [
+            ["과목", "34(전)기", "33(전)기"],
+            ["매출액", "900", "800"],
+            ["매출총이익", "550", "500"],
+            ["영업이익", "90", "80"],
+            ["당기순이익", "70", "60"],
+            ["기타", "2", "1"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), _simple_is_body(), prior]
+    archive = make_archive({"F.xml": bs_section(extra=extra)})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+    assert "ambiguous_statement:IS" not in result.diagnostics
+
+
+def test_period_parenthetical_with_quarter_digit_is_a_period() -> None:
+    from src.integrations.dart.document_statements import _current_columns, parse_filing_document
+
+    columns, _ = _current_columns((("과목", "제 68(당) 3분기", "제 67(전) 3분기"),))
+    assert columns == [1]
+    columns, _ = _current_columns((("과목", "제 68 (당)기 3 분기", "제 67 (전)기 3 분기"),))
+    assert columns == [1]
+
+    body = table(
+        [
+            ["과목", "제 68(당) 3분기", "제 67(전) 3분기"],
+            ["구분", "3개월", "누적"],
+            ["매출액", "250", "200"],
+            ["매출총이익", "150", "120"],
+            ["영업이익", "80", "70"],
+            ["당기순이익", "50", "40"],
+        ]
+    )
+    archive = q3_bs_with_is([para("3분기손익계산서"), para("(단위 : 원)"), body])
+    result = parse_filing_document(archive, reprt_code="11014", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (250, "quarter")
+
+
+def test_current_label_header_selects_current_columns() -> None:
+    from src.integrations.dart.document_statements import _current_columns, parse_filing_document
+
+    rows = [
+        ["과목", "당분기말", "당분기말", "전기말"],
+        ["자산총계", "1,000", "", "900"],
+        ["부채총계", "400", "", "350"],
+        ["자본총계", "600", "", "550"],
+        ["현금및현금성자산", "100", "", "90"],
+        ["이익잉여금", "50", "", "40"],
+    ]
+    columns, row_index = _current_columns(tuple(tuple(cell for cell in row) for row in rows))
+    assert columns == [1, 2]
+    assert row_index == 0
+    archive = make_archive({"F.xml": bs_section(when="2019년 9월 30일 현재", heading="분기재무상태표", rows=rows)})
+    result = parse_filing_document(archive, reprt_code="11014", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["assets"] == (1000, "point_in_time")
+
+
+def test_year_label_header_selects_highest_year() -> None:
+    from src.integrations.dart.document_statements import _current_columns, parse_filing_document
+
+    rows = (
+        ("과목", "2016회계연도", "2016회계연도", "2015회계연도"),
+        ("자산총계", "1,000", "", "900"),
+        ("부채총계", "400", "", "350"),
+        ("자본총계", "600", "", "550"),
+        ("현금및현금성자산", "100", "", "90"),
+    )
+    columns, _ = _current_columns(rows)
+    assert columns == [1, 2]
+    full_rows = [list(row) for row in rows] + [["이익잉여금", "50", "", "40"]]
+    archive = make_archive({"F.xml": bs_section(rows=full_rows)})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["assets"] == (1000, "point_in_time")
+
+
+def test_numbered_header_keeps_priority_over_current_label() -> None:
+    from src.integrations.dart.document_statements import _current_columns
+
+    columns, row_index = _current_columns(
+        (
+            ("과목", "제 35 기", "제 34 기"),
+            ("당기", "1,000", "900"),
+            ("부채총계", "400", "350"),
+        )
+    )
+    assert columns == [1]
+    assert row_index == 0
+
+
+def test_headers_without_current_marker_still_withhold() -> None:
+    from src.integrations.dart.document_statements import _current_columns, parse_filing_document
+
+    columns, row_index = _current_columns((("과목", "당해", "전해"),))
+    assert (columns, row_index) == ([], -1)
+    rows = [
+        ["과목", "당해", "전해"],
+        ["자산총계", "1,000", "900"],
+        ["부채총계", "400", "350"],
+        ["자본총계", "600", "550"],
+        ["현금및현금성자산", "100", "90"],
+        ["이익잉여금", "50", "40"],
+    ]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(rows=rows)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is None
+    assert "missing_current_column:BS" in result.diagnostics
+
+
+def test_spaced_date_digits_are_recovered() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    archive = make_archive({"F.xml": bs_section(when="2016년 0 9월 30일 현재", heading="분기재무상태표")})
+    result = parse_filing_document(archive, reprt_code="11014", biz_year="2016")
+
+    assert result.statements is not None
+    assert result.statements.period_end.isoformat() == "2016-09-30"
+
+
+def test_ordinary_dates_are_still_found() -> None:
+    from datetime import date
+
+    from src.integrations.dart.document_statements import _candidate_dates
+
+    assert date(2019, 12, 31) in _candidate_dates("2019.12.31 현재", (), [])
+    assert date(2019, 12, 31) in _candidate_dates("2019년 12월 31일 현재", (), [])
+
+
+def test_digits_without_separators_never_form_a_date() -> None:
+    from src.integrations.dart.document_statements import _candidate_dates
+
+    assert _candidate_dates("2016 09 30", (), []) == []
+    assert _candidate_dates("20160930", (), []) == []
+
+
+def test_fiscal_quarter_marker_is_fiscal_mismatch() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    archive = make_archive({"F.xml": bs_section(when="2017년 3월 31일 현재", heading="3분기말 재무상태표")})
+    result = parse_filing_document(archive, reprt_code="11013", biz_year="2017")
+
+    assert result.statements is None
+    assert result.diagnostics == ("missing_section:D-0-3-2-0", "non_december_fiscal_year")
+
+
+def test_off_quarter_fiscal_year_end_is_fiscal_mismatch() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    archive = make_archive({"F.xml": bs_section(when="2019년 3월 31일 현재")})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is None
+    assert "non_december_fiscal_year" in result.diagnostics
+
+
+def test_wrong_year_filing_stays_period_mismatch() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    archive = make_archive({"F.xml": bs_section(when="2018년 12월 31일 현재")})
+    result = parse_filing_document(archive, reprt_code="11011", biz_year="2019")
+
+    assert result.statements is None
+    assert "period_mismatch" in result.diagnostics
+    assert "non_december_fiscal_year" not in result.diagnostics
+
+
+def _is_body(rows: list[list[str]]) -> str:
+    return table(rows)
+
+
+def test_plain_and_comprehensive_income_tables_are_not_ambiguous() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    plain = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    twin = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), plain, para("포괄손익계산서"), para("(단위 : 원)"), twin]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+    assert "ambiguous_statement:IS" not in result.diagnostics
+
+
+def test_comprehensive_only_filing_keeps_its_income_statement() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("포괄손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+
+
+def test_two_plain_income_tables_stay_ambiguous() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body, para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "ambiguous_statement:IS" in result.diagnostics
+    assert "sales" not in facts_by_name(result)
+
+
+def test_disagreeing_twin_drops_the_shared_fact() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    plain = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "100", "70"],
+            ["매출총이익", "600", "550"],
+        ]
+    )
+    twin = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "90", "70"],
+            ["매출총이익", "600", "550"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), plain, para("포괄손익계산서"), para("(단위 : 원)"), twin]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "ambiguous_fact:net_income" in result.diagnostics
+    assert "net_income" not in facts_by_name(result)
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+
+
+def test_twin_only_facts_are_not_added() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    plain = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    twin = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), plain, para("포괄손익계산서"), para("(단위 : 원)"), twin]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "operating_profit" not in facts_by_name(result)
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+
+
+def test_gross_profit_identity_passes_with_bracketed_cost() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출원가", "(700)", "(650)"],
+            ["매출총이익", "300", "250"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+    assert facts_by_name(result)["gross_profit"] == (300, "annual")
+    assert "gross_profit_identity" in result.statements.checks
+
+
+def test_sign_flipped_gross_profit_withholds_revenue_and_gross_profit() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "8,686", "8,000"],
+            ["매출원가", "8,064", "7,500"],
+            ["매출총이익", "(622)", "500"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "sales" not in facts_by_name(result)
+    assert "gross_profit" not in facts_by_name(result)
+    assert "identity_failed:gross_profit" in result.diagnostics
+    assert facts_by_name(result)["operating_profit"] == (100, "annual")
+
+
+def test_missing_cost_of_sales_skips_the_identity() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+    assert facts_by_name(result)["gross_profit"] == (600, "annual")
+    assert result.statements is not None
+    assert "gross_profit_identity" not in result.statements.checks
+
+
+def test_bracketed_operating_loss_is_read_as_printed() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업손실", "(6,148)", "(5,000)"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert facts_by_name(result)["operating_profit"] == (-6148, "annual")
+
+
+def test_positive_operating_loss_needs_the_identity() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출원가", "700", "650"],
+            ["매출총이익", "300", "250"],
+            ["판매비와관리비", "800", "750"],
+            ["영업손실", "500", "400"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert facts_by_name(result)["operating_profit"] == (-500, "annual")
+
+
+def test_positive_operating_loss_without_confirmation_is_withheld() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["영업손실", "500", "400"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert "operating_profit" not in facts_by_name(result)
+    assert "ambiguous_loss_sign:operating_profit" in result.diagnostics
+
+
+def test_contradicting_identity_withholds_the_loss() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "2,000", "1,900"],
+            ["매출원가", "700", "650"],
+            ["매출총이익", "1,300", "1,250"],
+            ["판매비와관리비", "800", "750"],
+            ["영업손실", "500", "400"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert "operating_profit" not in facts_by_name(result)
+    assert "ambiguous_loss_sign:operating_profit" in result.diagnostics
+
+
+def test_positive_net_loss_is_always_withheld() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순손실", "900", "800"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert "net_income" not in facts_by_name(result)
+    assert "ambiguous_loss_sign:net_income" in result.diagnostics
+
+    bracketed = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순손실", "(900)", "(800)"],
+        ]
+    )
+    extra_bracketed = [para("손익계산서"), para("(단위 : 원)"), bracketed]
+    kept = parse_filing_document(
+        make_archive({"F.xml": bs_section(extra=extra_bracketed)}), reprt_code="11011", biz_year="2019"
+    )
+
+    assert facts_by_name(kept)["net_income"] == (-900, "annual")
+
+
+def test_loss_row_and_normal_row_conflict() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익(손실)", "100", "90"],
+            ["영업손실", "(50)", "(40)"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert "operating_profit" not in facts_by_name(result)
+    assert "ambiguous_fact:operating_profit" in result.diagnostics
+
+
+def test_support_lines_outside_income_statement_are_ignored() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    is_body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["영업이익", "100", "90"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    cf_body = table(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["영업활동으로인한현금흐름", "500", "400"],
+            ["유형자산의취득", "(30)", "(20)"],
+            ["기말현금및현금성자산", "100", "90"],
+            ["매출원가", "700", "650"],
+        ]
+    )
+    extra = [
+        para("손익계산서"),
+        para("(단위 : 원)"),
+        is_body,
+        para("현금흐름표"),
+        para("(단위 : 원)"),
+        cf_body,
+    ]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "gross_profit_identity" not in result.statements.checks
+    assert facts_by_name(result)["sales"] == (1000, "annual")
+
+
+def test_loss_row_without_single_amount_is_skipped() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["당기순이익", "80", "70"],
+            ["영업손실", "-", "-"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "operating_profit" not in facts_by_name(result)
+    assert "ambiguous_loss_sign:operating_profit" not in result.diagnostics
+
+
+def test_repeated_unconfirmed_loss_row_reports_once() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["당기순이익", "80", "70"],
+            ["영업손실", "500", "400"],
+            ["영업손실", "500", "400"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert "operating_profit" not in facts_by_name(result)
+    assert list(result.diagnostics).count("ambiguous_loss_sign:operating_profit") == 1
+
+
+def test_loss_only_primary_takes_basis_from_twin() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    primary = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["영업손실", "(100)", "(90)"],
+            ["당기순손실", "(200)", "(180)"],
+            ["매출원가", "700", "650"],
+        ]
+    )
+    twin = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["매출액", "1,000", "900"],
+            ["매출총이익", "600", "550"],
+            ["당기순이익", "80", "70"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), primary, para("포괄손익계산서"), para("(단위 : 원)"), twin]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert facts_by_name(result)["operating_profit"] == (-100, "annual")
+
+
+def test_loss_only_body_without_basis_withholds_silently() -> None:
+    from src.integrations.dart.document_statements import parse_filing_document
+
+    body = _is_body(
+        [
+            ["과목", "제 35 기", "제 34 기"],
+            ["영업손실", "(100)", "(90)"],
+            ["당기순손실", "(200)", "(180)"],
+            ["매출원가", "700", "650"],
+        ]
+    )
+    extra = [para("손익계산서"), para("(단위 : 원)"), body]
+    result = parse_filing_document(make_archive({"F.xml": bs_section(extra=extra)}), reprt_code="11011", biz_year="2019")
+
+    assert result.statements is not None
+    assert "operating_profit" not in facts_by_name(result)
+    assert "net_income" not in facts_by_name(result)

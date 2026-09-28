@@ -6,14 +6,16 @@
     "reprt_code": "11012",
     "rcept_no": "20160816001669"
   },
-  "parser_version": "dart-document-statements-v1",
-  "expected_values_source": "hand-verified against the filing document main member: interim half-year financial company (우리종합금융) CFS, BS only: IS/CF headings carry no 단위 note so both withheld with missing_unit; hand-verified: BS 1564353361798 == 1405000594428 + 159352767370 at 2016-06-30",
+  "parser_version": "dart-document-statements-v3",
+  "expected_values_source": "hand-verified against the filing document main member: interim half-year financial company (우리종합금융) CFS at 2016-06-30; BS 1564353361798 == 1405000594428 + 159352767370 holds; v2 caption-table fix: the 5-row caption table between each IS/CF heading and its body no longer steals the body, so the caption unit feeds IS/CF and quarter-basis IS (영업수익 38132958968, 영업이익 5210550830) plus cumulative CF are recovered, clearing missing_unit:IS/CF",
   "statements": {
     "consolidated": true,
     "period_end": "2016-06-30",
     "report_kind": "half",
     "unit_multipliers": {
-      "BS": 1
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
     },
     "facts": [
       {
@@ -39,14 +41,41 @@
         "value": 159352767370,
         "basis": "point_in_time",
         "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 38132958968,
+        "basis": "quarter",
+        "label": "영업수익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": 5210550830,
+        "basis": "quarter",
+        "label": "영업이익"
+      },
+      {
+        "fact": "net_income",
+        "value": 4818020395,
+        "basis": "quarter",
+        "label": "당(반)기순이익"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": 50519826222,
+        "basis": "cumulative",
+        "label": "영업활동으로인한현금흐름"
+      },
+      {
+        "fact": "capex",
+        "value": 29021000,
+        "basis": "cumulative",
+        "label": "유형자산의취득"
       }
     ],
     "checks": [
       "bs_balance"
     ]
   },
-  "diagnostics": [
-    "missing_unit:IS",
-    "missing_unit:CF"
-  ]
+  "diagnostics": []
 }

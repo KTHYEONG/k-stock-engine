@@ -1211,3 +1211,162 @@ def test_normalize_dart_facts_entry_uses_provider_trust_flag(tmp_path) -> None:
     )
 
     assert result["row_count"] == 1
+
+
+def _three_fact_pages():
+    template = '{"records": [{"ticker": "005930", "corp_code": "00126380", "fiscal_period": "2015Q3", "filing_id": "%s", "fact": "sales", "published_at": "2015-11-16T00:00:00+00:00", "value": 10.0, "unit": "KRW"}]}'
+    return [template % filing for filing in ("F1", "F2", "F3")]
+
+
+def test_discovery_without_verification_still_validates_receipts(tmp_path) -> None:
+    """Malformed receipts and kind mismatches raise even when hashing is skipped."""
+    import json
+
+    import pytest
+
+    from src.data.incremental_normalization import _discover_fact_receipts
+    from src.core.pit import PITDataError
+    from tests.fixtures import register_fact_page
+
+    bronze_root = tmp_path / "bronze"
+    bad_dir = bronze_root / "financial_facts" / "bad"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "payload.json").write_bytes(b'{"records": []}')
+    (bad_dir / "receipt.json").write_text("not json", encoding="utf-8")
+    register_fact_page(bronze_root, bad_dir, natural_key="bad")
+    with pytest.raises(PITDataError):
+        _discover_fact_receipts(bronze_root, verify_payload=False)
+
+    bronze_other = tmp_path / "bronze-other"
+    mismatch_dir = bronze_other / "financial_facts" / "mismatch"
+    mismatch_dir.mkdir(parents=True)
+    (mismatch_dir / "payload.json").write_bytes(b'{"records": []}')
+    (mismatch_dir / "receipt.json").write_text(
+        json.dumps(
+            {
+                "kind": "other_kind",
+                "content_hash": "a" * 64,
+                "retrieved_at": "2016-01-01T00:00:00+00:00",
+                "ingested_at": "2016-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    register_fact_page(bronze_other, mismatch_dir, natural_key="mismatch")
+    with pytest.raises(PITDataError, match=r"kind mismatch"):
+        _discover_fact_receipts(bronze_other, verify_payload=False)
+
+
+def test_discovery_with_verification_rejects_altered_payload(tmp_path) -> None:
+    """The default discovery path still hashes payloads and rejects tampering."""
+    import pytest
+
+    from src.data.incremental_normalization import _discover_fact_receipts
+    from src.core.pit import PITDataError
+    from tests.fixtures import register_fact_page
+
+    bronze_root = tmp_path / "bronze"
+    receipt_dir = bronze_root / "financial_facts" / "altered"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "payload.json").write_text('{"records": []}', encoding="utf-8")
+    (receipt_dir / "receipt.json").write_text(
+        '{"kind": "financial_facts", "content_hash": "%s", "retrieved_at": "2016-01-01T00:00:00+00:00", "ingested_at": "2016-01-01T00:00:00+00:00"}' % ("0" * 64),
+        encoding="utf-8",
+    )
+    register_fact_page(bronze_root, receipt_dir)
+    with pytest.raises(PITDataError, match=r"hash mismatch"):
+        _discover_fact_receipts(bronze_root)
+
+
+def test_refresh_reads_each_payload_once(tmp_path, monkeypatch) -> None:
+    """A multi-page refresh opens every payload file exactly once."""
+    from datetime import UTC, datetime
+    from pathlib import Path as _Path
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    for index, payload_text in enumerate(_three_fact_pages()):
+        _write_fact_receipt(tmp_path / "bronze", f"page{index}", payload_text)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    opened: list[str] = []
+    real_read_bytes = _Path.read_bytes
+
+    def _counted_read_bytes(self: _Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if self.name == "payload.json":
+            opened.append(str(self))
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "read_bytes", _counted_read_bytes)
+    artifact = refresh_dart_financial_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+        calendar=_covering_calendar(),
+    )
+    assert artifact.row_count == 3
+    assert sorted(opened) == sorted(
+        str(tmp_path / "bronze" / "financial_facts" / f"page{index}" / "payload.json") for index in range(3)
+    )
+
+
+def test_discovery_with_verification_rejects_missing_payload(tmp_path) -> None:
+    """Default discovery still fails when the payload file is gone."""
+    import hashlib
+
+    import pytest
+
+    from src.data.incremental_normalization import _discover_fact_receipts
+    from src.core.pit import PITDataError
+    from tests.fixtures import register_fact_page
+
+    bronze_root = tmp_path / "bronze"
+    receipt_dir = bronze_root / "financial_facts" / "gone"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "payload.json").write_bytes(b'{"records": []}')
+    digest = hashlib.sha256(b'{"records": []}').hexdigest()
+    (receipt_dir / "receipt.json").write_text(
+        '{"kind": "financial_facts", "content_hash": "'
+        + digest
+        + '", "retrieved_at": "2016-01-01T00:00:00+00:00", "ingested_at": "2016-01-01T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    register_fact_page(bronze_root, receipt_dir)
+    (receipt_dir / "payload.json").unlink()
+    with pytest.raises(PITDataError, match=r"missing Bronze payload"):
+        _discover_fact_receipts(bronze_root)
+
+
+def test_refresh_rejects_payload_removed_after_discovery(tmp_path, monkeypatch) -> None:
+    """A payload lost between discovery and read fails before anything is published."""
+    from datetime import UTC, datetime
+    from pathlib import Path as _Path
+
+    import pytest
+
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+    from src.core.pit import PITDataError
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    real_read_bytes = _Path.read_bytes
+
+    def _vanished_read_bytes(self: _Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if self.name == "payload.json":
+            raise OSError("payload removed")
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "read_bytes", _vanished_read_bytes)
+    with pytest.raises(PITDataError, match=r"invalid Bronze payload"):
+        refresh_dart_financial_facts(
+            bronze_root=tmp_path / "bronze",
+            silver_root=tmp_path / "silver",
+            artifact_root=tmp_path / "artifacts",
+            decision_time=decision_time,
+            calendar=_covering_calendar(),
+        )
+    assert not list((tmp_path / "silver").glob("financial_facts_*"))

@@ -6,7 +6,7 @@
     "reprt_code": "11012",
     "rcept_no": "20200814000806"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: interim half-year CFS; hand-verified: BS 29071912298 == 15774173078 + 13297739220 at 2020-06-30, IS quarter column (3개월) with sales row absent (-), CF cumulative; separate basis carries a bogus 2020-06-30~2020-12-31 heading range and mismatches",
   "statements": {
     "consolidated": true,
@@ -52,13 +52,13 @@
         "fact": "operating_profit",
         "value": -204349049,
         "basis": "quarter",
-        "label": "영업이익(손실"
+        "label": "영업이익(손실)"
       },
       {
         "fact": "net_income",
         "value": -510733209,
         "basis": "quarter",
-        "label": "당기순이익(손실"
+        "label": "당기순이익(손실)"
       },
       {
         "fact": "operating_cash_flow",

@@ -73,19 +73,26 @@ def test_standard_labels_drops_disagreeing_rows() -> None:
 
 
 def _stub_catalog(pages: dict[str, dict], directory: Path):
+    import hashlib as _hashlib
+
     class _Entry:
-        def __init__(self, natural_key: str, payload_path: Path) -> None:
+        def __init__(self, natural_key: str, payload_path: Path, content_hash: str) -> None:
             self.natural_key = natural_key
             self.retrieved_at = NOW
             self.payload_path = payload_path
+            self.content_hash = content_hash
 
     class _Catalog:
         def __init__(self) -> None:
+            self.root = directory
             self._entries = []
             for key, page in pages.items():
                 path = directory / f"{key.replace(':', '_')}.json"
-                path.write_text(json.dumps(page, ensure_ascii=False), encoding="utf-8")
-                self._entries.append(_Entry(key, path))
+                raw = json.dumps(page, ensure_ascii=False).encode("utf-8")
+                path.write_bytes(raw)
+                self._entries.append(
+                    _Entry(key, path, _hashlib.sha256(raw).hexdigest())
+                )
 
         def entries(self, *, source: str):
             assert source == "financial_facts"
@@ -381,11 +388,17 @@ def test_select_benchmark_filings_skips_unusable_pages(tmp_path: Path) -> None:
     pages = {good_key: _standard_page(extra_rows=_ten_fact_rows())}
     catalog = _stub_catalog(pages, tmp_path)
 
+    import hashlib as _hashlib
+
     class _Entry:
         def __init__(self, natural_key: str, payload_path: Path) -> None:
             self.natural_key = natural_key
             self.retrieved_at = NOW
             self.payload_path = payload_path
+            try:
+                self.content_hash = _hashlib.sha256(payload_path.read_bytes()).hexdigest()
+            except OSError:
+                self.content_hash = f"missing-{natural_key}"
 
     missing = _Entry("missing:2023:11011", tmp_path / "absent.json")
     corrupt_path = tmp_path / "corrupt.json"
@@ -421,6 +434,8 @@ def test_select_benchmark_filings_skips_unusable_pages(tmp_path: Path) -> None:
                missing, corrupt, legacy, labelless_entry, empty_entry, bad_entry]
 
     class _Catalog:
+        root = tmp_path
+
         def entries(self, *, source: str):
             assert source == "financial_facts"
             return iter(entries)
@@ -473,33 +488,71 @@ def test_archive_for_filing_prefers_same_key_hash(tmp_path: Path) -> None:
     """A usable hash on the filing's own page beats the receipt scan."""
     from src.data.dart_document_benchmark import _archive_for_filing
 
-    key = f"{CORP}:2023:11011"
     blob_path = tmp_path / "archive.zip"
     blob_path.write_bytes(b"PK\x03\x04same-key")
-    corrupt_path = tmp_path / "corrupt.json"
-    corrupt_path.write_text("not json", encoding="utf-8")
-    other_path = tmp_path / "other.json"
-    other_path.write_text(json.dumps(_standard_page(extra_rows=_ten_fact_rows())), encoding="utf-8")
-
-    class _Entry:
-        def __init__(self, natural_key: str, payload_path: Path) -> None:
-            self.natural_key = natural_key
-            self.payload_path = payload_path
-
-    hashed_page = _standard_page(extra_rows=_ten_fact_rows())
-    hashed_page["raw_document_hash"] = "abc123"
-    hashed_path = tmp_path / "hashed.json"
-    hashed_path.write_text(json.dumps(hashed_page), encoding="utf-8")
-
-    class _Catalog:
-        def entries(self, *, source: str):
-            assert source == "financial_facts"
-            return iter([_Entry("other:2023:11011", other_path),
-                         _Entry(key, corrupt_path), _Entry(key, hashed_path)])
-
-    archive = _archive_for_filing(catalog=_Catalog(), natural_key=key, receipt="00000000000000",
+    archive = _archive_for_filing(raw_document_hash="abc123", receipt="00000000000000",
                                   archive_paths={"abc123": blob_path}, receipt_index={})
     assert archive == b"PK\x03\x04same-key"
+
+
+def test_archive_for_filing_receipt_fallback_and_missing(tmp_path: Path) -> None:
+    """A filing without a usable hash falls back to its receipt archive."""
+    from src.data.dart_document_benchmark import _archive_for_filing
+
+    receipt_path = tmp_path / "receipt.zip"
+    receipt_path.write_bytes(b"PK\x03\x04receipt")
+    receipt_index = {RCEPT: [("2024-03-15T00:00:00+00:00", receipt_path)]}
+    archive = _archive_for_filing(raw_document_hash="", receipt=RCEPT,
+                                  archive_paths={}, receipt_index=receipt_index)
+    assert archive == b"PK\x03\x04receipt"
+    assert _archive_for_filing(raw_document_hash="missing", receipt="",
+                               archive_paths={}, receipt_index={}) is None
+    missing_path = tmp_path / "gone.zip"
+    missing_path.write_bytes(b"PK\x03\x04gone")
+    missing_path.unlink()
+    fallback = _archive_for_filing(raw_document_hash="gone", receipt=RCEPT,
+                                   archive_paths={"gone": missing_path},
+                                   receipt_index=receipt_index)
+    assert fallback == b"PK\x03\x04receipt"
+
+
+def test_run_benchmark_scans_fact_catalog_once(tmp_path: Path, monkeypatch) -> None:
+    """The fact catalog is consumed once no matter how many filings are requested."""
+    from src.data.dart_document_benchmark import run_benchmark
+    from src.data.dart_documents import DartDocumentStore
+    from src.data.receipt_catalog import ReceiptCatalog
+    import src.integrations.dart.document_statements as statements_mod
+    from src.integrations.dart.document_statements import DocumentParseResult
+    from src.data.dart_document_benchmark import standard_labels
+
+    bronze_root = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    keys = [f"{CORP}:2023:1101{i}" for i in range(3)]
+    page = _standard_page(extra_rows=_ten_fact_rows())
+    for key in keys:
+        _publish_standard(bronze_root, catalog, natural_key=key, page=page)
+    DartDocumentStore(bronze_root, catalog=catalog).store_archive(
+        b"PK\x03\x04benchmark", rcept_no=RCEPT, retrieved_at=NOW)
+    monkeypatch.setattr(statements_mod, "parse_filing_document",
+                        lambda *args, **kwargs: DocumentParseResult(
+                            statements=_statements_for(standard_labels(page)), diagnostics=()))
+    entry_calls = 0
+    real_entries = catalog.entries
+
+    def _counted_entries(*, source: str):
+        nonlocal entry_calls
+        if source == "financial_facts":
+            entry_calls += 1
+        return real_entries(source=source)
+
+    monkeypatch.setattr(catalog, "entries", _counted_entries)
+    import src.data.dart_document_benchmark as benchmark_mod
+
+    real_catalog = benchmark_mod.ReceiptCatalog
+    monkeypatch.setattr(benchmark_mod, "ReceiptCatalog", lambda *args, **kwargs: catalog)
+    report = run_benchmark(_runtime(bronze_root), filings=keys)
+    assert entry_calls == 1
+    assert report.documents == 3
 
 
 def test_run_benchmark_reads_archive_from_same_key_hash(tmp_path: Path, monkeypatch) -> None:
@@ -713,3 +766,19 @@ def test_cli_benchmark_documents_gate(tmp_path: Path, capsys, monkeypatch) -> No
     passed = _json.loads(capsys.readouterr().out.splitlines()[-1])
     assert passed["precision"] == 1.0
     assert passed["compared"] == len(standard_labels(page))
+
+
+def test_select_benchmark_filings_identical_cold_and_warm(tmp_path: Path) -> None:
+    """Cold and warm caches sample the same filings as the direct-read path."""
+    from src.data.dart_document_benchmark import select_benchmark_filings
+    from src.data.receipt_catalog import ReceiptCatalog
+
+    bronze_root = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    for key, page in _stratified_pages().items():
+        _publish_standard(bronze_root, catalog, natural_key=key, page=page)
+    cold = select_benchmark_filings(catalog, size=8, seed=7)
+    warm = select_benchmark_filings(catalog, size=8, seed=7)
+    assert cold == warm
+    assert len(cold) == 8
+    assert f"{CORP}:2020:11011F" not in cold
