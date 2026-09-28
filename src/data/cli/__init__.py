@@ -41,6 +41,8 @@ def _ensure_registered() -> None:
         "collect-scoped",
         "collect-krx-daily-market",
         "collect-krx-security-master",
+        "collect-kind-notices",
+        "collect-kind-documents",
         "collect-ls-investor-flow",
         "collect-kis-investor-flow",
         "collect-dart-disclosures",

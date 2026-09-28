@@ -31,6 +31,7 @@ __all__ = [
     "DartCorpCodeRecord",
     "DartCorporateActionPage",
     "DartDividendPage",
+    "DisclosureListing",
     "ProviderQuotaExhaustedError",
     "ProviderRetryableError",
     "ProviderTerminalError",
@@ -128,9 +129,33 @@ class DartClientProtocol(Protocol):
     def list_disclosures(
         self, start: date, end: date, *, corp_code: str | None = ..., disclosure_filter: DisclosureFilter | None = ..., page_count: int = ...
     ) -> list[dict[str, str]]: ...
+    def list_disclosure_window(
+        self,
+        start: date,
+        end: date,
+        *,
+        corp_code: str | None = ...,
+        disclosure_filter: DisclosureFilter | None = ...,
+        page_count: int = ...,
+    ) -> DisclosureListing: ...
     def fetch_document_archive(self, rcept_no: str) -> bytes: ...
     def ping(self) -> None: ...
     def load_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class DisclosureListing:
+    """One market-wide ``list.json`` window as DART reported it.
+
+    Attributes:
+        records: Receipt-deduplicated rows sorted by ``(rcept_dt, rcept_no)``.
+        reported_total: ``total_count`` DART declared for the query.
+        raw_rows: Rows received across all pages before receipt deduplication.
+    """
+
+    records: tuple[dict[str, str], ...]
+    reported_total: int
+    raw_rows: int
 
 
 class DartApiClient:
@@ -289,7 +314,7 @@ class DartApiClient:
     def _request_validated(self, endpoint: str, params: dict[str, str]) -> dict[str, Any]:
         return self.request_validated(endpoint, params)
 
-    def list_disclosures(
+    def list_disclosure_window(
         self,
         start: date,
         end: date,
@@ -297,13 +322,26 @@ class DartApiClient:
         corp_code: str | None = None,
         disclosure_filter: DisclosureFilter | None = None,
         page_count: int = 100,
-    ) -> list[dict[str, str]]:
+    ) -> DisclosureListing:
+        """List one window and report DART's declared total next to what was received.
+
+        Completeness is judged by the caller, because a window that is still open may
+        legitimately grow while it is paged.
+
+        Raises:
+            ValueError: ``start > end`` or ``page_count`` outside ``[1, 100]``.
+            DartApiError: pagination metadata is missing, contradictory or unbounded, a row lacks
+                receipt identity, one receipt carries contradictory rows, or ``total_count`` is
+                absent or not a non-negative integer.
+        """
         if start > end:
             raise ValueError("start must not be after end")
         if not 1 <= page_count <= 100:
             raise ValueError("page_count must be within [1, 100]")
         by_receipt: dict[str, dict[str, str]] = {}
         expected_total: int | None = None
+        expected_reported: int | None = None
+        raw_rows = 0
         page_no = 1
         while True:
             params: dict[str, str] = {
@@ -345,9 +383,22 @@ class DartApiClient:
             expected_total = total_page
             if page_no > total_page:
                 raise DartApiError("DART disclosure pagination metadata is contradictory")
+            count_raw = payload.get("total_count", payload.get("totalCount"))
+            if count_raw is None:
+                raise DartApiError("DART disclosure pagination metadata is invalid")
+            try:
+                reported_total = int(str(count_raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise DartApiError("DART disclosure pagination metadata is invalid") from exc
+            if reported_total < 0:
+                raise DartApiError("DART disclosure pagination metadata is invalid")
+            if expected_reported is not None and reported_total != expected_reported:
+                raise DartApiError("DART disclosure pagination metadata is contradictory")
+            expected_reported = reported_total
             for item in raw:
                 if not isinstance(item, dict):
                     continue
+                raw_rows += 1
                 rcept_no = str(item.get("rcept_no") or "").strip()
                 rcept_dt = str(item.get("rcept_dt") or "").strip()
                 if not rcept_no or not rcept_dt:
@@ -371,7 +422,27 @@ class DartApiClient:
             page_no += 1
             if page_no > 10000:
                 raise DartApiError("DART disclosure pagination exceeded safe bounds")
-        return sorted(by_receipt.values(), key=lambda x: (x["rcept_dt"], x["rcept_no"]))
+        records = sorted(by_receipt.values(), key=lambda x: (x["rcept_dt"], x["rcept_no"]))
+        return DisclosureListing(
+            records=tuple(records),
+            reported_total=expected_reported if expected_reported is not None else 0,
+            raw_rows=raw_rows,
+        )
+
+    def list_disclosures(
+        self,
+        start: date,
+        end: date,
+        *,
+        corp_code: str | None = None,
+        disclosure_filter: DisclosureFilter | None = None,
+        page_count: int = 100,
+    ) -> list[dict[str, str]]:
+        return list(
+            self.list_disclosure_window(
+                start, end, corp_code=corp_code, disclosure_filter=disclosure_filter, page_count=page_count
+            ).records
+        )
 
     def fetch_multi_accounts(
         self, corp_codes: tuple[str, ...], *, biz_year: str, reprt_code: str

@@ -647,6 +647,33 @@ def test_collect_scoped_rejects_unreadable_payload_files(tmp_path, capsys) -> No
     assert "error" in json.loads(capsys.readouterr().out)
 
 
+def test_collect_kind_notices_and_documents_dry_run(tmp_path, capsys) -> None:
+    from src.data.cli import main
+    from tests.fixtures.cli_fixtures import _cli_json_lines
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    assert main([
+        "collect-kind-notices",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--dry-run",
+    ]) == 0
+    summary = _cli_json_lines(capsys)[-1]
+    assert summary["job"] == "kind_notice_search"
+    assert summary["status"] == "dry_run"
+    assert summary["pending_left"] > 0
+
+    assert main([
+        "collect-kind-documents",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--dry-run",
+    ]) == 0
+    summary = _cli_json_lines(capsys)[-1]
+    assert summary["job"] == "kind_notice_documents"
+    assert summary["status"] == "dry_run"
+
+
 def test_reparse_and_fetch_documents_dry_run(tmp_path, capsys) -> None:
     from pathlib import Path
 

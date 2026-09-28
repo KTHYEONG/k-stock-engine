@@ -28,7 +28,7 @@ from src.data.datasets import (
     read_dataset,
 )
 
-POLICY_VERSION = "krx-market-panel-v3"
+POLICY_VERSION = "krx-market-panel-v4"
 
 _LOG = logging.getLogger(__name__)
 
@@ -114,6 +114,28 @@ def _default_delisting_block_max_sessions(path: Path | None = None) -> int:
     return value
 
 
+def _default_limitless_move_audit_threshold(path: Path | None = None) -> float:
+    """Return the configured fraction above which a no-limit session must be explained."""
+    raw, resolved = _panel_policy_toml(path)
+    value = raw.get("limitless_move_audit_threshold")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < float(value) < 1:
+        raise PITDataError(
+            f"market panel policy needs a limitless_move_audit_threshold in (0, 1): {resolved}"
+        )
+    return float(value)
+
+
+def _default_max_unexplained_limitless_moves(path: Path | None = None) -> int:
+    """Return the configured tolerance for unexplained no-limit sessions."""
+    raw, resolved = _panel_policy_toml(path)
+    value = raw.get("max_unexplained_limitless_moves")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PITDataError(
+            f"market panel policy needs a non-negative integer max_unexplained_limitless_moves: {resolved}"
+        )
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class MarketPanelPolicy:
     """Rolling-window contract for decision-time liquidity and risk columns.
@@ -136,6 +158,8 @@ class MarketPanelPolicy:
     return_vol_sessions: int = 60
     block_administrative: bool = field(default_factory=_default_block_administrative)
     delisting_block_max_sessions: int = field(default_factory=_default_delisting_block_max_sessions)
+    limitless_move_audit_threshold: float = field(default_factory=_default_limitless_move_audit_threshold)
+    max_unexplained_limitless_moves: int = field(default_factory=_default_max_unexplained_limitless_moves)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +176,7 @@ class MarketPanelResult:
     exits_traded: int
     exits_halted: int
     entry_blocked_rows: int = 0
+    unexplained_limitless_moves: int = 0
 
 
 def _load_input_manifest(
@@ -265,14 +290,19 @@ def _entry_block_frame(
     A delisting cancellation clears a pending delisting block; a delisting or liquidation block also
     lapses ``delisting_block_max_sessions`` sessions after the latest such notice; administrative
     blocks apply only when the run policy enables them.
+
+    A delisting or liquidation action that states its window (``effective_end``) blocks entries
+    from its availability session through ``effective_end`` and is exempt from the
+    ``delisting_block_max_sessions`` lapse, because the exchange itself fixed the end.
     """
     frame = read_dataset(Path(market_actions_path)).collect()
-    missing = {"instrument_id", "kind", "rcept_no", "available_at", "cancellation"} - set(frame.columns)
+    missing = {"instrument_id", "kind", "rcept_no", "available_at", "cancellation",
+               "effective_start", "effective_end"} - set(frame.columns)
     if missing:
         raise PITDataError(f"market actions dataset is missing columns {sorted(missing)}")
     if frame.height == 0:
         return pl.DataFrame([], schema=_BLOCK_SCHEMA)
-    by_instrument: dict[str, list[tuple[date, str, str, str, bool]]] = {}
+    by_instrument: dict[str, list[tuple[date, str, str, str, bool, date | None, date | None]]] = {}
     for row in frame.iter_rows(named=True):
         available_at = row["available_at"]
         if not isinstance(available_at, datetime):
@@ -291,8 +321,13 @@ def _entry_block_frame(
             "trading_resumed",
         }:
             raise PITDataError(f"market action has an unknown kind {kind!r}")
+        start_raw = row.get("effective_start")
+        end_raw = row.get("effective_end")
+        start = start_raw if isinstance(start_raw, date) else None
+        end = end_raw if isinstance(end_raw, date) else None
         by_instrument.setdefault(instrument_id, []).append(
-            (effective, str(available_at.isoformat()), str(row["rcept_no"]), kind, bool(row["cancellation"]))
+            (effective, str(available_at.isoformat()), str(row["rcept_no"]), kind, bool(row["cancellation"]),
+             start, end)
         )
     for actions in by_instrument.values():
         actions.sort()
@@ -302,18 +337,27 @@ def _entry_block_frame(
         liquidation = False
         administrative = False
         last_notice_idx = -1
+        bounded: list[tuple[int, date | None, date]] = []
         position = 0
         for session_idx, session in enumerate(sessions):
             while position < len(actions) and actions[position][0] <= session:
-                _, _, _, kind, cancellation = actions[position]
+                _, _, _, kind, cancellation, start, end = actions[position]
                 if cancellation:
                     pending_delisting = False
+                    liquidation = False
+                    bounded.clear()
                 elif kind == "delisting_decided":
-                    pending_delisting = True
-                    last_notice_idx = session_idx
+                    if end is not None:
+                        bounded.append((session_idx, start, end))
+                    else:
+                        pending_delisting = True
+                        last_notice_idx = session_idx
                 elif kind == "liquidation_trading":
-                    liquidation = True
-                    last_notice_idx = session_idx
+                    if end is not None:
+                        bounded.append((session_idx, start, end))
+                    else:
+                        liquidation = True
+                        last_notice_idx = session_idx
                 elif kind == "administrative_designated":
                     administrative = True
                 elif kind == "administrative_released":
@@ -322,8 +366,18 @@ def _entry_block_frame(
             if (pending_delisting or liquidation) and session_idx - last_notice_idx > delisting_block_max_sessions:
                 pending_delisting = False
                 liquidation = False
+            covering = [
+                (available_idx, start, end)
+                for available_idx, start, end in bounded
+                if available_idx <= session_idx and session <= end
+            ]
             reason: str | None = None
-            if pending_delisting:
+            if covering:
+                if any(start is not None and session >= start for _, start, _ in covering):
+                    reason = "liquidation_trading"
+                else:
+                    reason = "delisting_decided"
+            elif pending_delisting:
                 reason = "delisting_decided"
             elif liquidation:
                 reason = "liquidation_trading"
@@ -508,6 +562,13 @@ def materialize_market_panel(
         raise PITDataError("market panel windows must be positive integers")
     if isinstance(instrument_buckets, bool) or not isinstance(instrument_buckets, int) or instrument_buckets < 1:
         raise PITDataError("market panel instrument buckets must be a positive integer")
+    threshold = policy.limitless_move_audit_threshold
+    max_allowed = policy.max_unexplained_limitless_moves
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < float(threshold) < 1:
+        raise PITDataError("market panel limitless_move_audit_threshold must be in (0, 1)")
+    if isinstance(max_allowed, bool) or not isinstance(max_allowed, int) or max_allowed < 0:
+        raise PITDataError("market panel max_unexplained_limitless_moves must be a non-negative integer")
+    threshold_value = float(threshold)
     daily_id, daily_sessions, daily_by_session = _load_input_manifest(
         Path(daily_market_path), expected_kind="daily_market"
     )
@@ -571,6 +632,7 @@ def materialize_market_panel(
     entry_blocked_rows = 0
     total_rows = 0
     last_obs: dict[str, tuple[int, int, int]] = {}
+    audit_candidates: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="market-panel-") as temporary:
         shard_dir = Path(temporary)
@@ -634,6 +696,40 @@ def materialize_market_panel(
             open_at_lower_rows += frame.filter(pl.col("open_at_lower")).height
             entry_blocked_rows += frame.filter(pl.col("entry_blocked")).height
             total_rows += frame.height
+            if frame.height and market_actions_path is not None:
+                firsts = frame.group_by("instrument_id").agg(
+                    pl.col("session").min().alias("first_session")
+                )
+                joined = frame.join(firsts, on="instrument_id", how="left")
+                candidates = (
+                    joined.filter(
+                        (pl.col("session") != pl.col("first_session"))
+                        & pl.col("eligible")
+                        & (pl.col("volume") > 0)
+                        & (pl.col("base_price") > 0)
+                        & (~pl.col("limits_applicable"))
+                        & (
+                            (
+                                pl.col("close").cast(pl.Float64)
+                                / pl.col("base_price").cast(pl.Float64)
+                                - 1.0
+                            ).abs()
+                            > threshold_value
+                        )
+                        & (~pl.col("entry_blocked"))
+                    )
+                    .select("instrument_id", "session", "close", "base_price")
+                    .to_dicts()
+                )
+                for candidate in candidates:
+                    base = int(candidate["base_price"])
+                    audit_candidates.append(
+                        {
+                            "instrument_id": str(candidate["instrument_id"]),
+                            "session": candidate["session"],
+                            "move": float(int(candidate["close"]) / base - 1.0),
+                        }
+                    )
             if frame.height:
                 tails = frame.sort(["instrument_id", "session"]).group_by("instrument_id").agg(
                     pl.col("session").last().alias("session"),
@@ -684,6 +780,30 @@ def materialize_market_panel(
     partitions["instrument_exits.parquet"] = exits_frame
     exits_traded = int(exits_frame.filter(pl.col("exit_kind") == "traded_exit").height)
     exits_halted = int(exits_frame.filter(pl.col("exit_kind") == "halted_exit").height)
+    if market_actions_path is None:
+        audit_detail: object = "not_audited"
+        unexplained = 0
+    else:
+        ordered = sorted(audit_candidates, key=lambda item: (str(item["session"]), str(item["instrument_id"])))
+        unexplained = len(ordered)
+        samples = [
+            {"instrument_id": item["instrument_id"], "session": item["session"], "move": item["move"]}
+            for item in ordered[:20]
+        ]
+        audit_detail = {
+            "threshold": threshold_value,
+            "max_allowed": max_allowed,
+            "unexplained": unexplained,
+            "samples": samples,
+        }
+        if unexplained > max_allowed:
+            preview = "; ".join(
+                f"{item['instrument_id']}@{item['session']}:{float(item['move']):.4f}"
+                for item in ordered[:5]
+            )
+            raise PITDataError(
+                f"unexplained limitless moves {unexplained} exceed {max_allowed}: {preview}"
+            )
     details = {
         "years": years,
         "daily_market_dataset_id": daily_id,
@@ -704,6 +824,7 @@ def materialize_market_panel(
         },
         "dividends": "not_integrated",
         "exits_decision_safe": False,
+        "limitless_move_audit": audit_detail,
         "partitions": partition_details,
     }
     published = publish_dataset(
@@ -725,4 +846,5 @@ def materialize_market_panel(
         exits_traded=exits_traded,
         exits_halted=exits_halted,
         entry_blocked_rows=entry_blocked_rows,
+        unexplained_limitless_moves=unexplained,
     )

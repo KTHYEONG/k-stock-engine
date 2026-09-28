@@ -13,6 +13,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 from src.core.pit import EvidenceKind, PITDataError
 from src.data.collection import dart_fact_scoped_payload
@@ -25,7 +26,7 @@ from src.data.dart_documents import DartDocumentStore
 from src.data.evidence_sources import DART_DISCLOSURE_WINDOWS_SOURCE, DIVIDEND_DECISION_SOURCE
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
 from src.data.jobs.universe import corp_code_bridge, eligible_tickers
-from src.data.receipt_catalog import EvidenceStatus
+from src.data.receipt_catalog import EvidenceStatus, ReceiptIndexEntry
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedRawPayload, dart_fact_natural_key
 from src.integrations.dart.dividend_decision import is_dividend_decision_title
 from src.integrations.dart.xbrl import is_transport_failure_page
@@ -38,7 +39,6 @@ __all__ = [
     "DisclosureCoverageError",
     "DividendDecisionsJob",
     "disclosure_windows",
-    "import_legacy_dividend_cache",
     "last_completed_kst_day",
     "resolve_dart_job",
 ]
@@ -50,7 +50,6 @@ _FACT_MAX_REQUESTS = 3
 _DIVIDEND_MAX_REQUESTS = 1
 _DISCLOSURE_WINDOW_MAX_REQUESTS = 10
 _WINDOW_MONTHS = 3
-_LEGACY_DIVIDEND_CACHE = "dividend_decision_lists.json"
 _KST = timedelta(hours=9)
 
 _ANSWERED = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY, EvidenceStatus.EXTRACTION_FAILED})
@@ -107,10 +106,24 @@ def _window_key(detail_type: str, start: date, end: date) -> str:
 
 
 def _window_payload(
-    *, detail_type: str, start: date, end: date, records: list[dict[str, str]], retrieved_at: datetime
+    *,
+    detail_type: str,
+    start: date,
+    end: date,
+    records: list[dict[str, str]],
+    retrieved_at: datetime,
+    reported_total: int,
+    raw_rows: int,
 ) -> ScopedRawPayload:
     body = json.dumps(
-        {"detail_type": detail_type, "start": start.isoformat(), "end": end.isoformat(), "records": records},
+        {
+            "detail_type": detail_type,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "records": records,
+            "reported_total": reported_total,
+            "raw_rows": raw_rows,
+        },
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
@@ -127,37 +140,27 @@ def _window_payload(
     )
 
 
-def import_legacy_dividend_cache(ctx: JobContext) -> int:
-    """Import the dividend tool's window cache once as ``I001`` receipts, then delete it."""
-    cache_path = ctx.runtime.workspace.state_root / _LEGACY_DIVIDEND_CACHE
-    if not cache_path.is_file():
-        return 0
+def _window_receipt_complete(entry: ReceiptIndexEntry) -> bool:
+    """True only when the stored window payload is complete against DART's declared total."""
     try:
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise PITDataError(f"legacy dividend list cache is unreadable: {cache_path}") from exc
-    if not isinstance(raw, dict):
-        raise PITDataError(f"legacy dividend list cache must hold a mapping: {cache_path}")
-    payloads: list[ScopedRawPayload] = []
-    for key, rows in raw.items():
-        try:
-            start_raw, end_raw = str(key).split("..")
-            w_start, w_end = date.fromisoformat(start_raw), date.fromisoformat(end_raw)
-        except ValueError as exc:
-            raise PITDataError(f"legacy dividend list cache has an invalid window {key!r}") from exc
-        records = [dict(item) for item in rows] if isinstance(rows, list) else []
-        payloads.append(
-            _window_payload(
-                detail_type="I001", start=w_start, end=w_end,
-                records=[{str(k): str(v) for k, v in item.items()} for item in records if isinstance(item, dict)],
-                retrieved_at=ctx.now(),
-            )
-        )
-    if payloads:
-        ctx.writer.persist_many(tuple(payloads))
-    cache_path.unlink(missing_ok=True)
-    _LOG.info("[DATA] job=dividend_lists action=imported windows=%d", len(payloads))
-    return len(payloads)
+        raw = Path(entry.payload_path).read_bytes()
+    except OSError:
+        return False
+    if hashlib.sha256(raw).hexdigest() != entry.content_hash:
+        return False
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(document, dict):
+        return False
+    reported_total = document.get("reported_total")
+    raw_rows = document.get("raw_rows")
+    if isinstance(reported_total, bool) or isinstance(raw_rows, bool):
+        return False
+    if not isinstance(reported_total, int) or not isinstance(raw_rows, int):
+        return False
+    return raw_rows == reported_total
 
 
 def _window_covered(
@@ -232,13 +235,13 @@ class DartDisclosuresJob:
     name = "dart_disclosures"
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
-        import_legacy_dividend_cache(ctx)
         bridge = corp_code_bridge(ctx)
         tickers = eligible_tickers(ctx)
         eligible = frozenset(code for code, ticker in bridge.items() if ticker in tickers)
         coverage = per_corp_coverage(ctx.catalog)
         today = _kst_today(ctx.now())
         units: list[JobUnit] = []
+        replanned = 0
         for disclosure_filter in ctx.provider.dart.disclosure_filters:
             detail_type = disclosure_filter.code
             for w_start, w_end in disclosure_windows(ctx.runtime.scope.evidence_start, today):
@@ -262,7 +265,9 @@ class DartDisclosuresJob:
                 answered = ctx.catalog.latest(source=DISCLOSURE_WINDOW_SOURCE, natural_keys={key})
                 entry = answered.get(key)
                 if entry is not None and entry.status in _COMPLETED_ANSWERED:
-                    continue
+                    if _window_receipt_complete(entry):
+                        continue
+                    replanned += 1
                 units.append(
                     JobUnit(
                         source=DISCLOSURE_WINDOW_SOURCE,
@@ -276,6 +281,8 @@ class DartDisclosuresJob:
                     )
                 )
         units.sort(key=lambda unit: unit.natural_key)
+        if replanned:
+            _LOG.info("[DATA] job=dart_disclosures action=replan_incomplete windows=%d", replanned)
         return units
 
     def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
@@ -287,10 +294,16 @@ class DartDisclosuresJob:
             w_start = date.fromisoformat(unit.payload["window_start"])
             w_end = date.fromisoformat(unit.payload["window_end"])
             disclosure_filter = disclosure_filter_for_code(unit.payload["detail_type"])
-            rows = ctx.collector.list_disclosures(w_start, w_end, disclosure_filter=disclosure_filter)
-            if not rows and w_end < today:
+            listing = ctx.collector.list_disclosure_window(w_start, w_end, disclosure_filter=disclosure_filter)
+            rows = list(listing.records)
+            if w_end < today and listing.reported_total == 0:
                 raise PITDataError(
                     f"DART list returned no filings for completed window {unit.natural_key}"
+                )
+            if w_end < today and listing.raw_rows != listing.reported_total:
+                raise PITDataError(
+                    f"DART list window {unit.natural_key} is incomplete:"
+                    f" raw_rows={listing.raw_rows} reported_total={listing.reported_total}"
                 )
             out.append(
                 _window_payload(
@@ -299,6 +312,8 @@ class DartDisclosuresJob:
                     end=w_end,
                     records=[{str(k): str(v) for k, v in item.items()} for item in rows],
                     retrieved_at=ctx.now(),
+                    reported_total=listing.reported_total,
+                    raw_rows=listing.raw_rows,
                 )
             )
         return out
@@ -444,7 +459,6 @@ class DividendDecisionsJob:
     name = "dividend_decisions"
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
-        import_legacy_dividend_cache(ctx)
         bridge = corp_code_bridge(ctx)
         tickers = eligible_tickers(ctx)
         eligible = frozenset(code for code, ticker in bridge.items() if ticker in tickers)

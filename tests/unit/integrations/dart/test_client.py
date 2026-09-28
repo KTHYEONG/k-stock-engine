@@ -135,7 +135,7 @@ def test_list_disclosures_through_transport(tmp_path) -> None:
     from src.integrations.dart.client import DartApiClient
 
     pages = {
-        "1": {"status": "000", "total_page": "1", "list": [
+        "1": {"status": "000", "total_page": "1", "total_count": 1, "list": [
             {"rcept_no": "20240101000001", "rcept_dt": "20240101", "corp_code": "001",
              "corp_name": "A", "report_nm": "분기보고서 (2024.03)", "rm": ""},
         ]},
@@ -159,18 +159,18 @@ def test_list_disclosures_rejects_contradictory_receipts() -> None:
     from src.integrations.dart.client import DartApiError, DartApiClient
 
     pages = {
-        "1": {"status": "000", "total_page": "2", "list": [
+        "1": {"status": "000", "total_page": "2", "total_count": 2, "list": [
             {"rcept_no": "20240101000001", "rcept_dt": "20240101", "corp_code": "001",
              "corp_name": "A", "report_nm": "X", "rm": ""},
         ]},
-        "2": {"status": "000", "total_page": "2", "list": [
+        "2": {"status": "000", "total_page": "2", "total_count": 2, "list": [
             {"rcept_no": "20240101000001", "rcept_dt": "20240101", "corp_code": "001",
              "corp_name": "B", "report_nm": "X", "rm": ""},
         ]},
     }
     client = DartApiClient(
         api_key="key", quota_provider="OpenDART", min_interval=0.0,
-        request_json=lambda _e, p: {"status": "000", "total_page": "2", "list": pages[p["page_no"]]["list"]},
+        request_json=lambda _e, p: {"status": "000", "total_page": "2", "total_count": 2, "list": pages[p["page_no"]]["list"]},
     )
 
     with pytest.raises(DartApiError, match="contradictory"):
@@ -306,7 +306,7 @@ def test_list_disclosures_collects_all_pages_deduplicates_and_orders() -> None:
     from datetime import date
     from src.integrations.dart.client import DartApiClient
 
-    pages = {"1": {"status": "000", "total_page": "2", "list": [{"rcept_no": "20150515000002", "rcept_dt": "20150515", "corp_code": "001", "corp_name": "A", "report_nm": "분기보고서 (2015.03)", "rm": ""}]}, "2": {"status": "000", "total_page": "2", "list": [{"rcept_no": "20150515000001", "rcept_dt": "20150515", "corp_code": "001", "corp_name": "A", "report_nm": "분기보고서 (2015.03)", "rm": ""}]}}
+    pages = {"1": {"status": "000", "total_page": "2", "total_count": 2, "list": [{"rcept_no": "20150515000002", "rcept_dt": "20150515", "corp_code": "001", "corp_name": "A", "report_nm": "분기보고서 (2015.03)", "rm": ""}]}, "2": {"status": "000", "total_page": "2", "total_count": 2, "list": [{"rcept_no": "20150515000001", "rcept_dt": "20150515", "corp_code": "001", "corp_name": "A", "report_nm": "분기보고서 (2015.03)", "rm": ""}]}}
     client = DartApiClient(api_key="key", quota_provider="OpenDART", request_json=lambda _endpoint, p: pages[p["page_no"]], min_interval=0.0)
 
     rows = client.list_disclosures(date(2015, 1, 1), date(2015, 12, 31))
@@ -518,7 +518,7 @@ def test_dart_client_passes_disclosure_detail_type() -> None:
 
     def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
         seen.update(params)
-        return {"status": "000", "list": []}
+        return {"status": "000", "total_count": 0, "list": []}
 
     DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
         date(2024, 1, 1), date(2024, 1, 1),
@@ -538,7 +538,7 @@ def test_type_filter_sends_pblntf_ty() -> None:
 
     def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
         seen.update(params)
-        return {"status": "000", "list": []}
+        return {"status": "000", "total_count": 0, "list": []}
 
     DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
         date(2024, 1, 1), date(2024, 1, 1),
@@ -559,7 +559,7 @@ def test_detail_filter_sends_pblntf_detail_ty() -> None:
 
     def request(_endpoint: str, params: dict[str, str]) -> dict[str, object]:
         seen.update(params)
-        return {"status": "000", "list": []}
+        return {"status": "000", "total_count": 0, "list": []}
 
     DartApiClient(api_key="key", quota_provider="OpenDART", min_interval=0.0, request_json=request).list_disclosures(
         date(2024, 1, 1), date(2024, 1, 1),
@@ -1066,6 +1066,7 @@ def test_dart_client_transport_module_is_importable() -> None:
         calls.append((endpoint, params))
         return {
             "status": "000",
+            "total_count": 1,
             "list": [{"rcept_no": "202601020001", "rcept_dt": "20260102"}],
         }
 
@@ -1136,3 +1137,153 @@ def test_fetch_document_archive_rejects_empty_seam_payload() -> None:
 
     with pytest.raises(ProviderTerminalError, match="archive is empty"):
         client.fetch_document_archive("20240101000001")
+
+
+def _disclosure_row(rcept_no: str, rcept_dt: str = "20240101") -> dict:
+    return {
+        "rcept_no": rcept_no, "rcept_dt": rcept_dt, "corp_code": "001",
+        "corp_name": "A", "report_nm": "X", "rm": "",
+    }
+
+
+def test_disclosure_window_reports_declared_total_and_raw_rows() -> None:
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiClient
+
+    rows_page1 = [_disclosure_row(f"202401010000{i:02d}") for i in range(75)]
+    rows_page2 = [_disclosure_row(f"202401010001{i:02d}") for i in range(75)]
+    pages = {
+        "1": {"status": "000", "total_page": "2", "total_count": 150, "list": rows_page1},
+        "2": {"status": "000", "total_page": "2", "total_count": 150, "list": rows_page2},
+    }
+    client = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, p: pages[p["page_no"]],
+    )
+
+    listing = client.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+    assert listing.reported_total == 150
+    assert listing.raw_rows == 150
+    assert len(listing.records) == 150
+    assert [row["rcept_no"] for row in listing.records] == sorted(row["rcept_no"] for row in listing.records)
+
+
+def test_disclosure_window_duplicate_receipts_count_as_raw_rows() -> None:
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiClient
+
+    row = _disclosure_row("20240101000001")
+    other = _disclosure_row("20240101000002")
+    pages = {"1": {"status": "000", "total_page": "1", "total_count": 3, "list": [row, dict(row), other]}}
+    client = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, _p: pages["1"],
+    )
+
+    listing = client.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+    assert listing.raw_rows == 3
+    assert len(listing.records) == 2
+
+
+def test_disclosure_window_rejects_contradictory_total_count() -> None:
+    import pytest
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiError, DartApiClient
+
+    pages = {
+        "1": {"status": "000", "total_page": "2", "total_count": 150, "list": [_disclosure_row("20240101000001")]},
+        "2": {"status": "000", "total_page": "2", "total_count": 151, "list": [_disclosure_row("20240101000002")]},
+    }
+    client = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, p: pages[p["page_no"]],
+    )
+
+    with pytest.raises(DartApiError):
+        client.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+
+def test_disclosure_window_rejects_missing_total_count() -> None:
+    import pytest
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiError, DartApiClient
+
+    client = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, _p: {"status": "000", "total_page": "1", "list": []},
+    )
+
+    with pytest.raises(DartApiError):
+        client.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+
+def test_list_disclosures_stays_a_record_list() -> None:
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiClient
+
+    rows = [_disclosure_row("20240101000002"), _disclosure_row("20240101000001")]
+    pages = {"1": {"status": "000", "total_page": "1", "total_count": 2, "list": rows}}
+    client = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, _p: pages["1"],
+    )
+
+    assert client.list_disclosures(date(2024, 1, 1), date(2024, 1, 2)) == list(
+        client.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2)).records
+    )
+
+
+def test_disclosure_window_rejects_malformed_total_count() -> None:
+    import pytest
+    from datetime import date
+
+    from src.integrations.dart.client import DartApiError, DartApiClient
+
+    bad = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, _p: {"status": "000", "total_page": "1", "total_count": "many", "list": []},
+    )
+    with pytest.raises(DartApiError):
+        bad.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+    negative = DartApiClient(
+        api_key="key", quota_provider="OpenDART", min_interval=0.0,
+        request_json=lambda _e, _p: {"status": "000", "total_page": "1", "total_count": -1, "list": []},
+    )
+    with pytest.raises(DartApiError):
+        negative.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))
+
+
+def test_collector_list_disclosure_window_delegates() -> None:
+    import pytest
+    from datetime import date
+
+    from src.config.providers import DisclosureFilter
+    from src.core.pit import PITDataError
+    from src.integrations.dart.client import DisclosureListing
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    listing = DisclosureListing(records=(), reported_total=0, raw_rows=0)
+
+    class _Fake:
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None):  # type: ignore[no-untyped-def]
+            assert disclosure_filter.code == "A"
+            return listing
+
+    collector = DartXbrlCollector(api_key="k", min_interval=0.0, max_workers=1, client=_Fake())
+    assert collector.list_disclosure_window(
+        date(2024, 1, 1), date(2024, 1, 2),
+        disclosure_filter=DisclosureFilter(code="A", parameter="pblntf_ty"),
+    ) is listing
+
+    empty = DartXbrlCollector(api_key="k", min_interval=0.0, max_workers=1)
+    empty._client = None
+    with pytest.raises(PITDataError, match="not configured"):
+        empty.list_disclosure_window(date(2024, 1, 1), date(2024, 1, 2))

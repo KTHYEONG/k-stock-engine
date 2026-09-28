@@ -173,23 +173,36 @@ class _Collector:
         if not self._healthy:
             raise RuntimeError("connection reset")
 
-    def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
-        code = None
+    def _resolve_window(self, start, end, code):  # type: ignore[no-untyped-def]
+        for key, outcome in self._windows.items():
+            if len(key) == 3 and key[0] == start.isoformat() and key[1] == end.isoformat() and key[2] == code:
+                return outcome
+        return self._windows.get((start.isoformat(), end.isoformat(), code), [])
+
+    def _listing_for(self, outcome):  # type: ignore[no-untyped-def]
+        from src.integrations.dart.client import DisclosureListing
+
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, dict) and "records" in outcome:
+            records = [dict(item) for item in outcome.get("records", [])]
+            reported_total = int(outcome.get("reported_total", len(records)))
+            raw_rows = int(outcome.get("raw_rows", len(records)))
+            return DisclosureListing(records=tuple(records), reported_total=reported_total, raw_rows=raw_rows)
+        rows = [dict(item) for item in (outcome or [])]
+        return DisclosureListing(records=tuple(rows), reported_total=len(rows), raw_rows=len(rows))
+
+    def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
         if disclosure_filter is not None:
             code = disclosure_filter.code
             self.list_calls.append((start, end, disclosure_filter))
         else:
             code = detail_type
             self.list_calls.append((start, end, detail_type))
-        for key, outcome in self._windows.items():
-            if len(key) == 3 and key[0] == start.isoformat() and key[1] == end.isoformat() and key[2] == code:
-                if isinstance(outcome, Exception):
-                    raise outcome
-                return [dict(item) for item in outcome]
-        outcome = self._windows.get((start.isoformat(), end.isoformat(), code), [])
-        if isinstance(outcome, Exception):
-            raise outcome
-        return [dict(item) for item in outcome]
+        return self._listing_for(self._resolve_window(start, end, code))
+
+    def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+        return list(self.list_disclosure_window(start, end, disclosure_filter=disclosure_filter, detail_type=detail_type).records)
 
     def fetch_document_archive(self, rcept_no: str) -> bytes:
         self.archive_calls.append(rcept_no)
@@ -370,15 +383,18 @@ def test_open_window_stays_pending_after_run(tmp_path: Path) -> None:
     _disclosure_fixtures(runtime)
 
     class _NonEmpty(_Collector):
-        def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            from src.integrations.dart.client import DisclosureListing
+
             code = disclosure_filter.code if disclosure_filter is not None else detail_type
             self.list_calls.append((start, end, code))
-            return [
+            rows = [
                 {
                     "rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP,
                     "corp_name": "Test Co", "report_nm": "사업보고서 (2015.12)", "rm": "",
                 }
             ]
+            return DisclosureListing(records=tuple(rows), reported_total=len(rows), raw_rows=len(rows))
 
     collector = _NonEmpty()
     ctx = _ctx(runtime, _provider(), collector=collector)
@@ -435,7 +451,7 @@ def test_disclosures_quota_block_stops_run(tmp_path: Path) -> None:
     assert len(units) == 2
 
     class _Blocked(_Collector):
-        def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
             raise ProviderQuotaExhaustedError("blocked")
 
     ctx_blocked = _ctx(runtime, _provider(), collector=_Blocked())
@@ -473,44 +489,6 @@ def test_per_corp_coverage_ignores_malformed_pages(tmp_path: Path) -> None:
     coverage = _coverage()
     assert _window_covered(coverage, frozenset({CORP}), date(2016, 1, 1), date(2016, 3, 31)) is True
     assert _window_covered(coverage, frozenset({CORP}), date(2019, 7, 1), date(2019, 9, 30)) is False
-
-
-def test_legacy_dividend_cache_imports_once_then_deletes(tmp_path: Path) -> None:
-    from src.data.jobs.dart import DartDisclosuresJob, import_legacy_dividend_cache
-
-    runtime = _runtime(tmp_path)
-    _disclosure_fixtures(runtime)
-    cache = runtime.workspace.state_root / "dividend_decision_lists.json"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{"rcept_no": "20190814001234", "rcept_dt": "20190814", "corp_code": CORP, "report_nm": "현금배당결정", "rm": ""}]
-    cache.write_text(json.dumps({"2019-07-01..2019-09-30": rows}), encoding="utf-8")
-    ctx = _ctx(runtime, _provider())
-
-    assert import_legacy_dividend_cache(ctx) == 1
-    assert not cache.exists()
-
-    units = DartDisclosuresJob().pending(ctx)
-    assert "I001:2019-07-01..2019-09-30" not in {unit.natural_key for unit in units}
-    assert import_legacy_dividend_cache(ctx) == 0
-
-
-def test_legacy_dividend_cache_rejects_malformed_cache(tmp_path: Path) -> None:
-    from src.core.pit import PITDataError
-    from src.data.jobs.dart import import_legacy_dividend_cache
-
-    runtime = _runtime(tmp_path)
-    _disclosure_fixtures(runtime)
-    cache = runtime.workspace.state_root / "dividend_decision_lists.json"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text("not-json", encoding="utf-8")
-    with pytest.raises(PITDataError, match="unreadable"):
-        import_legacy_dividend_cache(_ctx(runtime, _provider()))
-    cache.write_text(json.dumps(["not", "a", "mapping"]), encoding="utf-8")
-    with pytest.raises(PITDataError, match="must hold a mapping"):
-        import_legacy_dividend_cache(_ctx(runtime, _provider()))
-    cache.write_text(json.dumps({"bogus-window": []}), encoding="utf-8")
-    with pytest.raises(PITDataError, match="invalid window"):
-        import_legacy_dividend_cache(_ctx(runtime, _provider()))
 
 
 # --- facts job -----------------------------------------------------------------
@@ -981,6 +959,185 @@ def test_disclosure_filter_reaches_collector(tmp_path: Path) -> None:
     sent = collector.list_calls[0][2]
     assert sent.code == "A"
     assert sent.parameter == "pblntf_ty"
+
+
+def _persist_complete_window(ctx, *, code: str, start: str, end: str, reported_total: int, raw_rows: int, records=None):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.jobs.dart import DISCLOSURE_WINDOW_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.data.scoped_ingestion import ScopedRawPayload
+
+    body = {"detail_type": code, "start": start, "end": end, "records": records or [],
+            "reported_total": reported_total, "raw_rows": raw_rows}
+    if reported_total is None or raw_rows is None:
+        body = {"detail_type": code, "start": start, "end": end, "records": records or []}
+    ctx.writer.persist(
+        ScopedRawPayload(
+            kind=EvidenceKind.DISCLOSURES,
+            source=DISCLOSURE_WINDOW_SOURCE,
+            natural_key=f"{code}:{start}..{end}",
+            as_of=date.fromisoformat(end),
+            fiscal_period=None,
+            status=EvidenceStatus.SUCCESS,
+            payload=json.dumps(body).encode("utf-8"),
+            retrieved_at=NOW,
+            source_label=f"test:{code}:{start}..{end}",
+        )
+    )
+
+
+def test_legacy_receipt_without_reported_total_is_replanned(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider())
+    _persist_complete_window(ctx, code="I001", start="2016-01-01", end="2016-03-31",
+                             reported_total=None, raw_rows=None,
+                             records=[{"rcept_no": "20160330001234", "rcept_dt": "20160330"}])
+
+    units = DartDisclosuresJob().pending(ctx)
+
+    assert "I001:2016-01-01..2016-03-31" in {unit.natural_key for unit in units}
+
+
+def test_complete_receipt_is_skipped(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider())
+    _persist_complete_window(ctx, code="I001", start="2016-01-01", end="2016-03-31",
+                             reported_total=1, raw_rows=1,
+                             records=[{"rcept_no": "20160330001234", "rcept_dt": "20160330"}])
+
+    units = DartDisclosuresJob().pending(ctx)
+
+    assert "I001:2016-01-01..2016-03-31" not in {unit.natural_key for unit in units}
+
+
+def test_short_receipt_is_replanned(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider())
+    _persist_complete_window(ctx, code="I001", start="2016-01-01", end="2016-03-31",
+                             reported_total=9194, raw_rows=87,
+                             records=[{"rcept_no": "20160330001234", "rcept_dt": "20160330"}])
+
+    units = DartDisclosuresJob().pending(ctx)
+
+    assert "I001:2016-01-01..2016-03-31" in {unit.natural_key for unit in units}
+
+
+def test_incomplete_completed_window_fails_closed_on_fetch(tmp_path: Path) -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.dart import DartDisclosuresJob
+    from src.integrations.dart.client import DisclosureListing
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+
+    class _Short(_Collector):
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            rows = [{"rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP,
+                     "corp_name": "T", "report_nm": "X", "rm": ""}]
+            return DisclosureListing(records=tuple(rows), reported_total=12, raw_rows=10)
+
+    ctx = _ctx(runtime, _provider(), collector=_Short())
+    (unit,) = [unit for unit in DartDisclosuresJob().pending(ctx)
+               if unit.natural_key == "A:2016-01-01..2016-03-31"]
+    before = set(ctx.catalog.latest(source="dart_disclosure_windows",
+                                    natural_keys={unit.natural_key}))
+
+    with pytest.raises(PITDataError, match=r"A:2016\-01\-01\.\.2016\-03\-31"):
+        DartDisclosuresJob().fetch(ctx, [unit])
+
+    after = set(ctx.catalog.latest(source="dart_disclosure_windows",
+                                   natural_keys={unit.natural_key}))
+    assert before == after
+
+
+def test_open_window_persists_mismatch(tmp_path: Path) -> None:
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from src.data.jobs.dart import DartDisclosuresJob, disclosure_windows
+    from src.integrations.dart.client import DisclosureListing
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    today = (_datetime(2026, 9, 27, 3, 0, tzinfo=_UTC) + __import__("datetime").timedelta(hours=9)).date()
+    windows = disclosure_windows(runtime.scope.evidence_start, today)
+    w_start, w_end = windows[-1]
+    assert w_end >= today
+
+    class _Short(_Collector):
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            rows = [{"rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP,
+                     "corp_name": "T", "report_nm": "X", "rm": ""}] * 10
+            return DisclosureListing(records=tuple(rows[:10]), reported_total=12, raw_rows=10)
+
+    ctx = _ctx(runtime, _provider(), collector=_Short(),
+               now=lambda: _datetime(2026, 9, 27, 3, 0, tzinfo=_UTC))
+    (unit,) = [unit for unit in DartDisclosuresJob().pending(ctx)
+               if unit.natural_key == f"A:{w_start.isoformat()}..{w_end.isoformat()}"]
+
+    (payload,) = DartDisclosuresJob().fetch(ctx, [unit])
+
+    body = json.loads(payload.payload)
+    assert body["reported_total"] == 12
+    assert body["raw_rows"] == 10
+
+
+def test_window_payload_round_trips_counts(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    rows = [{"rcept_no": "20160330001234", "rcept_dt": "20160330", "corp_code": CORP,
+             "corp_name": "T", "report_nm": "X", "rm": ""}]
+    collector = _Collector(windows={("2016-01-01", "2016-03-31", "A"): {
+        "records": rows, "reported_total": 1, "raw_rows": 1}})
+    ctx = _ctx(runtime, _provider(), collector=collector)
+    (unit,) = [unit for unit in DartDisclosuresJob().pending(ctx)
+               if unit.natural_key == "A:2016-01-01..2016-03-31"]
+
+    (payload,) = DartDisclosuresJob().fetch(ctx, [unit])
+    ctx.writer.persist(payload)
+
+    entry = ctx.catalog.latest(source="dart_disclosure_windows",
+                               natural_keys={unit.natural_key})[unit.natural_key]
+    body = json.loads(__import__("pathlib").Path(entry.payload_path).read_bytes())
+
+    assert body["reported_total"] == 1
+    assert body["raw_rows"] == 1
+
+
+def test_window_receipt_complete_rejects_corrupt_payloads(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from src.data.jobs.dart import _window_receipt_complete
+
+    assert _window_receipt_complete(SimpleNamespace(payload_path=tmp_path / "missing.json", content_hash="x")) is False
+
+    target = tmp_path / "payload.json"
+    target.write_bytes(b"{broken")
+    import hashlib as _hashlib
+
+    assert _window_receipt_complete(SimpleNamespace(payload_path=target, content_hash=_hashlib.sha256(b"{broken").hexdigest())) is False
+
+    target.write_bytes(b"[1]")
+    assert _window_receipt_complete(SimpleNamespace(payload_path=target, content_hash=_hashlib.sha256(b"[1]").hexdigest())) is False
+
+    target.write_bytes(b'{"reported_total": true, "raw_rows": 1}')
+    assert _window_receipt_complete(SimpleNamespace(payload_path=target, content_hash=_hashlib.sha256(target.read_bytes()).hexdigest())) is False
+
+    target.write_bytes(b'{"reported_total": 1, "raw_rows": 1, "extra": true}')
+    assert _window_receipt_complete(SimpleNamespace(payload_path=target, content_hash="0" * 64)) is False
 
 
 def test_past_period_without_filing_fails(tmp_path: Path) -> None:

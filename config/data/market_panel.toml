@@ -10,3 +10,11 @@ block_administrative = true
 # machine-recognizable. Read as the default of
 # MarketPanelPolicy.delisting_block_max_sessions.
 delisting_block_max_sessions = 250
+
+# Completeness audit: a session without price limits that moves more than this fraction from
+# its base price (KRX daily band is ±30%) must be explained by an entry block; otherwise an
+# exchange notice is missing from market_actions. Audit only; never feeds entry blocking.
+limitless_move_audit_threshold = 0.30
+
+# Unexplained limitless moves tolerated before the panel build fails closed.
+max_unexplained_limitless_moves = 0
