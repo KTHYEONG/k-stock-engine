@@ -1052,3 +1052,86 @@ def test_document_page_level_parser_inherited() -> None:
 
     assert frame['filing_id'].to_list() == ['INH']
     assert quarantined == ()
+
+
+def test_session_index_identical_output_with_and_without() -> None:
+    """A prebuilt index returns frames and quarantine records equal to the None path."""
+    from datetime import UTC, datetime
+    from src.core.time import SessionCalendar
+    from src.data.normalization import SessionIndex, normalize_dart_financial_facts_with_quarantine
+
+    published = datetime(2024, 11, 12, tzinfo=UTC)
+    pages = [
+        _standard_page(filing_id='A', published_at=published),
+        _legacy_page(filing_id='B', published_at=published),
+    ]
+    kwargs = {'disclosure_rows': (), 'source_hash': 'a' * 64, 'decision_time': datetime(2024, 11, 20, tzinfo=UTC)}
+    calendar = SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14')))
+    plain_frame, plain_quarantine = normalize_dart_financial_facts_with_quarantine(pages=pages, calendar=calendar, **kwargs)
+    index = SessionIndex.from_calendar(calendar)
+    indexed_frame, indexed_quarantine = normalize_dart_financial_facts_with_quarantine(pages=pages, calendar=calendar, session_index=index, **kwargs)
+    assert indexed_frame.equals(plain_frame)
+    assert indexed_quarantine == plain_quarantine
+
+
+def test_session_index_rejects_empty_calendar() -> None:
+    """An index cannot be built from a calendar without sessions."""
+    import pytest
+    from src.core.pit import PITDataError
+    from src.core.time import SessionCalendar
+    from src.data.normalization import SessionIndex
+
+    with pytest.raises(PITDataError, match=r'must contain sessions'):
+        SessionIndex.from_calendar(SessionCalendar(()))
+
+
+def test_session_index_rejects_naive_session() -> None:
+    """An index cannot be built from a session without tzinfo."""
+    from datetime import datetime
+    from types import SimpleNamespace
+    import pytest
+    from src.core.pit import PITDataError
+    from src.data.normalization import SessionIndex
+
+    with pytest.raises(PITDataError, match=r'timezone-aware'):
+        SessionIndex.from_calendar(SimpleNamespace(sessions=(datetime(2024, 11, 13, 9, 0),)))
+
+
+def test_session_index_views_aligned() -> None:
+    """Unsorted sessions index into ascending views with aligned dates and opens."""
+    from datetime import UTC
+    from types import SimpleNamespace
+    from src.core.time import KRX_TZ
+    from src.data.normalization import SessionIndex
+
+    later = _kst_open('2024-11-14')
+    earlier = _kst_open('2024-11-13')
+    index = SessionIndex.from_calendar(SimpleNamespace(sessions=(later, earlier)))
+    assert index.ordered == (earlier, later)
+    assert index.dates == (earlier.astimezone(KRX_TZ).date(), later.astimezone(KRX_TZ).date())
+    assert index.opens == (earlier.astimezone(UTC), later.astimezone(UTC))
+
+
+def test_normalize_with_index_skips_calendar_reconversion() -> None:
+    """A reused index performs no per-call session timezone conversion of the calendar."""
+    from datetime import UTC, datetime
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data.normalization import SessionIndex, normalize_dart_financial_facts_with_quarantine
+
+    converted = 0
+
+    class _Session(datetime):
+        def astimezone(self, tz=None):
+            nonlocal converted
+            converted += 1
+            return super().astimezone(tz)
+
+    sessions = (_Session(2024, 11, 13, 9, 0, tzinfo=KRX_TZ), _Session(2024, 11, 14, 9, 0, tzinfo=KRX_TZ))
+    calendar = SessionCalendar(sessions)
+    index = SessionIndex.from_calendar(calendar)
+    assert converted > 0
+    converted = 0
+    pages = [_standard_page(filing_id='A', published_at=datetime(2024, 11, 12, tzinfo=UTC))]
+    for _ in range(3):
+        normalize_dart_financial_facts_with_quarantine(pages=pages, disclosure_rows=(), source_hash='a' * 64, calendar=calendar, decision_time=datetime(2024, 11, 20, tzinfo=UTC), session_index=index)
+    assert converted == 0

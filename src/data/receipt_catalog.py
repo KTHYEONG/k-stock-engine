@@ -155,6 +155,11 @@ class ReceiptCatalog:
         self._bronze_root = self._root.parent
         self._database_path = self._root / "catalog.sqlite3"
 
+    @property
+    def root(self) -> Path:
+        """Directory holding the catalog database."""
+        return self._root
+
     def _database_is_missing(self) -> bool:
         if not self._database_path.exists():
             return True
@@ -384,6 +389,43 @@ class ReceiptCatalog:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
 
+    def _stored_payload_path(self, raw_path: Path) -> Path:
+        """Return the payload path of a catalog row after a lexical Bronze-root containment check.
+
+        Rows are verified against the filesystem when they are published (existence, content hash and
+        containment via ``_payload_path``); reading a row back only needs the stored location. The
+        check is lexical so streaming 10^5 rows performs no filesystem access.
+
+        Args:
+            raw_path: The ``payload_path`` column of a receipt or blob row, absolute or relative to the
+                Bronze root.
+
+        Returns:
+            The normalized absolute path.
+
+        Raises:
+            PITDataError: The normalized path lies outside the Bronze root.
+        """
+        candidate = raw_path if raw_path.is_absolute() else self._bronze_root / raw_path
+        anchor = candidate.anchor
+        stack: list[str] = []
+        for part in candidate.parts:
+            if part == anchor:
+                continue
+            if part == "..":
+                if stack:
+                    stack.pop()
+                continue
+            stack.append(part)
+        normalized = Path(anchor).joinpath(*stack) if stack else Path(anchor)
+        try:
+            normalized.relative_to(self._bronze_root)
+        except ValueError as exc:
+            raise PITDataError(
+                f"receipt catalog payload is outside the Bronze root: {normalized}"
+            ) from exc
+        return normalized
+
     def _payload_path(self, raw_path: Path, *, must_exist: bool) -> Path:
         candidate = raw_path if raw_path.is_absolute() else self._bronze_root / raw_path
         try:
@@ -435,9 +477,11 @@ class ReceiptCatalog:
                 status=EvidenceStatus(str(row[4])),
                 content_hash=str(row[5]),
                 retrieved_at=datetime.fromisoformat(str(raw_retrieved_at)),
-                payload_path=self._payload_path(Path(str(row[7])), must_exist=False),
+                payload_path=self._stored_payload_path(Path(str(row[7]))),
             )
         except (TypeError, ValueError) as exc:
+            if isinstance(exc, PITDataError):
+                raise
             raise PITDataError("receipt catalog contains a corrupt entry") from exc
 
     def _blob_from_row(self, row: Sequence[object]) -> BlobEntry:
@@ -449,9 +493,11 @@ class ReceiptCatalog:
                 usable=bool(row[3]),
                 unusable_reason=str(row[4]) if row[4] is not None else None,
                 retrieved_at=datetime.fromisoformat(str(row[5])),
-                payload_path=self._payload_path(Path(str(row[6])), must_exist=False),
+                payload_path=self._stored_payload_path(Path(str(row[6]))),
             )
         except (TypeError, ValueError) as exc:
+            if isinstance(exc, PITDataError):
+                raise
             raise PITDataError("receipt catalog contains a corrupt blob") from exc
 
     @staticmethod

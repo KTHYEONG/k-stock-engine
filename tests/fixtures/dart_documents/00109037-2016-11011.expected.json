@@ -6,7 +6,7 @@
     "reprt_code": "11011",
     "rcept_no": "20170331003204"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: annual OFS (no consolidated statements in filing), old layout (heading paragraph), full KRW; hand-verified: BS 52153920007 == 1832351682 + 50321568325, IS 영업수익/영업이익/당기순이익, CF operating cash flow and capex abs outflow",
   "statements": {
     "consolidated": false,

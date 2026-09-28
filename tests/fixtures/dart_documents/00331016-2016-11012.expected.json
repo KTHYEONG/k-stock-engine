@@ -6,11 +6,79 @@
     "reprt_code": "11012",
     "rcept_no": "20160816000210"
   },
-  "parser_version": "dart-document-statements-v1",
-  "expected_values_source": "hand-verified against the filing document main member: WITHHELD: consolidated section has no statements (missing_statement:BS); separate BS heading is a bare (1) 재무상태표 with no 단위 note (missing_unit:BS)",
-  "statements": null,
+  "parser_version": "dart-document-statements-v3",
+  "expected_values_source": "hand-verified against the filing document main member: CFS section has no statements (missing_statement:BS kept); v2 caption-table fix: the separate-section caption table no longer steals the BS body, so OFS verifies at 2016-06-30 with BS 14641498887 == 2209559295 + 12431939592 plus quarter-basis IS and cumulative CF",
+  "statements": {
+    "consolidated": false,
+    "period_end": "2016-06-30",
+    "report_kind": "half",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 2657041650,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 14641498887,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 2209559295,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 12431939592,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 2528479089,
+        "basis": "quarter",
+        "label": "매출액"
+      },
+      {
+        "fact": "gross_profit",
+        "value": 1536744481,
+        "basis": "quarter",
+        "label": "매출총이익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": 394931293,
+        "basis": "quarter",
+        "label": "영업이익"
+      },
+      {
+        "fact": "net_income",
+        "value": 355426852,
+        "basis": "quarter",
+        "label": "당기순이익"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": 927711097,
+        "basis": "cumulative",
+        "label": "영업활동으로인한현금흐름"
+      }
+    ],
+    "checks": [
+      "bs_balance",
+      "gross_profit_identity"
+    ]
+  },
   "diagnostics": [
-    "missing_statement:BS",
-    "missing_unit:BS"
+    "missing_statement:BS"
   ]
 }

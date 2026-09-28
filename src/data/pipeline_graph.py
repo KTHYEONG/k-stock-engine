@@ -495,7 +495,7 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
     )
 
     runtime = ctx.runtime
-    receipts = _discover_fact_receipts(runtime.workspace.bronze_root)
+    receipts = _discover_fact_receipts(runtime.workspace.bronze_root, verify_payload=False)
     # 빌더와 같이 대체된 수집 기록은 입력 요약에서 제외한다(포함하면 갱신 판정이 영원히 어긋난다).
     receipt_hashes = [
         str(item["content_hash"]) for item in receipts if str(item["content_hash"]) not in ctx.superseded_receipts

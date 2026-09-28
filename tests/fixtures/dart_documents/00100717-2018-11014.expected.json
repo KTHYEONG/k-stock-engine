@@ -6,7 +6,7 @@
     "reprt_code": "11014",
     "rcept_no": "20181114000364"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: WITHHELD: consolidated section has no statements at all (missing_statement:BS); separate BS body carries no 제N기 header cells (missing_current_column:BS)",
   "statements": null,
   "diagnostics": [

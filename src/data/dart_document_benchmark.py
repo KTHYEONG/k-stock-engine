@@ -237,21 +237,26 @@ def select_benchmark_filings(catalog: ReceiptCatalog, *, size: int, seed: int) -
         current = latest.get(entry.natural_key)
         if current is None or entry.retrieved_at > current.retrieved_at:
             latest[entry.natural_key] = entry
+    from src.data.fact_page_meta import FactPageMetaStore
+
+    store = FactPageMetaStore(catalog.root)
+    metas = {entry.natural_key: meta for entry, meta in store.resolve(
+        latest[natural_key] for natural_key in sorted(latest)
+    )}
     strata: dict[tuple[str, bool], list[str]] = {}
     for natural_key in sorted(latest):
-        entry = latest[natural_key]
-        page = _read_page(Path(str(entry.payload_path)))
-        if page is None:
+        meta = metas.get(natural_key)
+        if meta is None:
             continue
-        if str(page.get("source_kind") or "") != "opendart_standard":
+        if meta.source_kind != "opendart_standard":
             continue
-        if str(page.get("status") or "") != "000":
+        if meta.status != "000":
             continue
-        if not standard_labels(page):
+        if not meta.has_labels:
             continue
-        reprt_code = _page_field(page, "reprt_code") or natural_key.split(":")[-1]
-        biz_year = _page_field(page, "biz_year") or (natural_key.split(":")[1] if len(natural_key.split(":")) > 1 else "")
-        financial = _is_financial_page(page)
+        reprt_code = meta.reprt_code or natural_key.split(":")[-1]
+        biz_year = meta.biz_year or (natural_key.split(":")[1] if len(natural_key.split(":")) > 1 else "")
+        financial = meta.is_financial
         if financial:
             try:
                 if int(biz_year) < 2023:
@@ -308,24 +313,31 @@ def _receipt_archive_index(paths: Mapping[str, Path]) -> dict[str, list[tuple[st
 
 def _archive_for_filing(
     *,
-    catalog: ReceiptCatalog,
-    natural_key: str,
+    raw_document_hash: str,
     receipt: str,
     archive_paths: Mapping[str, Path],
     receipt_index: Mapping[str, list[tuple[str, Path]]],
 ) -> bytes | None:
-    for entry in catalog.entries(source=_FACT_SOURCE):
-        if entry.natural_key != natural_key:
-            continue
-        page = _read_page(Path(str(entry.payload_path)))
-        if page is None:
-            continue
-        raw_hash = str(page.get("raw_document_hash") or "")
-        if raw_hash and raw_hash in archive_paths:
-            try:
-                return archive_paths[raw_hash].read_bytes()
-            except OSError:  # pragma: no cover - blob removed between plan and read
-                continue
+    """Find the stored archive of one benchmark filing.
+
+    The filing's standard page is already loaded by the caller, so the archive is located from the
+    hash that page names (or, failing that, from the filing's receipt number) without touching the
+    catalog.
+
+    Args:
+        raw_document_hash: ``raw_document_hash`` of the filing's latest fact page, possibly empty.
+        receipt: Receipt number of the filing.
+        archive_paths: Usable document content hash to archive file.
+        receipt_index: Receipt number to stored archives, oldest first.
+
+    Returns:
+        The archive bytes, or None when none is stored.
+    """
+    if raw_document_hash and raw_document_hash in archive_paths:
+        try:
+            return archive_paths[raw_document_hash].read_bytes()
+        except OSError:
+            pass
     if receipt and receipt in receipt_index:
         for _, payload_path in receipt_index[receipt]:
             try:
@@ -347,8 +359,9 @@ def run_benchmark(runtime: DataRuntime, *, filings: Sequence[str]) -> BenchmarkR
             withheld_documents=0, coverage=0.0,
         )
     latest: dict[str, ReceiptIndexEntry] = {}
+    wanted_set = set(wanted)
     for catalog_entry in catalog.entries(source=_FACT_SOURCE):
-        if catalog_entry.natural_key not in set(wanted):
+        if catalog_entry.natural_key not in wanted_set:
             continue
         current = latest.get(catalog_entry.natural_key)
         if current is None or catalog_entry.retrieved_at > current.retrieved_at:
@@ -373,7 +386,8 @@ def run_benchmark(runtime: DataRuntime, *, filings: Sequence[str]) -> BenchmarkR
             continue
         receipt = _page_receipt(page)
         archive = _archive_for_filing(
-            catalog=catalog, natural_key=natural_key, receipt=receipt,
+            raw_document_hash=str(page.get("raw_document_hash") or ""),
+            receipt=receipt,
             archive_paths=archive_paths, receipt_index=receipt_index,
         )
         if archive is None:

@@ -6,7 +6,7 @@
     "reprt_code": "11011",
     "rcept_no": "20170331001148"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: annual financial company (흥국화재) CFS, spanned current column cols [2,3] with single amount, 백만원 unit; hand-verified: BS 10215979 == 9663721 + 552258 (x1e6), CF cash absent so no tie-out check",
   "statements": {
     "consolidated": true,

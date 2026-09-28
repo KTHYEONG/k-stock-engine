@@ -12,6 +12,22 @@ from typing import Final
 
 MAPPING_VERSION: Final = "dart-fact-map-v1"
 
+_LOSS_ONLY_TO_FACT: Final = {
+    "영업손실": "operating_profit",
+    "당기순손실": "net_income",
+    "분기순손실": "net_income",
+    "반기순손실": "net_income",
+    "연결당기순손실": "net_income",
+    "분기연결순손실": "net_income",
+    "반기연결순손실": "net_income",
+}
+
+_SUPPORT_TO_LINE: Final = {
+    "매출원가": "cost_of_sales",
+    "판매비와관리비": "sga",
+    "판매비및관리비": "sga",
+}
+
 _LABEL_TO_FACT: dict[str, str] = {
     "매출액": "sales",
     "매출": "sales",
@@ -90,15 +106,101 @@ def map_standardized_account(*, account_id: str = "", account_nm: str = "") -> s
     return None
 
 
+def map_loss_only_account(*, account_nm: str) -> str | None:
+    """Map a loss-only income label to the fact it reports.
+
+    Labels such as ``영업손실`` or ``당기순손실`` exist only for periods with a loss, but filings print
+    their amount either in brackets or as a bare positive magnitude, so the label alone does not fix
+    the sign. The mapping is kept apart from the standard vocabulary because XBRL and standard-API rows
+    never carry these labels.
+
+    Args:
+        account_nm: A label already reduced by ``normalize_statement_label``.
+
+    Returns:
+        ``operating_profit`` or ``net_income``; None for every other label.
+    """
+    return _LOSS_ONLY_TO_FACT.get(account_nm or "")
+
+
+def map_income_support_account(*, account_nm: str) -> str | None:
+    """Map a label to an income-statement support line used only for consistency checks.
+
+    Args:
+        account_nm: A label already reduced by ``normalize_statement_label``.
+
+    Returns:
+        ``cost_of_sales`` (매출원가) or ``sga`` (판매비와관리비, including the ``판매비및관리비``
+        spelling); None for every other label.
+    """
+    return _SUPPORT_TO_LINE.get(account_nm or "")
+
+
+def _balanced_brackets(label: str) -> bool:
+    """Check that every ``()`` and ``[]`` pair in the label is closed and nested."""
+    depth_paren = 0
+    depth_brack = 0
+    for char in label:
+        if char == "(":
+            depth_paren += 1
+        elif char == ")":
+            depth_paren -= 1
+            if depth_paren < 0:
+                return False
+        elif char == "[":
+            depth_brack += 1
+        elif char == "]":
+            depth_brack -= 1
+            if depth_brack < 0:
+                return False
+    return depth_paren == 0 and depth_brack == 0
+
+
+def _unwrap_whole_label(label: str) -> str:
+    """Strip brackets only when one pair wraps the whole remaining label."""
+    while len(label) >= 2:
+        opener, closer = label[0], label[-1]
+        if (opener, closer) not in (("(", ")"), ("[", "]")):
+            break
+        depth = 0
+        wraps_whole = True
+        for index, char in enumerate(label):
+            if char == opener:
+                depth += 1
+            elif char == closer:
+                depth -= 1
+            if depth == 0 and index < len(label) - 1:
+                wraps_whole = False
+                break
+        if not wraps_whole or depth != 0:
+            break
+        label = label[1:-1]
+    return label
+
+
 def normalize_statement_label(raw: str) -> str:
     """Reduce one source row label to its bare account name.
 
-    Removes whitespace, a trailing note reference such as ``(주석 29)``, a
-    leading enumerator (``I.``, ``1.``, ``(1)``, ``가.``) and any brackets
-    left around the name, so that a spaced ``"자 산 총 계"`` with a
-    roman-numeral prefix becomes ``"자산총계"`` for fact lookup.
+    Removes whitespace, a trailing note reference such as ``(주석 29)``, and a leading enumerator
+    (``I.``, ``1.``, ``(1)``, ``가.``, including roman-numeral forms). Brackets are removed only when they wrap the whole
+    remaining label or are left unpaired by the enumerator removal; a closed parenthetical that is part
+    of the account name (``수익(매출액)``) is preserved so vocabulary lookup can resolve it.
+
+    Args:
+        raw: The label cell as printed in the statement.
+
+    Returns:
+        The label without spacing, notes and enumerators, with balanced brackets intact.
     """
     label = "".join(raw.split())
     label = _NOTE_REFERENCE_RE.sub("", label)
-    label = _ENUMERATOR_RE.sub("", label)
-    return label.strip("()[]")
+    while True:
+        stripped = _ENUMERATOR_RE.sub("", label, count=1)
+        if stripped == label:
+            break
+        label = stripped
+    label = _unwrap_whole_label(label)
+    if not _balanced_brackets(label):
+        edge_stripped = label.strip("()[]")
+        label = edge_stripped if edge_stripped and _balanced_brackets(edge_stripped) else re.sub(r"[()\[\]]", "", label)
+    return label

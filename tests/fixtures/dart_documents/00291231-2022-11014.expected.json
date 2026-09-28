@@ -6,7 +6,7 @@
     "reprt_code": "11014",
     "rcept_no": "20221114000862"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: Q3 cumulative-only interim CFS (sub-header 발생|누적, no 3개월 marker), cumulative basis; hand-verified: BS 115696140723 == 47113229837 + 68582910886 at 2022-09-30, IS sales cumulative 72106465507, CF tie-out holds",
   "statements": {
     "consolidated": true,
@@ -81,6 +81,7 @@
     ],
     "checks": [
       "bs_balance",
+      "gross_profit_identity",
       "cf_cash_tieout"
     ]
   },

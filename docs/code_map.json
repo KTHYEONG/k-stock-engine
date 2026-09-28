@@ -244,5 +244,8 @@
       "tests/unit/integrations/dart/test_document_statements.py",
       "tests/unit/data/test_dart_document_benchmark.py"
     ]
+  },
+  "src/data/fact_page_meta.py": {
+    "testing": "tests/unit/data/test_fact_page_meta.py"
   }
 }
