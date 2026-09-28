@@ -66,13 +66,16 @@ def _strategy_config(tmp_path: Path) -> Path:
     return path
 
 
-def _args(tmp_path: Path, strategy: Path, *, dividends: str | None = None, no_dividends: bool = False) -> list[str]:
+def _args(
+    tmp_path: Path, strategy: Path, *, dividends: str | None = None, no_dividends: bool = False,
+    engine: Path = _ENGINE,
+) -> list[str]:
     args = [
         "--scope-config", str(_SCOPE),
         "--data-root", str(tmp_path / "data"),
         "--strategy", "equal_weight_liquid",
         "--strategy-config", str(strategy),
-        "--engine-config", str(_ENGINE),
+        "--engine-config", str(engine),
         "--capital", "1000000",
         "--start", "2024-01-02",
         "--end", "2024-01-03",
@@ -194,6 +197,67 @@ def test_cli_excludes_dividends_outside_panel_session_range(tmp_path: Path, caps
 
     assert main(_args(tmp_path, strategy)) == 0
     assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+def _engine_config_with_rate(tmp_path: Path, rate_line: str | None) -> Path:
+    lines = Path("config/backtest/default_engine.toml").read_text(encoding="utf-8").splitlines()
+    lines = [line for line in lines if not line.startswith("dividend_withholding_rate")]
+    if rate_line is not None:
+        lines.append(rate_line)
+    path = tmp_path / "engine.toml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_cli_rejects_invalid_withholding_rate(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+    for bad in ('dividend_withholding_rate = "1.2"', "dividend_withholding_rate = -0.1",
+                'dividend_withholding_rate = "not-a-rate"'):
+        engine = _engine_config_with_rate(tmp_path, bad)
+        assert main(_args(tmp_path, strategy, no_dividends=True, engine=engine)) == 1
+        assert "dividend_withholding_rate" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_rejects_missing_withholding_rate(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+    engine = _engine_config_with_rate(tmp_path, None)
+
+    assert main(_args(tmp_path, strategy, no_dividends=True, engine=engine)) == 1
+    assert "dividend_withholding_rate" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_rejects_non_bool_static_industry(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+    lines = Path("config/backtest/default_engine.toml").read_text(encoding="utf-8").splitlines()
+    lines = [line for line in lines if not line.startswith("allow_static_industry")]
+    lines.append('allow_static_industry = "yes"')
+    engine = tmp_path / "engine-static.toml"
+    engine.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert main(_args(tmp_path, strategy, no_dividends=True, engine=engine)) == 1
+    assert "allow_static_industry" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_rejects_missing_static_industry(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+    lines = Path("config/backtest/default_engine.toml").read_text(encoding="utf-8").splitlines()
+    lines = [line for line in lines if not line.startswith("allow_static_industry")]
+    engine = tmp_path / "engine-no-static.toml"
+    engine.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert main(_args(tmp_path, strategy, no_dividends=True, engine=engine)) == 1
+    assert "allow_static_industry" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_records_withholding_rate_in_manifest(tmp_path: Path, capsys) -> None:
+    strategy, _ = _setup(tmp_path)
+
+    assert main(_args(tmp_path, strategy, no_dividends=True)) == 0
+    capsys.readouterr()
+    run_dirs = sorted((tmp_path / "data" / "state" / "kr_swing_2019_v1" / "backtests").iterdir())
+    manifests = [json.loads((path / "manifest.json").read_text(encoding="utf-8")) for path in run_dirs if path.is_dir()]
+    assert manifests
+    assert {manifest["config"]["costs"]["dividend_withholding_rate"] for manifest in manifests} == {"0.154"}
 
 
 def test_resolve_runtime_paths_defaults_to_runtime_config() -> None:

@@ -126,7 +126,7 @@ def test_parse_dividend_decision_reads_table_less_rows_and_undecided_pay() -> No
 
     html = (
         '<?xml version="1.0" encoding="utf-8"?><document>'
-        "<tr><td>보통주 300원</td></tr>"
+        "<tr><td>보통주 1주당 배당금 300원</td></tr>"
         "<tr><td>배당기준일</td><td>2017-12-31</td></tr>"
         "<tr><td>배당금지급 예정일자</td><td>-</td></tr>"
         "</document>"
@@ -498,3 +498,236 @@ def test_parse_dividend_decision_reads_dividend_kind() -> None:
 
     assert with_kind.dividend_kind == "결산배당"
     assert without_kind.dividend_kind is None
+
+
+def test_parse_dividend_decision_correction_flag_comes_from_title() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    kwargs = {
+        "archive_bytes": make_archive({"20180201001234.xml": layout_2017_html()}),
+        "rcept_no": "20180201001234",
+        "corp_code": "00126380",
+        "received_on": date(2018, 2, 1),
+    }
+
+    corrected = parse_dividend_decision(**kwargs, report_nm="[기재정정]현금ㆍ현물배당결정")
+    assert corrected.is_correction is True
+
+    plain = parse_dividend_decision(**kwargs, report_nm="현금ㆍ현물배당결정")
+    assert plain.is_correction is False
+
+    padded = parse_dividend_decision(**kwargs, report_nm="  [기재정정]현금배당결정")
+    assert padded.is_correction is True
+
+
+def test_parse_dividend_decision_total_is_never_taken_as_dps() -> None:
+    from decimal import Decimal
+
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>배당금총액(원)</td><td>38,807,917,000</td><td>-</td></tr>"
+        "<tr><td>1주당 배당금(원)</td><td>500</td><td>550</td></tr>"
+        "<tr><td>시가배당율(%)</td><td>2.8%</td><td>3.0%</td></tr>"
+        "<tr><td>배당기준일</td><td>2024-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자</td><td>2025-04-18</td></tr>"
+        "</table></document>"
+    )
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20250203001234.xml": html}),
+        rcept_no="20250203001234",
+        corp_code="00126380",
+        received_on=date(2025, 2, 3),
+    )
+
+    assert decision.dps_common_krw == 500
+    assert decision.total_krw == 38807917000
+    assert decision.market_yield_pct == Decimal("2.8")
+
+
+def test_parse_dividend_decision_unlabelled_amount_fails_closed() -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>배당금총액(원)</td><td>38,807,917,000</td><td>-</td></tr>"
+        "<tr><td>배당기준일</td><td>2024-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자</td><td>2025-04-18</td></tr>"
+        "</table></document>"
+    )
+    with pytest.raises(PITDataError):
+        parse_dividend_decision(
+            archive_bytes=make_archive({"20250203001234.xml": html}),
+            rcept_no="20250203001234",
+            corp_code="00126380",
+            received_on=date(2025, 2, 3),
+        )
+
+    bare = (
+        '<?xml version="1.0" encoding="utf-8"?><document>'
+        "<tr><td>보통주 300원</td></tr>"
+        "<tr><td>배당기준일</td><td>2017-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자</td><td>-</td></tr>"
+        "</document>"
+    )
+    with pytest.raises(PITDataError):
+        parse_dividend_decision(
+            archive_bytes=make_archive({"20180201001234.xml": bare}),
+            rcept_no="20180201001234",
+            corp_code="00126380",
+            received_on=date(2018, 2, 1),
+        )
+
+
+def test_parse_dividend_decision_yield_and_total_are_optional() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20180201001234.xml": layout_2017_html()}),
+        rcept_no="20180201001234",
+        corp_code="00126380",
+        received_on=date(2018, 2, 1),
+    )
+
+    assert decision.dps_common_krw == 300
+    assert decision.total_krw is None
+    assert decision.market_yield_pct is None
+
+
+def test_parse_dividend_decision_reads_free_text_per_share_amount() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document>'
+        "<p>보통주 1주당 배당금 300원</p><table>"
+        "<tr><td>배당기준일</td><td>2017-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자</td><td>2018-04-20</td></tr>"
+        "</table></document>"
+    )
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20180201001234.xml": html}),
+        rcept_no="20180201001234",
+        corp_code="00126380",
+        received_on=date(2018, 2, 1),
+    )
+
+    assert decision.dps_common_krw == 300
+    assert decision.record_date == date(2017, 12, 31)
+
+
+def test_parse_dividend_decision_single_cell_per_share_label_with_digit() -> None:
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>1주당 배당금 보통주 300원</td></tr>"
+        "<tr><td>배당기준일 2017-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자 2018-04-20</td></tr>"
+        "</table></document>"
+    )
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20180201001234.xml": html}),
+        rcept_no="20180201001234",
+        corp_code="00126380",
+        received_on=date(2018, 2, 1),
+    )
+
+    assert decision.dps_common_krw == 300
+
+
+def test_parse_dividend_decision_skips_unparseable_yield_cells() -> None:
+    from decimal import Decimal
+
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    html = (
+        '<?xml version="1.0" encoding="utf-8"?><document><table>'
+        "<tr><td>구분</td><td>보통주</td><td>우선주</td></tr>"
+        "<tr><td>1주당 배당금(원)</td><td>500</td><td>550</td></tr>"
+        "<tr><td>시가배당율(%)</td><td></td><td>-</td><td>1.2.3</td><td>2.8%</td></tr>"
+        "<tr><td>배당기준일</td><td>2024-12-31</td></tr>"
+        "<tr><td>배당금지급 예정일자</td><td>2025-04-18</td></tr>"
+        "</table></document>"
+    )
+    decision = parse_dividend_decision(
+        archive_bytes=make_archive({"20250203001234.xml": html}),
+        rcept_no="20250203001234",
+        corp_code="00126380",
+        received_on=date(2025, 2, 3),
+    )
+
+    assert decision.market_yield_pct == Decimal("2.8")
+
+
+def real_form_html(*, notice: str = "") -> str:
+    """Current DART form: one field per row, share class in its own cell, footnotes below."""
+    return (
+        '<?xml version="1.0" encoding="utf-8"?><document>'
+        f"{notice}"
+        "<table>"
+        "<tr><td>1. 배당구분</td><td>결산배당</td></tr>"
+        "<tr><td>3. 1주당 배당금(원)</td><td>보통주식</td><td>50</td></tr>"
+        "<tr><td>종류주식</td><td>-</td></tr>"
+        "<tr><td>4. 시가배당율(%)</td><td>보통주식</td><td>1.28</td></tr>"
+        "<tr><td>종류주식</td><td>-</td></tr>"
+        "<tr><td>5. 배당금총액(원)</td><td>642,500,000</td></tr>"
+        "<tr><td>6. 배당기준일</td><td>2017-12-31</td></tr>"
+        "<tr><td>7. 배당금지급 예정일자</td><td>2018-04-20</td></tr>"
+        "<tr><td>1. 상기 4항의 시가배당율은 주주명부폐쇄일 2매매거래일 전부터 과거 1주일간 평균 종가 기준</td></tr>"
+        "<tr><td>2. 배당금총액은 발행주식 14,704,872주중에서 자기주식 1주를 제외</td></tr>"
+        "</table></document>"
+    )
+
+
+def _parse_form(html: str):  # noqa: ANN202 - local test helper
+    from src.integrations.dart.dividend_decision import parse_dividend_decision
+
+    return parse_dividend_decision(
+        archive_bytes=make_archive({"20180207900220.xml": html}),
+        rcept_no="20180207900220",
+        corp_code="00126380",
+        received_on=date(2018, 2, 7),
+    )
+
+
+def test_parse_dividend_decision_footnotes_never_supply_total_or_yield() -> None:
+    from decimal import Decimal
+
+    decision = _parse_form(real_form_html())
+
+    assert decision.dps_common_krw == 50
+    assert decision.total_krw == 642500000
+    assert decision.market_yield_pct == Decimal("1.28")
+
+
+def test_parse_dividend_decision_reads_yield_spelled_with_ryul() -> None:
+    from decimal import Decimal
+
+    decision = _parse_form(real_form_html().replace("4. 시가배당율(%)", "4. 시가배당률(%)"))
+
+    assert decision.market_yield_pct == Decimal("1.28")
+
+
+def test_parse_dividend_decision_correction_notice_after_column_is_superseded_by_body() -> None:
+    from decimal import Decimal
+
+    notice = (
+        "<table>"
+        "<tr><td>3. 정정사유</td><td>주주총회 승인을 통한 배당금총액 확정</td></tr>"
+        "<tr><td>4. 시가배당율(%)</td><td>1.9</td><td>2.0</td></tr>"
+        "<tr><td>5. 배당금총액(원)</td><td>1,013,777,200</td><td>991,534,100</td></tr>"
+        "</table>"
+    )
+    only_notice = _parse_form(real_form_html(notice=notice).replace("642,500,000", "").replace(">1.28<", "><"))
+    with_body = _parse_form(real_form_html(notice=notice))
+
+    assert only_notice.total_krw == 991534100
+    assert only_notice.market_yield_pct == Decimal("2.0")
+    assert with_body.total_krw == 642500000
+    assert with_body.market_yield_pct == Decimal("1.28")

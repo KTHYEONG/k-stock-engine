@@ -16,6 +16,7 @@ __all__ = [
     "DartKeyPolicy",
     "DartPolicy",
     "DisclosureFilter",
+    "DividendPlausibilityPolicy",
     "DocumentParserPolicy",
     "KisPolicy",
     "KrxPolicy",
@@ -83,6 +84,43 @@ class DartKeyPolicy(BaseModel):
         return self
 
 
+class DividendPlausibilityPolicy(BaseModel):
+    """Gate for dividend decisions entering the Silver event table.
+
+    An implausible decision is withheld, never repaired. The checks target gross misreads (a total
+    or a share count taken as DPS), not ordinary noise: treasury shares receive no dividend, so the
+    printed total may cover fewer than the listed shares, and the printed market yield uses the
+    average price of the week before the record date, not the pre-ex close.
+
+    Attributes:
+        max_yield: Hard ceiling on DPS over the pre-ex close.
+        max_yield_ratio: Largest allowed ratio between the implied and printed yield, either way.
+        min_paid_share_fraction: Smallest share of listed common shares the printed total may pay.
+        correction_window_days: Maximum record-date distance for a correction to replace a decision.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_yield: float = 0.5
+    max_yield_ratio: float = 2.0
+    min_paid_share_fraction: float = 0.5
+    correction_window_days: int = 45
+
+    @field_validator("max_yield", "max_yield_ratio", "min_paid_share_fraction")
+    @classmethod
+    def _check_ratio(cls, value: float) -> float:
+        if float(value) <= 0:
+            raise ValueError(f"invalid dividend plausibility ratio {value!r}: must be positive")
+        return float(value)
+
+    @field_validator("correction_window_days")
+    @classmethod
+    def _check_window(cls, value: int) -> int:
+        if isinstance(value, bool) or int(value) < 0:
+            raise ValueError(f"invalid correction_window_days {value!r}: must be a non-negative integer")
+        return int(value)
+
+
 class DocumentParserPolicy(BaseModel):
     """Gate for filing-document facts entering Silver."""
 
@@ -120,7 +158,6 @@ class DartPolicy(BaseModel):
     corp_codes_max_age_days: PositiveInt = 30
     document_parser: DocumentParserPolicy = DocumentParserPolicy()
     keys: dict[str, DartKeyPolicy]
-
     @field_validator("keys")
     @classmethod
     def _check_keys(cls, value: dict[str, DartKeyPolicy]) -> dict[str, DartKeyPolicy]:
@@ -268,6 +305,7 @@ class ProviderPolicy(BaseModel):
     kis: KisPolicy
     krx: KrxPolicy
     ls: LsPolicy
+    dividends: DividendPlausibilityPolicy = DividendPlausibilityPolicy()
 
     @property
     def primary_key_env(self) -> str:

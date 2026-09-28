@@ -1,0 +1,12 @@
+# Market-panel entry-blocking policy. When true, new entries are blocked while
+# an administrative (management-issue) designation is active; delisting and
+# liquidation-trading blocks always apply. Read as the default of
+# MarketPanelPolicy.block_administrative.
+block_administrative = true
+
+# A delisting-decision or liquidation-trading notice blocks new entries for at most
+# this many sessions (about one year). A name still trading beyond that was reprieved
+# by an injunction, appeal or improvement period whose notice title is not always
+# machine-recognizable. Read as the default of
+# MarketPanelPolicy.delisting_block_max_sessions.
+delisting_block_max_sessions = 250

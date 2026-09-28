@@ -357,7 +357,7 @@ def test_disclosures_skip_per_corp_covered_windows(tmp_path: Path) -> None:
     units = DartDisclosuresJob().pending(ctx)
 
     assert units
-    assert {unit.payload["detail_type"] for unit in units} == {"A", "I001"}
+    assert {unit.payload["detail_type"] for unit in units} == {"A", "I001", "I003"}
     assert min(unit.payload["window_start"] for unit in units) >= "2019-07-01"
     assert all(unit.max_requests > 0 for unit in units)
 

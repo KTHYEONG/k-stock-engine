@@ -31,7 +31,7 @@ INT_FIELD_NAMES: tuple[str, ...] = (
     "lower_limit",
 )
 FLOAT_FIELD_NAMES: tuple[str, ...] = ("sell_tax_rate", "adtv20", "ret_vol60", "share_factor")
-PANEL_BOOL_FIELD_NAMES: tuple[str, ...] = ("eligible", "open_at_upper", "open_at_lower")
+PANEL_BOOL_FIELD_NAMES: tuple[str, ...] = ("eligible", "open_at_upper", "open_at_lower", "entry_blocked")
 
 _MARKET_CODES: dict[str, int] = {"KOSPI": 1, "KOSDAQ": 2}
 
@@ -53,7 +53,7 @@ class MarketArrays:
             upper_limit, lower_limit`` as int64 SxN, ``0`` where absent.
         float_fields: ``sell_tax_rate, adtv20, ret_vol60, share_factor`` as
             float64 SxN, NaN where absent.
-        bool_fields: ``present, eligible, open_at_upper, open_at_lower`` SxN.
+        bool_fields: ``present, eligible, open_at_upper, open_at_lower, entry_blocked`` SxN.
         market: int8 SxN market code (1=KOSPI, 2=KOSDAQ, 0=absent).
     """
 
@@ -274,7 +274,13 @@ def load_market_arrays(*, panel_dir: Path, cache_root: Path) -> MarketArrays:
         float_fields[name][idx] = (
             frame[name].cast(pl.Float64).fill_null(float("nan")).to_numpy().astype(np.float64)
         )
+    try:
+        present_columns = set(pl.read_parquet(files[0], n_rows=0).columns)
+    except Exception as exc:  # pragma: no cover - probe follows successful scans
+        raise PITDataError(f"market panel schema probe is unreadable: {files[0]}") from exc
     for name in PANEL_BOOL_FIELD_NAMES:
+        if name not in present_columns:
+            continue
         frame = _scan_columns(files, ["session", "instrument_id", name])
         idx = _locate(frame, sessions_ord, instruments)
         bool_fields[name][idx] = frame[name].cast(pl.Boolean).fill_null(False).to_numpy().astype(bool)

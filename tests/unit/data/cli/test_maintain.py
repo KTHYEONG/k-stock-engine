@@ -1,6 +1,8 @@
 """Maintain-area CLI commands (verify, prune, datasets, audit, scope info)."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 
@@ -591,13 +593,25 @@ def test_cli_scope_commands_and_builder_dispatch_paths(tmp_path, monkeypatch, ca
     assert cli_module.main(_dataset_cli_args("build-ordinary-universe", runtime, "--sessions", str(sessions_file))) == 2
     assert "JSON list" in json.loads(capsys.readouterr().out)["error"]
 
-    monkeypatch.setattr(
-        dividend_module,
-        "materialize_dividend_events",
-        lambda **_kwargs: tmp_path / "dividend_events_0123456789abcdef",
-    )
+    dividend_calls: list[dict[str, object]] = []
+
+    def _fake_dividends(**kwargs: object) -> Path:
+        dividend_calls.append(kwargs)
+        return tmp_path / "dividend_events_0123456789abcdef"
+
+    monkeypatch.setattr(dividend_module, "materialize_dividend_events", _fake_dividends)
+    # 시세 데이터셋이 없으면 배당 타당성 게이트를 켤 수 없으므로 게시하지 않고 실패한다.
+    assert cli_module.main(_dataset_cli_args("build-dividend-events", runtime)) == 2
+    capsys.readouterr()
+    assert dividend_calls == []
+    from src.data.dataset_registry import DatasetRegistry
+
+    daily = _publish_cli_dataset(runtime, "daily_market")
+    DatasetRegistry(runtime.workspace.state_root).register("daily_market", daily.dataset_id)
     assert cli_module.main(_dataset_cli_args("build-dividend-events", runtime)) == 0
     assert json.loads(capsys.readouterr().out)["dataset_id"] == "dividend_events_0123456789abcdef"
+    assert dividend_calls[0]["daily_market_path"] == runtime.workspace.silver_root / daily.dataset_id
+    assert dividend_calls[0]["policy"] is not None
 
 
 

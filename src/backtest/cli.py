@@ -177,8 +177,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         participation_raw = _require_engine_key(engine_raw, sections, "max_participation")
         carry_raw = _require_engine_key(engine_raw, sections, "carry_unfilled")
         commission_raw = _require_engine_key(engine_raw, sections, "commission_rate")
+        withholding_raw = _require_engine_key(engine_raw, sections, "dividend_withholding_rate")
         impact_raw = _require_engine_key(engine_raw, sections, "impact_k")
         buffer_raw = _require_engine_key(engine_raw, sections, "cash_buffer")
+        static_raw = _require_engine_key(engine_raw, sections, "allow_static_industry")
 
         try:
             scenario = ExecutionScenario(str(scenario_raw))
@@ -197,19 +199,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(f"invalid commission_rate: {commission_raw!r}") from exc
         if commission_rate < 0:
             raise ValueError(f"commission_rate must be >= 0, got {commission_raw!r}")
+        try:
+            withholding_rate = Decimal(str(withholding_raw))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"invalid dividend_withholding_rate: {withholding_raw!r}") from exc
+        if not Decimal(0) <= withholding_rate < Decimal(1):
+            raise ValueError(f"dividend_withholding_rate must be in [0, 1), got {withholding_raw!r}")
         if isinstance(impact_raw, bool) or not isinstance(impact_raw, (int, float)):
             raise ValueError(f"impact_k must be a number, got {impact_raw!r}")
         impact_k = float(impact_raw)
         if isinstance(buffer_raw, bool) or not isinstance(buffer_raw, (int, float)):
             raise ValueError(f"cash_buffer must be a number, got {buffer_raw!r}")
         cash_buffer = float(buffer_raw)
+        if not isinstance(static_raw, bool):
+            raise ValueError(f"allow_static_industry must be a bool, got {static_raw!r}")
 
         execution = ExecutionConfig(
             scenario=scenario,
             max_participation=max_participation,
             carry_unfilled=carry_raw,
         )
-        costs = CostConfig(commission_rate=commission_rate, impact_k=impact_k)
+        costs = CostConfig(
+            commission_rate=commission_rate,
+            impact_k=impact_k,
+            dividend_withholding_rate=withholding_rate,
+        )
 
         deposits = _load_deposits(Path(args.deposits) if args.deposits is not None else None)
 
@@ -260,6 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     costs=costs,
                     halted_exit_policy=policy,
                     cash_buffer=cash_buffer,
+                    allow_static_industry=static_raw,
                 )
                 result = run_backtest(
                     arrays=arrays,
@@ -281,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     config=config,
                     strategy=strategy,
                     deposits=deposits,
+                    assumptions=result.assumptions,
                 )
                 sys.stdout.write(
                     json.dumps(
@@ -291,6 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "log_growth_annualized": summary.log_growth_annualized,
                             "final_nav": summary.final_nav,
                             "price_return_only": summary.price_return_only,
+                            "assumptions": list(result.assumptions),
                         },
                         sort_keys=True,
                     )

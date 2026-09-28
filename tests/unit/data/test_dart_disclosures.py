@@ -122,6 +122,31 @@ def test_conflicting_duplicate_fails(tmp_path: Path) -> None:
         list(iter_disclosure_records(_catalog(runtime)))
 
 
+def test_title_marker_relabel_collapses_to_the_marked_title(tmp_path: Path) -> None:
+    from src.data.dart_disclosures import iter_disclosure_records
+
+    runtime = _runtime(tmp_path)
+    _publish(runtime, source="dart_disclosure_windows", key="A:2026-07-01..2026-09-27", records=[_record("20260811000310", report_nm="반기보고서 (2026.06)")], as_of=date(2026, 9, 27))
+    _publish(runtime, source="dart_disclosure_windows", key="A:2026-07-01..2026-09-28", records=[_record("20260811000310", report_nm="[첨부추가]반기보고서 (2026.06)")], as_of=date(2026, 9, 28))
+
+    rows = list(iter_disclosure_records(_catalog(runtime)))
+
+    assert [row.report_nm for row in rows] == ["[첨부추가]반기보고서 (2026.06)"]
+
+
+def test_trailing_title_annotation_collapses_to_the_longer_title(tmp_path: Path) -> None:
+    from src.data.dart_disclosures import iter_disclosure_records
+
+    runtime = _runtime(tmp_path)
+    _publish(runtime, source="dart_disclosure_windows", key="I001:2026-07-01..2026-09-27", records=[_record("20260923800082", report_nm="[기재정정]기업가치제고계획(자율공시)              (PBR 개선 계획 제출 기업)")], as_of=date(2026, 9, 27))
+    _publish(runtime, source="dart_disclosure_windows", key="I001:2026-07-01..2026-09-28", records=[_record("20260923800082", report_nm="[기재정정]기업가치제고계획(자율공시)")], as_of=date(2026, 9, 28))
+
+    rows = list(iter_disclosure_records(_catalog(runtime)))
+
+    assert len(rows) == 1
+    assert "PBR 개선" in rows[0].report_nm
+
+
 def test_disclosure_payload_failures_raise_and_malformed_keys_skipped(tmp_path: Path) -> None:
     from src.core.pit import EvidenceKind
     from src.data.bronze import BronzeStore
@@ -224,3 +249,19 @@ def test_periodic_identity_selection_filters(tmp_path: Path) -> None:
         ticker_by_corp_code={"00126380": "005930"}, required_periods=None, corp_codes=frozenset({"00126380", "99999999"}),
     )
     assert [item["filing_id"] for item in identities] == ["good"]
+
+
+def test_same_receipt_with_a_different_company_or_date_is_a_real_conflict(tmp_path: Path) -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.dart_disclosures import iter_disclosure_records
+
+    runtime = _runtime(tmp_path)
+    first = _record("20260811000310", report_nm="반기보고서 (2026.06)")
+    other_corp = dict(first, corp_code="00999999")
+    _publish(runtime, source="dart_disclosure_windows", key="A:2026-07-01..2026-09-27", records=[first], as_of=date(2026, 9, 27))
+    _publish(runtime, source="dart_disclosure_windows", key="A:2026-07-01..2026-09-28", records=[other_corp], as_of=date(2026, 9, 28))
+
+    with pytest.raises(PITDataError, match="conflicting disclosure rows"):
+        list(iter_disclosure_records(_catalog(runtime)))

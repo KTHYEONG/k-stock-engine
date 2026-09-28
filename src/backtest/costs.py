@@ -20,10 +20,18 @@ class CostConfig:
     Attributes:
         commission_rate: Broker commission per side on notional.
         impact_k: Coefficient of the square-root impact term.
+        dividend_withholding_rate: Combined income and local income tax withheld
+            on cash dividends, a fraction of the gross amount.
     """
 
     commission_rate: Decimal
     impact_k: float
+    dividend_withholding_rate: Decimal
+
+    def __post_init__(self) -> None:
+        rate = self.dividend_withholding_rate
+        if not Decimal(0) <= rate < Decimal(1):
+            raise ValueError(f"dividend_withholding_rate must be in [0, 1), got {rate!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +54,24 @@ def fill_cost(
         else 0
     )
     return FillCost(commission=commission, sell_tax=tax)
+
+
+def dividend_withholding(*, gross_krw: int, config: CostConfig) -> int:
+    """Tax withheld from one cash dividend payment, truncated to whole KRW.
+
+    Args:
+        gross_krw: Gross dividend owed for one position (shares * DPS), non-negative.
+        config: Run cost configuration.
+
+    Returns:
+        Withheld KRW, ``0 <= withheld <= gross_krw``.
+
+    Raises:
+        ValueError: ``gross_krw`` is negative.
+    """
+    if gross_krw < 0:
+        raise ValueError(f"gross_krw must be >= 0, got {gross_krw!r}")
+    return int((Decimal(gross_krw) * config.dividend_withholding_rate).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def impact_fraction(*, notional: float, adtv20: float, vol60: float, config: CostConfig) -> float:
