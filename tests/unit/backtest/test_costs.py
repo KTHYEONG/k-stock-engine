@@ -6,9 +6,11 @@ from decimal import Decimal
 
 import pytest
 
-from src.backtest.costs import CostConfig, Side, fill_cost, impact_fraction
+from src.backtest.costs import CostConfig, Side, dividend_withholding, fill_cost, impact_fraction
 
-_CONFIG = CostConfig(commission_rate=Decimal("0.00015"), impact_k=1.0)
+_CONFIG = CostConfig(
+    commission_rate=Decimal("0.00015"), impact_k=1.0, dividend_withholding_rate=Decimal("0.154")
+)
 
 
 def test_sell_tax_by_regime() -> None:
@@ -39,7 +41,9 @@ def test_truncation_to_won() -> None:
 
 
 def test_impact_grows_with_sqrt_participation() -> None:
-    config = CostConfig(commission_rate=Decimal("0.00015"), impact_k=2.0)
+    config = CostConfig(
+        commission_rate=Decimal("0.00015"), impact_k=2.0, dividend_withholding_rate=Decimal("0.154")
+    )
     base = impact_fraction(notional=1_000_000.0, adtv20=100_000_000.0, vol60=0.04, config=config)
     assert base == pytest.approx(0.008)
     quadrupled = impact_fraction(
@@ -49,7 +53,7 @@ def test_impact_grows_with_sqrt_participation() -> None:
 
 
 def test_invalid_side_rejected() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="side must be"):
         fill_cost(
             side="buy",  # type: ignore[arg-type]
             quantity=1,
@@ -60,9 +64,51 @@ def test_invalid_side_rejected() -> None:
 
 
 def test_invalid_impact_inputs_rejected() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="impact inputs must be"):
         impact_fraction(notional=1_000.0, adtv20=1_000_000.0, vol60=float("nan"), config=_CONFIG)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="impact inputs must be"):
         impact_fraction(notional=1_000.0, adtv20=0.0, vol60=0.01, config=_CONFIG)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="impact inputs must be"):
         impact_fraction(notional=-1.0, adtv20=1_000_000.0, vol60=0.01, config=_CONFIG)
+
+
+def test_dividend_withholding_combined_rate() -> None:
+    assert dividend_withholding(gross_krw=140_000, config=_CONFIG) == 21_560
+
+
+def test_dividend_withholding_truncates_fractional_won() -> None:
+    assert dividend_withholding(gross_krw=100, config=_CONFIG) == 15
+
+
+def test_dividend_withholding_zero_rate_pays_gross() -> None:
+    gross_config = CostConfig(
+        commission_rate=Decimal("0.00015"), impact_k=1.0, dividend_withholding_rate=Decimal("0")
+    )
+    assert dividend_withholding(gross_krw=140_000, config=gross_config) == 0
+    assert dividend_withholding(gross_krw=0, config=_CONFIG) == 0
+
+
+def test_dividend_withholding_negative_gross_rejected() -> None:
+    with pytest.raises(ValueError, match="gross_krw"):
+        dividend_withholding(gross_krw=-1, config=_CONFIG)
+
+
+def test_dividend_withholding_rate_outside_unit_interval_rejected() -> None:
+    with pytest.raises(ValueError, match="dividend_withholding_rate"):
+        CostConfig(
+            commission_rate=Decimal("0.00015"),
+            impact_k=1.0,
+            dividend_withholding_rate=Decimal("1.2"),
+        )
+    with pytest.raises(ValueError, match="dividend_withholding_rate"):
+        CostConfig(
+            commission_rate=Decimal("0.00015"),
+            impact_k=1.0,
+            dividend_withholding_rate=Decimal("-0.1"),
+        )
+    with pytest.raises(ValueError, match="dividend_withholding_rate"):
+        CostConfig(
+            commission_rate=Decimal("0.00015"),
+            impact_k=1.0,
+            dividend_withholding_rate=Decimal("1"),
+        )

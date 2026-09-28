@@ -28,7 +28,9 @@ def _rules() -> KrxMarketRules:
 
 
 def _costs(impact_k: float = 1.0) -> CostConfig:
-    return CostConfig(commission_rate=Decimal("0.00015"), impact_k=impact_k)
+    return CostConfig(
+        commission_rate=Decimal("0.00015"), impact_k=impact_k, dividend_withholding_rate=Decimal("0")
+    )
 
 
 def _arrays(tmp_path: Path, name: str, rows: list[dict[str, Any]]) -> MarketArrays:
@@ -389,3 +391,39 @@ def test_unknown_market_code_rejected(tmp_path: Path) -> None:
             orders=(order,), arrays=arrays, t=1, config=_open_config(), costs=_costs(),
             rules=_rules(),
         )
+
+
+def test_buy_on_blocked_name_is_rejected(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_test",
+        [
+            _mrow(DAY0, "KRX:A", close=10_000, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=10_000, entry_blocked=True),
+        ],
+    )
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(buy,), arrays=arrays, t=1, config=_open_config(), costs=_costs(impact_k=0.0),
+        rules=_rules(),
+    )
+    assert fills == ()
+    assert [reject.reason for reject in rejects] == ["entry_blocked"]
+
+
+def test_sell_on_blocked_name_fills(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_test",
+        [
+            _mrow(DAY0, "KRX:A", close=10_000, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=10_000, entry_blocked=True),
+        ],
+    )
+    sell = Order(instrument_idx=0, side=Side.SELL, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(sell,), arrays=arrays, t=1, config=_open_config(), costs=_costs(impact_k=0.0),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 10_000)]

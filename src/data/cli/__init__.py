@@ -63,6 +63,7 @@ def _ensure_registered() -> None:
         "build-investor-flow-union",
         "build-financial-quality",
         "build-dividend-events",
+        "build-market-actions",
         "collect-industry-classification",
         "collect-stock-classification",
         "build-industry-classification-silver",

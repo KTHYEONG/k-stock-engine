@@ -11,6 +11,7 @@ from typing import Any
 
 from numpy.typing import NDArray
 
+from src.backtest.costs import CostConfig, dividend_withholding
 from src.backtest.events import DividendEvent
 from src.core.pit import PITDataError
 
@@ -23,6 +24,7 @@ class JournalKind(StrEnum):
     SELL_TAX = "sell_tax"
     CASH_IN_LIEU = "cash_in_lieu"
     DIVIDEND = "dividend"
+    DIVIDEND_TAX = "dividend_tax"
     EXIT_PROCEEDS = "exit_proceeds"
 
 
@@ -175,13 +177,15 @@ class Ledger:
             pay_idx = event.pay_session_idx
             self._receivable_by_pay[pay_idx] = self._receivable_by_pay.get(pay_idx, 0) + amount
 
-    def settle_dividends(self, *, session_idx: int) -> None:
+    def settle_dividends(self, *, session_idx: int, config: CostConfig) -> None:
         due = self._receivable_by_pay.pop(session_idx, 0)
         if due == 0:
             return
+        tax = dividend_withholding(gross_krw=due, config=config)
         self._receivable -= due
-        self._cash += due
+        self._cash += due - tax
         self._journal.append(JournalEntry(session_idx, JournalKind.DIVIDEND, None, due, 0))
+        self._journal.append(JournalEntry(session_idx, JournalKind.DIVIDEND_TAX, None, -tax, 0))
 
     def close_exit(self, *, session_idx: int, instrument_idx: int, price: int) -> None:
         instrument_idx = _checked_int(instrument_idx, what="instrument_idx", minimum=0)

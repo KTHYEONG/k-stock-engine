@@ -37,6 +37,7 @@ class EngineConfig:
     costs: CostConfig
     halted_exit_policy: DelistPolicy
     cash_buffer: float
+    allow_static_industry: bool = False
 
     def __post_init__(self) -> None:
         buffer = self.cash_buffer
@@ -46,6 +47,8 @@ class EngineConfig:
             or not 0.0 <= float(buffer) < 1.0
         ):
             raise ValueError(f"cash_buffer must be in [0, 1), got {buffer!r}")
+        if not isinstance(self.allow_static_industry, bool):
+            raise ValueError(f"allow_static_industry must be a bool, got {self.allow_static_industry!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +59,7 @@ class BacktestResult:
     journal: tuple[JournalEntry, ...]
     dividends_integrated: bool
     ledger_hash: str
+    assumptions: tuple[str, ...] = ()
 
 
 def _target_orders(
@@ -184,6 +188,7 @@ def run_backtest(
     rejects: list[Reject] = []
     records: list[NavRecord] = []
     buffer_scale = 1.0 - float(config.cash_buffer)
+    run_assumptions: set[str] = set()
     for t in range(lo, hi + 1):
         for instrument_idx, factor, base_price in events.share_factor_by_session.get(t, ()):
             ledger.apply_share_factor(
@@ -192,7 +197,7 @@ def run_backtest(
         ledger.record_dividend_entitlements(
             session_idx=t, events=events.dividends_by_ex_session.get(t, ())
         )
-        ledger.settle_dividends(session_idx=t)
+        ledger.settle_dividends(session_idx=t, config=config.costs)
         for exit_event in events.exits_by_session.get(t, ()):
             exited.add(exit_event.instrument_idx)
             if exit_event.instrument_idx in ledger.positions():
@@ -238,6 +243,7 @@ def run_backtest(
             t=t,
             decision_time=datetime.combine(sessions[t], _DECISION_AT, tzinfo=KRX_TZ),
             asof_tables=asof_tables,
+            allow_static_industry=config.allow_static_industry,
         )
         new_orders: list[Order] = []
         if strategy.is_rebalance(view):
@@ -249,6 +255,7 @@ def run_backtest(
                 weights=targets.weights, arrays=arrays, t=t, holdings=ledger.positions(),
                 nav=record.nav, buffer_scale=buffer_scale,
             )
+        run_assumptions.update(view.assumptions)
         pending = carried + new_orders
     journal = ledger.journal
     payload = {
@@ -284,4 +291,5 @@ def run_backtest(
         journal=journal,
         dividends_integrated=events.dividends_integrated,
         ledger_hash=ledger_hash,
+        assumptions=tuple(sorted(run_assumptions)),
     )

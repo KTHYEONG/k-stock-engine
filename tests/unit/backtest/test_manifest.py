@@ -92,7 +92,7 @@ def test_differing_run_with_same_id_fails(tmp_path: Path) -> None:
     run_root = tmp_path / "runs"
     path, result, summary, parts = _write(tmp_path, 20, run_root)
     other_summary = dataclasses.replace(summary, twr_total=summary.twr_total + 1.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="run id collision"):
         write_run(
             run_root=run_root,
             result=result,
@@ -109,7 +109,7 @@ def test_unreadable_existing_run_fails(tmp_path: Path) -> None:
     run_root = tmp_path / "runs"
     path, result, summary, parts = _write(tmp_path, 20, run_root)
     (path / "manifest.json").unlink()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="existing run is unreadable"):
         write_run(
             run_root=run_root,
             result=result,

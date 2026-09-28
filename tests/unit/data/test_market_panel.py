@@ -748,22 +748,22 @@ def test_materialize_volatility_skips_invalid_rows(tmp_path: Path) -> None:
 def test_materialize_policy_version_bump(tmp_path: Path) -> None:
     from src.data.market_panel import POLICY_VERSION
 
-    assert POLICY_VERSION == "krx-market-panel-v2"
+    assert POLICY_VERSION == "krx-market-panel-v3"
     daily = {DAY0: [_drow(DAY0, "005930", close=10000, change=0)]}
     daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
     result = materialize_market_panel(
         daily_market_path=daily_path, universe_path=universe_path, rules=RULES, gold_root=gold_root
     )
     manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["policy_version"] == "krx-market-panel-v2"
-    v1_id = "market_panel_" + hashlib.sha256(
+    assert manifest["policy_version"] == "krx-market-panel-v3"
+    v2_id = "market_panel_" + hashlib.sha256(
         "\n".join((
-            "krx-market-panel-v1", "20", "60", "60", RULES.version,
+            "krx-market-panel-v2", "20", "60", "60", RULES.version,
             manifest["daily_market_dataset_id"],
             manifest["universe_dataset_id"],
         )).encode("utf-8")
     ).hexdigest()[:16]
-    assert result.dataset_id != v1_id
+    assert result.dataset_id != v2_id
 
 
 def test_materialize_rejects_non_positive_bucket_count(tmp_path: Path) -> None:
@@ -873,3 +873,266 @@ def test_market_panel_input_manifest_boundaries(tmp_path: Path, monkeypatch) -> 
     )
     with pytest.raises(PITDataError, match="strictly ordered"):
         _load_input_manifest(unordered.path, expected_kind="daily_market")
+
+
+def _publish_actions(
+    root: Path, rows: list[dict[str, object]], *, schema_override: dict[str, object] | None = None,
+) -> Path:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    schema = {
+        "instrument_id": pl.String, "ticker": pl.String, "kind": pl.String, "rcept_no": pl.String,
+        "announced_on": pl.Date, "available_at": pl.Datetime("us", "Asia/Seoul"),
+        "effective_start": pl.Date, "effective_end": pl.Date, "cancellation": pl.Boolean,
+        "policy_version": pl.String,
+    }
+    if schema_override is not None:
+        schema = dict(schema_override)
+    frame = pl.DataFrame(rows, schema=schema) if rows else pl.DataFrame([], schema=schema)
+    return publish_dataset(
+        layer_root=root,
+        identity=DatasetIdentity(
+            kind="market_actions", layer=DatasetLayer.SILVER,
+            policy_version="market-actions-v1", inputs={}, params={},
+        ),
+        partitions={"part-00000.parquet": frame},
+    ).path
+
+
+def _action_row(
+    announced: date, available: date, ticker: str, kind: str, rcept_no: str, *, cancellation: bool = False,
+) -> dict[str, object]:
+    return {
+        "instrument_id": f"KRX:{ticker}", "ticker": ticker, "kind": kind, "rcept_no": rcept_no,
+        "announced_on": announced,
+        "available_at": datetime(available.year, available.month, available.day, 9, 0, tzinfo=KRX_TZ),
+        "effective_start": None, "effective_end": None, "cancellation": cancellation,
+        "policy_version": "market-actions-v1",
+    }
+
+
+def test_entry_blocked_only_after_publication(tmp_path: Path) -> None:
+    sessions = (DAY0, DAY1, DAY2)
+    tickers = ("005930", "000660", "000020")
+    daily = {
+        session: [
+            _drow(session, ticker, close=10000 + index * 100, change=100 * (index > 0))
+            for ticker in tickers
+        ]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    naive_schema = {
+        "instrument_id": pl.String, "ticker": pl.String, "kind": pl.String, "rcept_no": pl.String,
+        "announced_on": pl.Date, "available_at": pl.Datetime("us"),
+        "effective_start": pl.Date, "effective_end": pl.Date, "cancellation": pl.Boolean,
+        "policy_version": pl.String,
+    }
+
+    def _naive(announced: date, available: date, ticker: str, kind: str, rcept_no: str) -> dict[str, object]:
+        row = _action_row(announced, available, ticker, kind, rcept_no)
+        row["available_at"] = datetime(available.year, available.month, available.day, 9, 0)
+        return row
+
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [
+            _naive(DAY0, DAY1, "005930", "delisting_decided", "20200107000001"),
+            _naive(DAY1, DAY2, "000660", "liquidation_trading", "20200108000002"),
+            _naive(DAY0, DAY0, "000020", "administrative_designated", "20200106000003"),
+            _naive(DAY1, DAY2, "000020", "administrative_released", "20200108000004"),
+        ],
+        schema_override=naive_schema,
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort(["instrument_id", "session"])
+    blocked = frame.filter(pl.col("instrument_id") == "KRX:005930")
+    assert blocked["entry_blocked"].to_list() == [False, True, True]
+    assert blocked["entry_block_reason"].to_list() == ["", "delisting_decided", "delisting_decided"]
+    assert blocked["eligible"].to_list() == [True, True, True]
+    liquidated = frame.filter(pl.col("instrument_id") == "KRX:000660")
+    assert liquidated["entry_blocked"].to_list() == [False, False, True]
+    assert liquidated["entry_block_reason"].to_list() == ["", "", "liquidation_trading"]
+    managed = frame.filter(pl.col("instrument_id") == "KRX:000020")
+    assert managed["entry_blocked"].to_list() == [True, True, False]
+    assert managed["entry_block_reason"].to_list() == ["administrative_designated"] * 2 + [""]
+    assert result.entry_blocked_rows == 5
+    manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["market_actions_dataset_id"] == actions_path.name
+
+
+def test_entry_blocked_administrative_follows_policy(tmp_path: Path) -> None:
+    daily = {
+        DAY0: [_drow(DAY0, "005930", close=10000, change=0)],
+        DAY1: [_drow(DAY1, "005930", close=10100, change=100)],
+    }
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_action_row(DAY0, DAY0, "005930", "administrative_designated", "20200106000001")],
+    )
+    blocked_policy = MarketPanelPolicy(block_administrative=True, delisting_block_max_sessions=250)
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    blocked = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, policy=blocked_policy, market_actions_path=actions_path,
+    )
+    frame = _panel_frame(blocked.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [True, True]
+    assert frame["entry_block_reason"].to_list() == ["administrative_designated"] * 2
+    open_policy = MarketPanelPolicy(block_administrative=False)
+    daily_path2, universe_path2, gold_root2 = _inputs(tmp_path / "open", daily, _full_universe(daily))
+    opened = materialize_market_panel(
+        daily_market_path=daily_path2, universe_path=universe_path2, rules=RULES,
+        gold_root=gold_root2, policy=open_policy, market_actions_path=actions_path,
+    )
+    assert blocked.dataset_id != opened.dataset_id
+    reopened = _panel_frame(opened.dataset_path, 2020).sort("session")
+    assert reopened["entry_blocked"].to_list() == [False, False]
+
+
+def test_future_action_never_leaks(tmp_path: Path) -> None:
+    sessions = (DAY0, DAY1, DAY2)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 100, change=100 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    future = date(2020, 1, 9)
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_action_row(DAY2, future, "005930", "delisting_decided", "20200109000001")],
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [False, False, False]
+    perturbed_path = _publish_actions(
+        tmp_path / "silver-perturbed",
+        [_action_row(DAY2, future, "005930", "liquidation_trading", "20200109000001")],
+    )
+    daily_path2, universe_path2, gold_root2 = _inputs(tmp_path / "perturbed", daily, _full_universe(daily))
+    rerun = materialize_market_panel(
+        daily_market_path=daily_path2, universe_path=universe_path2, rules=RULES,
+        gold_root=gold_root2, market_actions_path=perturbed_path,
+    )
+    rerun_frame = _panel_frame(rerun.dataset_path, 2020).sort("session")
+    assert_frame_equal(
+        frame.select(["session", "instrument_id", "entry_blocked", "entry_block_reason"]),
+        rerun_frame.select(["session", "instrument_id", "entry_blocked", "entry_block_reason"]),
+    )
+
+
+def test_default_block_administrative_reads_config(tmp_path: Path) -> None:
+    from src.data.market_panel import _default_block_administrative
+
+    assert _default_block_administrative() is True
+    enabled = tmp_path / "enabled.toml"
+    enabled.write_text("block_administrative = true\n", encoding="utf-8")
+    assert _default_block_administrative(enabled) is True
+    disabled = tmp_path / "disabled.toml"
+    disabled.write_text("block_administrative = false\n", encoding="utf-8")
+    assert _default_block_administrative(disabled) is False
+    missing_key = tmp_path / "missing-key.toml"
+    missing_key.write_text("other = 1\n", encoding="utf-8")
+    with pytest.raises(PITDataError, match="boolean block_administrative"):
+        _default_block_administrative(missing_key)
+    non_bool = tmp_path / "non-bool.toml"
+    non_bool.write_text("block_administrative = 'yes'\n", encoding="utf-8")
+    with pytest.raises(PITDataError, match="boolean block_administrative"):
+        _default_block_administrative(non_bool)
+    invalid = tmp_path / "invalid.toml"
+    invalid.write_text("block_administrative = \n", encoding="utf-8")
+    with pytest.raises(PITDataError, match="invalid TOML"):
+        _default_block_administrative(invalid)
+    with pytest.raises(PITDataError, match="missing"):
+        _default_block_administrative(tmp_path / "absent.toml")
+
+
+def test_entry_block_frame_rejects_bad_actions(tmp_path: Path) -> None:
+    from src.data.market_panel import _entry_block_frame
+
+    sessions = [DAY0, DAY1]
+    good = _action_row(DAY0, DAY0, "005930", "delisting_decided", "20200106000001")
+    reduced_schema = {
+        "instrument_id": pl.String, "ticker": pl.String, "kind": pl.String, "rcept_no": pl.String,
+        "announced_on": pl.Date, "available_at": pl.Datetime("us", "Asia/Seoul"),
+        "effective_start": pl.Date, "effective_end": pl.Date, "policy_version": pl.String,
+    }
+    missing_columns = _publish_actions(
+        tmp_path / "silver-missing",
+        [{key: value for key, value in good.items() if key != "cancellation"}],
+        schema_override=reduced_schema,
+    )
+    with pytest.raises(PITDataError, match="missing columns"):
+        _entry_block_frame(missing_columns, sessions, block_administrative=True, delisting_block_max_sessions=250)
+    bad_available = dict(good)
+    bad_available["available_at"] = "not-a-date"
+    bad_frame = _publish_actions(
+        tmp_path / "silver-bad", [bad_available],
+        schema_override={
+            "instrument_id": pl.String, "ticker": pl.String, "kind": pl.String,
+            "rcept_no": pl.String, "announced_on": pl.Date, "available_at": pl.String,
+            "effective_start": pl.Date, "effective_end": pl.Date,
+            "cancellation": pl.Boolean, "policy_version": pl.String,
+        },
+    )
+    with pytest.raises(PITDataError, match="invalid available_at"):
+        _entry_block_frame(bad_frame, sessions, block_administrative=True, delisting_block_max_sessions=250)
+    unknown_kind = dict(good)
+    unknown_kind["kind"] = "mystery"
+    unknown_frame = _publish_actions(tmp_path / "silver-unknown", [unknown_kind])
+    with pytest.raises(PITDataError, match="unknown kind"):
+        _entry_block_frame(unknown_frame, sessions, block_administrative=True, delisting_block_max_sessions=250)
+
+
+def test_delisting_block_lapses_after_the_configured_cap(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.data.market_panel import _entry_block_frame
+
+    sessions = [DAY0 + timedelta(days=offset) for offset in range(6)]
+    row = _action_row(sessions[1], sessions[1], "005930", "delisting_decided", "20200106000001")
+    path = _publish_actions(tmp_path / "silver-cap", [row])
+
+    frame = _entry_block_frame(path, sessions, block_administrative=True, delisting_block_max_sessions=2)
+
+    # 공시 다음 세션부터 차단되고, 마지막 공시로부터 cap을 넘긴 세션부터 풀린다(과거 정보만 사용).
+    assert frame["session"].to_list() == sessions[1:4]
+    assert set(frame["entry_block_reason"].to_list()) == {"delisting_decided"}
+
+
+def test_new_notice_restarts_the_delisting_block_window(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.data.market_panel import _entry_block_frame
+
+    sessions = [DAY0 + timedelta(days=offset) for offset in range(8)]
+    rows = [
+        _action_row(sessions[0], sessions[0], "005930", "delisting_decided", "20200106000001"),
+        _action_row(sessions[3], sessions[3], "005930", "liquidation_trading", "20200109000001"),
+    ]
+    path = _publish_actions(tmp_path / "silver-restart", rows)
+
+    frame = _entry_block_frame(path, sessions, block_administrative=True, delisting_block_max_sessions=2)
+
+    assert frame["session"].to_list() == sessions[0:6]
+    assert frame["entry_block_reason"].to_list()[3:] == ["delisting_decided"] * 3
+
+
+def test_market_panel_policy_reads_the_delisting_cap_and_rejects_bad_values(tmp_path: Path) -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.market_panel import _default_delisting_block_max_sessions
+
+    assert _default_delisting_block_max_sessions() == 250
+    for body in ("delisting_block_max_sessions = 0\n", 'delisting_block_max_sessions = "x"\n', "block_administrative = true\n"):
+        path = tmp_path / "policy.toml"
+        path.write_text(body, encoding="utf-8")
+        with pytest.raises(PITDataError, match="delisting_block_max_sessions"):
+            _default_delisting_block_max_sessions(path)

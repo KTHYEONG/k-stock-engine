@@ -7,8 +7,9 @@ import json
 import logging
 import re
 import tempfile
-from dataclasses import dataclass
-from datetime import date
+import tomllib
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ import polars as pl
 
 from src.core.market_rules import KrxMarket, KrxMarketRules
 from src.core.pit import PITDataError
+from src.core.time import KRX_TZ
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
@@ -23,9 +25,10 @@ from src.data.datasets import (
     dataset_reference,
     load_manifest,
     publish_dataset,
+    read_dataset,
 )
 
-POLICY_VERSION = "krx-market-panel-v2"
+POLICY_VERSION = "krx-market-panel-v3"
 
 _LOG = logging.getLogger(__name__)
 
@@ -59,6 +62,8 @@ _SCHEMA: dict[str, Any] = {
     "open_at_lower": pl.Boolean,
     "close_at_upper": pl.Boolean,
     "close_at_lower": pl.Boolean,
+    "entry_blocked": pl.Boolean,
+    "entry_block_reason": pl.String,
     "adtv20": pl.Float64,
     "adtv60": pl.Float64,
     "ret_vol60": pl.Float64,
@@ -76,6 +81,39 @@ _EXITS_SCHEMA: dict[str, Any] = {
 }
 
 
+def _panel_policy_toml(path: Path | None = None) -> tuple[dict[str, Any], Path]:
+    resolved = (
+        path
+        if path is not None
+        else Path(__file__).resolve().parents[2] / "config" / "data" / "market_panel.toml"
+    )
+    try:
+        with open(resolved, "rb") as handle:
+            return tomllib.load(handle), resolved
+    except OSError as exc:
+        raise PITDataError(f"market panel policy is missing: {resolved}") from exc
+    except ValueError as exc:
+        raise PITDataError(f"market panel policy is invalid TOML: {resolved}") from exc
+
+
+def _default_block_administrative(path: Path | None = None) -> bool:
+    """Return the configured default for blocking entries on administrative designations."""
+    raw, resolved = _panel_policy_toml(path)
+    value = raw.get("block_administrative")
+    if not isinstance(value, bool):
+        raise PITDataError(f"market panel policy needs a boolean block_administrative: {resolved}")
+    return value
+
+
+def _default_delisting_block_max_sessions(path: Path | None = None) -> int:
+    """Return the configured cap on how long a delisting or liquidation notice blocks entries."""
+    raw, resolved = _panel_policy_toml(path)
+    value = raw.get("delisting_block_max_sessions")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise PITDataError(f"market panel policy needs a positive integer delisting_block_max_sessions: {resolved}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class MarketPanelPolicy:
     """Rolling-window contract for decision-time liquidity and risk columns.
@@ -84,11 +122,20 @@ class MarketPanelPolicy:
         adtv_short_sessions: Trailing observations for ``adtv20``.
         adtv_long_sessions: Trailing observations for ``adtv60``.
         return_vol_sessions: Trailing non-null price returns for ``ret_vol60``.
+        block_administrative: Block new entries while an administrative
+            (management-issue) designation is active. Delisting and
+            liquidation-trading blocks always apply.
+        delisting_block_max_sessions: A delisting or liquidation notice blocks entries for at most
+            this many sessions after the latest such notice. A name still trading beyond that
+            was reprieved (injunction, appeal, improvement period), and the title of the reversal is
+            not always machine-recognizable; the cap uses only past information.
     """
 
     adtv_short_sessions: int = 20
     adtv_long_sessions: int = 60
     return_vol_sessions: int = 60
+    block_administrative: bool = field(default_factory=_default_block_administrative)
+    delisting_block_max_sessions: int = field(default_factory=_default_delisting_block_max_sessions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +151,7 @@ class MarketPanelResult:
     open_at_lower_rows: int
     exits_traded: int
     exits_halted: int
+    entry_blocked_rows: int = 0
 
 
 def _load_input_manifest(
@@ -196,6 +244,105 @@ def _width_expr(rules: KrxMarketRules) -> pl.Expr:
     return expr
 
 
+_BLOCK_SCHEMA: dict[str, Any] = {
+    "session": pl.Date,
+    "instrument_id": pl.String,
+    "entry_blocked": pl.Boolean,
+    "entry_block_reason": pl.String,
+}
+
+def _entry_block_frame(
+    market_actions_path: Path,
+    sessions: list[date],
+    *,
+    block_administrative: bool,
+    delisting_block_max_sessions: int,
+) -> pl.DataFrame:
+    """Return blocked ``(session, instrument)`` cells from point-in-time market actions.
+
+    An action applies from its ``available_at`` session onward, so ``entry_blocked``
+    at session ``t`` depends only on actions available at the decision time for ``t``.
+    A delisting cancellation clears a pending delisting block; a delisting or liquidation block also
+    lapses ``delisting_block_max_sessions`` sessions after the latest such notice; administrative
+    blocks apply only when the run policy enables them.
+    """
+    frame = read_dataset(Path(market_actions_path)).collect()
+    missing = {"instrument_id", "kind", "rcept_no", "available_at", "cancellation"} - set(frame.columns)
+    if missing:
+        raise PITDataError(f"market actions dataset is missing columns {sorted(missing)}")
+    if frame.height == 0:
+        return pl.DataFrame([], schema=_BLOCK_SCHEMA)
+    by_instrument: dict[str, list[tuple[date, str, str, str, bool]]] = {}
+    for row in frame.iter_rows(named=True):
+        available_at = row["available_at"]
+        if not isinstance(available_at, datetime):
+            raise PITDataError(f"market action has an invalid available_at: {row['rcept_no']!r}")
+        if available_at.tzinfo is None:
+            available_at = available_at.replace(tzinfo=KRX_TZ)
+        effective = available_at.astimezone(KRX_TZ).date()
+        instrument_id = str(row["instrument_id"])
+        kind = str(row["kind"])
+        if kind not in {
+            "delisting_decided",
+            "liquidation_trading",
+            "administrative_designated",
+            "administrative_released",
+            "trading_halted",
+            "trading_resumed",
+        }:
+            raise PITDataError(f"market action has an unknown kind {kind!r}")
+        by_instrument.setdefault(instrument_id, []).append(
+            (effective, str(available_at.isoformat()), str(row["rcept_no"]), kind, bool(row["cancellation"]))
+        )
+    for actions in by_instrument.values():
+        actions.sort()
+    blocked: list[dict[str, Any]] = []
+    for instrument_id, actions in by_instrument.items():
+        pending_delisting = False
+        liquidation = False
+        administrative = False
+        last_notice_idx = -1
+        position = 0
+        for session_idx, session in enumerate(sessions):
+            while position < len(actions) and actions[position][0] <= session:
+                _, _, _, kind, cancellation = actions[position]
+                if cancellation:
+                    pending_delisting = False
+                elif kind == "delisting_decided":
+                    pending_delisting = True
+                    last_notice_idx = session_idx
+                elif kind == "liquidation_trading":
+                    liquidation = True
+                    last_notice_idx = session_idx
+                elif kind == "administrative_designated":
+                    administrative = True
+                elif kind == "administrative_released":
+                    administrative = False
+                position += 1
+            if (pending_delisting or liquidation) and session_idx - last_notice_idx > delisting_block_max_sessions:
+                pending_delisting = False
+                liquidation = False
+            reason: str | None = None
+            if pending_delisting:
+                reason = "delisting_decided"
+            elif liquidation:
+                reason = "liquidation_trading"
+            elif administrative and block_administrative:
+                reason = "administrative_designated"
+            if reason is not None:
+                blocked.append(
+                    {
+                        "session": session,
+                        "instrument_id": instrument_id,
+                        "entry_blocked": True,
+                        "entry_block_reason": reason,
+                    }
+                )
+    if not blocked:
+        return pl.DataFrame([], schema=_BLOCK_SCHEMA)
+    return pl.DataFrame(blocked, schema=_BLOCK_SCHEMA).sort(["session", "instrument_id"])
+
+
 def _build_bucket_frame(
     *,
     daily: pl.DataFrame,
@@ -203,6 +350,7 @@ def _build_bucket_frame(
     calendar_frame: pl.DataFrame,
     rules: KrxMarketRules,
     policy: MarketPanelPolicy,
+    blocks: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     if daily.height == 0:
         return pl.DataFrame([], schema=_SCHEMA)
@@ -289,6 +437,14 @@ def _build_bucket_frame(
             policy_version=pl.lit(POLICY_VERSION),
         )
     )
+    if blocks is not None and blocks.height:
+        df = df.join(blocks, on=["session", "instrument_id"], how="left")
+    df = df.with_columns(
+        entry_blocked=pl.col("entry_blocked").fill_null(False) if "entry_blocked" in df.columns else pl.lit(False),
+        entry_block_reason=pl.col("entry_block_reason").fill_null("")
+        if "entry_block_reason" in df.columns
+        else pl.lit(""),
+    )
     if df.filter(pl.col("tick_size").is_null() | pl.col("sell_tax_rate").is_null()).height:
         bad = df.filter(pl.col("tick_size").is_null() | pl.col("sell_tax_rate").is_null())
         raise PITDataError(f"market panel session outside rule coverage: {bad['session'].to_list()[0]}")
@@ -337,6 +493,7 @@ def materialize_market_panel(
     gold_root: Path,
     policy: MarketPanelPolicy = MarketPanelPolicy(),  # noqa: B008
     instrument_buckets: int = 16,
+    market_actions_path: Path | None = None,
 ) -> MarketPanelResult:
     """Build and publish the decision-safe session-by-instrument market panel."""
 
@@ -375,11 +532,18 @@ def materialize_market_panel(
         inputs={
             "daily_market": dataset_reference(daily_id, kind="daily_market"),
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
+            **(
+                {"market_actions": dataset_reference(Path(market_actions_path).name, kind="market_actions")}
+                if market_actions_path is not None
+                else {}
+            ),
         },
         params={
             "adtv_short_sessions": policy.adtv_short_sessions,
             "adtv_long_sessions": policy.adtv_long_sessions,
             "return_vol_sessions": policy.return_vol_sessions,
+            "block_administrative": policy.block_administrative,
+            "delisting_block_max_sessions": policy.delisting_block_max_sessions,
             "rules_version": rules.version,
             "rules_fingerprint": _rules_fingerprint(rules),
         },
@@ -388,6 +552,14 @@ def materialize_market_panel(
         {"session": calendar, "pos": list(range(len(calendar)))},
         schema={"session": pl.Date, "pos": pl.Int64},
     )
+    blocks_all: pl.DataFrame | None = None
+    if market_actions_path is not None:
+        blocks_all = _entry_block_frame(
+            Path(market_actions_path),
+            calendar,
+            block_administrative=policy.block_administrative,
+            delisting_block_max_sessions=policy.delisting_block_max_sessions,
+        )
     daily_files = [str(daily_by_session[session]) for session in calendar]
     partitions: dict[str, pl.DataFrame] = {}
     partition_details: list[dict[str, object]] = []
@@ -396,6 +568,7 @@ def materialize_market_panel(
     limit_inapplicable_rows = 0
     open_at_upper_rows = 0
     open_at_lower_rows = 0
+    entry_blocked_rows = 0
     total_rows = 0
     last_obs: dict[str, tuple[int, int, int]] = {}
 
@@ -448,6 +621,9 @@ def materialize_market_panel(
                 calendar_frame=calendar_frame,
                 rules=rules,
                 policy=policy,
+                blocks=blocks_all.filter(pl.col("instrument_id").is_in(members))
+                if blocks_all is not None and members
+                else None,
             )
             corporate_action_rows += frame.filter(
                 pl.col("share_factor").is_not_null() & (pl.col("share_factor") != 1.0)
@@ -456,6 +632,7 @@ def materialize_market_panel(
             limit_inapplicable_rows += frame.filter(~pl.col("limits_applicable")).height
             open_at_upper_rows += frame.filter(pl.col("open_at_upper")).height
             open_at_lower_rows += frame.filter(pl.col("open_at_lower")).height
+            entry_blocked_rows += frame.filter(pl.col("entry_blocked")).height
             total_rows += frame.height
             if frame.height:
                 tails = frame.sort(["instrument_id", "session"]).group_by("instrument_id").agg(
@@ -516,6 +693,8 @@ def materialize_market_panel(
         "limit_inapplicable_rows": limit_inapplicable_rows,
         "open_at_upper_rows": open_at_upper_rows,
         "open_at_lower_rows": open_at_lower_rows,
+        "entry_blocked_rows": entry_blocked_rows,
+        "market_actions_dataset_id": Path(market_actions_path).name if market_actions_path is not None else None,
         "exits_traded": exits_traded,
         "exits_halted": exits_halted,
         "exits": {
@@ -545,4 +724,5 @@ def materialize_market_panel(
         open_at_lower_rows=open_at_lower_rows,
         exits_traded=exits_traded,
         exits_halted=exits_halted,
+        entry_blocked_rows=entry_blocked_rows,
     )

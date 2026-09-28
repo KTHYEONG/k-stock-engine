@@ -128,6 +128,10 @@ def price_orders(
         if int(arrays.int_fields["volume"][t, n]) == 0:
             rejects.append(Reject(order, "halted"))
             continue
+        blocked_field = arrays.bool_fields.get("entry_blocked")
+        if is_buy and blocked_field is not None and bool(blocked_field[t, n]):
+            rejects.append(Reject(order, "entry_blocked"))
+            continue
         market = _market_at(arrays, t, n)
         base = _base_price(
             scenario=config.scenario, arrays=arrays, t=t, n=n, is_buy=is_buy, session=session,

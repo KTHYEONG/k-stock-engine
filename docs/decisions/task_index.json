@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "BACKTEST_REALISM_DIVIDEND_MARKET_ACTIONS",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_BACKTEST_REALISM_DIVIDEND_MARKET_ACTIONS",
+      "domain": "data",
+      "title": "Backtest realism: dividend integrity, withholding, market actions, static industry",
+      "why": "Real-data audit found double-counted and misparsed dividends, liquidation-trading names still enterable, an undated industry snapshot and gross dividend crediting.",
+      "resolution": "Added correction-aware dividend resolution with a filing-based plausibility gate, dividend withholding, PIT exchange market actions with a capped entry block, and an explicit static-industry assumption.",
+      "impact": "Dividend yields are bounded and de-duplicated, entries into delisting or administrative names are blocked from publication time, and the run manifest records the static industry assumption.",
+      "caveat": "KOSPI administrative designations are unobservable and the 250-session block cap is a structural bound for reversals whose titles are not machine-recognizable."
+    },
+    {
       "task_id": "PIPELINE_PERF_REPEATED_SCANS",
       "date": "2026-09-28",
       "adr_id": "ADR_20260928_PIPELINE_PERF_REPEATED_SCANS",

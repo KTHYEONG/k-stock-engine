@@ -30,7 +30,7 @@ def test_moved_values_are_unchanged() -> None:
     assert provider.default_key_env == "OPENDART_API_KEY_2"
     assert provider.dart_key(provider.default_key_env).default is True
     assert provider.dart_key(provider.primary_key_env).default is False
-    assert tuple(provider.dart.disclosure_types) == ("A", "I001")
+    assert tuple(provider.dart.disclosure_types) == ("A", "I001", "I003")
     assert (provider.kis.app_key_env, provider.kis.app_secret_env) == ("KIS_APP_KEY", "KIS_APP_SECRET")
     assert provider.kis.min_interval_seconds == 1.0
     assert provider.kis.max_attempts == 3
@@ -187,6 +187,33 @@ def test_malformed_disclosure_code_rejected() -> None:
 
 def test_corp_codes_max_age_defaults_to_30_days() -> None:
     assert _policy().dart.corp_codes_max_age_days == 30
+
+
+def test_dividend_plausibility_policy_values() -> None:
+    policy = _policy().dividends
+
+    assert (
+        policy.max_yield,
+        policy.max_yield_ratio,
+        policy.min_paid_share_fraction,
+        policy.correction_window_days,
+    ) == (0.5, 2.0, 0.5, 45)
+
+
+def test_dividend_plausibility_policy_rejects_bad_values() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DividendPlausibilityPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        DividendPlausibilityPolicy(max_yield=0.0)
+    with pytest.raises(pydantic.ValidationError):
+        DividendPlausibilityPolicy(max_yield_ratio=-0.1)
+    with pytest.raises(pydantic.ValidationError):
+        DividendPlausibilityPolicy(min_paid_share_fraction=0.0)
+    with pytest.raises(pydantic.ValidationError):
+        DividendPlausibilityPolicy(correction_window_days=-1)
 
 
 def test_disclosure_filter_helper_rejects_malformed_code() -> None:

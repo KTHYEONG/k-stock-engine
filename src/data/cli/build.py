@@ -69,6 +69,7 @@ def _add_panel(parser: argparse.ArgumentParser) -> None:
     add_scoped_args(parser)
     parser.add_argument("--daily-market-dataset-id", default=None)
     parser.add_argument("--universe-dataset-id", default=None)
+    parser.add_argument("--market-actions-dataset-id", default=None)
     parser.add_argument("--rules", type=Path, required=False, default=None)
     parser.add_argument("--instrument-buckets", type=int, default=16)
 
@@ -224,15 +225,20 @@ def _run_panel(args: argparse.Namespace) -> Mapping[str, object]:
     registry = DatasetRegistry(runtime.workspace.state_root)
     daily_id = registered_id(registry, "daily_market", args.daily_market_dataset_id)
     universe_id = resolve_input_id(runtime, registry, "ordinary_universe", args.universe_dataset_id)
+    actions_id = args.market_actions_dataset_id
+    if actions_id is None:
+        actions_id = registry.current("market_actions")
     result = materialize_market_panel(
         daily_market_path=runtime.workspace.silver_root / daily_id,
         universe_path=runtime.workspace.silver_root / universe_id,
         rules=load_krx_market_rules(Path(args.rules) if args.rules is not None else load_runtime_config().market_rules),
         gold_root=runtime.workspace.gold_root, instrument_buckets=args.instrument_buckets,
+        market_actions_path=runtime.workspace.silver_root / actions_id if actions_id is not None else None,
     )
     register_dataset(runtime, "market_panel", result.dataset_id)
     return asdict(result) | {"dataset_path": str(result.dataset_path),
-                             "daily_market_dataset_id": daily_id, "universe_dataset_id": universe_id}
+                             "daily_market_dataset_id": daily_id, "universe_dataset_id": universe_id,
+                             "market_actions_dataset_id": actions_id}
 
 
 def _run_benchmarks(args: argparse.Namespace) -> Mapping[str, object]:
@@ -343,16 +349,42 @@ def _run_quality(args: argparse.Namespace) -> Mapping[str, object]:
 def _run_dividends(args: argparse.Namespace) -> Mapping[str, object]:
     from datetime import datetime
 
+    from src.config import load_provider_policy, load_runtime_config
     from src.core.krx_calendar import xkrx_calendar_through
     from src.core.time import KRX_TZ
+    from src.data.dataset_registry import DatasetRegistry
     from src.data.dividend_events import materialize_dividend_events
 
     runtime = scoped_runtime(args)
+    # 배당 타당성 게이트는 일별 시세가 있어야 동작하므로 CLI 경로도 현재 시세 데이터셋을 반드시 넘긴다.
+    daily_id = registered_id(DatasetRegistry(runtime.workspace.state_root), "daily_market", None)
     path = materialize_dividend_events(
         catalog=scoped_catalog(runtime),
         silver_root=runtime.workspace.silver_root, calendar=xkrx_calendar_through(datetime.now(KRX_TZ).date()),
+        daily_market_path=runtime.workspace.silver_root / daily_id,
+        policy=load_provider_policy(load_runtime_config()).dividends,
     )
     register_dataset(runtime, "dividend_events", path.name)
+    return {"dataset_id": path.name, "dataset_path": str(path)}
+
+
+def _run_market_actions(args: argparse.Namespace) -> Mapping[str, object]:
+    from datetime import datetime
+
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+    from src.data.jobs.universe import read_corp_code_bridge
+    from src.data.market_actions import materialize_market_actions
+
+    runtime = scoped_runtime(args)
+    mapping, _ = read_corp_code_bridge(scoped_catalog(runtime))
+    path = materialize_market_actions(
+        catalog=scoped_catalog(runtime),
+        silver_root=runtime.workspace.silver_root,
+        calendar=xkrx_calendar_through(datetime.now(KRX_TZ).date()),
+        bridge=dict(mapping),
+    )
+    register_dataset(runtime, "market_actions", path.name)
     return {"dataset_id": path.name, "dataset_path": str(path)}
 
 
@@ -382,5 +414,6 @@ BUILD_COMMANDS: tuple[Command, ...] = (
     Command("build-investor-flow-union", "Union certified LS flow and its KIS supplement into one dataset", _add_flow_union, _run_flow_union),
     Command("build-financial-quality", "Build certified financial-quality evidence from facts and quarantine", _add_quality, _run_quality),
     Command("build-dividend-events", "Build Silver cash-dividend events from dated decision filings", _add_scoped_only, _run_dividends),
+    Command("build-market-actions", "Build Silver exchange market actions from disclosure titles and daily flags", _add_scoped_only, _run_market_actions),
     Command("build-industry-classification-silver", "Build the certified industry classification Silver snapshot", _add_scoped_only, _run_industry_silver),
 )
