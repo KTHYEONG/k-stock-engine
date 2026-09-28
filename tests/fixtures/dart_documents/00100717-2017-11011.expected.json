@@ -6,7 +6,7 @@
     "reprt_code": "11011",
     "rcept_no": "20180404002030"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: annual CFS, new layout (heading table), full KRW; hand-verified: BS 29168292242 == 18685164890 + 10483127352, IS sales from 수익(매출액) row, CF tie-out holds with duplicate operating_cash_flow row withheld as ambiguous_fact",
   "statements": {
     "consolidated": true,
@@ -46,7 +46,7 @@
         "fact": "sales",
         "value": 15278143559,
         "basis": "annual",
-        "label": "수익(매출액"
+        "label": "수익(매출액)"
       },
       {
         "fact": "gross_profit",
@@ -58,13 +58,13 @@
         "fact": "operating_profit",
         "value": -6848221325,
         "basis": "annual",
-        "label": "영업이익(손실"
+        "label": "영업이익(손실)"
       },
       {
         "fact": "net_income",
         "value": -28269614795,
         "basis": "annual",
-        "label": "당기순이익(손실"
+        "label": "당기순이익(손실)"
       },
       {
         "fact": "operating_cash_flow",
@@ -81,6 +81,7 @@
     ],
     "checks": [
       "bs_balance",
+      "gross_profit_identity",
       "cf_cash_tieout"
     ]
   },

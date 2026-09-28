@@ -6,11 +6,11 @@
     "reprt_code": "11012",
     "rcept_no": "20171114001347"
   },
-  "parser_version": "dart-document-statements-v1",
-  "expected_values_source": "hand-verified against the filing document main member: WITHHELD March-fiscal-year company (제미니투자): consolidated section has no statements (missing_statement:BS); separate BS dated 2017-09-30 against 11012 expectation 2017-06-30 (period_mismatch)",
+  "parser_version": "dart-document-statements-v3",
+  "expected_values_source": "hand-verified against the filing document main member: WITHHELD March-fiscal-year company (제미니투자): consolidated section has no statements (missing_statement:BS); separate BS dated 2017-09-30 against 11012 expectation 2017-06-30, same-year different quarter end (non_december_fiscal_year)",
   "statements": null,
   "diagnostics": [
     "missing_statement:BS",
-    "period_mismatch"
+    "non_december_fiscal_year"
   ]
 }

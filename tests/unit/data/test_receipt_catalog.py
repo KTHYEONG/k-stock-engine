@@ -1054,3 +1054,74 @@ def test_deleting_receipts_migrates_a_legacy_catalog(tmp_path: Path) -> None:
     assert catalog.latest(source="krx_daily_market", natural_keys=["2024-01-02", "2024-01-03"]) == {}
     assert catalog.blob_digest(source="krx_daily_market") == dataset_digest([])
 
+
+
+def test_streaming_rows_performs_no_path_resolution(tmp_path: Path, monkeypatch) -> None:
+    """Many rows stream with stored paths and no per-row filesystem resolution."""
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    entries = tuple(_entry(tmp_path, natural_key=f"2024-01-{day:02d}") for day in range(2, 6))
+    _publish(catalog, entries)
+
+    resolve_calls = 0
+    real_resolve = Path.resolve
+
+    def _counted_resolve(self: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _counted_resolve)
+    streamed_entries = list(catalog.entries(source="krx_daily_market"))
+    streamed_blobs = list(catalog.blobs(source="krx_daily_market"))
+    assert resolve_calls == 0
+    bronze_root = (tmp_path / "catalog").resolve().parent
+    for item in (*streamed_entries, *streamed_blobs):
+        assert item.payload_path.is_absolute()
+        assert str(item.payload_path).startswith(str(bronze_root))
+
+
+def test_stored_path_outside_bronze_root_is_rejected_on_read(tmp_path: Path) -> None:
+    """A stored path escaping the root through .. fails with a containment error."""
+    import sqlite3
+
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    _publish(catalog, (_entry(tmp_path),))
+    bronze_root = (tmp_path / "catalog").resolve().parent
+    escaped = f"{bronze_root}/../outside/payload.json"
+    with sqlite3.connect(tmp_path / "catalog" / "catalog.sqlite3") as connection:
+        connection.execute("UPDATE receipts SET payload_path = ?", (escaped,))
+        connection.commit()
+    with pytest.raises(PITDataError, match="outside the Bronze root"):
+        list(catalog.entries(source="krx_daily_market"))
+
+
+def test_relative_stored_paths_join_bronze_root_and_publish_verifies_content(tmp_path: Path) -> None:
+    """Relative stored paths resolve under the root; bad publish bytes still fail."""
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    entry = _entry(tmp_path)
+    _publish(catalog, (entry,))
+    bronze_root = (tmp_path / "catalog").resolve().parent
+    (streamed,) = list(catalog.entries(source="krx_daily_market"))
+    assert streamed.payload_path == bronze_root / streamed.payload_path.relative_to(bronze_root)
+    tampered = replace(entry, natural_key="2024-01-09", content_hash="0" * 64)
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        catalog.publish((tampered,), blobs=[_blob(tampered)])
+    outside = replace(entry, natural_key="2024-01-10",
+                      payload_path=tmp_path.parent / "outside-payload.json")
+    with pytest.raises(PITDataError, match=r"outside the Bronze root|missing"):
+        catalog.publish((outside,), blobs=[replace(_blob(outside), payload_path=outside.payload_path)])
+
+
+def test_stored_blob_path_outside_bronze_root_is_rejected_on_read(tmp_path: Path) -> None:
+    """A blob row escaping the root through .. fails with a containment error."""
+    import sqlite3
+
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    _publish(catalog, (_entry(tmp_path),))
+    bronze_root = (tmp_path / "catalog").resolve().parent
+    escaped = f"{bronze_root}/../outside/payload.zip"
+    with sqlite3.connect(tmp_path / "catalog" / "catalog.sqlite3") as connection:
+        connection.execute("UPDATE blobs SET payload_path = ?", (escaped,))
+        connection.commit()
+    with pytest.raises(PITDataError, match=r"outside the Bronze root"):
+        list(catalog.blobs(source="krx_daily_market"))

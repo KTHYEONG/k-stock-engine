@@ -819,7 +819,7 @@ def test_facts_preview_excludes_superseded_receipts_like_the_builder(tmp_path: P
     from src.data.datasets import dataset_digest
 
     ctx = _built_fixture(tmp_path)
-    monkeypatch.setattr(inc, "_discover_fact_receipts", lambda _root: [{"content_hash": "a" * 64}, {"content_hash": "b" * 64}])
+    monkeypatch.setattr(inc, "_discover_fact_receipts", lambda _root, **_: [{"content_hash": "a" * 64}, {"content_hash": "b" * 64}])
 
     plain = graph._preview_financial_facts(replace(ctx, superseded_receipts=frozenset()))
     superseded = graph._preview_financial_facts(replace(ctx, superseded_receipts=frozenset({"b" * 64})))
@@ -975,3 +975,25 @@ def test_refresh_dry_run_reports_phased_order(tmp_path: Path) -> None:
     assert "investor_flow_ls" in kinds
     jobs = [str(item.get("job")) for item in events if isinstance(item, dict) and item.get("type") == "collection"]
     assert jobs.index("ls_investor_flow") < jobs.index("kis_investor_flow")
+
+
+def test_facts_preview_plans_without_hashing_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stale-check builds its identity without hashing any payload file."""
+    from src.data import incremental_normalization as inc
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    calls = 0
+    real_sha = inc._sha256_file
+
+    def _counted(path):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_sha(path)
+
+    monkeypatch.setattr(inc, "_sha256_file", _counted)
+    first = graph._preview_financial_facts(ctx)
+    second = graph._preview_financial_facts(ctx)
+    assert calls == 0
+    assert first == second
+    assert first.inputs["bronze_facts"]

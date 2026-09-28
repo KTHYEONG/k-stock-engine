@@ -229,6 +229,40 @@ def _empty_dart_fact_frame() -> pl.DataFrame:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionIndex:
+    """Precomputed views of a KRX session calendar shared by many normalization calls.
+
+    Attributes:
+        ordered: Session opens in ascending order, timezone-aware.
+        dates: Local KRX trading date of each session, aligned with ``ordered``.
+        opens: Each session open in UTC, aligned with ``ordered``.
+    """
+
+    ordered: tuple[datetime, ...]
+    dates: tuple[date, ...]
+    opens: tuple[datetime, ...]
+
+    @classmethod
+    def from_calendar(cls, calendar: SessionCalendar) -> SessionIndex:
+        """Build the index once per calendar.
+
+        Raises:
+            PITDataError: The calendar has no sessions or a session is not timezone-aware.
+        """
+        ordered = tuple(sorted(calendar.sessions))
+        if not ordered:
+            raise PITDataError("calendar must contain sessions")
+        for session in ordered:
+            if not isinstance(session, datetime) or session.tzinfo is None:
+                raise PITDataError("calendar session must be timezone-aware")
+        return cls(
+            ordered=ordered,
+            dates=tuple(session.astimezone(KRX_TZ).date() for session in ordered),
+            opens=tuple(session.astimezone(UTC) for session in ordered),
+        )
+
+
 def normalize_dart_financial_facts_with_quarantine(
     *,
     pages: Any,
@@ -240,6 +274,7 @@ def normalize_dart_financial_facts_with_quarantine(
     bridge_receipt_hash: str | None = None,
     trusted_source_kinds: frozenset[str] = TRUSTED_FACT_SOURCE_KINDS,
     trust_document_facts: bool = False,
+    session_index: SessionIndex | None = None,
 ) -> tuple[pl.DataFrame, tuple[QuarantinedFiling, ...]]:
     """Normalize trusted DART fact records and list the filings withheld as untrusted.
 
@@ -301,12 +336,10 @@ def normalize_dart_financial_facts_with_quarantine(
             if fid and row.get("published_at") is not None:
                 disc_published[fid] = row.get("published_at")
     flat = _flatten_dart_fact_pages(page_list)
-    ordered_sessions = sorted(calendar.sessions)
-    for session in ordered_sessions:
-        if not isinstance(session, datetime) or session.tzinfo is None:
-            raise PITDataError("calendar session must be timezone-aware")
-    session_dates = [s.astimezone(KRX_TZ).date() for s in ordered_sessions]
-    session_opens = [s.astimezone(UTC) for s in ordered_sessions]
+    if session_index is None:
+        session_index = SessionIndex.from_calendar(calendar)
+    session_dates = list(session_index.dates)
+    session_opens = list(session_index.opens)
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str, str, bool]] = set()
     trusted_keys: set[tuple[str, str, str]] = set()
