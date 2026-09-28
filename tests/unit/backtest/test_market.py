@@ -39,6 +39,7 @@ _PANEL_SCHEMA: dict[str, Any] = {
     "eligible": pl.Boolean,
     "open_at_upper": pl.Boolean,
     "open_at_lower": pl.Boolean,
+    "entry_blocked": pl.Boolean,
 }
 
 
@@ -63,6 +64,7 @@ def _mrow(session: date, instrument_id: str, **overrides: Any) -> dict[str, Any]
         "eligible": True,
         "open_at_upper": False,
         "open_at_lower": False,
+        "entry_blocked": False,
     }
     row.update(overrides)
     return row
@@ -288,3 +290,38 @@ def test_cache_shape_and_checksum_failures_rebuild_from_source(tmp_path: Path) -
         np.savez(cache_file, **payload)
         rebuilt = load_market_arrays(panel_dir=panel, cache_root=cache)
         _assert_equal(fresh, rebuilt)
+
+
+def test_load_market_arrays_defaults_missing_entry_blocked(tmp_path: Path) -> None:
+    import hashlib as _hashlib
+    import json as _json
+
+    dataset = tmp_path / "gold" / "market_panel_legacy"
+    rows = [_mrow(DAY0, "KRX:A"), _mrow(DAY1, "KRX:A")]
+    legacy = [{key: value for key, value in row.items() if key != "entry_blocked"} for row in rows]
+    legacy_schema = {key: value for key, value in _PANEL_SCHEMA.items() if key != "entry_blocked"}
+    by_year: dict[int, list[dict[str, object]]] = {}
+    for row in legacy:
+        session = row["session"]
+        assert isinstance(session, date)
+        by_year.setdefault(session.year, []).append(row)
+    partitions = []
+    for year in sorted(by_year):
+        rel = f"year={year}/part.parquet"
+        out_path = dataset / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        frame = pl.DataFrame(by_year[year], schema=legacy_schema)
+        frame.write_parquet(out_path)
+        partitions.append({
+            "year": year,
+            "path": rel,
+            "row_count": frame.height,
+            "parquet_sha256": _hashlib.sha256(out_path.read_bytes()).hexdigest(),
+        })
+    (dataset / "manifest.json").write_text(
+        _json.dumps({"dataset_id": "market_panel_legacy", "partitions": partitions}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    arrays = _load(dataset, tmp_path / "cache")
+    assert "entry_blocked" in arrays.bool_fields
+    assert arrays.bool_fields["entry_blocked"].tolist() == [[False], [False]]

@@ -7,6 +7,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from src.core.pit import PITDataError
 from src.integrations.dart.html_tables import decode_member as _decode_member
@@ -47,6 +48,8 @@ class DividendDecision:
     is_correction: bool
     agm_date: date | None = None
     dividend_kind: str | None = None
+    total_krw: int | None = None
+    market_yield_pct: Decimal | None = None
 
 
 def is_dividend_decision_title(report_nm: str) -> bool:
@@ -130,6 +133,23 @@ def _parse_amount_cell(cell: str) -> int | None:
         return None
 
 
+def _row_label_text(row: list[str]) -> str:
+    return "".join(row).replace(" ", "").replace("　", "")
+
+
+def _row_has_per_share_label(row: list[str]) -> bool:
+    """True when the row is labelled as a per-share dividend.
+
+    Accepts the current ``1주당 배당금`` form and the pre-2020 ``주당배당금``
+    form (including variants such as ``1주당 현금배당금``); rows labelled as a
+    total, a yield or a share count are never per-share labels.
+    """
+    text = _row_label_text(row)
+    if "총액" in text or "시가배당율" in text or "주식수" in text:
+        return False
+    return "주당" in text and "배당금" in text
+
+
 def _extract_dps(tables: list[list[list[str]]], full_text: str) -> int | None:
     for table in tables:
         common_col: int | None = None
@@ -141,34 +161,110 @@ def _extract_dps(tables: list[list[list[str]]], full_text: str) -> int | None:
             if common_col is not None:
                 break
         for row in table:
-            joined = "".join(row)
-            if "배당" not in joined and "주당" not in joined:
+            if not _row_has_per_share_label(row):
                 continue
-            if "보통주" in joined:
+            if "보통주" in "".join(row):
                 for cell in row[1:]:
                     amount = _parse_amount_cell(cell)
                     if amount is not None and amount > 0:
                         return amount
                 tail = row[0].split("보통주", 1)[-1]
-                for token in re.findall(r"[\d,]+", tail):
-                    try:
-                        amount = int(token.replace(",", ""))
-                    except ValueError:
-                        continue
-                    if amount > 0:
-                        return amount
+                won = re.search(r"([\d,]+)\s*원", tail)
+                candidates = [won.group(1)] if won else []
+                candidates.extend(re.findall(r"[\d,]+", re.sub(r"1?주당.*?배당금", "", tail)))
+                for token in candidates:
+                    digits = token.replace(",", "")
+                    if digits.isdigit():
+                        amount = int(digits)
+                        if amount > 0:
+                            return amount
             elif common_col is not None and common_col < len(row):
                 # Column-style layout: header names 보통주 once, DPS rows
-                # carry only the 배당 label (e.g. the pre-2020 form).
+                # carry only the per-share 배당 label (e.g. the pre-2020 form).
                 amount = _parse_amount_cell(row[common_col])
                 if amount is not None and amount > 0:
                     return amount
-    # Fallback: free-text scan for "보통주 ... N원" outside tables.
-    for m in re.finditer(r"보통주[^0-9]{0,30}(\d[\d,]*)\s*원?", full_text):
+    # Fallback: free-text scan for a per-share 보통주 amount outside tables.
+    for m in re.finditer(r"보통주\s*1?주당[^0-9]*?배당금[^0-9]{0,30}?(\d[\d,]*)\s*원?", full_text):
         amount = int(m.group(1).replace(",", ""))
         if amount > 0 and not _cell_has_date(m.group(0)):
             return amount
     return None
+
+
+# 양식 필드 라벨만 인정한다. 공시 하단 주석("1. 상기 4항의 시가배당율은 ...")도 같은 단어를
+# 포함하므로, 라벨 셀 전체가 필드명 형태일 때만 값 행으로 본다.
+_TOTAL_LABEL_RE = re.compile(r"^(?:\d+\.)?배당금?총액(?:\(원\))?$")
+_YIELD_LABEL_RE = re.compile(r"^(?:\d+\.)?시가배당[율률](?:\(%\))?$")
+
+
+def _label_cell(row: list[str]) -> str:
+    return row[0].replace(" ", "").replace("\u3000", "") if row else ""
+
+
+def _extract_total_krw(tables: list[list[list[str]]]) -> int | None:
+    """Filing's printed dividend total (common + preferred as printed).
+
+    Only a row whose label cell is the form field itself is read, and only from its value cells;
+    footnotes that mention the total are ignored. The last value cell wins so a correction notice's
+    "after" column and the restated body both yield the corrected total.
+    """
+    total: int | None = None
+    for table in tables:
+        for row in table:
+            if _TOTAL_LABEL_RE.fullmatch(_label_cell(row)) is None:
+                continue
+            values = [amount for cell in row[1:] if (amount := _parse_amount_cell(cell)) is not None]
+            if values:
+                total = values[-1]
+    return total
+
+
+def _parse_yield_cell(cell: str) -> Decimal | None:
+    text = cell.strip().replace("%", "").replace("\uff05", "").replace(",", "").strip()
+    if not text or _cell_has_date(cell):
+        return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text) is None:
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation:  # pragma: no cover - guarded by the pattern above
+        return None
+
+
+def _extract_market_yield_pct(tables: list[list[list[str]]]) -> Decimal | None:
+    """Filing's printed 시가배당율 for common shares, if the form states one.
+
+    Only the form field row is read. When the row names the share class (``보통주식``), the value
+    to its right is used; when a header row names the common-share column, that column is used;
+    otherwise the last numeric value cell (a correction notice's "after" column). Footnotes are
+    ignored.
+    """
+    market_yield: Decimal | None = None
+    for table in tables:
+        # 구양식은 머리글 행에 "보통주|우선주" 열을 한 번만 두고, 값 행에는 계층명이 없다.
+        header_col = next(
+            (idx for row in table for idx, cell in enumerate(row) if idx > 0 and "보통주" in cell),
+            None,
+        )
+        for row in table:
+            if _YIELD_LABEL_RE.fullmatch(_label_cell(row)) is None:
+                continue
+            cells = row[1:]
+            found: Decimal | None = None
+            common = next((i for i, cell in enumerate(cells) if "보통주" in cell), None)
+            if common is not None:
+                for cell in cells[common + 1 :]:
+                    if (found := _parse_yield_cell(cell)) is not None:
+                        break
+            elif header_col is not None and header_col < len(row):
+                found = _parse_yield_cell(row[header_col])
+            if found is None and common is None:
+                values = [value for cell in cells if (value := _parse_yield_cell(cell)) is not None]
+                found = values[-1] if values else None
+            if found is not None:
+                market_yield = found
+    return market_yield
 
 
 def _extract_agm_date(rows: list[list[str]]) -> date | None:
@@ -213,23 +309,28 @@ def _extract_pay_value(rows: list[list[str]]) -> str | None:
 
 
 def parse_dividend_decision(
-    *, archive_bytes: bytes, rcept_no: str, corp_code: str, received_on: date
+    *, archive_bytes: bytes, rcept_no: str, corp_code: str, received_on: date, report_nm: str = ""
 ) -> DividendDecision:
     """Extract record date, pay date, and common-share DPS from a decision filing's document archive.
+
+    The common-share DPS is read only from a row labelled as a per-share dividend (``1주당 배당금`` or
+    the pre-2020 ``주당배당금``) in the common-share column; a total amount, a share count or a yield is
+    never accepted as DPS. The total dividend and the market-price yield printed by the same filing are
+    returned so the builder can check the DPS against them.
 
     Args:
         archive_bytes: Raw ``document.xml`` ZIP archive bytes.
         rcept_no: 14-digit DART receipt number owning the filing.
         corp_code: 8-digit DART corporation code.
         received_on: Filing receipt date (calendar date, KST).
+        report_nm: Filing title from the disclosure list; ``[기재정정]`` marks a correction.
 
     Returns:
-        Parsed decision with common-share DPS in KRW; undecided pay dates
-        become ``None``.
+        Parsed decision with common-share DPS in KRW; undecided pay dates become ``None``.
 
     Raises:
-        PITDataError: the archive is unreadable or lacks a record date or
-            common-share DPS; missing values are never defaulted.
+        PITDataError: the archive is unreadable or lacks a record date or a labelled common-share DPS;
+            missing values are never defaulted.
     """
     receipt = str(rcept_no or "").strip()
     corp = str(corp_code or "").strip()
@@ -308,6 +409,13 @@ def parse_dividend_decision(
     dps = _extract_dps(tables, full_text)
     if dps is None:
         raise PITDataError("dividend-decision archive lacks a common-share DPS; certification blocked")
+    title = str(report_nm or "").strip()
+    if title.startswith("[기재정정]"):
+        is_correction = True
+    elif title:
+        is_correction = False
+    else:
+        is_correction = _CORRECTION_MARK in full_text
     return DividendDecision(
         rcept_no=receipt,
         corp_code=corp,
@@ -315,7 +423,9 @@ def parse_dividend_decision(
         record_date=record_date,
         pay_date=pay_date,
         dps_common_krw=dps,
-        is_correction=_CORRECTION_MARK in full_text,
+        is_correction=is_correction,
         agm_date=_extract_agm_date(rows),
         dividend_kind=_extract_dividend_kind(rows),
+        total_krw=_extract_total_krw(tables),
+        market_yield_pct=_extract_market_yield_pct(tables),
     )

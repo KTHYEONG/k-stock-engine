@@ -7,7 +7,7 @@ import io
 import json
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -80,9 +80,11 @@ def _engine_config_payload(config: EngineConfig) -> dict[str, Any]:
         "costs": {
             "commission_rate": str(config.costs.commission_rate),
             "impact_k": config.costs.impact_k,
+            "dividend_withholding_rate": str(config.costs.dividend_withholding_rate),
         },
         "halted_exit_policy": config.halted_exit_policy.value,
         "cash_buffer": config.cash_buffer,
+        "allow_static_industry": config.allow_static_industry,
     }
 
 
@@ -113,6 +115,7 @@ def write_run(
     config: EngineConfig,
     strategy: Strategy,
     deposits: Mapping[date, int],
+    assumptions: Sequence[str] = (),
 ) -> Path:
     """Persist one run under ``run_root/<run_id>/`` with a manifest sufficient to reproduce it.
 
@@ -125,6 +128,7 @@ def write_run(
     params_hash = hashlib.sha256(_canonical(strategy_params).encode("utf-8")).hexdigest()
     config_payload = _engine_config_payload(config)
     config_hash = hashlib.sha256(_canonical(config_payload).encode("utf-8")).hexdigest()
+    merged = sorted(set(assumptions) | set(getattr(result, "assumptions", ())))
     body: dict[str, Any] = {
         "inputs": dict(sorted(inputs.items())),
         "strategy": {
@@ -138,6 +142,7 @@ def write_run(
         "code_version": _code_version(),
         "dividends_integrated": result.dividends_integrated,
         "ledger_hash": result.ledger_hash,
+        "assumptions": merged,
     }
     run_id = hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()[:16]
     target = run_root / run_id

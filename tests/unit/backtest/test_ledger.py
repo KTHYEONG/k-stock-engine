@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import numpy as np
 import pytest
 
+from src.backtest.costs import CostConfig
 from src.backtest.events import DividendEvent
 from src.backtest.ledger import JournalKind, Ledger
 from src.core.pit import PITDataError
+
+
+def _costs(withholding: str = "0") -> CostConfig:
+    return CostConfig(
+        commission_rate=Decimal("0.00015"),
+        impact_k=1.0,
+        dividend_withholding_rate=Decimal(withholding),
+    )
 
 
 def _entitlement(instrument_idx: int, ex: int, pay: int, dps: int) -> DividendEvent:
@@ -45,7 +56,7 @@ def test_cash_equals_journal_sum_after_replay() -> None:
     ledger.sell(
         session_idx=5, instrument_idx=0, quantity=60, price=9_000, commission=500, sell_tax=1_620
     )
-    ledger.settle_dividends(session_idx=6)
+    ledger.settle_dividends(session_idx=6, config=_costs())
     ledger.close_exit(session_idx=7, instrument_idx=1, price=15_000)
 
     assert _cash(ledger, initial) == 11_483_860
@@ -67,7 +78,7 @@ def test_cash_equals_journal_sum_after_replay() -> None:
 def test_overspend_leaves_state_unchanged() -> None:
     ledger = Ledger(initial_cash=1_000)
     journal_before = ledger.journal
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="buy costs"):
         ledger.buy(session_idx=0, instrument_idx=0, quantity=1, price=1_000, commission=1)
     assert ledger.journal == journal_before
     assert ledger.positions() == {}
@@ -104,7 +115,7 @@ def test_dividend_accrues_then_pays() -> None:
     )
     assert before.dividend_receivable == 5_000
     assert before.nav == 1_010_000
-    ledger.settle_dividends(session_idx=20)
+    ledger.settle_dividends(session_idx=20, config=_costs())
     after = ledger.mark(
         session_idx=20, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool)
     )
@@ -125,21 +136,21 @@ def test_missing_mark_fails_closed() -> None:
 
 
 def test_non_integer_and_range_arguments_rejected() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="initial_cash"):
         Ledger(initial_cash=-1)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="initial_cash"):
         Ledger(initial_cash=1.5)
     ledger = Ledger(initial_cash=100)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="amount"):
         ledger.deposit(session_idx=0, amount=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="quantity"):
         ledger.buy(session_idx=0, instrument_idx=0, quantity=True, price=10, commission=0)
 
 
 def test_sell_above_holding_rejected() -> None:
     ledger = Ledger(initial_cash=1_000_000)
     ledger.buy(session_idx=0, instrument_idx=0, quantity=5, price=10_000, commission=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="exceeds holding"):
         ledger.sell(
             session_idx=1, instrument_idx=0, quantity=6, price=10_000, commission=0, sell_tax=0
         )
@@ -154,8 +165,56 @@ def test_share_factor_without_position_is_noop() -> None:
 
 def test_settle_without_due_is_noop() -> None:
     ledger = Ledger(initial_cash=100)
-    ledger.settle_dividends(session_idx=9)
+    ledger.settle_dividends(session_idx=9, config=_costs())
     assert ledger.journal == ()
+
+
+def test_settle_dividends_pays_net_and_records_tax() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.buy(session_idx=0, instrument_idx=0, quantity=100, price=10_000, commission=0)
+    ledger.record_dividend_entitlements(session_idx=3, events=(_entitlement(0, 3, 20, 1_400),))
+    ledger.settle_dividends(session_idx=20, config=_costs("0.154"))
+
+    assert ledger.cash == 118_440
+    kinds = [entry.kind for entry in ledger.journal]
+    assert kinds.count(JournalKind.DIVIDEND) == 1
+    assert kinds.count(JournalKind.DIVIDEND_TAX) == 1
+    gross = next(entry.cash_delta for entry in ledger.journal if entry.kind is JournalKind.DIVIDEND)
+    tax = next(entry.cash_delta for entry in ledger.journal if entry.kind is JournalKind.DIVIDEND_TAX)
+    assert (gross, tax) == (140_000, -21_560)
+    assert gross == 118_440 - tax
+    assert _cash(ledger, 1_000_000) == ledger.cash
+    assert ledger.mark(
+        session_idx=20, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool)
+    ).dividend_receivable == 0
+
+
+def test_settle_dividends_zero_rate_pays_gross() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.buy(session_idx=0, instrument_idx=0, quantity=100, price=10_000, commission=0)
+    ledger.record_dividend_entitlements(session_idx=3, events=(_entitlement(0, 3, 20, 1_400),))
+    ledger.settle_dividends(session_idx=20, config=_costs("0"))
+
+    assert ledger.cash == 140_000
+    tax = next(entry.cash_delta for entry in ledger.journal if entry.kind is JournalKind.DIVIDEND_TAX)
+    assert tax == 0
+
+
+def test_settle_dividends_conserves_gross_across_payments() -> None:
+    ledger = Ledger(initial_cash=10_000_000)
+    ledger.buy(session_idx=0, instrument_idx=0, quantity=100, price=10_000, commission=0)
+    ledger.buy(session_idx=0, instrument_idx=1, quantity=50, price=20_000, commission=0)
+    ledger.record_dividend_entitlements(
+        session_idx=1,
+        events=(_entitlement(0, 1, 5, 1_400), _entitlement(1, 1, 9, 333)),
+    )
+    ledger.settle_dividends(session_idx=5, config=_costs("0.154"))
+    ledger.settle_dividends(session_idx=9, config=_costs("0.154"))
+
+    gross = sum(entry.cash_delta for entry in ledger.journal if entry.kind is JournalKind.DIVIDEND)
+    withheld = -sum(entry.cash_delta for entry in ledger.journal if entry.kind is JournalKind.DIVIDEND_TAX)
+    assert gross == 100 * 1_400 + 50 * 333
+    assert _cash(ledger, 10_000_000) == 10_000_000 - 2_000_000 + gross - withheld
 
 
 def test_close_exit_at_zero_records_total_loss() -> None:

@@ -187,13 +187,33 @@ def _build_market_panel(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
 
     runtime = ctx.runtime
     rules = load_krx_market_rules(load_runtime_config().market_rules)
+    market_actions_id = inputs.get("market_actions")
     result = materialize_market_panel(
         daily_market_path=runtime.workspace.silver_root / inputs["daily_market"],
         universe_path=runtime.workspace.silver_root / inputs["ordinary_universe"],
         rules=rules,
         gold_root=runtime.workspace.gold_root,
+        market_actions_path=(
+            runtime.workspace.silver_root / market_actions_id if market_actions_id is not None else None
+        ),
     )
     return _published(result.dataset_path)
+
+
+def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+    """Build Silver exchange market actions from disclosure titles and daily flags."""
+    from src.data.jobs.universe import read_corp_code_bridge
+    from src.data.market_actions import materialize_market_actions
+
+    _ = inputs
+    mapping, _ = read_corp_code_bridge(ctx.catalog)
+    path = materialize_market_actions(
+        catalog=ctx.catalog,
+        silver_root=ctx.runtime.workspace.silver_root,
+        calendar=_build_calendar(ctx),
+        bridge=dict(mapping),
+    )
+    return _published(path)
 
 
 def _build_investor_flow_kis_supplement(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
@@ -278,14 +298,17 @@ def _build_financial_quality(ctx: RefreshContext, inputs: Mapping[str, str]) -> 
 
 def _build_dividend_events(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver cash-dividend events from dated decision filings."""
+    from src.config import load_provider_policy, load_runtime_config
     from src.data.dividend_events import materialize_dividend_events
 
-    _ = inputs
     runtime = ctx.runtime
+    policy = load_provider_policy(load_runtime_config()).dividends
     path = materialize_dividend_events(
         catalog=ctx.catalog,
         silver_root=runtime.workspace.silver_root,
         calendar=_build_calendar(ctx),
+        daily_market_path=runtime.workspace.silver_root / inputs["daily_market"],
+        policy=policy,
     )
     return _published(path)
 
@@ -387,6 +410,42 @@ def _preview_investor_flow_ls(ctx: RefreshContext) -> DatasetIdentity:
     )
 
 
+def _preview_market_actions(ctx: RefreshContext) -> DatasetIdentity:
+    """Compute the would-be market-actions identity from Bronze digests."""
+    import hashlib as _hashlib
+
+    from src.core.time import KRX_TZ
+    from src.data.datasets import DatasetLayer as _Layer
+    from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
+    from src.data.market_actions import (
+        POLICY_VERSION,
+        corp_bridge_digest,
+        daily_flags_source_digest,
+        disclosure_source_digest,
+        market_actions_dataset_inputs,
+    )
+
+    mapping, _ = _read_bridge(ctx.catalog)
+    calendar = _build_calendar(ctx)
+    return DatasetIdentity(
+        kind="market_actions",
+        layer=_Layer.SILVER,
+        policy_version=POLICY_VERSION,
+        inputs=market_actions_dataset_inputs(
+            bronze_disclosures=disclosure_source_digest(ctx.catalog),
+            corp_code_bridge=corp_bridge_digest(dict(mapping)),
+            bronze_daily=daily_flags_source_digest(ctx.catalog, calendar),
+        ),
+        params={
+            "calendar_digest": _hashlib.sha256(
+                "\n".join(session.astimezone(KRX_TZ).isoformat() for session in calendar.sessions).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+        },
+    )
+
+
 def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be market-panel identity from resolved inputs and rules."""
     from src.config.runtime import load_runtime_config
@@ -396,6 +455,7 @@ def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
 
     daily_id = ctx.registry.require("daily_market")
     universe_id = ctx.registry.require("ordinary_universe")
+    market_actions_id = ctx.registry.require("market_actions")
     rules = load_krx_market_rules(load_runtime_config().market_rules)
     policy = MarketPanelPolicy()
     return DatasetIdentity(
@@ -405,11 +465,14 @@ def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
         inputs={
             "daily_market": dataset_reference(daily_id, kind="daily_market"),
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
+            "market_actions": dataset_reference(market_actions_id, kind="market_actions"),
         },
         params={
             "adtv_short_sessions": policy.adtv_short_sessions,
             "adtv_long_sessions": policy.adtv_long_sessions,
             "return_vol_sessions": policy.return_vol_sessions,
+            "block_administrative": policy.block_administrative,
+            "delisting_block_max_sessions": policy.delisting_block_max_sessions,
             "rules_version": rules.version,
             "rules_fingerprint": _rules_fingerprint(rules),
         },
@@ -580,7 +643,12 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
 
     from src.core.time import KRX_TZ
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.dividend_events import POLICY_VERSION, _iter_decision_envelopes
+    from src.data.dividend_events import (
+        POLICY_VERSION,
+        _iter_decision_envelopes,
+        dividend_dataset_inputs,
+        dividend_policy_params,
+    )
 
     envelopes = _iter_decision_envelopes(ctx.catalog)
     envelope_hashes = [
@@ -595,21 +663,27 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
         _, bridge_receipt_hash = _read_bridge(ctx.catalog)
     except PITDataError:  # pragma: no cover - missing bridge preview fallback
         bridge_receipt_hash = ""
+    from src.config import load_provider_policy, load_runtime_config
+
+    policy = load_provider_policy(load_runtime_config()).dividends
+    daily_market_id = ctx.registry.require("daily_market")
     calendar = _build_calendar(ctx)
     return DatasetIdentity(
         kind="dividend_events",
         layer=_Layer.SILVER,
         policy_version=POLICY_VERSION,
-        inputs={
-            "bronze_dividend_decisions": dataset_digest(envelope_hashes),
-            "corp_code_bridge": dataset_digest([bridge_receipt_hash]),
-        },
+        inputs=dividend_dataset_inputs(
+            bronze_dividend_decisions=dataset_digest(envelope_hashes),
+            corp_code_bridge=dataset_digest([bridge_receipt_hash]),
+            daily_market_id=daily_market_id,
+        ),
         params={
             "calendar_digest": hashlib.sha256(
                 "\n".join(
                     session.astimezone(KRX_TZ).date().isoformat() for session in calendar.sessions
                 ).encode("utf-8")
-            ).hexdigest()
+            ).hexdigest(),
+            **dividend_policy_params(policy),
         },
     )
 
@@ -648,6 +722,7 @@ _PREVIEW_FNS: Final[dict[str, Callable[[RefreshContext], DatasetIdentity]]] = {
     "ordinary_universe": _preview_ordinary_universe,
     "daily_market": _preview_daily_market,
     "investor_flow_ls": _preview_investor_flow_ls,
+    "market_actions": _preview_market_actions,
     "market_panel": _preview_market_panel,
     "investor_flow_kis_supplement": _preview_investor_flow_kis_supplement,
     "investor_flow": _preview_investor_flow,
@@ -660,7 +735,6 @@ _PREVIEW_FNS: Final[dict[str, Callable[[RefreshContext], DatasetIdentity]]] = {
 
 SCOPE_GRAPH: Final[tuple[BuildNode, ...]] = (
     BuildNode(kind="ordinary_universe", inputs=(), bronze_sources=("krx_security_master",), build=_build_ordinary_universe),
-    BuildNode(kind="dividend_events", inputs=(), bronze_sources=("corporate_actions",), build=_build_dividend_events),
     BuildNode(kind="industry", inputs=(), bronze_sources=("industry",), build=_build_industry),
     BuildNode(kind="financial_facts", inputs=(), bronze_sources=("financial_facts",), build=_build_financial_facts),
     BuildNode(
@@ -668,6 +742,12 @@ SCOPE_GRAPH: Final[tuple[BuildNode, ...]] = (
         inputs=("ordinary_universe",),
         bronze_sources=("krx_daily_market",),
         build=_build_daily_market,
+    ),
+    BuildNode(
+        kind="dividend_events",
+        inputs=("daily_market",),
+        bronze_sources=("corporate_actions",),
+        build=_build_dividend_events,
     ),
     BuildNode(
         kind="investor_flow_ls",
@@ -682,8 +762,14 @@ SCOPE_GRAPH: Final[tuple[BuildNode, ...]] = (
         build=_build_financial_quality,
     ),
     BuildNode(
+        kind="market_actions",
+        inputs=("daily_market",),
+        bronze_sources=("corporate_actions", "krx_daily_market"),
+        build=_build_market_actions,
+    ),
+    BuildNode(
         kind="market_panel",
-        inputs=("daily_market", "ordinary_universe"),
+        inputs=("daily_market", "ordinary_universe", "market_actions"),
         bronze_sources=(),
         build=_build_market_panel,
     ),

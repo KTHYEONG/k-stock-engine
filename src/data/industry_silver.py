@@ -29,6 +29,8 @@ _SCHEMA: dict[str, Any] = {
     "ksic_support": pl.Int64,
     "delisted_on": pl.Date,
     "available_at": pl.Datetime("us", "UTC"),
+    "known_since": pl.Datetime("us", "Asia/Seoul"),
+    "attribute_basis": pl.String,
     "source_hash": pl.String,
     "ksic_source_hash": pl.String,
     "policy_version": pl.String,
@@ -271,6 +273,11 @@ def materialize_industry_classification_silver(
                 industry_list.append(None)
                 basis_list.append("unmapped")
                 ksic_support_list.append(None)
+    from zoneinfo import ZoneInfo
+
+    _kst = ZoneInfo("Asia/Seoul")
+    known_since_list = [when.astimezone(_kst) for when in available_list]
+    attribute_basis_list = ["static_snapshot" for _ in ticker_list]
     frame = (
         pl.DataFrame(
             {
@@ -284,6 +291,8 @@ def materialize_industry_classification_silver(
                 "ksic_support": ksic_support_list,
                 "delisted_on": delisted_list,
                 "available_at": available_list,
+                "known_since": known_since_list,
+                "attribute_basis": attribute_basis_list,
                 "source_hash": source_list,
                 "ksic_source_hash": ksic_source_list,
                 "policy_version": [POLICY_VERSION for _ in ticker_list],

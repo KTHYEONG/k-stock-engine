@@ -20,6 +20,7 @@ from tests.fixtures.cli_fixtures import (
     _stage_quality_facts_dataset,
     _quality_cli_args,
     _dataset_runtime,
+    _dataset_cli_args,
 )
 
 
@@ -829,3 +830,25 @@ def test_cli_normalize_scoped_and_unscoped_registration_paths(tmp_path, monkeypa
     ]
     assert cli_module.main(unscoped_args) == 0
     assert json.loads(capsys.readouterr().out)["dataset_id"] == unscoped_published.dataset_id
+
+
+def test_build_market_actions_command_registers_dataset(tmp_path, monkeypatch, capsys) -> None:
+    import json
+
+    import src.data.jobs.universe as universe_module
+    import src.data.market_actions as actions_module
+    from src.data.cli import main
+
+    runtime = _dataset_runtime(tmp_path)
+    monkeypatch.setattr(
+        universe_module, "read_corp_code_bridge", lambda _catalog: ({"00126380": "005930"}, "a" * 64)
+    )
+    monkeypatch.setattr("src.data.cli.build.register_dataset", lambda *_args: None)
+    target = tmp_path / "market_actions_0123456789abcdef"
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        actions_module, "materialize_market_actions", lambda **_kwargs: target
+    )
+    assert main(_dataset_cli_args("build-market-actions", runtime)) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"] == "market_actions_0123456789abcdef"

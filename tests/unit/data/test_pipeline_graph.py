@@ -28,12 +28,13 @@ SESSIONS = tuple(date(2025, 12, 1) + timedelta(days=offset) for offset in range(
 DECISION_TIME = datetime(2026, 9, 14, tzinfo=UTC)
 EXPECTED_KINDS = (
     "ordinary_universe",
-    "dividend_events",
     "industry",
     "financial_facts",
     "daily_market",
+    "dividend_events",
     "investor_flow_ls",
     "financial_quality",
+    "market_actions",
     "market_panel",
     "investor_flow_kis_supplement",
     "investor_flow",
@@ -320,6 +321,8 @@ def test_plan_refresh_propagates_daily_market_lineage(tmp_path: Path) -> None:
     )
     assert [node.kind for node in plan_refresh(ctx)] == [
         "daily_market",
+        "dividend_events",
+        "market_actions",
         "market_panel",
         "investor_flow_kis_supplement",
         "investor_flow",
@@ -490,6 +493,8 @@ def test_plan_refresh_marks_missing_or_corrupt_datasets_stale(tmp_path: Path) ->
     registry_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
     assert [node.kind for node in plan_refresh(ctx)] == [
         "daily_market",
+        "dividend_events",
+        "market_actions",
         "market_panel",
         "investor_flow_kis_supplement",
         "investor_flow",
