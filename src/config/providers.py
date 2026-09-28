@@ -18,6 +18,7 @@ __all__ = [
     "DisclosureFilter",
     "DividendPlausibilityPolicy",
     "DocumentParserPolicy",
+    "KindPolicy",
     "KisPolicy",
     "KrxPolicy",
     "LsPolicy",
@@ -273,6 +274,34 @@ class LsPolicy(BaseModel):
         return value
 
 
+class KindPolicy(BaseModel):
+    """KIND collection policy: pacing, ledger bound and the notice vocabulary to search.
+
+    Attributes:
+        circuit_threshold: Consecutive transport failures that abort a run.
+        min_interval_seconds: Minimum spacing between requests to a public web service.
+        daily_limit: Ledger bound for one KST day.
+        search_keywords: Title keywords searched per window; each keyword is its own window key.
+        document_titles: Normalized titles (brackets and spaces removed) whose bodies are fetched.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    circuit_threshold: PositiveInt
+    min_interval_seconds: PositiveFloat
+    daily_limit: PositiveInt
+    search_keywords: tuple[str, ...]
+    document_titles: tuple[str, ...]
+
+    @field_validator("search_keywords", "document_titles")
+    @classmethod
+    def _check_vocabulary(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(item.strip() for item in value if isinstance(item, str) and item.strip())
+        if not cleaned or len(cleaned) != len(tuple(value)):
+            raise ValueError("KIND vocabulary must be non-empty with no blank entries")
+        return cleaned
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerPolicy:
     """Provider-specific safety limits the job runner enforces."""
@@ -305,6 +334,7 @@ class ProviderPolicy(BaseModel):
     kis: KisPolicy
     krx: KrxPolicy
     ls: LsPolicy
+    kind: KindPolicy
     dividends: DividendPlausibilityPolicy = DividendPlausibilityPolicy()
 
     @property
@@ -336,7 +366,7 @@ class ProviderPolicy(BaseModel):
         """Return the safety limits the job runner enforces for one provider.
 
         Args:
-            provider: ``"dart"``, ``"kis"``, ``"krx"`` or ``"ls"``.
+            provider: ``"dart"``, ``"kis"``, ``"krx"``, ``"ls"`` or ``"kind"``.
             key_env: DART key selecting its budget and reserve; the default
                 key applies when omitted. The DART ``quota_provider`` is a
                 ``"DART"`` placeholder here: the per-key ledger name depends on
@@ -380,6 +410,14 @@ class ProviderPolicy(BaseModel):
                 daily_budget=self.ls.daily_limit,
                 daily_reserve=0,
                 circuit_threshold=self.ls.circuit_threshold,
+                avoid_windows_kst=(),
+            )
+        if name == "kind":
+            return RunnerPolicy(
+                quota_provider="KIND",
+                daily_budget=self.kind.daily_limit,
+                daily_reserve=0,
+                circuit_threshold=self.kind.circuit_threshold,
                 avoid_windows_kst=(),
             )
         raise ConfigError(f"unknown provider for runner policy: {provider!r}")

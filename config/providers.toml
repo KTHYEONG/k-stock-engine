@@ -73,6 +73,16 @@ daily_limit = 10000
 # LS business-level "try later" response codes (rsp_cd exact match); anything else is terminal.
 retryable_rsp_codes = ["IGW00201"]
 
+[kind]
+circuit_threshold = 3
+# Public web service without a published rate policy: stay at one request per second.
+min_interval_seconds = 1.0
+daily_limit = 5000
+# Title keywords covering delisting decisions, liquidation trading and administrative issues.
+search_keywords = ["상장폐지", "정리매매", "관리종목"]
+# Exchange forms whose bodies carry dates or the share class the title lacks.
+document_titles = ["상장폐지", "관리종목지정", "관리종목지정해제"]
+
 # Dividend decision plausibility gate. An implausible DPS is withheld, never repaired.
 [dividends]
 max_yield = 0.5
