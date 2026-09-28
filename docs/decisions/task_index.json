@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "market_actions_kind_integrity",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_market_actions_kind_integrity",
+      "domain": "data",
+      "title": "KOSPI exchange-notice completeness: DART window integrity and KIND channel",
+      "why": "DART windows were silently truncated by a filtered legacy cache and DART omits KOSPI delisting and administrative notices, leaving 45 liquidation-trading sessions unblocked.",
+      "resolution": "Added DART declared-total window verification, KIND notice collection with form parsing, KIND-dated bounded delisting blocks, and a fail-closed limitless-move audit in the market panel.",
+      "impact": "Liquidation and administrative blocks now derive from official minute-stamped exchange notices, and any future missing notice fails the panel build instead of passing silently.",
+      "caveat": "KIND is an unofficial web endpoint so parsers fail closed on layout change; real-data acceptance (DART re-collection, KIND collection, rebuild, audit equals zero) is still pending."
+    },
+    {
       "task_id": "BACKTEST_REALISM_DIVIDEND_MARKET_ACTIONS",
       "date": "2026-09-28",
       "adr_id": "ADR_20260928_BACKTEST_REALISM_DIVIDEND_MARKET_ACTIONS",

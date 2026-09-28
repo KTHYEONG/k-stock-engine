@@ -255,7 +255,69 @@ def _fixture_context(tmp_path: Path) -> RefreshContext:
     invalid_disclosures = runtime.workspace.silver_root / "disclosures_zzzz_invalid"
     invalid_disclosures.mkdir(parents=True, exist_ok=True)
     (invalid_disclosures / "manifest.json").write_text('{"bogus": true}', encoding="utf-8")
+    _seed_kind_coverage(bronze_root, catalog)
     return build_refresh_context(runtime, decision_time=DECISION_TIME)
+
+
+def _seed_kind_coverage(bronze_root: Path, catalog: ReceiptCatalog) -> None:
+    """Seed complete empty KIND search windows so the market-actions build sees full coverage."""
+    import calendar as _calendar
+
+    from src.config import load_provider_policy, load_runtime_config
+    from src.core.pit import EvidenceKind as _EvidenceKind
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+    from src.data.jobs.dart import disclosure_windows
+    from src.data.receipt_catalog import BlobEntry as _BlobEntry
+
+    provider = load_provider_policy(load_runtime_config())
+    decision_day = DECISION_TIME.astimezone(KRX_TZ).date()
+    sessions = xkrx_calendar_through(decision_day).sessions
+    start = sessions[0].astimezone(KRX_TZ).date()
+    through = sessions[-1].astimezone(KRX_TZ).date()
+    retrieved = datetime(2025, 12, 31, 12, 0, tzinfo=UTC)
+    entries: list[ReceiptIndexEntry] = []
+    for keyword in provider.kind.search_keywords:
+        for window_start, window_end in disclosure_windows(start, through):
+            end_month = (window_start.month - 1) // 3 * 3 + 3
+            quarter_end = date(
+                window_start.year, end_month,
+                _calendar.monthrange(window_start.year, end_month)[1],
+            )
+            if quarter_end > through:
+                continue
+            key = f"{keyword}:{window_start.isoformat()}..{window_end.isoformat()}"
+            raw = json.dumps(
+                {
+                    "keyword": keyword,
+                    "start": window_start.isoformat(),
+                    "end": window_end.isoformat(),
+                    "reported_total": 0,
+                    "pages": [],
+                },
+                sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            payload_path = bronze_root / "catalog-payloads" / f"kind-{digest[:12]}.json"
+            payload_path.write_bytes(raw)
+            entries.append(
+                ReceiptIndexEntry(
+                    source="kind_notice_search", natural_key=key, as_of=window_end,
+                    fiscal_period=None, status=EvidenceStatus.EMPTY,
+                    content_hash=digest, retrieved_at=retrieved, payload_path=payload_path,
+                )
+            )
+    catalog.publish(
+        entries,
+        blobs=[
+            _BlobEntry(
+                content_hash=entry.content_hash, kind=_EvidenceKind.DISCLOSURES,
+                source="kind_notice_search", usable=True, unusable_reason=None,
+                retrieved_at=entry.retrieved_at, payload_path=entry.payload_path,
+            )
+            for entry in entries
+        ],
+    )
 
 
 def _built_fixture(tmp_path: Path) -> RefreshContext:
@@ -467,10 +529,11 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 8
+    assert len(report.collection) == 10
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
-        "krx_daily_market", "krx_security_master", "ls_investor_flow", "kis_investor_flow",
+        "krx_daily_market", "krx_security_master", "kind_notice_search", "kind_notice_documents",
+        "ls_investor_flow", "kis_investor_flow",
     }
 
 

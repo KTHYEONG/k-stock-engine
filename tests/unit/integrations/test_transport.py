@@ -248,6 +248,37 @@ def test_provider_property_and_post() -> None:
     assert seen["json"] == {"a": 1}
 
 
+def test_form_post_sends_urlencoded_data() -> None:
+    from types import SimpleNamespace
+
+    seen: dict[str, object] = {}
+    acquires: list[str] = []
+
+    class _Gate:
+        def acquire(self, *, endpoint: str) -> None:
+            acquires.append(endpoint)
+
+        def record_rate_limit(self, *, endpoint: str, retry_after: float | None) -> None:
+            pass
+
+    def fake_post(url, *, params=None, data=None, json=None, headers=None, timeout=None):
+        seen.update({"url": url, "data": data, "json": json})
+        return _ok_response()
+
+    transport = _transport(
+        session=SimpleNamespace(get=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("GET must not be used")), post=fake_post),
+        quota=_Gate(), sleep=lambda _s: None,
+    )
+
+    response = transport.post_form("disclosure/details.do", {"method": "searchDetailsSub", "pageIndex": "2"})
+
+    assert response.status_code == 200
+    assert seen["url"] == "https://example.invalid/disclosure/details.do"
+    assert seen["data"] == {"method": "searchDetailsSub", "pageIndex": "2"}
+    assert seen["json"] is None
+    assert acquires == ["disclosure/details.do"]
+
+
 def test_429_records_rate_limit_and_retries() -> None:
     from types import SimpleNamespace
 

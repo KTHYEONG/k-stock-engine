@@ -249,6 +249,7 @@
     "testing": "tests/unit/data/test_fact_page_meta.py"
   },
   "src/data/market_actions.py": {
-    "testing": "tests/unit/data/test_market_actions.py"
+    "testing": "tests/unit/data/test_market_actions.py",
+    "architecture": "docs/architecture/engineering-decisions.md"
   }
 }

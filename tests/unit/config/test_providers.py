@@ -39,6 +39,11 @@ def test_moved_values_are_unchanged() -> None:
     assert provider.kis.investor_flow_rows_per_page == 30
     assert provider.krx.circuit_threshold == 3
     assert provider.krx.daily_limit == 10000
+    assert provider.kind.circuit_threshold == 3
+    assert provider.kind.min_interval_seconds == 1.0
+    assert provider.kind.daily_limit == 5000
+    assert tuple(provider.kind.search_keywords) == ("상장폐지", "정리매매", "관리종목")
+    assert tuple(provider.kind.document_titles) == ("상장폐지", "관리종목지정", "관리종목지정해제")
     assert provider.ls.circuit_threshold == 3
     assert provider.ls.max_sessions_per_request == 700
     assert provider.ls.daily_limit == 10000
@@ -339,10 +344,39 @@ def test_runner_policy_per_provider() -> None:
     assert kis.circuit_threshold == 3
     assert kis.avoid_windows_kst == ()
 
+    kind = provider.runner("kind")
+    assert (kind.quota_provider, kind.daily_budget, kind.daily_reserve) == ("KIND", 5000, 0)
+    assert kind.circuit_threshold == 3
+    assert kind.avoid_windows_kst == ()
+
     with pytest.raises(ConfigError, match="unknown provider"):
         provider.runner("nyse")
     with pytest.raises(ConfigError, match="no declared policy"):
         provider.runner("dart", key_env="OPENDART_API_KEY_9")
+
+
+def test_kind_policy_rejects_empty_keyword_list() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import KindPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        KindPolicy(
+            circuit_threshold=3,
+            min_interval_seconds=1.0,
+            daily_limit=5000,
+            search_keywords=[],
+            document_titles=["상장폐지"],
+        )
+    with pytest.raises(pydantic.ValidationError):
+        KindPolicy(
+            circuit_threshold=3,
+            min_interval_seconds=1.0,
+            daily_limit=5000,
+            search_keywords=["상장폐지", "  "],
+            document_titles=["상장폐지"],
+        )
 
 
 def test_document_parser_defaults_to_untrusted_gate() -> None:

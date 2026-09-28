@@ -14,6 +14,8 @@ from src.core.time import KRX_TZ, SessionCalendar
 from src.data.datasets import load_manifest, read_dataset, verify_dataset
 from src.data.market_actions import MarketActionKind, classify_market_action_title, materialize_market_actions
 
+from tests.fixtures.kind_html import kind_row_html, kind_search_html
+
 SCOPE_CONFIG = Path("config/research/kr_swing_2019_v1.toml")
 RETRIEVED_AT = datetime(2024, 6, 1, tzinfo=UTC)
 CORP = "00126380"
@@ -139,6 +141,7 @@ def test_materialize_availability_is_next_session_open(tmp_path: Path) -> None:
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
         calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
     )
     assert verify_dataset(path, known_ids=lambda _dataset_id: True).passed
     frame = read_dataset(path).collect().sort("rcept_no")
@@ -167,6 +170,8 @@ def test_materialize_rebuild_is_idempotent(tmp_path: Path) -> None:
         "silver_root": runtime.workspace.silver_root,
         "calendar": _calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
         "bridge": _bridge(),
+        "kind_keywords": (),
+        "kind_coverage_start": date(2024, 1, 1),
     }
     first = materialize_market_actions(**kwargs)
     before = (first / "manifest.json").read_bytes()
@@ -193,6 +198,7 @@ def test_withdrawn_delisting_cancels_panel_block(tmp_path: Path) -> None:
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
         calendar=_calendar(*sessions, date(2024, 1, 8)),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 1),
     )
     frame = read_dataset(actions).collect()
     assert frame.height == 2
@@ -250,6 +256,7 @@ def test_administrative_flag_reads_the_short_code_of_real_daily_pages(tmp_path: 
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
         calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
     )
     frame = read_dataset(path).collect()
     assert frame["kind"].to_list() == [MarketActionKind.ADMINISTRATIVE_DESIGNATED.value]
@@ -272,6 +279,7 @@ def test_kosdaq_administrative_flag_transitions(tmp_path: Path) -> None:
             date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5), date(2024, 1, 8)
         ),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 1),
     )
     frame = read_dataset(path).collect().sort("announced_on")
     assert frame.height == 2
@@ -303,6 +311,7 @@ def test_unmapped_corp_code_is_skipped_and_counted(tmp_path: Path) -> None:
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
         calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
     )
     frame = read_dataset(path).collect()
     assert frame.height == 1
@@ -321,6 +330,7 @@ def test_materialize_requires_a_later_session(tmp_path: Path) -> None:
             catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
             calendar=_calendar(date(2024, 1, 2), date(2024, 1, 4)),
             bridge=_bridge(),
+            kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
         )
 
 
@@ -330,6 +340,7 @@ def test_materialize_empty_catalog_publishes_no_rows(tmp_path: Path) -> None:
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
         calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
         bridge=_bridge(),
+        kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
     )
     assert verify_dataset(path, known_ids=lambda _dataset_id: True).passed
     assert read_dataset(path).collect().height == 0
@@ -345,6 +356,7 @@ def test_materialize_requires_two_sessions(tmp_path: Path) -> None:
             catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
             calendar=_calendar(date(2024, 1, 2)),
             bridge=_bridge(),
+            kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
         )
 
 
@@ -397,6 +409,7 @@ def test_materialize_rejects_malformed_daily_page(tmp_path: Path, raw: bytes) ->
             catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
             calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
             bridge=_bridge(),
+            kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
         )
 
 
@@ -411,6 +424,7 @@ def test_materialize_rejects_tampered_daily_page(tmp_path: Path) -> None:
             catalog=catalog, silver_root=runtime.workspace.silver_root,
             calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
             bridge=_bridge(),
+            kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
         )
 
 
@@ -426,6 +440,7 @@ def test_materialize_rejects_missing_daily_payload(tmp_path: Path) -> None:
             catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
             calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
             bridge=_bridge(),
+            kind_keywords=(), kind_coverage_start=date(2024, 1, 2),
         )
 
 
@@ -492,3 +507,414 @@ def test_withdrawn_or_voided_delisting_is_a_cancellation_and_subsidiary_notice_i
     ):
         assert classify_market_action_title(title) is None
         assert _is_delisting_cancellation_title(_base_title(title)) is True
+
+
+def test_combined_halt_and_release_notice_is_a_halt() -> None:
+    from src.data.market_actions import MarketActionKind, classify_market_action_title
+
+    assert classify_market_action_title("매매거래정지및정지해제(중요내용공시)") is MarketActionKind.TRADING_HALTED
+    assert classify_market_action_title("매매거래정지 및 정지해제(풍문 등 조회공시)") is MarketActionKind.TRADING_HALTED
+
+
+def test_plain_release_stays_a_resumption() -> None:
+    from src.data.market_actions import MarketActionKind, classify_market_action_title
+
+    assert classify_market_action_title("주권매매거래정지해제") is MarketActionKind.TRADING_RESUMED
+    assert classify_market_action_title("매매거래정지해제") is MarketActionKind.TRADING_RESUMED
+
+
+def test_liquidation_precedence_survives() -> None:
+    from src.data.market_actions import MarketActionKind, classify_market_action_title
+
+    assert (
+        classify_market_action_title("주권매매거래정지해제(상장폐지에 따른 정리매매 개시)")
+        is MarketActionKind.LIQUIDATION_TRADING
+    )
+
+
+KIND_DELISTING_HTML = """<html><body><table>
+<tr><td>단축코드</td><td>A005980</td></tr>
+<tr><td>정리매매 허용기간 시작일</td><td>2018-09-19</td></tr>
+<tr><td>종료일</td><td>2018-10-02</td></tr>
+<tr><td>상장폐지일</td><td>2018-10-04</td></tr>
+</table></body></html>"""
+
+KIND_ADMIN_COMMON_HTML = """<html><body><table>
+<tr><td>종목명</td><td>삼성전자보통주</td></tr>
+<tr><td>지정일</td><td>2024년 01월 03일</td></tr>
+</table></body></html>"""
+
+KIND_ADMIN_PREFERRED_HTML = """<html><body><table>
+<tr><td>종목명</td><td>대상홀딩스1우선주</td></tr>
+<tr><td>지정일</td><td>2024년 01월 03일</td></tr>
+</table></body></html>"""
+
+
+
+
+
+
+def _publish_kind_search(runtime, *, keyword: str, start: str, end: str, rows: list, total: int | None = None):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.bronze import BronzeStore
+    from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptIndexEntry
+
+    reported = len(rows) if total is None else total
+    body = json.dumps(
+        {"keyword": keyword, "start": start, "end": end,
+         "reported_total": reported, "pages": [kind_search_html(rows, reported)]},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    store = BronzeStore(runtime.workspace.bronze_root)
+    receipt = store.import_bytes(body, kind=EvidenceKind.DISCLOSURES, retrieved_at=RETRIEVED_AT, source_label="test")
+    _catalog(runtime).publish(
+        [
+            ReceiptIndexEntry(
+                source="kind_notice_search", natural_key=f"{keyword}:{start}..{end}",
+                as_of=date.fromisoformat(end), fiscal_period=None,
+                status=EvidenceStatus.EMPTY if reported == 0 else EvidenceStatus.SUCCESS,
+                content_hash=receipt.content_hash, retrieved_at=receipt.retrieved_at,
+                payload_path=receipt.payload_path,
+            )
+        ],
+        blobs=[
+            BlobEntry(
+                content_hash=receipt.content_hash, kind=EvidenceKind.DISCLOSURES,
+                source="kind_notice_search", usable=True, unusable_reason=None,
+                retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+            )
+        ],
+    )
+
+
+def _publish_kind_document(runtime, *, acptno: str, html: str, disclosed_at: str):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.bronze import BronzeStore
+    from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptIndexEntry
+
+    body = json.dumps(
+        {"acptno": acptno, "doc_no": "1234567", "template": "68051.htm",
+         "html": html, "disclosed_at": disclosed_at},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    store = BronzeStore(runtime.workspace.bronze_root)
+    receipt = store.import_bytes(body, kind=EvidenceKind.DISCLOSURES, retrieved_at=RETRIEVED_AT, source_label="test")
+    _catalog(runtime).publish(
+        [
+            ReceiptIndexEntry(
+                source="kind_notice_documents", natural_key=acptno,
+                as_of=date.fromisoformat(disclosed_at[:10]), fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=receipt.content_hash, retrieved_at=receipt.retrieved_at,
+                payload_path=receipt.payload_path,
+            )
+        ],
+        blobs=[
+            BlobEntry(
+                content_hash=receipt.content_hash, kind=EvidenceKind.DISCLOSURES,
+                source="kind_notice_documents", usable=True, unusable_reason=None,
+                retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+            )
+        ],
+    )
+
+
+def test_kind_delisting_form_becomes_bounded_delisting_action(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20180913000001", "2018-09-13 18:59", "상장폐지", "00598", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2018-09-13", end="2018-09-28", rows=[row])
+    _publish_kind_document(runtime, acptno="20180913000001", html=KIND_DELISTING_HTML,
+                           disclosed_at="2018-09-13T18:59:00+09:00")
+    _publish_daily(runtime, session=date(2018, 9, 13), records=[{"ISU_SRT_CD": "005980"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2018, 9, 13), date(2018, 9, 14), date(2018, 9, 17)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2018, 9, 13),
+    )
+    frame = read_dataset(path).collect()
+    kind_rows = frame.filter(pl.col("source") == "kind")
+    assert kind_rows.height == 1
+    row_out = kind_rows.to_dicts()[0]
+    assert row_out["kind"] == MarketActionKind.DELISTING_DECIDED.value
+    assert row_out["source"] == "kind"
+    assert row_out["available_at"] == datetime(2018, 9, 14, 9, 0, tzinfo=KRX_TZ)
+    assert row_out["effective_start"] == date(2018, 9, 19)
+    assert row_out["effective_end"] == date(2018, 10, 4)
+    assert row_out["rcept_no"] == "KIND-20180913000001"
+
+
+def test_kind_pre_open_notice_is_available_the_same_day(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    title = "기타시장안내(상장폐지결정 효력정지 가처분 신청 기각결정에 따른 정리매매절차 재개)"
+    row = kind_row_html("20240102000001", "2024-01-02 07:30", title, "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect().filter(pl.col("source") == "kind")
+    assert frame.height == 1
+    assert frame["available_at"].to_list() == [datetime(2024, 1, 2, 9, 0, tzinfo=KRX_TZ)]
+
+
+def test_kind_missing_form_body_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "상장폐지", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    with pytest.raises(PITDataError, match="20240102000001"):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+            bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_coverage_start=date(2024, 1, 2),
+        )
+
+
+def test_kind_preferred_only_designation_never_touches_common_stock(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "관리종목 지정", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="관리종목", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_ADMIN_PREFERRED_HTML,
+                           disclosed_at="2024-01-02T15:30:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("관리종목",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_other_share_class"] == 1
+
+
+def test_kind_unlisted_resolved_ticker_is_skipped_and_counted(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    title = "기타시장안내(상장폐지결정 효력정지 가처분 신청 기각결정에 따른 정리매매절차 재개)"
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", title, "12345", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_unresolved_rows"] == 1
+
+
+def test_kind_company_filed_notice_is_ignored(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "상장폐지", "00593", "삼성전자")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    assert read_dataset(path).collect().height == 0
+
+
+def test_kind_title_only_liquidation_notice_classifies_like_dart(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    title = "기타시장안내(상장폐지결정 효력정지 가처분 신청 기각결정에 따른 정리매매절차 재개)"
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", title, "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 1
+    out = frame.to_dicts()[0]
+    assert out["kind"] == MarketActionKind.LIQUIDATION_TRADING.value
+    assert out["source"] == "kind"
+    assert out["effective_start"] is None
+    assert out["effective_end"] is None
+
+
+def test_kind_coverage_gap_aborts_the_build(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    with pytest.raises(PITDataError):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(date(2024, 1, 2), date(2024, 4, 2)),
+            bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_coverage_start=date(2024, 1, 2),
+        )
+
+
+def test_kind_identity_changes_with_kind_bronze(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    kwargs = {
+        "catalog": _catalog(runtime),
+        "silver_root": runtime.workspace.silver_root,
+        "calendar": _calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        "bridge": _bridge(),
+        "kind_keywords": (),
+        "kind_coverage_start": date(2024, 1, 1),
+    }
+    first = materialize_market_actions(**kwargs)
+    row = kind_row_html("20240102000001", "2024-01-02 07:30", "현금배당 결정", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    second = materialize_market_actions(**kwargs)
+    assert first != second
+
+
+def test_kind_common_designation_becomes_administrative_action(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "관리종목 지정", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="관리종목", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_ADMIN_COMMON_HTML,
+                           disclosed_at="2024-01-02T15:30:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("관리종목",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 1
+    out = frame.to_dicts()[0]
+    assert out["kind"] == MarketActionKind.ADMINISTRATIVE_DESIGNATED.value
+    assert out["source"] == "kind"
+    assert out["ticker"] == "005930"
+    assert out["effective_start"] == date(2024, 1, 3)
+    assert out["effective_end"] is None
+
+
+def test_kind_delisting_form_with_unlisted_ticker_is_skipped_and_counted(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "상장폐지", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_DELISTING_HTML,
+                           disclosed_at="2024-01-02T15:30:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_unresolved_rows"] == 1
+
+
+def test_kind_administrative_missing_body_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "관리종목 지정", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="관리종목", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    with pytest.raises(PITDataError, match="20240102000001"):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+            bridge=_bridge(), kind_keywords=("관리종목",),
+            kind_coverage_start=date(2024, 1, 2),
+        )
+
+
+def test_kind_notice_after_last_session_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    title = "기타시장안내(상장폐지결정 효력정지 가처분 신청 기각결정에 따른 정리매매절차 재개)"
+    row = kind_row_html("20240103000001", "2024-01-03 18:00", title, "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    with pytest.raises(PITDataError, match="no certified session open"):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+            bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_coverage_start=date(2024, 1, 2),
+        )
+
+
+def test_kind_notice_without_covering_daily_page_is_skipped_and_counted(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    title = "기타시장안내(상장폐지결정 효력정지 가처분 신청 기각결정에 따른 정리매매절차 재개)"
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", title, "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 3), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_unresolved_rows"] == 1
+
+
+def test_kind_common_admin_with_unlisted_ticker_is_skipped_and_counted(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "관리종목 지정", "12345", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="관리종목", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_ADMIN_COMMON_HTML,
+                           disclosed_at="2024-01-02T15:30:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("관리종목",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_unresolved_rows"] == 1
+
+
+def test_kind_withdrawn_delisting_is_a_cancellation(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", "상장폐지결정 취소", "00593", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 2),
+    )
+    frame = read_dataset(path).collect()
+    assert frame.height == 1
+    out = frame.to_dicts()[0]
+    assert out["kind"] == MarketActionKind.DELISTING_DECIDED.value
+    assert out["source"] == "kind"
+    assert out["cancellation"] is True
+    manifest = load_manifest(path)
+    assert manifest.details["kind_cancellations"] == 1
+    assert manifest.details["kind_actions"] == 0
+
+
+def test_kind_coverage_uses_the_collector_window_anchor_not_the_first_session(tmp_path: Path) -> None:
+    # 수집기는 scope의 evidence_start(1월 1일)부터 창을 만들고 첫 세션은 1월 4일이다.
+    runtime = _runtime(tmp_path)
+    _publish_kind_search(runtime, keyword="상장폐지", start="2016-01-01", end="2016-03-31", rows=[])
+    calendar = _calendar(date(2016, 1, 4), date(2016, 4, 1), date(2016, 4, 4))
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=calendar, bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2016, 1, 1),
+    )
+    assert path.exists()
+
+    with pytest.raises(PITDataError, match=r"상장폐지:2016-01-04\.\.2016-03-31"):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=calendar, bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_coverage_start=date(2016, 1, 4),
+        )

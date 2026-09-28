@@ -748,17 +748,17 @@ def test_materialize_volatility_skips_invalid_rows(tmp_path: Path) -> None:
 def test_materialize_policy_version_bump(tmp_path: Path) -> None:
     from src.data.market_panel import POLICY_VERSION
 
-    assert POLICY_VERSION == "krx-market-panel-v3"
+    assert POLICY_VERSION == "krx-market-panel-v4"
     daily = {DAY0: [_drow(DAY0, "005930", close=10000, change=0)]}
     daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
     result = materialize_market_panel(
         daily_market_path=daily_path, universe_path=universe_path, rules=RULES, gold_root=gold_root
     )
     manifest = json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["policy_version"] == "krx-market-panel-v3"
+    assert manifest["policy_version"] == "krx-market-panel-v4"
     v2_id = "market_panel_" + hashlib.sha256(
         "\n".join((
-            "krx-market-panel-v2", "20", "60", "60", RULES.version,
+            "krx-market-panel-v3", "20", "60", "60", RULES.version,
             manifest["daily_market_dataset_id"],
             manifest["universe_dataset_id"],
         )).encode("utf-8")
@@ -1136,3 +1136,278 @@ def test_market_panel_policy_reads_the_delisting_cap_and_rejects_bad_values(tmp_
         path.write_text(body, encoding="utf-8")
         with pytest.raises(PITDataError, match="delisting_block_max_sessions"):
             _default_delisting_block_max_sessions(path)
+
+
+def _bounded_action_row(announced: date, available: date, ticker: str, kind: str, rcept_no: str, *, start: date | None, end: date | None) -> dict[str, object]:
+    row = _action_row(announced, available, ticker, kind, rcept_no)
+    row["effective_start"] = start
+    row["effective_end"] = end
+    return row
+
+
+def test_bounded_delisting_blocks_through_stated_delisting_date(tmp_path: Path) -> None:
+    sessions = _sessions(date(2020, 1, 6), 7)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 10, change=10 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_bounded_action_row(sessions[0], sessions[0], "005930", "delisting_decided", "20200106000001",
+                             start=sessions[2], end=sessions[5])],
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(delisting_block_max_sessions=1),
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [True] * 6 + [False]
+    assert frame["entry_block_reason"].to_list() == (
+        ["delisting_decided"] * 2 + ["liquidation_trading"] * 4 + [""]
+    )
+
+
+def test_bounded_block_never_starts_before_availability(tmp_path: Path) -> None:
+    sessions = _sessions(date(2020, 1, 6), 3)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 10, change=10 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_bounded_action_row(sessions[1], sessions[1], "005930", "delisting_decided", "20200107000001",
+                             start=date(2019, 12, 1), end=sessions[2])],
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [False, True, True]
+
+
+def test_cancellation_lifts_bounded_block(tmp_path: Path) -> None:
+    sessions = _sessions(date(2020, 1, 6), 4)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 10, change=10 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    bounded = _bounded_action_row(sessions[0], sessions[0], "005930", "delisting_decided", "20200106000001",
+                                  start=None, end=sessions[3])
+    cancel = _action_row(sessions[2], sessions[2], "005930", "delisting_decided", "20200108000002", cancellation=True)
+    actions_path = _publish_actions(tmp_path / "silver", [bounded, cancel])
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [True, True, False, False]
+
+
+def test_unbounded_actions_keep_lapse_cap(tmp_path: Path) -> None:
+    sessions = _sessions(date(2020, 1, 6), 4)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 10, change=10 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_action_row(sessions[0], sessions[0], "005930", "liquidation_trading", "20200106000001")],
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(delisting_block_max_sessions=1),
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [True, True, False, False]
+
+
+def _limitless_daily() -> dict[date, list[dict[str, object]]]:
+    day0, day1 = DAY0, DAY1
+    return {
+        day0: [_drow(day0, "005930", close=1000, change=0)],
+        day1: [_drow(day1, "005930", close=100, change=-900, high=1100, low=50)],
+    }
+
+
+def test_unexplained_limitless_move_fails_the_build(tmp_path: Path) -> None:
+    daily = _limitless_daily()
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(tmp_path / "silver", [])
+    with pytest.raises(PITDataError):
+        materialize_market_panel(
+            daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+            gold_root=gold_root, market_actions_path=actions_path,
+        )
+    assert list((tmp_path / "gold").glob("market_panel_*")) == []
+
+
+def test_explained_or_exempt_moves_pass_the_audit(tmp_path: Path) -> None:
+    daily = _limitless_daily()
+    blocked_actions = _publish_actions(
+        tmp_path / "silver-blocked",
+        [_action_row(DAY0, DAY1, "005930", "delisting_decided", "20200107000001")],
+    )
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    blocked = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=blocked_actions,
+    )
+    assert blocked.unexplained_limitless_moves == 0
+
+    single = {DAY0: [_drow(DAY0, "005930", close=100, change=0, high=1100, low=50)]}
+    single_path, single_universe, single_gold = _inputs(tmp_path / "single", single, _full_universe(single))
+    single_actions = _publish_actions(tmp_path / "silver-single", [])
+    first_row = materialize_market_panel(
+        daily_market_path=single_path, universe_path=single_universe, rules=RULES,
+        gold_root=single_gold, market_actions_path=single_actions,
+    )
+    assert first_row.unexplained_limitless_moves == 0
+
+    quiet = {
+        DAY0: [_drow(DAY0, "005930", close=1000, change=0)],
+        DAY1: [_drow(DAY1, "005930", close=100, change=-900, high=1100, low=50, volume=0, trading_value=0)],
+    }
+    quiet_path, quiet_universe, quiet_gold = _inputs(tmp_path / "quiet", quiet, _full_universe(quiet))
+    quiet_actions = _publish_actions(tmp_path / "silver-quiet", [])
+    skipped = materialize_market_panel(
+        daily_market_path=quiet_path, universe_path=quiet_universe, rules=RULES,
+        gold_root=quiet_gold, market_actions_path=quiet_actions,
+    )
+    assert skipped.unexplained_limitless_moves == 0
+
+
+def test_tolerance_admits_known_residue(tmp_path: Path) -> None:
+    import json as _json
+
+    daily = _limitless_daily()
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(tmp_path / "silver", [])
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(max_unexplained_limitless_moves=1),
+    )
+    assert result.unexplained_limitless_moves == 1
+    manifest = _json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["details"]["limitless_move_audit"]["unexplained"] == 1
+    assert len(manifest["details"]["limitless_move_audit"]["samples"]) == 1
+
+
+def test_audit_never_alters_panel_content(tmp_path: Path) -> None:
+    daily = {
+        DAY0: [_drow(DAY0, "005930", close=10000, change=0)],
+        DAY1: [_drow(DAY1, "005930", close=10100, change=100)],
+    }
+    actions_path = _publish_actions(tmp_path / "silver", [])
+    strict_path, strict_universe, strict_gold = _inputs(tmp_path / "strict", daily, _full_universe(daily))
+    strict = materialize_market_panel(
+        daily_market_path=strict_path, universe_path=strict_universe, rules=RULES,
+        gold_root=strict_gold, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(limitless_move_audit_threshold=0.3),
+    )
+    loose_path, loose_universe, loose_gold = _inputs(tmp_path / "loose", daily, _full_universe(daily))
+    loose = materialize_market_panel(
+        daily_market_path=loose_path, universe_path=loose_universe, rules=RULES,
+        gold_root=loose_gold, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(limitless_move_audit_threshold=0.9),
+    )
+    assert strict.dataset_id == loose.dataset_id
+    left = (strict.dataset_path / "year=2020" / "part.parquet").read_bytes()
+    right = (loose.dataset_path / "year=2020" / "part.parquet").read_bytes()
+    assert left == right
+
+
+def test_audit_skipped_without_market_actions(tmp_path: Path) -> None:
+    import json as _json
+
+    daily = _limitless_daily()
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES, gold_root=gold_root,
+    )
+    manifest = _json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["details"]["limitless_move_audit"] == "not_audited"
+
+
+def test_default_audit_policy_reads_config(tmp_path: Path) -> None:
+    from src.data.market_panel import (
+        _default_limitless_move_audit_threshold,
+        _default_max_unexplained_limitless_moves,
+    )
+
+    assert _default_limitless_move_audit_threshold() == 0.30
+    assert _default_max_unexplained_limitless_moves() == 0
+    custom = tmp_path / "custom.toml"
+    custom.write_text(
+        "block_administrative = true\ndelisting_block_max_sessions = 250\n"
+        "limitless_move_audit_threshold = 0.5\nmax_unexplained_limitless_moves = 2\n",
+        encoding="utf-8",
+    )
+    assert _default_limitless_move_audit_threshold(custom) == 0.5
+    assert _default_max_unexplained_limitless_moves(custom) == 2
+    bad = tmp_path / "bad.toml"
+    bad.write_text(
+        "block_administrative = true\ndelisting_block_max_sessions = 250\n"
+        "limitless_move_audit_threshold = 1.5\nmax_unexplained_limitless_moves = 0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PITDataError):
+        _default_limitless_move_audit_threshold(bad)
+    with pytest.raises(PITDataError):
+        _default_max_unexplained_limitless_moves(tmp_path / "absent.toml")
+    bad_max = tmp_path / "bad-max.toml"
+    bad_max.write_text(
+        "block_administrative = true\ndelisting_block_max_sessions = 250\n"
+        "limitless_move_audit_threshold = 0.3\nmax_unexplained_limitless_moves = -1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PITDataError):
+        _default_max_unexplained_limitless_moves(bad_max)
+
+
+def test_bounded_liquidation_blocks_through_stated_end(tmp_path: Path) -> None:
+    sessions = _sessions(date(2020, 1, 6), 5)
+    daily = {
+        session: [_drow(session, "005930", close=10000 + index * 10, change=10 * (index > 0))]
+        for index, session in enumerate(sessions)
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(
+        tmp_path / "silver",
+        [_bounded_action_row(sessions[0], sessions[0], "005930", "liquidation_trading", "20200106000001",
+                             start=sessions[1], end=sessions[3])],
+    )
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+        gold_root=gold_root, market_actions_path=actions_path,
+        policy=MarketPanelPolicy(delisting_block_max_sessions=1),
+    )
+    frame = _panel_frame(result.dataset_path, 2020).sort("session")
+    assert frame["entry_blocked"].to_list() == [True, True, True, True, False]
+    assert frame["entry_block_reason"].to_list() == (
+        ["delisting_decided", "liquidation_trading", "liquidation_trading", "liquidation_trading", ""]
+    )
+
+
+def test_materialize_rejects_invalid_audit_policy(tmp_path: Path) -> None:
+    daily = {DAY0: [_drow(DAY0, "005930", close=10000, change=0)]}
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    with pytest.raises(PITDataError):
+        materialize_market_panel(
+            daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+            gold_root=gold_root,
+            policy=MarketPanelPolicy(limitless_move_audit_threshold=1.5),
+        )
+    with pytest.raises(PITDataError):
+        materialize_market_panel(
+            daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+            gold_root=gold_root,
+            policy=MarketPanelPolicy(max_unexplained_limitless_moves=-1),
+        )
