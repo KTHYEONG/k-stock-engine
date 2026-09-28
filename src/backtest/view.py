@@ -37,6 +37,11 @@ class AsOfTable:
         stop = bisect.bisect_right(self._keys, decision_time)
         return self._frame.slice(0, stop)
 
+    @property
+    def full(self) -> pl.DataFrame:
+        """All rows regardless of decision time (for explicit static-snapshot handling)."""
+        return self._frame
+
 
 class PITView:
     """Decision-time view: only data observable at ``decision_time`` is reachable.
@@ -48,7 +53,7 @@ class PITView:
     impossible rather than a convention strategies must follow.
     """
 
-    __slots__ = ("_arrays", "_asof_tables", "_decision_time", "_t")
+    __slots__ = ("_allow_static_industry", "_arrays", "_asof_tables", "_assumptions", "_decision_time", "_t")
 
     def __init__(
         self,
@@ -57,6 +62,7 @@ class PITView:
         t: int,
         decision_time: datetime,
         asof_tables: Mapping[str, AsOfTable],
+        allow_static_industry: bool = False,
     ) -> None:
         if isinstance(t, bool) or not isinstance(t, int) or not 0 <= t < len(arrays.sessions):
             raise PITDataError(f"session index out of range: {t!r}")
@@ -69,6 +75,8 @@ class PITView:
         self._t = t
         self._decision_time = decision_time
         self._asof_tables = dict(asof_tables)
+        self._allow_static_industry = allow_static_industry
+        self._assumptions: list[str] = []
 
     @property
     def t(self) -> int:
@@ -97,3 +105,40 @@ class PITView:
 
     def table(self, name: str) -> pl.DataFrame:
         return self._asof_tables[name].upto(self._decision_time)
+
+    @property
+    def allow_static_industry(self) -> bool:
+        """Run-config opt-in for the static industry snapshot (never set by strategy code)."""
+        return self._allow_static_industry
+
+    @property
+    def assumptions(self) -> tuple[str, ...]:
+        """Recorded static-data assumptions relied on through this view."""
+        return tuple(self._assumptions)
+
+    def industry_as_of(self, decision_time: datetime, *, allow_static: bool) -> pl.DataFrame:
+        """Industry rows usable at ``decision_time``.
+
+        A static snapshot observed after ``decision_time`` is returned only when the run opts in with
+        ``allow_static``; the view then records that the run relied on a static industry assumption.
+
+        Raises:
+            PITDataError: the snapshot is newer than ``decision_time`` and ``allow_static`` is False.
+        """
+        table = self._asof_tables["industry"]
+        visible = table.upto(decision_time)
+        if visible.height > 0:
+            return visible
+        full = table.full
+        bases = set(full["attribute_basis"].drop_nulls().unique().to_list()) if "attribute_basis" in full.columns else set()
+        if bases != {"static_snapshot"}:
+            raise PITDataError("industry snapshot is newer than decision_time")
+        known_col = "known_since" if "known_since" in full.columns else "available_at"
+        known_min = full[known_col].min()
+        if not allow_static:
+            raise PITDataError("industry snapshot is newer than decision_time")
+        snapshot_date = known_min.date().isoformat() if known_min is not None else "unknown"  # type: ignore[union-attr]
+        assumption = f"static_industry_snapshot:{snapshot_date}"
+        if assumption not in self._assumptions:
+            self._assumptions.append(assumption)
+        return full

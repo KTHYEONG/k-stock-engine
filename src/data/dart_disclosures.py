@@ -75,6 +75,27 @@ def _read_records_payload(entry_content_hash: str, payload_path: Path) -> list[o
     return records
 
 
+_TITLE_MARKER_PREFIX = re.compile(r"^(?:\[[^\]]*\])+")
+
+
+def _normalized_title(title: str) -> str:
+    return " ".join(_TITLE_MARKER_PREFIX.sub("", title).split())
+
+
+def _same_filing_relabelled(left: DisclosureRecord, right: DisclosureRecord) -> bool:
+    """True when two rows of one receipt carry the same title up to DART annotations.
+
+    DART adds leading markers such as ``[첨부추가]`` or ``[기재정정]`` and sometimes a trailing
+    note to a title after the original filing; company and receipt date never change. After marker
+    and whitespace normalization one title must be a prefix of the other. A different report kind is
+    a real conflict.
+    """
+    if (left.corp_code, left.rcept_no, left.rcept_dt) != (right.corp_code, right.rcept_no, right.rcept_dt):
+        return False
+    first, second = _normalized_title(left.report_nm), _normalized_title(right.report_nm)
+    return first.startswith(second) or second.startswith(first)
+
+
 def iter_disclosure_records(catalog: ReceiptCatalog) -> Iterator[DisclosureRecord]:
     """Stream every retained disclosure row from the catalog's latest receipts.
 
@@ -82,8 +103,12 @@ def iter_disclosure_records(catalog: ReceiptCatalog) -> Iterator[DisclosureRecor
     sources only, one payload at a time. A row missing ``corp_code``,
     ``rcept_no`` or a valid ``rcept_dt`` is skipped, as today.
 
+    Rows of one receipt whose titles differ only by leading DART markers collapse to the longer
+    (annotated) title.
+
     Raises:
-        PITDataError: a referenced payload is missing, unreadable or fails its hash.
+        PITDataError: a referenced payload is missing, unreadable or fails its hash, or one receipt
+            carries rows that differ beyond title markers.
     """
     seen: dict[str, DisclosureRecord] = {}
     for source in _DISCLOSURE_SOURCES:
@@ -107,7 +132,11 @@ def iter_disclosure_records(catalog: ReceiptCatalog) -> Iterator[DisclosureRecor
                 if previous is None:
                     seen[rcept_no] = candidate
                 elif previous != candidate:
-                    raise PITDataError(f"conflicting disclosure rows for receipt {rcept_no!r}")
+                    if not _same_filing_relabelled(previous, candidate):
+                        raise PITDataError(f"conflicting disclosure rows for receipt {rcept_no!r}")
+                    # DART가 나중에 제목에 표지·안내를 덧붙이므로 더 긴 제목을 취한다.
+                    if len(candidate.report_nm) > len(previous.report_nm):
+                        seen[rcept_no] = candidate
     yield from seen.values()
 
 

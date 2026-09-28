@@ -501,6 +501,7 @@ _LIVE_SUBCOMMANDS = frozenset(
         "build-financial-quality",
         "build-ordinary-universe",
         "build-dividend-events",
+        "build-market-actions",
         "build-investor-flow-silver",
         "build-daily-market-silver",
         "build-investor-flow-kis-supplement",

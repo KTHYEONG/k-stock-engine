@@ -60,8 +60,12 @@ def _panel_dir(tmp_path: Path, name: str) -> Path:
     return tmp_path / "gold" / name
 
 
-def _costs(commission: str = "0.00015", impact_k: float = 0.5) -> CostConfig:
-    return CostConfig(commission_rate=Decimal(commission), impact_k=impact_k)
+def _costs(commission: str = "0.00015", impact_k: float = 0.5, withholding: str = "0") -> CostConfig:
+    return CostConfig(
+        commission_rate=Decimal(commission),
+        impact_k=impact_k,
+        dividend_withholding_rate=Decimal(withholding),
+    )
 
 
 def _execution(carry: bool = False, participation: float = 1.0) -> ExecutionConfig:
@@ -485,6 +489,12 @@ def test_bad_window_and_deposits_rejected(tmp_path: Path) -> None:
         EngineConfig(
             initial_cash=1, execution=_execution(), costs=_costs(),
             halted_exit_policy=DelistPolicy.LAST_CLOSE, cash_buffer=1.0,
+        )
+    with pytest.raises(ValueError, match="allow_static_industry"):
+        EngineConfig(
+            initial_cash=1, execution=_execution(), costs=_costs(),
+            halted_exit_policy=DelistPolicy.LAST_CLOSE, cash_buffer=0.0,
+            allow_static_industry="yes",  # type: ignore[arg-type]
         )
 
 

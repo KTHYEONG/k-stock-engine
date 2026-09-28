@@ -147,3 +147,87 @@ def test_view_hides_market_arrays(tmp_path: Path) -> None:
     assert not hasattr(view, "arrays")
     assert not hasattr(view, "market_arrays")
     assert isinstance(view.t, int)
+
+
+_SNAPSHOT_AT = datetime(2026, 9, 24, 18, 0, tzinfo=KRX_TZ)
+
+
+def _industry_table(*, delisted: date | None = None) -> AsOfTable:
+    return AsOfTable(
+        pl.DataFrame(
+            {
+                "instrument_id": ["KRX:005930"],
+                "industry_name": ["전기·전자"],
+                "available_at": [_SNAPSHOT_AT],
+                "known_since": [_SNAPSHOT_AT],
+                "attribute_basis": ["static_snapshot"],
+                "delisted_on": [delisted],
+            },
+            schema={
+                "instrument_id": pl.String,
+                "industry_name": pl.String,
+                "available_at": pl.Datetime("us", "Asia/Seoul"),
+                "known_since": pl.Datetime("us", "Asia/Seoul"),
+                "attribute_basis": pl.String,
+                "delisted_on": pl.Date,
+            },
+        )
+    )
+
+
+def _industry_view(tmp_path: Path, table: AsOfTable) -> PITView:
+    arrays = _five_session_panel(tmp_path, "market_panel_test")
+    view = PITView(
+        arrays=arrays, t=0, decision_time=_decision(DAY0), asof_tables={"industry": table}
+    )
+    assert view.allow_static_industry is False
+    return view
+
+
+def test_industry_strict_pit_rejects_future_snapshot(tmp_path: Path) -> None:
+    view = _industry_view(tmp_path, _industry_table())
+    with pytest.raises(PITDataError):
+        view.industry_as_of(datetime(2020, 1, 2, 18, 0, tzinfo=KRX_TZ), allow_static=False)
+
+
+def test_industry_opt_in_returns_rows_and_records_assumption(tmp_path: Path) -> None:
+    view = _industry_view(tmp_path, _industry_table())
+    rows = view.industry_as_of(datetime(2020, 1, 2, 18, 0, tzinfo=KRX_TZ), allow_static=True)
+    assert rows.height == 1
+    assert rows["instrument_id"].to_list() == ["KRX:005930"]
+    assert view.assumptions == ("static_industry_snapshot:2026-09-24",)
+
+
+def test_industry_opt_in_keeps_delisted_names(tmp_path: Path) -> None:
+    view = _industry_view(tmp_path, _industry_table(delisted=date(2024, 5, 1)))
+    rows = view.industry_as_of(datetime(2020, 1, 2, 18, 0, tzinfo=KRX_TZ), allow_static=True)
+    assert rows.height == 1
+    assert rows["delisted_on"].to_list() == [date(2024, 5, 1)]
+
+
+def test_industry_after_snapshot_records_no_assumption(tmp_path: Path) -> None:
+    view = _industry_view(tmp_path, _industry_table())
+    rows = view.industry_as_of(datetime(2026, 9, 25, 18, 0, tzinfo=KRX_TZ), allow_static=False)
+    assert rows.height == 1
+    assert view.assumptions == ()
+
+
+def test_industry_opt_in_rejected_for_non_static_table(tmp_path: Path) -> None:
+    arrays = _five_session_panel(tmp_path, "market_panel_test")
+    table = AsOfTable(
+        pl.DataFrame(
+            {
+                "instrument_id": ["KRX:005930"],
+                "available_at": [_SNAPSHOT_AT],
+            },
+            schema={
+                "instrument_id": pl.String,
+                "available_at": pl.Datetime("us", "Asia/Seoul"),
+            },
+        )
+    )
+    view = PITView(
+        arrays=arrays, t=0, decision_time=_decision(DAY0), asof_tables={"industry": table}
+    )
+    with pytest.raises(PITDataError):
+        view.industry_as_of(datetime(2020, 1, 2, 18, 0, tzinfo=KRX_TZ), allow_static=True)
