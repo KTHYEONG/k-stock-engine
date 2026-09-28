@@ -9,7 +9,7 @@ SRC = REPO / "src"
 TOOLS = REPO / "tools"
 SECRETS_MODULE = SRC / "config" / "secrets.py"
 # Reference-only until the parser spec deletes the tool; never executed.
-EXCLUDED = {REPO / "tools" / "legacy_recovery", REPO / "tools" / "agent_skills"}
+EXCLUDED = {REPO / "tools" / "agent_skills"}
 
 _PATH_PREFIXES = ("config/", "data/", "/home/")
 

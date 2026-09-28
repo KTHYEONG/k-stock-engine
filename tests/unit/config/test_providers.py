@@ -316,3 +316,39 @@ def test_runner_policy_per_provider() -> None:
         provider.runner("nyse")
     with pytest.raises(ConfigError, match="no declared policy"):
         provider.runner("dart", key_env="OPENDART_API_KEY_9")
+
+
+def test_document_parser_defaults_to_untrusted_gate() -> None:
+    """Fail closed: a policy that does not say so never trusts document facts.
+
+    The shipped file flips ``trusted`` only after the precision benchmark passes,
+    so the default is checked on the model and the gate values on the shipped file.
+    """
+    from src.config.providers import DocumentParserPolicy
+
+    assert DocumentParserPolicy().trusted is False
+    provider = _policy()
+    assert provider.dart.document_parser.min_precision == 0.995
+    assert provider.dart.document_parser.benchmark_sample == 300
+
+
+def test_document_parser_rejects_bad_precision() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DocumentParserPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        DocumentParserPolicy(trusted=False, min_precision=0.0, benchmark_sample=300)
+    with pytest.raises(pydantic.ValidationError):
+        DocumentParserPolicy(trusted=False, min_precision=1.5, benchmark_sample=300)
+
+
+def test_document_parser_rejects_bad_sample() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DocumentParserPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        DocumentParserPolicy(trusted=False, min_precision=0.995, benchmark_sample=0)

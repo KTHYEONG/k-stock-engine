@@ -1,6 +1,3 @@
-import pytest
-
-
 def test_normalize_corporate_action_records_preserves_settlement_and_rejects_legacy_bonus() -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -343,18 +340,44 @@ def test_non_mapping_and_keyless_pages_skipped() -> None:
     assert quarantined == ()
 
 
-def _attested_page(*, filing_id: str, published_at, verification) -> dict:
-    record = _legacy_record(
-        filing_id=filing_id, published_at=published_at,
-        extra={'source_kind': 'legacy_document_verified', 'verification': verification},
-    )
-    return {'source_kind': 'legacy_document_verified', 'records': [record]}
+def _document_record(*, filing_id: str, published_at, fact: str = 'assets', basis: str = 'point_in_time', extra: dict | None = None) -> dict:
+    from src.integrations.dart.document_statements import PARSER_VERSION
+
+    record = {
+        'ticker': '005930',
+        'corp_code': '00126380',
+        'fiscal_period': '2024Q3',
+        'reprt_code': '11014',
+        'filing_id': filing_id,
+        'fact': fact,
+        'published_at': published_at,
+        'value': 10.0,
+        'unit': 'KRW',
+        'consolidated': True,
+        'source_kind': 'document_verified',
+        'period_basis': basis,
+        'parser_version': PARSER_VERSION,
+        'checks': ['bs_balance'],
+    }
+    if extra:
+        record.update(extra)
+    return record
 
 
-_ATTESTATION = {'benchmark_id': 'b' * 64, 'fact_class': 'balance_sheet', 'checks': ['identity']}
+def _document_page(*, filing_id: str, published_at, records: list | None = None) -> dict:
+    from src.integrations.dart.document_statements import PARSER_VERSION
+
+    if records is None:
+        records = [_document_record(filing_id=filing_id, published_at=published_at)]
+    return {
+        'source_kind': 'document_verified',
+        'parser_version': PARSER_VERSION,
+        'checks': ['bs_balance'],
+        'records': records,
+    }
 
 
-def test_attested_page_enters_silver() -> None:
+def test_verified_facts_trusted_when_enabled() -> None:
     from datetime import UTC, datetime
 
     from src.core.time import SessionCalendar
@@ -362,28 +385,45 @@ def test_attested_page_enters_silver() -> None:
 
     published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
     frame, quarantined = normalize_dart_financial_facts_with_quarantine(
-        pages=[_attested_page(filing_id='ATT', published_at=published, verification=_ATTESTATION)],
+        pages=[_document_page(filing_id='DOC', published_at=published)],
         disclosure_rows=(), source_hash='a' * 64,
         calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
         decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=True,
     )
 
-    assert frame['source_kind'].to_list() == ['legacy_document_verified']
+    assert frame['filing_id'].to_list() == ['DOC']
     assert quarantined == ()
 
 
-@pytest.mark.parametrize(
-    'verification',
-    [
-        None,
-        {},
-        {'benchmark_id': ' ', 'fact_class': 'balance_sheet', 'checks': ['identity']},
-        {'benchmark_id': 'b' * 64, 'fact_class': '', 'checks': ['identity']},
-        {'benchmark_id': 'b' * 64, 'fact_class': 'balance_sheet', 'checks': []},
-        {'benchmark_id': 'b' * 64, 'fact_class': 'balance_sheet', 'checks': 'identity'},
-    ],
-)
-def test_attested_page_without_complete_attestation_fails_closed(verification) -> None:
+def test_frame_hash_column_is_string_without_document_rows() -> None:
+    """A batch of standard-API rows only must still stage raw_document_hash as String.
+
+    An all-None column is otherwise Null typed and cannot be concatenated with
+    a batch that carries document hashes.
+    """
+    import polars as pl
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
+
+    published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
+    record = _document_record(filing_id='STD', published_at=published, extra={'source_kind': 'opendart_standard'})
+    for key in ('period_basis', 'parser_version', 'checks'):
+        record.pop(key)
+    frame, _ = normalize_dart_financial_facts_with_quarantine(
+        pages=[{'source_kind': 'opendart_standard', 'records': [record]}],
+        disclosure_rows=(), source_hash='b' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+    )
+
+    assert frame['raw_document_hash'].dtype == pl.String
+    assert frame['raw_document_hash'].to_list() == [None]
+
+
+def test_trust_disabled_quarantines() -> None:
     from datetime import UTC, datetime
 
     from src.core.time import SessionCalendar
@@ -391,33 +431,81 @@ def test_attested_page_without_complete_attestation_fails_closed(verification) -
 
     published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
     frame, quarantined = normalize_dart_financial_facts_with_quarantine(
-        pages=[_attested_page(filing_id='ATT', published_at=published, verification=verification)],
+        pages=[_document_page(filing_id='DOC', published_at=published)],
         disclosure_rows=(), source_hash='a' * 64,
         calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
         decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=False,
     )
 
     assert frame.is_empty()
-    assert [q.filing_id for q in quarantined] == ['ATT']
+    assert [q.filing_id for q in quarantined] == ['DOC']
 
 
-def test_attested_page_level_verification_is_inherited_by_records() -> None:
+def test_stale_parser_version_quarantines() -> None:
     from datetime import UTC, datetime
 
     from src.core.time import SessionCalendar
     from src.data.normalization import normalize_dart_financial_facts_with_quarantine
 
     published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
-    record = _legacy_record(filing_id='ATT', published_at=published, extra={'source_kind': 'legacy_document_verified'})
-    page = {'source_kind': 'legacy_document_verified', 'verification': _ATTESTATION, 'records': [record]}
+    page = _document_page(filing_id='DOC', published_at=published)
+    page['parser_version'] = 'old'
+    for record in page['records']:
+        record['parser_version'] = 'old'
     frame, quarantined = normalize_dart_financial_facts_with_quarantine(
-        pages=[page], disclosure_rows=(), source_hash='a' * 64,
+        pages=[page],
+        disclosure_rows=(), source_hash='a' * 64,
         calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
         decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=True,
     )
 
-    assert frame['filing_id'].to_list() == ['ATT']
+    assert frame.is_empty()
+    assert [q.filing_id for q in quarantined] == ['DOC']
+
+
+def test_basis_mismatch_drops_the_record_only() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
+
+    published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
+    records = [
+        _document_record(filing_id='DOC', published_at=published, fact='sales', basis='cumulative'),
+        _document_record(filing_id='DOC', published_at=published, fact='assets', basis='point_in_time'),
+    ]
+    frame, quarantined = normalize_dart_financial_facts_with_quarantine(
+        pages=[_document_page(filing_id='DOC', published_at=published, records=records)],
+        disclosure_rows=(), source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=True,
+    )
+
+    assert 'sales' not in frame['fact'].to_list()
+    assert 'assets' in frame['fact'].to_list()
     assert quarantined == ()
+
+
+def test_legacy_stays_quarantined() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
+
+    published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
+    frame, quarantined = normalize_dart_financial_facts_with_quarantine(
+        pages=[_legacy_page(filing_id='LEG', published_at=published)],
+        disclosure_rows=(), source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=True,
+    )
+
+    assert frame.is_empty()
+    assert [q.filing_id for q in quarantined] == ['LEG']
 
 def canonical_page(*, filing_id: str, fiscal_period: str, published_at, value: float) -> dict:
     return {
@@ -873,4 +961,94 @@ def test_normalize_disclosure_availability_boundaries_are_ignored() -> None:
         decision_time=datetime(2024, 1, 4, tzinfo=UTC),
     )
     assert frame.is_empty()
+    assert quarantined == ()
+
+
+def test_document_basis_boundaries() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import _document_record_trusted, _expected_document_basis
+
+    assert _expected_document_basis("assets", "11013") == "point_in_time"
+    assert _expected_document_basis("cash", "11011") is None
+    assert _expected_document_basis("operating_cash_flow", "11011") == "annual"
+    assert _expected_document_basis("operating_cash_flow", "11014") == "cumulative"
+    assert _expected_document_basis("capex", "99999") is None
+    assert _expected_document_basis("mystery", "11011") is None
+
+    from src.integrations.dart.document_statements import PARSER_VERSION
+
+    base = {
+        "parser_version": PARSER_VERSION,
+        "checks": "bs_balance",
+        "fact": "assets",
+        "period_basis": "point_in_time",
+        "reprt_code": "11014",
+    }
+    assert _document_record_trusted(dict(base)) is True
+    assert _document_record_trusted({**base, "checks": ["other"]}) is None
+    assert _document_record_trusted({**base, "checks": 42}) is None
+    assert _document_record_trusted({**base, "fact": "cash", "period_basis": "point_in_time"}) is True
+    assert _document_record_trusted({**base, "fact": "cash", "period_basis": "annual", "reprt_code": "11011"}) is True
+    assert _document_record_trusted({**base, "fact": "cash", "period_basis": "annual", "reprt_code": "11014"}) is False
+    assert _document_record_trusted({**base, "fact": "cash", "period_basis": "cumulative", "reprt_code": "11014"}) is True
+    assert _document_record_trusted({**base, "fact": "cash", "period_basis": "quarter"}) is False
+    assert _document_record_trusted({**base, "fact": "mystery", "period_basis": "quarter"}) is False
+    assert _document_record_trusted({**base, "fact": "sales", "period_basis": "quarter", "reprt_code": ""}) is False
+    assert (
+        _document_record_trusted(
+            {**base, "fact": "sales", "period_basis": "quarter", "reprt_code": "", "fiscal_period": "2024Q3"}
+        )
+        is True
+    )
+
+    calendar = SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14')))
+    kwargs = {
+        'disclosure_rows': (), 'source_hash': 'a' * 64,
+        'calendar': calendar, 'decision_time': datetime(2024, 11, 20, tzinfo=UTC),
+        'trust_document_facts': True,
+    }
+    page = _document_page(
+        filing_id='CASH',
+        published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+        records=[
+            _document_record(filing_id='CASH', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+                             fact='operating_cash_flow', basis='cumulative',
+                             extra={'reprt_code': '11014'}),
+            _document_record(filing_id='CASH', published_at=datetime(2024, 11, 13, 0, 0, tzinfo=UTC),
+                             fact='cash', basis='cumulative', extra={'reprt_code': '11014'}),
+        ],
+    )
+    frame, quarantined = __import__('src.data.normalization', fromlist=['normalize_dart_financial_facts_with_quarantine']).normalize_dart_financial_facts_with_quarantine(
+        pages=[page], **kwargs
+    )
+    assert set(frame['fact'].to_list()) == {'operating_cash_flow', 'cash'}
+    assert quarantined == ()
+
+
+def test_document_page_level_parser_inherited() -> None:
+    from datetime import UTC, datetime
+
+    from src.core.time import SessionCalendar
+    from src.data.normalization import normalize_dart_financial_facts_with_quarantine
+
+    published = datetime(2024, 11, 13, 0, 0, tzinfo=UTC)
+    record = _document_record(filing_id='INH', published_at=published)
+    del record['parser_version']
+    del record['checks']
+    page = {
+        'source_kind': 'document_verified',
+        'parser_version': record.get('parser_version') or __import__('src.integrations.dart.document_statements', fromlist=['PARSER_VERSION']).PARSER_VERSION,
+        'checks': ['bs_balance'],
+        'records': [record],
+    }
+    frame, quarantined = normalize_dart_financial_facts_with_quarantine(
+        pages=[page], disclosure_rows=(), source_hash='a' * 64,
+        calendar=SessionCalendar((_kst_open('2024-11-13'), _kst_open('2024-11-14'))),
+        decision_time=datetime(2024, 11, 20, tzinfo=UTC),
+        trust_document_facts=True,
+    )
+
+    assert frame['filing_id'].to_list() == ['INH']
     assert quarantined == ()

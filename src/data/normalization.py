@@ -16,23 +16,71 @@ from src.core.time import KRX_TZ, SessionCalendar
 _DART_MAPPING_VERSION = "dart-fact-map-v1"
 
 
-TRUSTED_FACT_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"opendart_standard", "legacy_document_verified"})
-ATTESTED_FACT_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"legacy_document_verified"})
+TRUSTED_FACT_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"opendart_standard"})
+
+_DOCUMENT_SOURCE_KIND: Final = "document_verified"
+
+_BALANCE_SHEET_FACTS: Final = frozenset({"assets", "debt", "equity"})
+_INCOME_FACTS: Final = frozenset({"sales", "gross_profit", "operating_profit", "net_income"})
+_CASH_FLOW_FACTS: Final = frozenset({"operating_cash_flow", "capex"})
 
 
-def _has_valid_attestation(record: Mapping[str, Any]) -> bool:
-    """Return True only when the record carries a complete attestation mapping."""
-    verification = record.get("verification")
-    if not isinstance(verification, Mapping):
-        return False
-    benchmark_id = verification.get("benchmark_id")
-    if not isinstance(benchmark_id, str) or not benchmark_id.strip():
-        return False
-    fact_class = verification.get("fact_class")
-    if not isinstance(fact_class, str) or not fact_class.strip():
-        return False
-    checks = verification.get("checks")
-    return isinstance(checks, list) and bool(checks)
+def _expected_document_basis(fact: str, reprt_code: str) -> str | None:
+    """Return the period basis the standard path implies for one fact and report."""
+    code = str(reprt_code or "").strip()
+    if fact in _BALANCE_SHEET_FACTS:
+        return "point_in_time"
+    if fact == "cash":
+        return None
+    if fact in _INCOME_FACTS:
+        return "annual" if code == "11011" else "quarter" if code in {"11012", "11013", "11014"} else None
+    if fact in _CASH_FLOW_FACTS:
+        return "annual" if code == "11011" else "cumulative" if code in {"11012", "11013", "11014"} else None
+    return None
+
+
+def _document_record_trusted(record: Mapping[str, Any]) -> bool | None:
+    """Decide one ``document_verified`` record: True, False (drop only it), or None (quarantine filing).
+
+    Returns ``None`` when the parser version or the balance-sheet check fails,
+    which quarantines the whole filing fail closed. A period-basis mismatch
+    returns ``False`` so only that record is dropped.
+    """
+    from src.integrations.dart.document_statements import PARSER_VERSION
+
+    if str(record.get("parser_version") or "") != PARSER_VERSION:
+        return None
+    checks = record.get("checks")
+    if isinstance(checks, str):
+        checks_list = [checks]
+    elif isinstance(checks, (list, tuple, set, frozenset)):
+        checks_list = list(checks)
+    else:
+        checks_list = []
+    if "bs_balance" not in checks_list:
+        return None
+    fact = str(record.get("fact") or "").strip()
+    basis = str(record.get("period_basis") or "").strip()
+    if fact == "cash":
+        if basis not in {"point_in_time", "cumulative", "annual"}:
+            return False
+        reprt_code = str(record.get("reprt_code") or "").strip()
+        if basis == "point_in_time":
+            return True
+        if basis == "annual":
+            return reprt_code == "11011"
+        return reprt_code in {"11012", "11013", "11014"}
+    expected = _expected_document_basis(fact, str(record.get("reprt_code") or ""))
+    if expected is None:
+        page_code = str(record.get("reprt_code") or "").strip()
+        if not page_code:
+            fiscal = str(record.get("fiscal_period") or "")
+            suffix = fiscal[4:] if len(fiscal) == 6 else ""
+            derived = {"Q1": "11013", "Q2": "11012", "Q3": "11014", "Q4": "11011"}.get(suffix, "")
+            expected = _expected_document_basis(fact, derived)
+        if expected is None:
+            return False
+    return basis == expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,17 +106,14 @@ def _flatten_dart_fact_pages(page_list: list[Any]) -> list[Mapping[str, Any]]:
             page_hash = page.get("raw_document_hash")
             raw_identity = page.get("identity")
             page_identity: Mapping[str, Any] = raw_identity if isinstance(raw_identity, Mapping) else {}
-            raw_verification = page.get("verification")
-            page_verification: Mapping[str, Any] | None = (
-                raw_verification if isinstance(raw_verification, Mapping) else None
-            )
             for rec in page["records"]:
                 if isinstance(rec, Mapping):
                     merged: dict[str, Any] = dict(rec)
                     merged.setdefault("source_kind", page_kind)
                     merged.setdefault("mapping_version", page_version)
-                    if page_verification is not None:
-                        merged.setdefault("verification", page_verification)
+                    for inherit_key in ("parser_version", "checks", "period_basis", "reprt_code", "biz_year"):
+                        if merged.get(inherit_key) in (None, "") and page.get(inherit_key) not in (None, ""):
+                            merged[inherit_key] = page.get(inherit_key)
                     if "raw_document_hash" not in merged:
                         merged["raw_document_hash"] = page_hash
                     for k in ("company_id", "filing_id", "fiscal_period", "published_at"):
@@ -194,6 +239,7 @@ def normalize_dart_financial_facts_with_quarantine(
     ticker_by_corp_code: Mapping[str, str] | None = None,
     bridge_receipt_hash: str | None = None,
     trusted_source_kinds: frozenset[str] = TRUSTED_FACT_SOURCE_KINDS,
+    trust_document_facts: bool = False,
 ) -> tuple[pl.DataFrame, tuple[QuarantinedFiling, ...]]:
     """Normalize trusted DART fact records and list the filings withheld as untrusted.
 
@@ -213,6 +259,8 @@ def normalize_dart_financial_facts_with_quarantine(
         ticker_by_corp_code: Frozen corp-code bridge for pages lacking a ticker.
         bridge_receipt_hash: Receipt hash of the bridge.
         trusted_source_kinds: Source kinds whose values may enter Silver.
+        trust_document_facts: When True, ``document_verified`` pages passing
+            the parser-version, balance-sheet and period-basis checks enter Silver.
 
     Returns:
         The fact frame (same schema as ``normalize_dart_financial_facts``) and the
@@ -273,10 +321,16 @@ def normalize_dart_financial_facts_with_quarantine(
             continue
         company_id, dart_corp_code, ticker = resolved
         source_kind = str(rec.get("source_kind") or "opendart_standard")
-        if source_kind in ATTESTED_FACT_SOURCE_KINDS and not _has_valid_attestation(rec):
-            trusted = False
+        effective_trusted = set(trusted_source_kinds)
+        if trust_document_facts:
+            effective_trusted.add(_DOCUMENT_SOURCE_KIND)
+        if source_kind == _DOCUMENT_SOURCE_KIND and source_kind in effective_trusted:
+            verdict = _document_record_trusted(rec)
+            if verdict is False:
+                continue
+            trusted = verdict is True
         else:
-            trusted = source_kind in trusted_source_kinds
+            trusted = source_kind in effective_trusted
         if not trusted:
             timing = _fact_availability(
                 rec=rec,
@@ -387,7 +441,9 @@ def normalize_dart_financial_facts_with_quarantine(
     )
     if not rows:
         return _empty_dart_fact_frame(), quarantined
-    return pl.DataFrame(rows), quarantined
+    # 표준 API 행만 있는 배치는 raw_document_hash가 전부 None이라 Null 타입이 된다.
+    # 문서 유래 행이 섞인 배치(String)와 합칠 수 있도록 항상 String으로 고정한다.
+    return pl.DataFrame(rows).with_columns(pl.col("raw_document_hash").cast(pl.String)), quarantined
 
 
 def _as_aware(value: Any, fallback: datetime) -> datetime:

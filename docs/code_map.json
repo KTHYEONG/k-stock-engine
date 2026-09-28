@@ -238,5 +238,11 @@
   },
   "src/data/dart_disclosures.py": {
     "testing": "tests/unit/data/test_dart_disclosures.py"
+  },
+  "src/integrations/dart/document_statements.py": {
+    "testing": [
+      "tests/unit/integrations/dart/test_document_statements.py",
+      "tests/unit/data/test_dart_document_benchmark.py"
+    ]
   }
 }

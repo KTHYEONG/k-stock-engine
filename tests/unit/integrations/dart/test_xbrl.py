@@ -1049,7 +1049,7 @@ def test_fetch_one_financial_fact_source_rejects_invalid_and_parses_valid_legacy
     bad_zip_page = collector_bad_zip._fetch_one_financial_fact_source(identity)
     assert bad_zip_page["diagnostics"] == ("invalid_document_archive",)
 
-    # Given/When/Then: a valid zip with a well-formed two-account statement parses successfully.
+    # Given/When/Then: a valid zip without form sections verifies nothing.
     good_xml = (
         '<?xml version="1.0" encoding="utf-8"?>'
         "<document>"
@@ -1066,8 +1066,10 @@ def test_fetch_one_financial_fact_source_rejects_invalid_and_parses_valid_legacy
         request_bytes=lambda _e, _p: good_archive,
     )
     good_page = collector_good._fetch_one_financial_fact_source(identity)
-    assert good_page["source_kind"] == "legacy_document"
-    assert len(good_page["records"]) >= 1
+    assert good_page["source_kind"] == "document_verified"
+    assert good_page["status"] == "extraction_failed"
+    assert good_page["records"] == []
+    assert good_page["raw_archive"] == good_archive
 
     # Given/When/Then: a valid zip with an ambiguous (duplicate) statement fails extraction.
     ambiguous_xml = (
@@ -1086,6 +1088,7 @@ def test_fetch_one_financial_fact_source_rejects_invalid_and_parses_valid_legacy
         request_bytes=lambda _e, _p: ambiguous_archive,
     )
     ambiguous_page = collector_ambiguous._fetch_one_financial_fact_source(identity)
+    assert ambiguous_page["source_kind"] == "document_verified"
     assert ambiguous_page["status"] == "extraction_failed"
     assert ambiguous_page["records"] == []
 
@@ -1358,3 +1361,86 @@ def test_dart_rejects_missing_filing_identity() -> None:
     collector = DartXbrlCollector(max_workers=1, min_interval=0.0, api_key='test-key', request_json=lambda endpoint, params: {})
     with pytest.raises(PITDataError, match='filing identity'):
         tuple(collector.fetch_xbrl_facts(({'filing_id': 'F1'},)))
+
+
+def _verified_zip_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+        handle.writestr("doc.xml", "<html>fixture</html>")
+    return buf.getvalue()
+
+
+def test_verified_document_page_carries_basis_and_archive(monkeypatch) -> None:
+    from datetime import date
+
+    from src.integrations.dart.document_statements import (
+        PARSER_VERSION,
+        DocumentParseResult,
+        PeriodBasis,
+        StatementFact,
+        VerifiedStatements,
+    )
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    statements = VerifiedStatements(
+        consolidated=True,
+        period_end=date(2020, 12, 31),
+        report_kind="annual",
+        unit_multipliers={"BS": 1},
+        facts=(
+            StatementFact(fact="assets", value=1000, basis=PeriodBasis.POINT_IN_TIME, label="자산총계"),
+            StatementFact(fact="sales", value=2000, basis=PeriodBasis.ANNUAL, label="매출액"),
+        ),
+        checks=("bs_balance",),
+    )
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=statements, diagnostics=()),
+    )
+    archive = _verified_zip_bytes()
+    collector = DartXbrlCollector(
+        api_key="k",
+        min_interval=0.0,
+        max_workers=1,
+        request_json=lambda _e, _p: {"status": "013", "list": []},
+        request_bytes=lambda _e, _p: archive,
+    )
+    page = collector._fetch_one_financial_fact_source(_collector_identity())
+
+    assert page["source_kind"] == "document_verified"
+    assert page["status"] == "000"
+    assert page["fs_div"] == "CFS"
+    assert page["parser_version"] == PARSER_VERSION
+    assert page["checks"] == ["bs_balance"]
+    assert page["raw_archive"] == archive
+    assert page["raw_document_hash"] is not None
+    assert len(page["records"]) == 2
+    assert all(record["period_basis"] for record in page["records"])
+    assert all(record["parser_version"] == PARSER_VERSION for record in page["records"])
+
+
+def test_unverified_document_is_extraction_failed(monkeypatch) -> None:
+    from src.integrations.dart.document_statements import DocumentParseResult
+    from src.integrations.dart.xbrl import DartXbrlCollector
+
+    monkeypatch.setattr(
+        "src.integrations.dart.document_statements.parse_filing_document",
+        lambda archive, *, reprt_code, biz_year: DocumentParseResult(statements=None, diagnostics=("identity_failed:bs_balance",)),
+    )
+    archive = _verified_zip_bytes()
+    collector = DartXbrlCollector(
+        api_key="k",
+        min_interval=0.0,
+        max_workers=1,
+        request_json=lambda _e, _p: {"status": "013", "list": []},
+        request_bytes=lambda _e, _p: archive,
+    )
+    page = collector._fetch_one_financial_fact_source(_collector_identity())
+
+    assert page["source_kind"] == "document_verified"
+    assert page["status"] == "extraction_failed"
+    assert page["records"] == []
+    assert page["raw_archive"] == archive

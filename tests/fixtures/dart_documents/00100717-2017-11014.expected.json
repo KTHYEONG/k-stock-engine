@@ -1,0 +1,88 @@
+{
+  "identity": {
+    "corp_code": "00100717",
+    "corp_name": "아이이",
+    "biz_year": "2017",
+    "reprt_code": "11014",
+    "rcept_no": "20171114001919"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: Q3 CFS with 3개월|누적 sub-header, quarter basis; hand-verified: BS 52692203702 == 23607280679 + 29084923023 at 2017-09-30, IS gross_profit quarter 555717201 vs cumulative 2535615707, CF tie-out holds",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2017-09-30",
+    "report_kind": "q3",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 3585874365,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 52692203702,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 23607280679,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 29084923023,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 3459521017,
+        "basis": "quarter",
+        "label": "수익(매출액"
+      },
+      {
+        "fact": "gross_profit",
+        "value": 555717201,
+        "basis": "quarter",
+        "label": "매출총이익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": -2251058315,
+        "basis": "quarter",
+        "label": "영업이익(손실"
+      },
+      {
+        "fact": "net_income",
+        "value": -2505011118,
+        "basis": "quarter",
+        "label": "당기순이익(손실"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": -3126736535,
+        "basis": "cumulative",
+        "label": "영업활동현금흐름"
+      },
+      {
+        "fact": "cash",
+        "value": 3585874365,
+        "basis": "cumulative",
+        "label": "기말현금및현금성자산"
+      }
+    ],
+    "checks": [
+      "bs_balance",
+      "cf_cash_tieout"
+    ]
+  },
+  "diagnostics": []
+}

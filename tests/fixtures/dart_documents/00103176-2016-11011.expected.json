@@ -1,0 +1,75 @@
+{
+  "identity": {
+    "corp_code": "00103176",
+    "corp_name": "흥국화재",
+    "biz_year": "2016",
+    "reprt_code": "11011",
+    "rcept_no": "20170331001148"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: annual financial company (흥국화재) CFS, spanned current column cols [2,3] with single amount, 백만원 unit; hand-verified: BS 10215979 == 9663721 + 552258 (x1e6), CF cash absent so no tie-out check",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2016-12-31",
+    "report_kind": "annual",
+    "unit_multipliers": {
+      "BS": 1000000,
+      "CF": 1000000,
+      "IS": 1000000
+    },
+    "facts": [
+      {
+        "fact": "assets",
+        "value": 10215979000000,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 9663721000000,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 552258000000,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 4335956000000,
+        "basis": "annual",
+        "label": "영업수익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": 15702000000,
+        "basis": "annual",
+        "label": "영업이익"
+      },
+      {
+        "fact": "net_income",
+        "value": 31504000000,
+        "basis": "annual",
+        "label": "당기순이익"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": 985548000000,
+        "basis": "annual",
+        "label": "영업활동으로인한현금흐름"
+      },
+      {
+        "fact": "capex",
+        "value": 3035000000,
+        "basis": "annual",
+        "label": "유형자산의취득"
+      }
+    ],
+    "checks": [
+      "bs_balance"
+    ]
+  },
+  "diagnostics": []
+}

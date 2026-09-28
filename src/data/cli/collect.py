@@ -273,6 +273,86 @@ def _run_collect_classification(args: argparse.Namespace, *, stage: str, collect
     )
 
 
+def _run_document_job(args: argparse.Namespace, *, job_name: str) -> dict[str, object]:
+    """One document job, emitting one JSON line per phase plus a summary."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.dart_backfill import build_scoped_dart_collector
+    from src.data.jobs.dart_documents import (
+        DartBenchmarkDocumentFetchJob,
+        DartDocumentFetchJob,
+        DartDocumentReparseJob,
+    )
+    from src.data.jobs.runner import build_job_context, run_job
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime = scoped_runtime(args)
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    key_env = getattr(args, "key_env", None) or provider.default_key_env
+    quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    dry_run = bool(getattr(args, "dry_run", False))
+    spec: Any
+    if job_name == "dart_document_reparse":
+        spec = DartDocumentReparseJob()
+    elif job_name == "dart_benchmark_documents":
+        spec = DartBenchmarkDocumentFetchJob()
+    else:
+        spec = DartDocumentFetchJob()
+    collector = None
+    if job_name in {"dart_document_fetch", "dart_benchmark_documents"} and not dry_run:  # pragma: no cover - live provider path
+        collector = build_scoped_dart_collector(provider=provider, quota_store=quota_store, key_env=key_env)
+    ctx = build_job_context(runtime=runtime, provider=provider, key_env=key_env, collector=collector)
+
+    def _emit(payload: Mapping[str, object]) -> None:
+        sys.stdout.write(json.dumps(dict(payload), sort_keys=True, default=str) + "\n")
+
+    report = run_job(
+        spec, ctx,
+        chunk_size=provider.dart.batch_identities, max_chunks=getattr(args, "max_chunks", None),
+        dry_run=dry_run, emit=_emit,
+    )
+    _LOG.info(
+        "[DATA] command=%s status=%s done=%d pending_left=%d requests_used=%d",
+        job_name, report.status, report.done, report.pending_left, report.requests_used,
+    )
+    return {"job": job_name, "status": report.status, "done": report.done,
+            "pending_left": report.pending_left, "requests_used": report.requests_used}
+
+
+def _add_document_fetch_job(parser: argparse.ArgumentParser) -> None:
+    add_scoped_args(parser)
+    parser.add_argument("--key-env", type=str, required=False, default=None)
+    _add_dry_run_max_chunks(parser)
+
+
+def _add_document_reparse_job(parser: argparse.ArgumentParser) -> None:
+    add_scoped_args(parser)
+    _add_dry_run_max_chunks(parser)
+
+
+def _run_benchmark_documents(args: argparse.Namespace) -> Mapping[str, object]:
+    """Parse stored benchmark documents and report same-filing precision."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.cli.common import CommandFailed, scoped_catalog
+    from src.data.dart_document_benchmark import BENCHMARK_SEED, run_benchmark, select_benchmark_filings
+
+    runtime = scoped_runtime(args)
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    catalog = scoped_catalog(runtime)
+    policy = provider.dart.document_parser
+    filings = select_benchmark_filings(catalog, size=policy.benchmark_sample, seed=BENCHMARK_SEED)
+    report = run_benchmark(runtime, filings=filings)
+    payload: dict[str, object] = dict(report.to_dict())
+    if report.precision < policy.min_precision:
+        raise CommandFailed(1, payload)
+    return payload
+
+
+def _add_benchmark_documents(parser: argparse.ArgumentParser) -> None:
+    add_scoped_args(parser)
+
+
 COLLECT_COMMANDS: tuple[Command, ...] = (
     Command("collect-scoped", "Persist scoped raw payloads to Bronze and catalog", _add_collect_scoped, _run_collect_scoped),
     Command("collect-krx-daily-market", "Collect KRX daily-market pages for completed sessions", _add_krx_job,
@@ -289,6 +369,14 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_dart_job(args, job_name="dart_facts")),
     Command("collect-dividend-decisions", "Collect DART cash-dividend decision archives", _add_dart_job,
             lambda args: _run_dart_job(args, job_name="dividend_decisions")),
+    Command("reparse-dart-documents", "Re-derive document fact pages from stored archives", _add_document_reparse_job,
+            lambda args: _run_document_job(args, job_name="dart_document_reparse")),
+    Command("collect-dart-documents", "Fetch document archives for relevant document-path identities", _add_document_fetch_job,
+            lambda args: _run_document_job(args, job_name="dart_document_fetch")),
+    Command("collect-dart-benchmark-documents", "Fetch document archives for benchmark filings", _add_document_fetch_job,
+            lambda args: _run_document_job(args, job_name="dart_benchmark_documents")),
+    Command("benchmark-dart-documents", "Benchmark parsed documents against same-filing standard labels", _add_benchmark_documents,
+            _run_benchmark_documents),
     Command("collect-industry-classification", "Collect current KIS industry classifications to Bronze", _add_classification,
             lambda args: _run_collect_classification(args, stage="collect-industry-classification",
                                                      collector="KisIndustryCollector",

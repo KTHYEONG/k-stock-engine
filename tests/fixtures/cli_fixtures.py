@@ -72,6 +72,9 @@ def _write_cli_fact_receipt(bronze_root, payload_text) -> None:
         ),
         encoding="utf-8",
     )
+    from tests.fixtures import register_fact_page
+
+    register_fact_page(bronze_root, receipt_dir)
 
 
 
@@ -484,6 +487,10 @@ _LIVE_SUBCOMMANDS = frozenset(
         "collect-dart-corp-codes",
         "collect-dart-facts",
         "collect-dividend-decisions",
+        "reparse-dart-documents",
+        "collect-dart-documents",
+        "collect-dart-benchmark-documents",
+        "benchmark-dart-documents",
         "collect-krx-daily-market",
         "collect-krx-security-master",
         "collect-ls-investor-flow",
