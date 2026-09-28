@@ -54,10 +54,20 @@ def _sha256_file(path: Path) -> str:
 
 
 def _discover_fact_receipts(bronze_root: Path) -> list[dict[str, object]]:
-    kind_dir = Path(bronze_root) / EvidenceKind.FINANCIAL_FACTS.value
-    if not kind_dir.exists():
-        raise PITDataError("missing required evidence: financial_facts")
-    receipt_paths = sorted(kind_dir.rglob("receipt.json"))
+    """Latest catalog page of every fact identity, integrity-checked.
+
+    Only the catalog's latest receipt per natural key is an input. Older pages of
+    the same identity stay on disk, but reading them too would let a page that a
+    newer one replaced (a legacy fallback, a re-fetch) leak into Silver and
+    conflict with its successor.
+    """
+    from src.data.receipt_catalog import ReceiptCatalog
+
+    catalog = ReceiptCatalog(Path(bronze_root) / "catalog")
+    receipt_paths = sorted(
+        Path(str(entry.payload_path)).parent / "receipt.json"
+        for entry in catalog.entries(source=EvidenceKind.FINANCIAL_FACTS.value)
+    )
     if not receipt_paths:
         raise PITDataError("missing required evidence: financial_facts")
     verified: list[dict[str, object]] = []
@@ -314,6 +324,7 @@ def refresh_dart_financial_facts(
     superseded_receipt_hashes: frozenset[str] = frozenset(),
     disclosures_dataset_id: str | None = None,
     financial_facts_dataset_id: str | None = None,
+    trust_document_facts: bool = False,
 ) -> DartFactRefreshArtifact:
     """Rebuild the financial-facts Silver table from every verified Bronze fact receipt.
 
@@ -353,7 +364,15 @@ def refresh_dart_financial_facts(
         raise PITDataError("batch_size must be positive")
     bound = int(batch_size)
     receipts = _discover_fact_receipts(Path(bronze_root))
-    unknown = superseded_receipt_hashes - {str(r["content_hash"]) for r in receipts}
+    from src.data.receipt_catalog import ReceiptCatalog as _Catalog
+
+    stored_catalog = _Catalog(Path(bronze_root) / "catalog")
+    stored_hashes = {
+        blob.content_hash
+        for usable in (True, False)
+        for blob in stored_catalog.blobs(source=EvidenceKind.FINANCIAL_FACTS.value, usable=usable)
+    } | {str(r["content_hash"]) for r in receipts}
+    unknown = superseded_receipt_hashes - stored_hashes
     if unknown:
         raise PITDataError(f"superseded receipts not found in Bronze: {sorted(unknown)}")
     receipts = [r for r in receipts if str(r["content_hash"]) not in superseded_receipt_hashes]
@@ -394,6 +413,7 @@ def refresh_dart_financial_facts(
                 decision_time=decision_time,
                 ticker_by_corp_code=bridge,
                 bridge_receipt_hash=bridge_receipt_hash,
+                trust_document_facts=trust_document_facts,
             )
             quarantined_all.extend(batch_quarantine)
             if frame.height > 0:
@@ -420,6 +440,7 @@ def refresh_dart_financial_facts(
             decision_time=decision_time,
             ticker_by_corp_code=bridge,
             bridge_receipt_hash=bridge_receipt_hash,
+            trust_document_facts=trust_document_facts,
         )
         quarantined_all.extend(empty_quarantine)
     merged = _merge_fact_frames(None, new_rows)
@@ -442,13 +463,15 @@ def refresh_dart_financial_facts(
         for record in _deduplicate_quarantine(quarantined_all)
         if (record.company_id, record.fiscal_period, record.filing_id) not in trusted_filings
     ]
-    trusted_kinds = sorted(TRUSTED_FACT_SOURCE_KINDS)
+    trusted_kinds = sorted(TRUSTED_FACT_SOURCE_KINDS if not trust_document_facts else (TRUSTED_FACT_SOURCE_KINDS | {"document_verified"}))
     quarantine_path = _write_quarantine_file(
         artifact_root=Path(artifact_root), output_hash=output_hash, records=quarantined
     )
     calendar_digest = hashlib.sha256(
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
     ).hexdigest()
+    from src.integrations.dart.document_statements import PARSER_VERSION as _PARSER_VERSION
+
     identity = DatasetIdentity(
         kind="financial_facts",
         layer=DatasetLayer.SILVER,
@@ -464,6 +487,8 @@ def refresh_dart_financial_facts(
             "availability_policy": AVAILABILITY_POLICY,
             "calendar_digest": calendar_digest,
             "ticker_bridge": bridge_receipt_hash,
+            "trust_document_facts": trust_document_facts,
+            "document_parser_version": _PARSER_VERSION,
         },
     )
     published = publish_dataset(
@@ -524,11 +549,16 @@ def normalize_dart_facts(
     superseded_receipts: Path | None = None,
     disclosures_dataset_id: str | None = None,
     financial_facts_dataset_id: str | None = None,
+    trust_document_facts: bool | None = None,
 ) -> dict[str, object]:
     """Incremental DART fact refresh entry point for the normalize-dart-facts command."""
     from src.core.krx_calendar import xkrx_calendar_through
     from src.core.time import KRX_TZ
 
+    if trust_document_facts is None:
+        from src.config import load_provider_policy, load_runtime_config
+
+        trust_document_facts = bool(load_provider_policy(load_runtime_config()).dart.document_parser.trusted)
     artifact = refresh_dart_financial_facts(
         bronze_root=Path(bronze_root),
         silver_root=Path(silver_root),
@@ -541,5 +571,6 @@ def normalize_dart_facts(
         else frozenset(),
         disclosures_dataset_id=disclosures_dataset_id,
         financial_facts_dataset_id=financial_facts_dataset_id,
+        trust_document_facts=bool(trust_document_facts),
     )
     return {"output_hash": artifact.output_hash, "report_hash": artifact.report_hash, "row_count": artifact.row_count, "quarantined_filings": artifact.quarantined_filings, "quarantine_path": artifact.quarantine_path, "dataset_path": artifact.dataset_path}

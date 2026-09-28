@@ -11,6 +11,11 @@ disclosure_types = ["A", "I001"]
 # Days a retained corp-code bridge stays fresh without a missing ticker.
 corp_codes_max_age_days = 30
 
+[dart.document_parser]
+trusted = true
+min_precision = 0.995
+benchmark_sample = 300
+
 # Primary key shared with other projects: conservative budget and reserve.
 [dart.keys.OPENDART_API_KEY]
 daily_limit = 20000

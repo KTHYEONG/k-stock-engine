@@ -325,9 +325,12 @@ def test_resolve_dart_job_registry() -> None:
     from src.core.pit import PITDataError
     from src.data.jobs.dart import DART_JOBS, resolve_dart_job
 
-    assert set(DART_JOBS) == {"dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions"}
+    assert set(DART_JOBS) == {"dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions", "dart_document_reparse", "dart_document_fetch", "dart_benchmark_documents"}
     assert resolve_dart_job("dart_facts").name == "dart_facts"
     assert resolve_dart_job("dart_corp_codes").name == "dart_corp_codes"
+    assert resolve_dart_job("dart_document_reparse").name == "dart_document_reparse"
+    assert resolve_dart_job("dart_document_fetch").name == "dart_document_fetch"
+    assert resolve_dart_job("dart_benchmark_documents").name == "dart_benchmark_documents"
     with pytest.raises(PITDataError, match="unknown DART job"):
         resolve_dart_job("nope")
 

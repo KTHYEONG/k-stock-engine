@@ -4,12 +4,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tests.fixtures.catalog_fixtures import blob_for, seed_corp_code_bridge, seed_receipts
+from tests.fixtures.catalog_fixtures import blob_for, register_fact_page, seed_corp_code_bridge, seed_receipts
 
 __all__ = [
     "blob_for",
     "fake_transport",
     "publish_fixture_dataset",
+    "register_fact_page",
     "scope_runtime",
     "seed_corp_code_bridge",
     "seed_receipts",

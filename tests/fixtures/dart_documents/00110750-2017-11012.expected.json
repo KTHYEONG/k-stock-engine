@@ -1,0 +1,16 @@
+{
+  "identity": {
+    "corp_code": "00110750",
+    "corp_name": "GMI벤처",
+    "biz_year": "2017",
+    "reprt_code": "11012",
+    "rcept_no": "20171114001347"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: WITHHELD March-fiscal-year company (제미니투자): consolidated section has no statements (missing_statement:BS); separate BS dated 2017-09-30 against 11012 expectation 2017-06-30 (period_mismatch)",
+  "statements": null,
+  "diagnostics": [
+    "missing_statement:BS",
+    "period_mismatch"
+  ]
+}

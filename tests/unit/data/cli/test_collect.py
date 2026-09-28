@@ -645,3 +645,31 @@ def test_collect_scoped_rejects_unreadable_payload_files(tmp_path, capsys) -> No
     not_rows.write_text(json.dumps([42]), encoding="utf-8")
     assert main(["collect-scoped", *base, "--payloads", str(not_rows)]) == 2
     assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_reparse_and_fetch_documents_dry_run(tmp_path, capsys) -> None:
+    from pathlib import Path
+
+    from src.data.cli import main
+    from tests.fixtures.cli_fixtures import _cli_json_lines
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    assert main([
+        "reparse-dart-documents",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--dry-run",
+    ]) == 0
+    summary = _cli_json_lines(capsys)[-1]
+    assert summary["job"] == "dart_document_reparse"
+    assert summary["status"] == "dry_run"
+
+    assert main([
+        "collect-dart-documents",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--dry-run",
+    ]) == 0
+    summary = _cli_json_lines(capsys)[-1]
+    assert summary["job"] == "dart_document_fetch"
+    assert summary["status"] == "dry_run"

@@ -1,0 +1,90 @@
+{
+  "identity": {
+    "corp_code": "00100717",
+    "corp_name": "아이이",
+    "biz_year": "2017",
+    "reprt_code": "11011",
+    "rcept_no": "20180404002030"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: annual CFS, new layout (heading table), full KRW; hand-verified: BS 29168292242 == 18685164890 + 10483127352, IS sales from 수익(매출액) row, CF tie-out holds with duplicate operating_cash_flow row withheld as ambiguous_fact",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2017-12-31",
+    "report_kind": "annual",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 2800776128,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 29168292242,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 18685164890,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 10483127352,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 15278143559,
+        "basis": "annual",
+        "label": "수익(매출액"
+      },
+      {
+        "fact": "gross_profit",
+        "value": 2571300031,
+        "basis": "annual",
+        "label": "매출총이익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": -6848221325,
+        "basis": "annual",
+        "label": "영업이익(손실"
+      },
+      {
+        "fact": "net_income",
+        "value": -28269614795,
+        "basis": "annual",
+        "label": "당기순이익(손실"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": -10972496780,
+        "basis": "annual",
+        "label": "영업활동현금흐름"
+      },
+      {
+        "fact": "cash",
+        "value": 2800776128,
+        "basis": "annual",
+        "label": "기말현금및현금성자산"
+      }
+    ],
+    "checks": [
+      "bs_balance",
+      "cf_cash_tieout"
+    ]
+  },
+  "diagnostics": [
+    "ambiguous_fact:operating_cash_flow"
+  ]
+}

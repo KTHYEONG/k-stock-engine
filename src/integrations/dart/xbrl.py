@@ -313,11 +313,8 @@ class DartXbrlCollector:
         fallback, and any other response failure returns an ``unavailable``
         record preserving the original error text in diagnostics.
         """
-        from src.integrations.dart.legacy_filing import (
-            MAPPING_VERSION,
-            map_standardized_account,
-            parse_legacy_filing_archive,
-        )
+        from src.integrations.dart.accounts import MAPPING_VERSION, map_standardized_account
+        from src.integrations.dart.document_statements import document_verified_page, parse_filing_document
         from src.integrations.errors import ProviderQuotaExhaustedError, ProviderRetryableError
 
         def _blocked_record(status: str) -> dict[str, Any]:
@@ -552,29 +549,10 @@ class DartXbrlCollector:
         import hashlib
 
         digest = hashlib.sha256(bytes(archive)).hexdigest()
-        parsed = parse_legacy_filing_archive(
-            archive_bytes=bytes(archive), identity=dict(identity), document_hash=digest
+        parsed = parse_filing_document(
+            bytes(archive),
+            reprt_code=str(identity.get("reprt_code") or ""),
+            biz_year=str(identity.get("biz_year") or ""),
         )
-        if parsed.status == "extraction_failed" and not parsed.records:
-            return {
-                "source_kind": "legacy_document",
-                "status": "extraction_failed",
-                "identity": dict(identity),
-                "records": [],
-                "mapping_version": MAPPING_VERSION,
-                "diagnostics": tuple(parsed.diagnostics),
-                "raw_document_hash": digest,
-                "raw_archive": bytes(archive),
-                **identity,
-            }
-        return {
-            "source_kind": "legacy_document",
-            "status": last_status or "013",
-            "identity": dict(identity),
-            "records": list(parsed.records),
-            "mapping_version": MAPPING_VERSION,
-            "diagnostics": tuple(parsed.diagnostics),
-            "raw_document_hash": digest,
-            "raw_archive": bytes(archive),
-            **identity,
-        }
+        page = document_verified_page(identity=dict(identity), result=parsed, document_hash=digest)
+        return {**dict(page), "raw_archive": bytes(archive)}

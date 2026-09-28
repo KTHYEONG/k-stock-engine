@@ -1,0 +1,88 @@
+{
+  "identity": {
+    "corp_code": "00291231",
+    "corp_name": "우전",
+    "biz_year": "2022",
+    "reprt_code": "11014",
+    "rcept_no": "20221114000862"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: Q3 cumulative-only interim CFS (sub-header 발생|누적, no 3개월 marker), cumulative basis; hand-verified: BS 115696140723 == 47113229837 + 68582910886 at 2022-09-30, IS sales cumulative 72106465507, CF tie-out holds",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2022-09-30",
+    "report_kind": "q3",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 13610031775,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 115696140723,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 47113229837,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 68582910886,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 72106465507,
+        "basis": "cumulative",
+        "label": "매출액"
+      },
+      {
+        "fact": "gross_profit",
+        "value": 8525810107,
+        "basis": "cumulative",
+        "label": "매출총이익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": -865985763,
+        "basis": "cumulative",
+        "label": "영업이익"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": 10203959850,
+        "basis": "cumulative",
+        "label": "영업활동으로인한현금흐름"
+      },
+      {
+        "fact": "capex",
+        "value": 7806885757,
+        "basis": "cumulative",
+        "label": "유형자산의취득"
+      },
+      {
+        "fact": "cash",
+        "value": 13610031775,
+        "basis": "cumulative",
+        "label": "기말현금및현금성자산"
+      }
+    ],
+    "checks": [
+      "bs_balance",
+      "cf_cash_tieout"
+    ]
+  },
+  "diagnostics": []
+}

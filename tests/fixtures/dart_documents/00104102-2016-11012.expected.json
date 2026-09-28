@@ -1,0 +1,52 @@
+{
+  "identity": {
+    "corp_code": "00104102",
+    "corp_name": "우리종합금융",
+    "biz_year": "2016",
+    "reprt_code": "11012",
+    "rcept_no": "20160816001669"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: interim half-year financial company (우리종합금융) CFS, BS only: IS/CF headings carry no 단위 note so both withheld with missing_unit; hand-verified: BS 1564353361798 == 1405000594428 + 159352767370 at 2016-06-30",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2016-06-30",
+    "report_kind": "half",
+    "unit_multipliers": {
+      "BS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 71637999417,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 1564353361798,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 1405000594428,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 159352767370,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      }
+    ],
+    "checks": [
+      "bs_balance"
+    ]
+  },
+  "diagnostics": [
+    "missing_unit:IS",
+    "missing_unit:CF"
+  ]
+}

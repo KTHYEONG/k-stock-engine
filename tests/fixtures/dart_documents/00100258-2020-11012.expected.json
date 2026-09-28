@@ -1,0 +1,82 @@
+{
+  "identity": {
+    "corp_code": "00100258",
+    "corp_name": "에스마크",
+    "biz_year": "2020",
+    "reprt_code": "11012",
+    "rcept_no": "20200814000806"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: interim half-year CFS; hand-verified: BS 29071912298 == 15774173078 + 13297739220 at 2020-06-30, IS quarter column (3개월) with sales row absent (-), CF cumulative; separate basis carries a bogus 2020-06-30~2020-12-31 heading range and mismatches",
+  "statements": {
+    "consolidated": true,
+    "period_end": "2020-06-30",
+    "report_kind": "half",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 219362942,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 29071912298,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 15774173078,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 13297739220,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "gross_profit",
+        "value": 0,
+        "basis": "quarter",
+        "label": "매출총이익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": -204349049,
+        "basis": "quarter",
+        "label": "영업이익(손실"
+      },
+      {
+        "fact": "net_income",
+        "value": -510733209,
+        "basis": "quarter",
+        "label": "당기순이익(손실"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": -284636342,
+        "basis": "cumulative",
+        "label": "영업활동현금흐름"
+      },
+      {
+        "fact": "cash",
+        "value": 219362942,
+        "basis": "cumulative",
+        "label": "기말현금및현금성자산"
+      }
+    ],
+    "checks": [
+      "bs_balance",
+      "cf_cash_tieout"
+    ]
+  },
+  "diagnostics": []
+}
