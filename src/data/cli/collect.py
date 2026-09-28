@@ -133,6 +133,37 @@ def _run_krx_job(args: argparse.Namespace, *, job_name: str) -> dict[str, object
             "pending_left": report.pending_left, "requests_used": report.requests_used}
 
 
+def _run_kind_job(args: argparse.Namespace, *, job_name: str) -> dict[str, object]:
+    """One KIND notice job, emitting one JSON line per phase plus a summary."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.jobs.kind import KIND_CHUNK_SIZE, build_kind_job_context, resolve_kind_job
+    from src.data.jobs.runner import run_job
+    from src.integrations.krx.kind import build_scoped_kind_client
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime = scoped_runtime(args)
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    dry_run = bool(getattr(args, "dry_run", False))
+    quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
+    collector = None if dry_run else build_scoped_kind_client(policy=provider.kind, quota_store=quota_store)
+    ctx = build_kind_job_context(runtime=runtime, provider=provider, collector=collector)
+
+    def _emit(payload: Mapping[str, object]) -> None:
+        sys.stdout.write(json.dumps(dict(payload), sort_keys=True, default=str) + "\n")
+
+    report = run_job(
+        resolve_kind_job(job_name), ctx, chunk_size=KIND_CHUNK_SIZE,
+        max_chunks=getattr(args, "max_chunks", None), dry_run=dry_run, emit=_emit,
+    )
+    _LOG.info(
+        "[DATA] command=%s status=%s done=%d pending_left=%d requests_used=%d",
+        job_name, report.status, report.done, report.pending_left, report.requests_used,
+    )
+    return {"job": job_name, "status": report.status, "done": report.done,
+            "pending_left": report.pending_left, "requests_used": report.requests_used}
+
+
 def _run_ls_job(args: argparse.Namespace) -> dict[str, object]:
     """One range-planned LS investor-flow job, emitting one JSON line per phase plus a summary."""
     from src.config import load_provider_policy, load_runtime_config
@@ -359,6 +390,10 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_krx_job(args, job_name="krx_daily_market")),
     Command("collect-krx-security-master", "Collect KRX security-master snapshots for completed sessions", _add_krx_job,
             lambda args: _run_krx_job(args, job_name="krx_security_master")),
+    Command("collect-kind-notices", "Collect KIND exchange-notice search windows", _add_krx_job,
+            lambda args: _run_kind_job(args, job_name="kind_notice_search")),
+    Command("collect-kind-documents", "Collect KIND exchange-notice bodies", _add_krx_job,
+            lambda args: _run_kind_job(args, job_name="kind_notice_documents")),
     Command("collect-ls-investor-flow", "Collect range-planned LS investor-flow windows", _add_flow_job, _run_ls_job),
     Command("collect-kis-investor-flow", "Collect range-planned KIS investor-flow pages", _add_flow_job, _run_kis_flow_job),
     Command("collect-dart-disclosures", "Collect market-wide DART disclosure windows", _add_dart_job,

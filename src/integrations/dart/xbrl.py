@@ -13,7 +13,7 @@ from src.core.pit import PITDataError
 
 if TYPE_CHECKING:
     from src.config.providers import DisclosureFilter
-    from src.integrations.dart.client import DartCorpCodeRecord
+    from src.integrations.dart.client import DartCorpCodeRecord, DisclosureListing
     from src.integrations.quota import ProviderQuotaStateStore
 
 _REQUIRED_FACTS: tuple[str, ...] = (
@@ -265,6 +265,17 @@ class DartXbrlCollector:
         # 중단 시 전송 실패 페이지는 증거로 남기지 않는다(해당 식별자는 미완료로 유지되어 재시도된다).
         pages = [p for p in results if p is not None and not (self.aborted and _is_transport_failure(p))]
         return iter(tuple(pages))
+
+    def list_disclosure_window(self, start: date, end: date, *, disclosure_filter: DisclosureFilter | None = None) -> DisclosureListing:
+        """List one market-wide window with DART's declared total.
+
+        Raises:
+            PITDataError: the client is unavailable.
+        """
+        if self._client is None:
+            raise PITDataError("DART disclosures endpoint is not configured")
+        listing: DisclosureListing = self._client.list_disclosure_window(start, end, disclosure_filter=disclosure_filter)
+        return listing
 
     def list_disclosures(self, start: date, end: date, *, disclosure_filter: DisclosureFilter | None = None) -> list[dict[str, str]]:
         """List market-wide disclosures in a window, optionally narrowed to one DART filter.

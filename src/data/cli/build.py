@@ -371,6 +371,7 @@ def _run_dividends(args: argparse.Namespace) -> Mapping[str, object]:
 def _run_market_actions(args: argparse.Namespace) -> Mapping[str, object]:
     from datetime import datetime
 
+    from src.config import load_provider_policy, load_runtime_config
     from src.core.krx_calendar import xkrx_calendar_through
     from src.core.time import KRX_TZ
     from src.data.jobs.universe import read_corp_code_bridge
@@ -378,11 +379,14 @@ def _run_market_actions(args: argparse.Namespace) -> Mapping[str, object]:
 
     runtime = scoped_runtime(args)
     mapping, _ = read_corp_code_bridge(scoped_catalog(runtime))
+    provider = load_provider_policy(load_runtime_config())
     path = materialize_market_actions(
         catalog=scoped_catalog(runtime),
         silver_root=runtime.workspace.silver_root,
         calendar=xkrx_calendar_through(datetime.now(KRX_TZ).date()),
         bridge=dict(mapping),
+        kind_keywords=tuple(provider.kind.search_keywords),
+        kind_coverage_start=runtime.scope.evidence_start,
     )
     register_dataset(runtime, "market_actions", path.name)
     return {"dataset_id": path.name, "dataset_path": str(path)}
@@ -414,6 +418,6 @@ BUILD_COMMANDS: tuple[Command, ...] = (
     Command("build-investor-flow-union", "Union certified LS flow and its KIS supplement into one dataset", _add_flow_union, _run_flow_union),
     Command("build-financial-quality", "Build certified financial-quality evidence from facts and quarantine", _add_quality, _run_quality),
     Command("build-dividend-events", "Build Silver cash-dividend events from dated decision filings", _add_scoped_only, _run_dividends),
-    Command("build-market-actions", "Build Silver exchange market actions from disclosure titles and daily flags", _add_scoped_only, _run_market_actions),
+    Command("build-market-actions", "Build Silver exchange market actions from DART, KIND and daily flags", _add_scoped_only, _run_market_actions),
     Command("build-industry-classification-silver", "Build the certified industry classification Silver snapshot", _add_scoped_only, _run_industry_silver),
 )

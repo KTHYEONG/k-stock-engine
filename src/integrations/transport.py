@@ -145,6 +145,7 @@ class HttpTransport:
         *,
         params: Mapping[str, str] | None = None,
         json_body: Mapping[str, object] | None = None,
+        form_body: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         classify: ClassifyHook | None = None,
     ) -> requests.Response:
@@ -158,6 +159,14 @@ class HttpTransport:
                 if method == "GET":
                     response = self._session.get(
                         url, params=dict(params or {}), headers=dict(headers or {}), timeout=self._timeout
+                    )
+                elif form_body is not None:
+                    response = self._session.post(
+                        url,
+                        params=dict(params or {}),
+                        data=dict(form_body),
+                        headers=dict(headers or {}),
+                        timeout=self._timeout,
                     )
                 else:
                     response = self._session.post(
@@ -244,6 +253,17 @@ class HttpTransport:
     ) -> requests.Response:
         """Send one ledgered POST with bounded retries."""
         return self._send("POST", endpoint, json_body=json_body, headers=headers, classify=classify)
+
+    def post_form(
+        self,
+        endpoint: str,
+        form: Mapping[str, str],
+        *,
+        headers: Mapping[str, str] | None = None,
+        classify: ClassifyHook | None = None,
+    ) -> requests.Response:
+        """Send one ledgered form-encoded POST with bounded retries."""
+        return self._send("POST", endpoint, form_body=form, headers=headers, classify=classify)
 
 
 class TokenCache:

@@ -202,16 +202,20 @@ def _build_market_panel(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
 
 def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver exchange market actions from disclosure titles and daily flags."""
+    from src.config import load_provider_policy, load_runtime_config
     from src.data.jobs.universe import read_corp_code_bridge
     from src.data.market_actions import materialize_market_actions
 
     _ = inputs
     mapping, _ = read_corp_code_bridge(ctx.catalog)
+    provider = load_provider_policy(load_runtime_config())
     path = materialize_market_actions(
         catalog=ctx.catalog,
         silver_root=ctx.runtime.workspace.silver_root,
         calendar=_build_calendar(ctx),
         bridge=dict(mapping),
+        kind_keywords=tuple(provider.kind.search_keywords),
+        kind_coverage_start=ctx.runtime.scope.evidence_start,
     )
     return _published(path)
 
@@ -417,6 +421,7 @@ def _preview_market_actions(ctx: RefreshContext) -> DatasetIdentity:
     from src.core.time import KRX_TZ
     from src.data.datasets import DatasetLayer as _Layer
     from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
+    from src.data.kind_notices import kind_source_digest
     from src.data.market_actions import (
         POLICY_VERSION,
         corp_bridge_digest,
@@ -435,6 +440,7 @@ def _preview_market_actions(ctx: RefreshContext) -> DatasetIdentity:
             bronze_disclosures=disclosure_source_digest(ctx.catalog),
             corp_code_bridge=corp_bridge_digest(dict(mapping)),
             bronze_daily=daily_flags_source_digest(ctx.catalog, calendar),
+            bronze_kind=kind_source_digest(ctx.catalog),
         ),
         params={
             "calendar_digest": _hashlib.sha256(
@@ -1031,6 +1037,39 @@ def _run_krx_collection_step(
     )
 
 
+def _run_kind_collection_step(
+    ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
+) -> CollectionStepReport:
+    """Run one KIND notice collection job without duplicating runner wiring."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.jobs.kind import KIND_CHUNK_SIZE, build_kind_job_context, resolve_kind_job
+    from src.data.jobs.runner import run_job
+    from src.integrations.krx.kind import build_scoped_kind_client
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    collector = None
+    if not dry_run:  # pragma: no cover - live provider path
+        collector = build_scoped_kind_client(
+            policy=provider.kind,
+            quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
+        )
+    job_ctx = build_kind_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
+    report = run_job(
+        resolve_kind_job(job_name),
+        job_ctx,
+        chunk_size=KIND_CHUNK_SIZE,
+        max_chunks=None,
+        dry_run=dry_run,
+        emit=emit,
+    )
+    return CollectionStepReport(
+        job=job_name, status=report.status, done=report.done,
+        pending_left=report.pending_left, requests_used=report.requests_used,
+    )
+
+
 def _run_ls_flow_collection_step(
     ctx: RefreshContext, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
@@ -1157,6 +1196,18 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
             "krx_security_master",
             lambda ctx, *, dry_run, emit: _run_krx_collection_step(
                 ctx, "krx_security_master", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "kind_notice_search",
+            lambda ctx, *, dry_run, emit: _run_kind_collection_step(
+                ctx, "kind_notice_search", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "kind_notice_documents",
+            lambda ctx, *, dry_run, emit: _run_kind_collection_step(
+                ctx, "kind_notice_documents", dry_run=dry_run, emit=emit
             ),
         ),
         ("ls_investor_flow", _run_ls_flow_collection_step),
