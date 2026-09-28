@@ -1,0 +1,16 @@
+{
+  "identity": {
+    "corp_code": "00331016",
+    "corp_name": "에프앤가이드",
+    "biz_year": "2016",
+    "reprt_code": "11012",
+    "rcept_no": "20160816000210"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: WITHHELD: consolidated section has no statements (missing_statement:BS); separate BS heading is a bare (1) 재무상태표 with no 단위 note (missing_unit:BS)",
+  "statements": null,
+  "diagnostics": [
+    "missing_statement:BS",
+    "missing_unit:BS"
+  ]
+}

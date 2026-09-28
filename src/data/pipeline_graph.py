@@ -241,10 +241,12 @@ def _build_industry(ctx: RefreshContext, inputs: Mapping[str, str]) -> Published
 
 def _build_financial_facts(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Rebuild the financial-facts Silver table from every verified Bronze receipt."""
+    from src.config import load_provider_policy, load_runtime_config
     from src.data.incremental_normalization import refresh_dart_financial_facts
 
     _ = inputs
     runtime = ctx.runtime
+    provider = load_provider_policy(load_runtime_config())
     artifact = refresh_dart_financial_facts(
         bronze_root=runtime.workspace.bronze_root,
         silver_root=runtime.workspace.silver_root,
@@ -252,6 +254,7 @@ def _build_financial_facts(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pu
         decision_time=ctx.decision_time,
         calendar=_build_calendar(ctx),
         superseded_receipt_hashes=ctx.superseded_receipts,
+        trust_document_facts=bool(provider.dart.document_parser.trusted),
     )
     return _published(Path(str(artifact.dataset_path)))
 
@@ -516,6 +519,13 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
     calendar_digest = hashlib.sha256(
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
     ).hexdigest()
+    from src.config import load_provider_policy, load_runtime_config
+    from src.integrations.dart.document_statements import PARSER_VERSION as _PARSER_VERSION
+
+    try:
+        _trusted = bool(load_provider_policy(load_runtime_config()).dart.document_parser.trusted)
+    except Exception:  # pragma: no cover - missing provider preview fallback
+        _trusted = False
     return DatasetIdentity(
         kind="financial_facts",
         layer=_Layer.SILVER,
@@ -531,6 +541,8 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
             "availability_policy": AVAILABILITY_POLICY,
             "calendar_digest": calendar_digest,
             "ticker_bridge": bridge_receipt_hash,
+            "trust_document_facts": _trusted,
+            "document_parser_version": _PARSER_VERSION,
         },
     )
 

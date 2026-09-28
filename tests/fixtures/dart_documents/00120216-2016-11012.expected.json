@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "corp_code": "00120216",
+    "corp_name": "KB손해보험",
+    "biz_year": "2016",
+    "reprt_code": "11012",
+    "rcept_no": "20160816002105"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: WITHHELD financial company (KB손해보험): 자산총계 cell carries a trailing ======== marker so the amount is not parseable, BS totals incomplete, both bases fail identity_failed:bs_balance",
+  "statements": null,
+  "diagnostics": [
+    "identity_failed:bs_balance"
+  ]
+}

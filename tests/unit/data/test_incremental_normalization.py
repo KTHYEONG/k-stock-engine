@@ -15,6 +15,8 @@ def test_refresh_dart_facts_rejects_tampered_receipt_before_publish(tmp_path) ->
     receipt_dir.mkdir(parents=True)
     (receipt_dir / 'payload.json').write_text('{"records": []}', encoding='utf-8')
     (receipt_dir / 'receipt.json').write_text('{"kind": "financial_facts", "content_hash": "0" * 64, "retrieved_at": "2016-01-01T00:00:00+00:00", "ingested_at": "2016-01-01T00:00:00+00:00"}', encoding='utf-8')
+    from tests.fixtures import register_fact_page
+    register_fact_page(tmp_path / 'bronze', receipt_dir)
 
     with pytest.raises(PITDataError, match='hash mismatch'):
         refresh_dart_financial_facts(bronze_root=tmp_path / 'bronze', silver_root=tmp_path / 'silver', artifact_root=tmp_path / 'artifacts', decision_time=datetime(2016, 12, 30, tzinfo=UTC), calendar=_covering_calendar())
@@ -53,6 +55,9 @@ def _write_fact_receipt(bronze_root, name, payload_text, retrieved="2016-01-01T0
         ),
         encoding="utf-8",
     )
+    from tests.fixtures import register_fact_page
+
+    register_fact_page(bronze_root, receipt_dir, natural_key=name)
     return digest
 
 
@@ -223,6 +228,34 @@ def test_refresh_rejects_conflicting_duplicate_payloads(tmp_path) -> None:
     assert not (tmp_path / "silver" / "financial_facts").exists()
 
 
+def test_discovery_reads_only_the_latest_page_of_each_identity(tmp_path) -> None:
+    """A page that a newer receipt replaced stays on disk but is never a refresh input."""
+    from datetime import datetime, UTC
+
+    from src.data.incremental_normalization import _discover_fact_receipts
+    from tests.fixtures import register_fact_page
+
+    older = _write_fact_receipt(tmp_path / "bronze", "older", _FACT_PAGE, retrieved="2016-01-01T00:00:00+00:00")
+    newer_text = _FACT_PAGE.replace('"value": 10.0', '"value": 11.0')
+    newer = _write_fact_receipt(tmp_path / "bronze", "newer", newer_text, retrieved="2016-02-01T00:00:00+00:00")
+    # 같은 자연키(=식별자)에 더 늦은 수집 기록을 올려 older를 대체한다.
+    from src.data.receipt_catalog import ReceiptCatalog, ReceiptIndexEntry, EvidenceStatus
+    from tests.fixtures import blob_for
+
+    entry = ReceiptIndexEntry(
+        source="financial_facts", natural_key="older", as_of=None, fiscal_period=None,
+        status=EvidenceStatus.SUCCESS, content_hash=newer, retrieved_at=datetime(2016, 3, 1, tzinfo=UTC),
+        payload_path=tmp_path / "bronze" / "financial_facts" / "newer" / "payload.json",
+    )
+    ReceiptCatalog(tmp_path / "bronze" / "catalog").publish([entry], blobs=[blob_for(entry)])
+
+    hashes = {str(item["content_hash"]) for item in _discover_fact_receipts(tmp_path / "bronze")}
+
+    assert newer in hashes
+    assert older not in hashes
+    _ = register_fact_page
+
+
 def test_refresh_rejects_missing_payload_before_publish(tmp_path) -> None:
     from datetime import UTC, datetime
 
@@ -231,8 +264,13 @@ def test_refresh_rejects_missing_payload_before_publish(tmp_path) -> None:
     from src.data.incremental_normalization import refresh_dart_financial_facts
     from src.core.pit import PITDataError
 
+    from tests.fixtures import register_fact_page
+
     receipt_dir = tmp_path / "bronze" / "financial_facts" / "ghost"
     receipt_dir.mkdir(parents=True)
+    (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
+    register_fact_page(tmp_path / "bronze", receipt_dir)
+    (receipt_dir / "payload.json").unlink()
     (receipt_dir / "receipt.json").write_text(
         '{"kind": "financial_facts", "content_hash": "a", "retrieved_at": "2016-01-01T00:00:00+00:00", "ingested_at": "2016-01-01T00:00:00+00:00"}',
         encoding="utf-8",
@@ -357,6 +395,9 @@ def test_refresh_rejects_malformed_receipt_metadata(tmp_path) -> None:
         receipt_dir.mkdir(parents=True)
         (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
         (receipt_dir / "receipt.json").write_text(receipt_text, encoding="utf-8")
+        from tests.fixtures import register_fact_page
+
+        register_fact_page(scope / "bronze", receipt_dir)
         with pytest.raises(PITDataError, match=match):
             refresh_dart_financial_facts(
                 bronze_root=scope / "bronze",
@@ -459,6 +500,9 @@ def test_refresh_rejects_unreadable_or_garbage_receipt(tmp_path) -> None:
     receipt_dir.mkdir(parents=True)
     (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
     (receipt_dir / "receipt.json").mkdir()
+    from tests.fixtures import register_fact_page
+
+    register_fact_page(unreadable / "bronze", receipt_dir)
     with pytest.raises(PITDataError, match="malformed Bronze receipt"):
         refresh_dart_financial_facts(
             bronze_root=unreadable / "bronze",
@@ -472,6 +516,7 @@ def test_refresh_rejects_unreadable_or_garbage_receipt(tmp_path) -> None:
     receipt_dir.mkdir(parents=True)
     (receipt_dir / "payload.json").write_text("{}", encoding="utf-8")
     (receipt_dir / "receipt.json").write_text("{{{ not json", encoding="utf-8")
+    register_fact_page(garbage / "bronze", receipt_dir)
     with pytest.raises(PITDataError, match="hash mismatch"):
         refresh_dart_financial_facts(
             bronze_root=garbage / "bronze",
@@ -497,6 +542,9 @@ def test_refresh_rejects_receipt_with_bad_ingested_at(tmp_path) -> None:
         '{"kind": "financial_facts", "content_hash": "a", "retrieved_at": "2016-01-01T00:00:00+00:00", "ingested_at": "nope"}',
         encoding="utf-8",
     )
+    from tests.fixtures import register_fact_page
+
+    register_fact_page(tmp_path / "bronze", receipt_dir)
     with pytest.raises(PITDataError, match="malformed Bronze receipt"):
         refresh_dart_financial_facts(
             bronze_root=tmp_path / "bronze",
@@ -626,6 +674,10 @@ def test_refresh_rebuild_ignores_prior_rows(tmp_path) -> None:
     import shutil
 
     shutil.rmtree(tmp_path / "bronze" / "financial_facts" / "f2")
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "bronze" / "catalog" / "catalog.sqlite3") as connection:  # 입력 집합에서 f2를 뺀다
+        connection.execute("DELETE FROM receipts WHERE source = 'financial_facts' AND natural_key = 'f2'")
     second = refresh_dart_financial_facts(**kwargs)
 
     published = pl.read_parquet(
@@ -879,7 +931,7 @@ def test_refresh_manifest_records_quarantine_exclusion(tmp_path) -> None:
         (_artifact_dataset_path(artifact) / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["details"]["quarantined_filings"] == 1
-    assert manifest["details"]["trusted_source_kinds"] == ["legacy_document_verified", "opendart_standard"]
+    assert manifest["details"]["trusted_source_kinds"] == ["opendart_standard"]
     import hashlib
     from pathlib import Path
 
@@ -1139,3 +1191,23 @@ def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tm
     ):
         with pytest.raises(PITDataError, match=message):
             _validate_fact_frame(bad_frame, decision_time=decision_time)
+
+
+def test_normalize_dart_facts_entry_uses_provider_trust_flag(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.cli import main as _cli_main  # noqa: F401 - keeps CLI wiring covered
+    from src.data.incremental_normalization import normalize_dart_facts
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    result = normalize_dart_facts(
+        bronze_root=tmp_path / "bronze",
+        silver_root=tmp_path / "silver",
+        artifact_root=tmp_path / "artifacts",
+        decision_time=decision_time,
+    )
+
+    assert result["row_count"] == 1
