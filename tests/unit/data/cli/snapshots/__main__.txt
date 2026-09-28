@@ -1,11 +1,11 @@
 usage: cli.py [-h]
-              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
               ...
 
 PIT dataset foundation CLI
 
 positional arguments:
-  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
     normalize-dart-facts
                         Incremental DART fact refresh
     audit-ordinary-universe-prices
@@ -34,6 +34,16 @@ positional arguments:
                         filings
     collect-dividend-decisions
                         Collect DART cash-dividend decision archives
+    reparse-dart-documents
+                        Re-derive document fact pages from stored archives
+    collect-dart-documents
+                        Fetch document archives for relevant document-path
+                        identities
+    collect-dart-benchmark-documents
+                        Fetch document archives for benchmark filings
+    benchmark-dart-documents
+                        Benchmark parsed documents against same-filing
+                        standard labels
     build-investor-flow-silver
                         Build Silver LS investor-flow dataset from raw rows
     build-daily-market-silver

@@ -1,6 +1,28 @@
 {
   "tasks": [
     {
+      "task_id": "TASK_DART_DOCUMENT_ROLLOUT",
+      "date": "2026-09-28",
+      "adr_id": "ADR_20260928_DART_DOCUMENT_ROLLOUT",
+      "domain": "data",
+      "title": "DART document parser real-data rollout",
+      "why": "The parser and trust gate were checked but had not been validated or enabled on real data.",
+      "resolution": "Passed the same-filing precision gate at 0.9993, reparsed and fetched the relevant archives, enabled document trust, and rebuilt financial_facts/quality, plus fixed a benchmark job that overwrote its own labels, a null-typed hash column, and fact discovery that read superseded on-disk pages instead...",
+      "impact": "2,777 previously quarantined filings across 315 companies now contribute 18,864 fact rows, and refresh reads only each identity's latest catalog page.",
+      "caveat": "Quarterly income statements with a 발생/누적 sub-header and one gross_profit sign case in the benchmark are unresolved; 495 filings stay withheld by the parser."
+    },
+    {
+      "task_id": "TASK_DART_DOCUMENT_PARSER",
+      "date": "2026-09-27",
+      "adr_id": "ADR_20260927_DART_DOCUMENT_PARSER",
+      "domain": "data",
+      "title": "Section-anchored DART filing-document parser replacing the legacy fallback",
+      "why": "The old document.xml parser picked the largest-magnitude table candidate and was correct on only ~30% of values, so every fallback filing was quarantined and 2,731 universe-relevant filings stayed excluded.",
+      "resolution": "Built a grid-aware HTML reader, a section-anchored statement parser verified by the balance-sheet identity and a cash tie-out, a document_verified trust contract requiring the current parser version, and reparse/fetch jobs plus a same-filing precision benchmark gated at 0.995 before trust is enabled...",
+      "impact": "Legacy_filing.py and tools/legacy_recovery/ are deleted, and once the benchmark gate passes, financial_facts can gain rows for financial companies pre-2023 and newly listed companies that today have none.",
+      "caveat": "Quarterly income statements whose sub-header is 발생/누적 instead of 3개월/누적 are not recognized as the 3-month column, so those flow facts are omitted (not wrong) until the benchmark shows how common that layout is; trusted stays false until the real-data benchmark run passes the precision gate."
+    },
+    {
       "task_id": "TASK_DART_DISCOVERY_ROLLOUT",
       "date": "2026-09-27",
       "adr_id": "ADR_20260927_DART_DISCOVERY_ROLLOUT",

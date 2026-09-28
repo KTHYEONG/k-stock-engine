@@ -16,7 +16,7 @@ from src.data.receipt_catalog import (
     ReceiptIndexEntry,
 )
 
-__all__ = ["blob_for", "seed_corp_code_bridge", "seed_receipts"]
+__all__ = ["blob_for", "register_fact_page", "seed_corp_code_bridge", "seed_receipts"]
 
 
 def blob_for(entry: ReceiptIndexEntry, *, usable: bool = True) -> BlobEntry:
@@ -76,5 +76,26 @@ def seed_corp_code_bridge(
     )
     ReceiptCatalog(Path(bronze_root) / "catalog").publish(
         [entry], blobs=[replace(blob_for(entry), kind=EvidenceKind.SECURITY_MASTER)]
+    )
+    return digest
+
+
+def register_fact_page(bronze_root: Path, receipt_dir: Path, *, natural_key: str | None = None) -> str:
+    """Catalog the ``payload.json`` stored in one on-disk ``financial_facts`` page directory.
+
+    Fact refresh reads only catalogued pages. The catalog hashes the actual
+    payload, so a fixture may still hold a ``receipt.json`` that disagrees with it
+    (tampered, malformed): the refresh must reject that at read time.
+    """
+    payload_path = Path(receipt_dir) / "payload.json"
+    digest = hashlib.sha256(payload_path.read_bytes()).hexdigest()
+    moment = datetime(2016, 1, 1, tzinfo=UTC)
+    entry = ReceiptIndexEntry(
+        source="financial_facts", natural_key=natural_key or Path(receipt_dir).name, as_of=None,
+        fiscal_period=None, status=EvidenceStatus.SUCCESS, content_hash=digest,
+        retrieved_at=moment, payload_path=payload_path,
+    )
+    ReceiptCatalog(Path(bronze_root) / "catalog").publish(
+        [entry], blobs=[replace(blob_for(entry), kind=EvidenceKind.FINANCIAL_FACTS)]
     )
     return digest

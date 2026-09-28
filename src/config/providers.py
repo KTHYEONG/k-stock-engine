@@ -16,6 +16,7 @@ __all__ = [
     "DartKeyPolicy",
     "DartPolicy",
     "DisclosureFilter",
+    "DocumentParserPolicy",
     "KisPolicy",
     "KrxPolicy",
     "LsPolicy",
@@ -82,6 +83,30 @@ class DartKeyPolicy(BaseModel):
         return self
 
 
+class DocumentParserPolicy(BaseModel):
+    """Gate for filing-document facts entering Silver."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    trusted: bool = False
+    min_precision: float = 0.995
+    benchmark_sample: int = 300
+
+    @field_validator("min_precision")
+    @classmethod
+    def _check_precision(cls, value: float) -> float:
+        if not 0 < float(value) <= 1:
+            raise ValueError(f"invalid min_precision {value!r}: must be in (0, 1]")
+        return float(value)
+
+    @field_validator("benchmark_sample")
+    @classmethod
+    def _check_sample(cls, value: int) -> int:
+        if isinstance(value, bool) or int(value) < 1:
+            raise ValueError(f"invalid benchmark_sample {value!r}: must be a positive integer")
+        return int(value)
+
+
 class DartPolicy(BaseModel):
     """Shared DART collection policy plus one entry per declared key."""
 
@@ -93,6 +118,7 @@ class DartPolicy(BaseModel):
     shared_ip_avoid_windows_kst: list[tuple[str, str]] = []
     disclosure_types: tuple[str, ...] = ("A", "I001")
     corp_codes_max_age_days: PositiveInt = 30
+    document_parser: DocumentParserPolicy = DocumentParserPolicy()
     keys: dict[str, DartKeyPolicy]
 
     @field_validator("keys")

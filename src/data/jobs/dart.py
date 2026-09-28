@@ -516,11 +516,32 @@ def _dart_corp_codes_job() -> JobSpec:
     return DartCorpCodesJob()
 
 
+def _dart_document_reparse_job() -> JobSpec:
+    from src.data.jobs.dart_documents import DartDocumentReparseJob
+
+    return DartDocumentReparseJob()
+
+
+def _dart_document_fetch_job() -> JobSpec:
+    from src.data.jobs.dart_documents import DartDocumentFetchJob
+
+    return DartDocumentFetchJob()
+
+
+def _dart_benchmark_document_fetch_job() -> JobSpec:
+    from src.data.jobs.dart_documents import DartBenchmarkDocumentFetchJob
+
+    return DartBenchmarkDocumentFetchJob()
+
+
 DART_JOBS: Mapping[str, JobSpec] = {
     DartDisclosuresJob.name: DartDisclosuresJob(),
     DartFactsJob.name: DartFactsJob(),
     DividendDecisionsJob.name: DividendDecisionsJob(),
     "dart_corp_codes": _dart_corp_codes_job(),
+    "dart_document_reparse": _dart_document_reparse_job(),
+    "dart_document_fetch": _dart_document_fetch_job(),
+    "dart_benchmark_documents": _dart_benchmark_document_fetch_job(),
 }
 
 

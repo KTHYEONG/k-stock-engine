@@ -1,0 +1,83 @@
+{
+  "identity": {
+    "corp_code": "00109037",
+    "corp_name": "대성창투",
+    "biz_year": "2016",
+    "reprt_code": "11011",
+    "rcept_no": "20170331003204"
+  },
+  "parser_version": "dart-document-statements-v1",
+  "expected_values_source": "hand-verified against the filing document main member: annual OFS (no consolidated statements in filing), old layout (heading paragraph), full KRW; hand-verified: BS 52153920007 == 1832351682 + 50321568325, IS 영업수익/영업이익/당기순이익, CF operating cash flow and capex abs outflow",
+  "statements": {
+    "consolidated": false,
+    "period_end": "2016-12-31",
+    "report_kind": "annual",
+    "unit_multipliers": {
+      "BS": 1,
+      "CF": 1,
+      "IS": 1
+    },
+    "facts": [
+      {
+        "fact": "cash",
+        "value": 6464367979,
+        "basis": "point_in_time",
+        "label": "현금및현금성자산"
+      },
+      {
+        "fact": "assets",
+        "value": 52153920007,
+        "basis": "point_in_time",
+        "label": "자산총계"
+      },
+      {
+        "fact": "debt",
+        "value": 1832351682,
+        "basis": "point_in_time",
+        "label": "부채총계"
+      },
+      {
+        "fact": "equity",
+        "value": 50321568325,
+        "basis": "point_in_time",
+        "label": "자본총계"
+      },
+      {
+        "fact": "sales",
+        "value": 10347339561,
+        "basis": "annual",
+        "label": "영업수익"
+      },
+      {
+        "fact": "operating_profit",
+        "value": 2823935045,
+        "basis": "annual",
+        "label": "영업이익"
+      },
+      {
+        "fact": "net_income",
+        "value": 2316579553,
+        "basis": "annual",
+        "label": "당기순이익"
+      },
+      {
+        "fact": "operating_cash_flow",
+        "value": 2126677722,
+        "basis": "annual",
+        "label": "영업활동으로인한현금흐름"
+      },
+      {
+        "fact": "capex",
+        "value": 98977553,
+        "basis": "annual",
+        "label": "유형자산의취득"
+      }
+    ],
+    "checks": [
+      "bs_balance"
+    ]
+  },
+  "diagnostics": [
+    "missing_statement:BS"
+  ]
+}

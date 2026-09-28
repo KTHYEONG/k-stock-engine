@@ -60,6 +60,10 @@ def _write_bronze_receipt(bronze_root: Path, kind: str, payload: object, *, retr
         ),
         encoding="utf-8",
     )
+    if kind == "financial_facts":
+        from tests.fixtures import register_fact_page
+
+        register_fact_page(bronze_root, receipt_dir, natural_key=digest)
     return digest
 
 
