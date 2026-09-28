@@ -11,6 +11,7 @@ from src.core.pit import PITDataError
 from src.data.collection import dart_fact_scoped_payload
 from src.data.dart_documents import DartDocumentStore
 from src.data.evidence_sources import DART_DOCUMENT_SOURCE
+from src.data.fact_page_meta import FactPageMetaStore
 from src.data.jobs.runner import JobContext, JobUnit
 from src.data.scoped_ingestion import ScopedRawPayload, dart_fact_natural_key
 
@@ -189,25 +190,59 @@ class DartDocumentReparseJob:
 
     name = "dart_document_reparse"
 
+    def __init__(self) -> None:
+        self._archive_cache: dict[str, Path] | None = None
+
+    def _archive_bytes(self, ctx: JobContext, content_hash: str) -> bytes | None:
+        """Read the stored archive of one document hash.
+
+        The runner calls ``fetch`` once per unit, so the hash-to-file mapping is built once per job
+        instance instead of once per call. A new job instance (a new run) always rebuilds it, so blobs
+        registered between runs are seen.
+
+        Args:
+            ctx: Job context whose catalog holds the usable ``dart_documents`` blobs.
+            content_hash: Content hash named by a fact page's ``raw_document_hash``.
+
+        Returns:
+            The archive bytes, or None when the hash has no usable blob or its file is unreadable.
+        """
+        if self._archive_cache is None:
+            self._archive_cache = {
+                blob.content_hash: Path(str(blob.payload_path))
+                for blob in ctx.catalog.blobs(source=DART_DOCUMENT_SOURCE)
+            }
+        path = self._archive_cache.get(content_hash)
+        if path is not None:
+            try:
+                return path.read_bytes()
+            except OSError:  # pragma: no cover - blob removed between plan and fetch
+                return None
+        candidate = ctx.runtime.workspace.bronze_root / DART_DOCUMENT_SOURCE / content_hash / "payload.zip"
+        try:
+            return candidate.read_bytes()
+        except OSError:
+            return None
+
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
         from src.integrations.dart.document_statements import PARSER_VERSION
 
         usable = _usable_document_hashes(ctx)
+        latest = _latest_fact_entries(ctx)
+        store = FactPageMetaStore(ctx.catalog.root)
         units: list[JobUnit] = []
-        for natural_key, entry in _latest_fact_entries(ctx).items():
+        for entry, meta in store.resolve(latest.values()):
+            natural_key = entry.natural_key
+            if meta.source_kind not in _PENDING_KINDS:
+                continue
+            if meta.document_not_found:
+                continue
+            if meta.source_kind == "document_verified" and meta.parser_version == PARSER_VERSION:
+                continue
+            if not meta.raw_document_hash or meta.raw_document_hash not in usable:
+                continue
             page = _read_page(entry)
-            if page is None:  # pragma: no cover - corrupt payload file
-                continue
-            if str(page.get("source_kind") or "") not in _PENDING_KINDS:
-                continue
-            if _is_document_not_found(page):
-                continue
-            if str(page.get("source_kind") or "") == "document_verified" and str(
-                page.get("parser_version") or ""
-            ) == PARSER_VERSION:
-                continue
-            raw_hash = str(page.get("raw_document_hash") or "")
-            if not raw_hash or raw_hash not in usable:
+            if page is None:  # pragma: no cover - payload removed between plan and read
                 continue
             units.append(
                 JobUnit(
@@ -229,8 +264,8 @@ class DartDocumentReparseJob:
             raw_hash = str(identity.get("raw_document_hash") or "")
             if not raw_hash:
                 continue
-            archive = _archive_bytes_for_hash(ctx, raw_hash)
-            if archive is None:  # pragma: no cover - blob removed between plan and fetch
+            archive = self._archive_bytes(ctx, raw_hash)
+            if archive is None:
                 continue
             parsed = parse_filing_document(
                 bytes(archive),
@@ -260,23 +295,23 @@ class DartDocumentFetchJob:
         except PITDataError:
             return ()
         usable = _usable_document_hashes(ctx)
+        latest = _latest_fact_entries(ctx)
+        store = FactPageMetaStore(ctx.catalog.root)
         units: list[JobUnit] = []
-        for natural_key, entry in _latest_fact_entries(ctx).items():
+        for entry, meta in store.resolve(latest.values()):
+            natural_key = entry.natural_key
             if natural_key not in relevant:
                 continue
+            if meta.source_kind not in _PENDING_KINDS:
+                continue
+            if meta.document_not_found:
+                continue
+            if meta.source_kind == "document_verified" and meta.parser_version == PARSER_VERSION:
+                continue
+            if meta.raw_document_hash and meta.raw_document_hash in usable:
+                continue
             page = _read_page(entry)
-            if page is None:  # pragma: no cover - corrupt payload file
-                continue
-            if str(page.get("source_kind") or "") not in _PENDING_KINDS:
-                continue
-            if _is_document_not_found(page):
-                continue
-            if str(page.get("source_kind") or "") == "document_verified" and str(
-                page.get("parser_version") or ""
-            ) == PARSER_VERSION:
-                continue
-            raw_hash = str(page.get("raw_document_hash") or "")
-            if raw_hash and raw_hash in usable:
+            if page is None:  # pragma: no cover - payload removed between plan and read
                 continue
             units.append(
                 JobUnit(

@@ -6,7 +6,7 @@
     "reprt_code": "11013",
     "rcept_no": "20180515001984"
   },
-  "parser_version": "dart-document-statements-v1",
+  "parser_version": "dart-document-statements-v3",
   "expected_values_source": "hand-verified against the filing document main member: Q1 CFS with 3개월|누적 sub-header, quarter basis; hand-verified: BS 27418890050 == 18469191572 + 8949698478 at 2018-03-31, CF tie-out holds, duplicate operating_cash_flow row withheld as ambiguous_fact",
   "statements": {
     "consolidated": true,
@@ -46,7 +46,7 @@
         "fact": "sales",
         "value": 3606451508,
         "basis": "quarter",
-        "label": "수익(매출액"
+        "label": "수익(매출액)"
       },
       {
         "fact": "gross_profit",
@@ -58,13 +58,13 @@
         "fact": "operating_profit",
         "value": -802153015,
         "basis": "quarter",
-        "label": "영업이익(손실"
+        "label": "영업이익(손실)"
       },
       {
         "fact": "net_income",
         "value": -1392219762,
         "basis": "quarter",
-        "label": "당기순이익(손실"
+        "label": "당기순이익(손실)"
       },
       {
         "fact": "operating_cash_flow",
@@ -81,6 +81,7 @@
     ],
     "checks": [
       "bs_balance",
+      "gross_profit_identity",
       "cf_cash_tieout"
     ]
   },
