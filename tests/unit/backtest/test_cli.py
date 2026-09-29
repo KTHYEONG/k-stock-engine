@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, UTC
 from pathlib import Path
 
 import polars as pl
@@ -91,7 +91,35 @@ def _setup(tmp_path: Path) -> tuple[Path, object]:
     data_root = tmp_path / "data"
     panel = _publish(data_root, "market_panel", DatasetLayer.GOLD, _panel_frame())
     strategy = _strategy_config(tmp_path)
+    _open_holdout(tmp_path)
     return strategy, panel
+
+
+def _open_holdout(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    from src.data.research_protocol import FinalistRecord, LockboxLedger, load_research_protocol
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(_SCOPE)
+    protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
+    ledger = LockboxLedger(
+        state_root=tmp_path / "data" / "state" / "kr_swing_2019_v1",
+        protocol=protocol,
+        now=lambda: datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    ledger.register_finalists(
+        [
+            FinalistRecord(
+                spec_hash="cli-opener",
+                family="cli",
+                discovery_trial_id="trial-cli",
+                gate_report_digest="digest-cli",
+                registered_at=datetime(2026, 9, 29, tzinfo=UTC),
+            )
+        ]
+    )
+    ledger.authorize(start=date(2024, 1, 2), end=date(2024, 1, 3), spec_hash="cli-opener")
 
 
 def test_cli_resolves_dividends_from_silver_registry_and_records_ids(tmp_path: Path, capsys) -> None:
@@ -272,10 +300,59 @@ def test_resolve_runtime_paths_defaults_to_runtime_config() -> None:
         strategy_config=None, engine_config=None,
     )
 
-    scope_config, data_root, strategy_config, engine_config, rules_path = _resolve_runtime_paths(args)
+    scope_config, data_root, strategy_config, engine_config, rules_path, protocol_path = _resolve_runtime_paths(args)
 
     assert scope_config == runtime_config.default_scope
     assert data_root == runtime_config.data_root
     assert strategy_config == runtime_config.strategies_root / "equal_weight_liquid.toml"
     assert engine_config == runtime_config.engine
     assert rules_path == runtime_config.market_rules
+    assert protocol_path == runtime_config.research_protocol
+
+
+def test_cli_refuses_holdout_dates_while_sealed(tmp_path: Path, capsys) -> None:
+    data_root = tmp_path / "data"
+    _publish(data_root, "market_panel", DatasetLayer.GOLD, _panel_frame())
+    strategy = _strategy_config(tmp_path)
+
+    assert main(_args(tmp_path, strategy)) == 1
+    assert "sealed" in json.loads(capsys.readouterr().out)["error"] or "lockbox" in json.loads(
+        capsys.readouterr().out)["error"].lower() or "holdout" in json.loads(capsys.readouterr().out)["error"].lower()
+
+
+def test_cli_runs_discovery_dates(tmp_path: Path, capsys) -> None:
+    discovery = pl.DataFrame(
+        [
+            {
+                "session": session,
+                "instrument_id": "KRX:005930",
+                "market": "KOSPI",
+                "open": 100,
+                "high": 100,
+                "low": 100,
+                "close": 100,
+                "base_price": 100,
+                "tick_size": 1,
+                "upper_limit": 200,
+                "lower_limit": 1,
+                "volume": 1000,
+                "sell_tax_rate": 0.0,
+                "adtv20": 1_000_000.0,
+                "ret_vol60": 0.0,
+                "share_factor": 1.0,
+                "eligible": True,
+                "open_at_upper": False,
+                "open_at_lower": False,
+            }
+            for session in (date(2023, 12, 27), date(2023, 12, 28))
+        ]
+    )
+    _publish(tmp_path / "data", "market_panel", DatasetLayer.GOLD, discovery)
+    strategy = _strategy_config(tmp_path)
+    args = _args(tmp_path, strategy, no_dividends=True)
+    start_index = args.index("--start") + 1
+    end_index = args.index("--end") + 1
+    args[start_index] = "2023-12-27"
+    args[end_index] = "2023-12-28"
+
+    assert main(args) == 0
