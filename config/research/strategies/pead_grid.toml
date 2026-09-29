@@ -1,0 +1,7 @@
+base = "config/research/strategies/pead_early.toml"
+
+[axes]
+n = [10, 15, 20, 30, 50]
+keep_rank_multiple = [1.0, 1.5, 2.0, 3.0]
+"junk.min_rank" = [0.0, 0.1, 0.2, 0.3]
+rebalance = ["W", "M"]
