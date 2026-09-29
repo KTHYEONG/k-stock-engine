@@ -32,6 +32,7 @@ EXPECTED_KINDS = (
     "financial_facts",
     "daily_market",
     "dividend_events",
+    "earnings_releases",
     "investor_flow_ls",
     "financial_quality",
     "market_actions",
@@ -529,9 +530,10 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 10
+    assert len(report.collection) == 11
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
+        "earnings_releases",
         "krx_daily_market", "krx_security_master", "kind_notice_search", "kind_notice_documents",
         "ls_investor_flow", "kis_investor_flow",
     }
@@ -1065,3 +1067,89 @@ def test_facts_preview_plans_without_hashing_payloads(tmp_path: Path, monkeypatc
     assert calls == 0
     assert first == second
     assert first.inputs["bronze_facts"]
+
+
+def test_graph_contains_earnings_releases() -> None:
+    import src.data.pipeline_graph as graph_module
+
+    node = next(item for item in SCOPE_GRAPH if item.kind == "earnings_releases")
+
+    assert node.inputs == ()
+    assert graph_module._PREVIEW_FNS["earnings_releases"] is graph_module._preview_earnings_releases
+
+
+def _seed_earnings_envelope(bronze_root: Path, *, rcept_no: str, received_on: str,
+                            retrieved_at: datetime | None = None,
+                            sales_quarter: str = "321,223", variant: str = "") -> None:
+    import base64
+    import hashlib as _hashlib
+    import io as _io
+    import zipfile as _zipfile
+
+    from src.data.evidence_sources import EARNINGS_RELEASE_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptIndexEntry
+
+    rows = [
+        ["1. 연결실적내용", "단위 : 백만원, %"],
+        ["구분", "당기실적", "전기실적", "전기대비증감율(%)", "전년동기실적", "전년동기대비증감율(%)"],
+        ["('18.4Q)", "('18.3Q)", "('17.4Q)"],
+        ["매출액", "당해실적", sales_quarter, "376,466", "-14.7", "87,836", "265.7"],
+        ["누계실적", "1,365,439", "1,044,216", "-", "87,836", "1,454.5"],
+    ]
+    body = "<table>" + "".join(
+        "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows
+    ) + "</table>"
+    output = _io.BytesIO()
+    with _zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("document.xml", body)
+    archive_bytes = output.getvalue()
+    envelope = {
+        "rcept_no": rcept_no,
+        "corp_code": "00126380",
+        "received_on": received_on,
+        "report_nm": "연결재무제표기준영업(잠정)실적(공정공시)",
+        "archive_b64": base64.b64encode(archive_bytes).decode("ascii"),
+        "archive_sha256": _hashlib.sha256(archive_bytes).hexdigest(),
+    }
+    raw = json.dumps(envelope, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    payload_path = bronze_root / "catalog-payloads" / f"earnings-{rcept_no}{variant}.json"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(raw)
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    seed_receipts(
+        catalog,
+        [
+            ReceiptIndexEntry(
+                source=EARNINGS_RELEASE_SOURCE, natural_key=rcept_no,
+                as_of=date.fromisoformat(received_on), fiscal_period=None,
+                status=EvidenceStatus.SUCCESS, content_hash=_hashlib.sha256(raw).hexdigest(),
+                retrieved_at=(retrieved_at or datetime(2026, 1, 2, 12, 0, tzinfo=UTC)),
+                payload_path=payload_path,
+            )
+        ],
+    )
+
+
+def test_earnings_preview_equals_built_identity(tmp_path: Path) -> None:
+    import src.data.pipeline_graph as graph_module
+    from src.data.datasets import dataset_id_for
+    from tests.fixtures import seed_corp_code_bridge
+
+    runtime = _scope_runtime(tmp_path)
+    seed_corp_code_bridge(
+        runtime.workspace.bronze_root,
+        json.dumps([{"corp_code": "00126380", "ticker": "005930"}], sort_keys=True).encode("utf-8"),
+    )
+    _seed_earnings_envelope(runtime.workspace.bronze_root, rcept_no="20190131000001", received_on="2019-01-31")
+    _seed_earnings_envelope(runtime.workspace.bronze_root, rcept_no="20190215000002", received_on="2019-02-15")
+    _seed_earnings_envelope(
+        runtime.workspace.bronze_root, rcept_no="20190215000002", received_on="2019-02-15",
+        retrieved_at=datetime(2026, 1, 3, 12, 0, tzinfo=UTC),
+        sales_quarter="322,000", variant="-dup",
+    )
+    ctx = build_refresh_context(runtime)
+
+    expected = graph_module._preview_earnings_releases(ctx)
+    built = graph_module._build_earnings_releases(ctx, {})
+
+    assert built.dataset_id == dataset_id_for(expected)

@@ -23,12 +23,17 @@ from src.data.dart_disclosures import (
     periodic_filing_identities,
 )
 from src.data.dart_documents import DartDocumentStore
-from src.data.evidence_sources import DART_DISCLOSURE_WINDOWS_SOURCE, DIVIDEND_DECISION_SOURCE
+from src.data.evidence_sources import (
+    DART_DISCLOSURE_WINDOWS_SOURCE,
+    DIVIDEND_DECISION_SOURCE,
+    EARNINGS_RELEASE_SOURCE,
+)
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
 from src.data.jobs.universe import corp_code_bridge, eligible_tickers
 from src.data.receipt_catalog import EvidenceStatus, ReceiptIndexEntry
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedRawPayload, dart_fact_natural_key
 from src.integrations.dart.dividend_decision import is_dividend_decision_title
+from src.integrations.dart.earnings_release import classify_earnings_release_title
 from src.integrations.dart.xbrl import is_transport_failure_page
 from src.integrations.errors import ProviderQuotaExhaustedError, ProviderRetryableError
 
@@ -38,6 +43,7 @@ __all__ = [
     "DartFactsJob",
     "DisclosureCoverageError",
     "DividendDecisionsJob",
+    "EarningsReleasesJob",
     "disclosure_windows",
     "last_completed_kst_day",
     "resolve_dart_job",
@@ -428,7 +434,7 @@ class DartFactsJob:
         ctx.collector.health_check()
 
 
-def _dividend_envelope(*, rcept_no: str, corp_code: str, received_on: str, report_nm: str, archive: bytes | None) -> bytes:
+def _archive_envelope(*, rcept_no: str, corp_code: str, received_on: str, report_nm: str, archive: bytes | None) -> bytes:
     if archive is None:
         return json.dumps(
             {
@@ -509,7 +515,7 @@ class DividendDecisionsJob:
                     as_of=as_of,
                     fiscal_period=None,
                     status=EvidenceStatus.SUCCESS if is_zip else EvidenceStatus.EMPTY,
-                    payload=_dividend_envelope(
+                    payload=_archive_envelope(
                         rcept_no=unit.payload["rcept_no"],
                         corp_code=unit.payload["corp_code"],
                         received_on=as_of.isoformat(),
@@ -518,6 +524,77 @@ class DividendDecisionsJob:
                     ),
                     retrieved_at=retrieved_at,
                     source_label=f"{DIVIDEND_DECISION_SOURCE}:{unit.natural_key}",
+                )
+            )
+        return out
+
+    def health_check(self, ctx: JobContext) -> None:
+        ctx.collector.health_check()
+
+
+class EarningsReleasesJob:
+    """Early-earnings release filings fetched as archives; ``014`` bodies are ``empty``."""
+
+    name = "earnings_releases"
+
+    def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
+        bridge = corp_code_bridge(ctx)
+        tickers = eligible_tickers(ctx)
+        eligible = frozenset(code for code, ticker in bridge.items() if ticker in tickers)
+        scope = ctx.runtime.scope
+        end = last_completed_kst_day(ctx.now())
+        matches: dict[str, dict[str, str]] = {}
+        for record in iter_disclosure_records(ctx.catalog):
+            if record.corp_code not in eligible:
+                continue
+            as_of = record.rcept_dt
+            if as_of < scope.evidence_start or as_of > end:
+                continue
+            if classify_earnings_release_title(record.report_nm) is None:
+                continue
+            receipt_day = as_of.strftime("%Y%m%d")
+            matches[record.rcept_no] = {
+                "rcept_no": record.rcept_no,
+                "corp_code": record.corp_code,
+                "rcept_dt": receipt_day,
+                "report_nm": record.report_nm,
+            }
+        pending_keys = _unanswered(ctx, source=EARNINGS_RELEASE_SOURCE, keys=sorted(matches))
+        return [
+            JobUnit(
+                source=EARNINGS_RELEASE_SOURCE,
+                natural_key=key,
+                payload=dict(matches[key]),
+                max_requests=_DIVIDEND_MAX_REQUESTS,
+            )
+            for key in sorted(pending_keys, key=lambda k: (matches[k]["rcept_dt"], matches[k]["rcept_no"]))
+        ]
+
+    def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
+        retrieved_at = ctx.now()
+        out: list[ScopedRawPayload] = []
+        for unit in units:
+            archive = bytes(ctx.collector.fetch_document_archive(unit.payload["rcept_no"]))
+            is_zip = archive[:2] == b"PK"
+            receipt_day = unit.payload["rcept_dt"]
+            as_of = date(int(receipt_day[:4]), int(receipt_day[4:6]), int(receipt_day[6:8]))
+            out.append(
+                ScopedRawPayload(
+                    kind=EvidenceKind.DISCLOSURES,
+                    source=EARNINGS_RELEASE_SOURCE,
+                    natural_key=unit.natural_key,
+                    as_of=as_of,
+                    fiscal_period=None,
+                    status=EvidenceStatus.SUCCESS if is_zip else EvidenceStatus.EMPTY,
+                    payload=_archive_envelope(
+                        rcept_no=unit.payload["rcept_no"],
+                        corp_code=unit.payload["corp_code"],
+                        received_on=as_of.isoformat(),
+                        report_nm=unit.payload["report_nm"],
+                        archive=archive if is_zip else None,
+                    ),
+                    retrieved_at=retrieved_at,
+                    source_label=f"{EARNINGS_RELEASE_SOURCE}:{unit.natural_key}",
                 )
             )
         return out
@@ -554,6 +631,7 @@ DART_JOBS: Mapping[str, JobSpec] = {
     DartDisclosuresJob.name: DartDisclosuresJob(),
     DartFactsJob.name: DartFactsJob(),
     DividendDecisionsJob.name: DividendDecisionsJob(),
+    EarningsReleasesJob.name: EarningsReleasesJob(),
     "dart_corp_codes": _dart_corp_codes_job(),
     "dart_document_reparse": _dart_document_reparse_job(),
     "dart_document_fetch": _dart_document_fetch_job(),

@@ -30,7 +30,7 @@ def test_moved_values_are_unchanged() -> None:
     assert provider.default_key_env == "OPENDART_API_KEY_2"
     assert provider.dart_key(provider.default_key_env).default is True
     assert provider.dart_key(provider.primary_key_env).default is False
-    assert tuple(provider.dart.disclosure_types) == ("A", "I001", "I003")
+    assert tuple(provider.dart.disclosure_types) == ("A", "I001", "I002", "I003")
     assert (provider.kis.app_key_env, provider.kis.app_secret_env) == ("KIS_APP_KEY", "KIS_APP_SECRET")
     assert provider.kis.min_interval_seconds == 1.0
     assert provider.kis.max_attempts == 3
@@ -47,6 +47,26 @@ def test_moved_values_are_unchanged() -> None:
     assert provider.ls.circuit_threshold == 3
     assert provider.ls.max_sessions_per_request == 700
     assert provider.ls.daily_limit == 10000
+
+
+def test_earnings_release_policy_loads_from_toml() -> None:
+    provider = _policy()
+
+    assert provider.earnings_releases.max_filing_lag_days == 135
+    filters = {item.code: item.parameter for item in provider.dart.disclosure_filters}
+    assert filters["I002"] == "pblntf_detail_ty"
+
+
+def test_earnings_release_policy_rejects_non_positive_lag() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import EarningsReleasePolicy
+
+    with pytest.raises(pydantic.ValidationError, match="positive"):
+        EarningsReleasePolicy(max_filing_lag_days=0)
+    with pytest.raises(pydantic.ValidationError):
+        EarningsReleasePolicy(max_filing_lag_days=-5)
 
 
 def test_undeclared_key_is_rejected() -> None:

@@ -6,10 +6,10 @@ requests_per_identity = 3
 batch_identities = 500
 shared_ip_avoid_windows_kst = [["21:25", "21:50"]]
 # Market-wide disclosure list types the DART jobs consume: periodic reports (A),
-# the detail type carrying dividend decisions (I001), and the exchange
-# market-action notices (I003: delisting, liquidation trading, administrative
-# issues, trading halts).
-disclosure_types = ["A", "I001", "I003"]
+# profit-structure changes (I001), fair disclosures carrying preliminary results
+# (I002), and the exchange market-action notices (I003: delisting, liquidation
+# trading, administrative issues, trading halts).
+disclosure_types = ["A", "I001", "I002", "I003"]
 # Days a retained corp-code bridge stays fresh without a missing ticker.
 corp_codes_max_age_days = 30
 
@@ -89,3 +89,8 @@ max_yield = 0.5
 max_yield_ratio = 2.0
 min_paid_share_fraction = 0.5
 correction_window_days = 45
+
+# Early earnings releases: a preliminary result is accepted only when its receipt falls within
+# this many days after the labelled fiscal quarter end (corrections are exempt).
+[earnings_releases]
+max_filing_lag_days = 135
