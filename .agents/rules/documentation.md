@@ -8,10 +8,10 @@
 - **No Ephemeral Spec References:** NEVER reference temporary `docs/specs/*.md` paths in code, docstrings, or comments. Specs are transient working files that get purged. Use persistent `ADR-XXXX` IDs or self-contained domain rationale.
 - **No Diagnostic or Session Artifacts:** Never leave AI task logs, revision chronicles, or linter fix annotations in production code or comments.
 
-## 2. Docstring Standards
-- **Contract-Driven Documentation:** Document public interfaces when behavior, side effects, units, timing assumptions, or failure conditions are not self-evident from type signatures and function names.
-- **Consistent Convention:** When a structured docstring is required, follow the repository's Google-style convention (`Args:`, `Returns:`, `Raises:`). Avoid conversational prose or historical journaling.
-- **Private Helpers:** Omit docstrings for private helper functions unless the algorithmic logic or mathematical derivation is non-trivial.
+## 2. Interface Documentation Standards
+- **Contract-Driven Documentation:** Document public interfaces when behavior, side effects, units, timing assumptions, or failure conditions are not self-evident from type signatures and names.
+- **Consistent Semantic Convention:** When structured documentation is required, adhere to established semantic conventions documenting input contracts, return guarantees, side effects, and thrown errors. Avoid conversational prose or historical journaling.
+- **Private Helpers:** Omit interface documentation for private helper functions unless the algorithmic logic or mathematical derivation is non-trivial.
 
 ## 3. Architecture & Domain Documentation (`docs/architecture/`)
 - **Stable Boundaries & Semantics:** Keep architecture documents focused on stable system boundaries, data flows, formal mathematical models, and domain semantics. Avoid cluttering with transient implementation details.
@@ -19,5 +19,5 @@
 - **Contract & Spec Reconciliation:** Treat discrepancies between code contracts and architecture documentation as issues to investigate and resolve; never silently assume either side is automatically correct.
 
 ## 4. Repository Language Conventions
-- **Docstrings & External Documentation:** Written in English for toolchain and global standard compatibility.
-- **In-line Comments (`#`):** Korean preferred for immediate intuition and clarity among local maintainers.
+- **Public Interface Documentation:** Written in English for toolchain and global standard compatibility.
+- **In-line Comments:** Korean preferred for immediate intuition and clarity among local maintainers.
