@@ -904,6 +904,8 @@ def test_kind_coverage_uses_the_collector_window_anchor_not_the_first_session(tm
     # 수집기는 scope의 evidence_start(1월 1일)부터 창을 만들고 첫 세션은 1월 4일이다.
     runtime = _runtime(tmp_path)
     _publish_kind_search(runtime, keyword="상장폐지", start="2016-01-01", end="2016-03-31", rows=[])
+    _publish_daily(runtime, session=date(2016, 1, 4), records=[{"ISU_SRT_CD": "005930"}])
+    _publish_daily(runtime, session=date(2016, 4, 4), records=[{"ISU_SRT_CD": "005930"}])
     calendar = _calendar(date(2016, 1, 4), date(2016, 4, 1), date(2016, 4, 4))
     path = materialize_market_actions(
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
@@ -918,3 +920,118 @@ def test_kind_coverage_uses_the_collector_window_anchor_not_the_first_session(tm
             calendar=calendar, bridge=_bridge(), kind_keywords=("상장폐지",),
             kind_coverage_start=date(2016, 1, 4),
         )
+
+
+def test_kind_coverage_horizon_is_the_last_observed_session_not_the_calendar_end(tmp_path: Path) -> None:
+    # 실제 달력은 다음 해 말까지 이어진다. 관측이 끝난 뒤의 분기 창까지 요구하면 안 된다.
+    runtime = _runtime(tmp_path)
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31", rows=[])
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    _publish_daily(runtime, session=date(2024, 3, 29), records=[{"ISU_SRT_CD": "005930"}])
+    calendar = _calendar(date(2024, 1, 2), date(2024, 3, 29), date(2025, 12, 30))
+
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=calendar, bridge=_bridge(), kind_keywords=("상장폐지",),
+        kind_coverage_start=date(2024, 1, 1),
+    )
+
+    assert path.exists()
+
+
+def test_kind_channel_without_any_daily_page_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    with pytest.raises(PITDataError, match="daily-market page"):
+        materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)), bridge=_bridge(),
+            kind_keywords=("상장폐지",), kind_coverage_start=date(2024, 1, 1),
+        )
+
+
+def test_kind_reposted_delisting_form_with_a_past_schedule_becomes_open_ended(tmp_path: Path) -> None:
+    # 가처분 취소로 양식이 재게시되면 이미 지난 옛 일정이 실려 온다(실측: 065160, 2019-04-26).
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 18:00", "상장폐지", "00598", "유가증권시장본부")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-01-31", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_DELISTING_HTML,
+                           disclosed_at="2024-01-02T18:00:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005980"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("상장폐지",), kind_coverage_start=date(2024, 1, 1),
+    )
+    (out,) = read_dataset(path).collect().filter(pl.col("source") == "kind").to_dicts()
+    assert out["kind"] == MarketActionKind.DELISTING_DECIDED.value
+    assert out["effective_start"] is None
+    assert out["effective_end"] is None
+
+
+def test_partial_cause_release_keeps_the_administrative_status() -> None:
+    # 실측: 관리종목지정사유일부해제 265건 등은 사유 일부만 해소되어 지위가 유지된다.
+    for title in (
+        "관리종목지정사유일부해제(회생절차 개시신청 사유 해소)",
+        "관리종목지정사유추가및일부해제(반기검토의견 의견거절 추가)",
+        "관리종목지정사유일부해제",
+    ):
+        assert classify_market_action_title(title) is None
+    assert classify_market_action_title("관리종목해제(자본잠식률 50% 미만으로 회복 등)") is (
+        MarketActionKind.ADMINISTRATIVE_RELEASED
+    )
+    assert classify_market_action_title("관리종목지정해제") is MarketActionKind.ADMINISTRATIVE_RELEASED
+
+
+def test_liquidation_resumption_after_a_reversed_order_is_not_a_withdrawal() -> None:
+    # 실측(065160, 2019-04-26): 가처분 결정 취소로 정리매매가 재개된다. 제목의 `취소`는 철회가 아니다.
+    assert classify_market_action_title(
+        "주권매매거래정지해제(상장폐지금지 가처분 결정 취소에 따른 정리매매 재개)"
+    ) is MarketActionKind.LIQUIDATION_TRADING
+    assert classify_market_action_title(
+        "기타시장안내(상장폐지무효확인 청구의 소 기각에 따른 정리매매절차 재개)"
+    ) is MarketActionKind.LIQUIDATION_TRADING
+    assert classify_market_action_title("기타 주요경영사항(상장폐지결정 철회)") is None
+
+
+def _admin_kind_run(tmp_path: Path, *, desk: str, title: str):  # type: ignore[no-untyped-def]
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240102000001", "2024-01-02 15:30", title, "00593", desk)
+    _publish_kind_search(runtime, keyword="관리종목", start="2024-01-02", end="2024-01-05", rows=[row])
+    _publish_kind_document(runtime, acptno="20240102000001", html=KIND_ADMIN_COMMON_HTML,
+                           disclosed_at="2024-01-02T15:30:00+09:00")
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_SRT_CD": "005930"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3)),
+        bridge=_bridge(), kind_keywords=("관리종목",), kind_coverage_start=date(2024, 1, 2),
+    )
+    return path, read_dataset(path).collect().filter(pl.col("source") == "kind")
+
+
+def test_kosdaq_kind_release_is_ignored_because_the_daily_flag_is_the_authority(tmp_path: Path) -> None:
+    # 실측: KOSDAQ 종목의 `관리종목 해제(…사유 해소)`는 사유별로 나오며 해제 329건 중 92건이 플래그와 어긋났다.
+    path, frame = _admin_kind_run(tmp_path, desk="코스닥시장본부", title="관리종목 해제(자본잠식률 회복)")
+
+    assert frame.height == 0
+    assert load_manifest(path).details["kind_kosdaq_release_ignored"] == 1
+
+
+def test_kospi_kind_release_still_releases_because_no_flag_exists(tmp_path: Path) -> None:
+    path, frame = _admin_kind_run(tmp_path, desk="유가증권시장본부", title="관리종목 해제(자본잠식률 회복)")
+
+    assert frame["kind"].to_list() == [MarketActionKind.ADMINISTRATIVE_RELEASED.value]
+    assert load_manifest(path).details["kind_kosdaq_release_ignored"] == 0
+
+
+def test_kosdaq_kind_designation_is_still_applied(tmp_path: Path) -> None:
+    _, frame = _admin_kind_run(tmp_path, desk="코스닥시장본부", title="관리종목 지정(자본잠식률 50% 이상)")
+
+    assert frame["kind"].to_list() == [MarketActionKind.ADMINISTRATIVE_DESIGNATED.value]
+
+
+def test_kosdaq_release_ignored_on_both_kind_title_paths(tmp_path: Path) -> None:
+    # `관리종목지정해제`(본문을 읽는 경로)와 `관리종목 해제(…)`(제목 분류 경로) 모두 KOSDAQ에서는 무시된다.
+    for index, title in enumerate(("관리종목지정해제", "관리종목 해제(사유 해소)")):
+        path, frame = _admin_kind_run(tmp_path / str(index), desk="코스닥시장본부", title=title)
+        assert frame.height == 0, title
+        assert load_manifest(path).details["kind_kosdaq_release_ignored"] == 1, title
