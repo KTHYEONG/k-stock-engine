@@ -41,7 +41,7 @@ __all__ = [
     "materialize_market_actions",
 ]
 
-POLICY_VERSION = "market-actions-v6"
+POLICY_VERSION = "market-actions-v10"
 
 _LOG = logging.getLogger(__name__)
 
@@ -85,9 +85,15 @@ def _is_withdrawal_title(base: str) -> bool:
     return any(marker in base for marker in ("공시번복", "취소", "철회", "무효"))
 
 
+def _is_liquidation_resumption_title(base: str) -> bool:
+    """Whether a title announces resumed liquidation trading after a reversed suspension order."""
+    compact = "".join(base.split())
+    return "정리매매" in compact and ("재개" in compact or "개시" in compact) and "상장폐지" in compact
+
+
 def _is_delisting_cancellation_title(base: str) -> bool:
     """Whether a stripped title withdraws or court-suspends a delisting decision."""
-    if "상장폐지" not in base:
+    if "상장폐지" not in base or _is_liquidation_resumption_title(base):
         return False
     return _is_withdrawal_title(base) or ("가처분" in base and "인용" in base)
 
@@ -111,7 +117,8 @@ def classify_market_action_title(report_nm: str) -> MarketActionKind | None:
     Only a fixed vocabulary is recognized; titles that merely mention a keyword inside another action
     (for example a company's own review-reason disclosure) are not actions. Corrections (``[기재정정]``)
     map like their base title. Withdrawals (``공시번복``, ``취소``) of a delisting decision map to None
-    and are handled by the builder as a cancellation.
+    and are handled by the builder as a cancellation, except ``…취소에 따른 정리매매 재개`` notices,
+    which announce that a reversed court order lets liquidation trading resume.
 
     A combined ``매매거래정지 및 정지해제`` notice announces a halt together with its release
     condition; the release is not effective at announcement, so it maps to a halt.
@@ -125,6 +132,10 @@ def classify_market_action_title(report_nm: str) -> MarketActionKind | None:
     base = _base_title(report_nm)
     if not base:
         return None
+    # `…가처분 결정 취소에 따른 정리매매 재개`는 법원 결정이 뒤집혀 상장폐지 절차가 다시 진행되는 통지다.
+    # 제목의 `취소`는 상장폐지 결정의 철회가 아니므로 철회 판정보다 먼저 정리매매로 분류한다.
+    if _is_liquidation_resumption_title(base):
+        return MarketActionKind.LIQUIDATION_TRADING
     if _is_withdrawal_title(base):
         return None
     # 해외증권시장(ADR·GDR 등) 상장폐지, 코스닥 이전상장, 주총 안건 상정, 자회사 공시, 가처분 신청 자체는 국내 거래를 막는 조치가 아니다.
@@ -142,7 +153,8 @@ def classify_market_action_title(report_nm: str) -> MarketActionKind | None:
         return _halt_kind(base)
     if "상장폐지" in base and "결정" in base:
         return MarketActionKind.DELISTING_DECIDED
-    if ("관리종목" in base or "투자주의환기종목" in base) and "해제" in base:
+    # `관리종목지정사유일부해제`·`…사유추가및일부해제`는 지정 사유 중 일부만 해소된 것이라 관리종목 지위가 유지된다.
+    if ("관리종목" in base or "투자주의환기종목" in base) and "해제" in base and "일부해제" not in base:
         return MarketActionKind.ADMINISTRATIVE_RELEASED
     if ("관리종목" in base or "투자주의환기종목" in base) and "지정" in base and "사유" not in base:
         return MarketActionKind.ADMINISTRATIVE_DESIGNATED
@@ -249,6 +261,20 @@ def _resolve_kind_available_at(disclosed_at: datetime, *, calendar: SessionCalen
     raise PITDataError(f"no certified session open after KIND notice at {disclosed_at.isoformat()}")
 
 
+_KOSDAQ_DESK = "코스닥시장본부"
+
+
+def _is_kosdaq_administrative_release(notice_submitter: str, kind: MarketActionKind | None) -> bool:
+    """Whether a KIND release must be ignored because the daily flag is the authority for KOSDAQ.
+
+    KOSDAQ names announce one ``관리종목 해제(…사유 해소)`` per resolved designation cause and stay
+    designated until the last one clears (measured: 92 of 329 KIND releases on flagged tickers had no
+    flag release within five days), so the title cannot say whether the status ended. The daily
+    ``SECT_TP_NM`` flag records the actual status, hence it alone releases a KOSDAQ name.
+    """
+    return kind is MarketActionKind.ADMINISTRATIVE_RELEASED and notice_submitter == _KOSDAQ_DESK
+
+
 def _kind_ticker_present(
     ticker: str, announced_on: date, *, covered_days: list[date], flag_pages: dict[date, dict[str, bool]]
 ) -> bool:
@@ -302,11 +328,16 @@ def materialize_market_actions(
     """
     if len(calendar.sessions) < 2:
         raise PITDataError("market actions require at least two certified sessions")
+    flag_pages = _load_daily_flag_rows(catalog, calendar)
+    covered_days = sorted(flag_pages)
+    # 달력은 다음 해 말까지 이어지므로 커버리지 기준일은 달력 끝이 아니라 실제 관측한 마지막 거래일이다.
+    if kind_keywords and not covered_days:
+        raise PITDataError("KIND coverage needs at least one daily-market page to anchor its horizon")
     require_kind_coverage(
         catalog,
         keywords=kind_keywords,
         start=kind_coverage_start,
-        through=calendar.sessions[-1].astimezone(KRX_TZ).date(),
+        through=covered_days[-1] if covered_days else kind_coverage_start,
     )
     rows: list[dict[str, Any]] = []
     unmapped_rows = 0
@@ -340,12 +371,11 @@ def materialize_market_actions(
     designations = 0
     releases = 0
     flagged_before: dict[str, bool] = {}
-    flag_pages = _load_daily_flag_rows(catalog, calendar)
-    covered_days = sorted(flag_pages)
     kind_actions = 0
     kind_cancellations = 0
     kind_unresolved_rows = 0
     kind_other_share_class = 0
+    kind_kosdaq_release_ignored = 0
     for notice in iter_kind_notices(catalog):
         if not notice.submitter.endswith("시장본부") or not notice.company_code:
             continue
@@ -358,6 +388,13 @@ def materialize_market_actions(
             if body is None:
                 raise PITDataError(f"KIND delisting notice {notice.acptno} has no stored body")
             delisting_form = parse_kind_delisting_form(body)
+            # 가처분 취소 등으로 양식이 재게시되면 옛 정리매매·상장폐지 일정이 그대로 실려 온다.
+            # 이미 지난 종료일은 공시 시점에 알려진 미래 정보가 아니므로 기간을 버리고 종료일 없는 결정으로 본다.
+            stale = (
+                delisting_form.delisting_date is not None and delisting_form.delisting_date <= announced_on
+            )
+            effective_start = None if stale else delisting_form.liquidation_start
+            effective_end = None if stale else delisting_form.delisting_date
             for ticker in delisting_form.tickers:
                 if not _kind_ticker_present(
                     ticker, announced_on, covered_days=covered_days, flag_pages=flag_pages
@@ -373,8 +410,8 @@ def materialize_market_actions(
                         "rcept_no": rcept_no,
                         "announced_on": announced_on,
                         "available_at": available_at,
-                        "effective_start": delisting_form.liquidation_start,
-                        "effective_end": delisting_form.delisting_date,
+                        "effective_start": effective_start,
+                        "effective_end": effective_end,
                         "cancellation": False,
                         "policy_version": POLICY_VERSION,
                     }
@@ -386,6 +423,12 @@ def materialize_market_actions(
             if body is None:
                 raise PITDataError(f"KIND administrative notice {notice.acptno} has no stored body")
             admin_form = parse_kind_administrative_form(body)
+            release_kind = (
+                MarketActionKind.ADMINISTRATIVE_RELEASED if normalized == "관리종목지정해제" else None
+            )
+            if _is_kosdaq_administrative_release(notice.submitter, release_kind):
+                kind_kosdaq_release_ignored += 1
+                continue
             if not admin_form.is_common:
                 kind_other_share_class += 1
                 continue
@@ -420,6 +463,9 @@ def materialize_market_actions(
         kind = classify_market_action_title(notice.title)
         cancellation = kind is None and _is_delisting_cancellation_title(base)
         if kind is None and not cancellation:
+            continue
+        if _is_kosdaq_administrative_release(notice.submitter, kind):
+            kind_kosdaq_release_ignored += 1
             continue
         ticker = f"{notice.company_code}0"
         if not _kind_ticker_present(
@@ -525,16 +571,19 @@ def materialize_market_actions(
             "kind_cancellations": kind_cancellations,
             "kind_unresolved_rows": kind_unresolved_rows,
             "kind_other_share_class": kind_other_share_class,
+            "kind_kosdaq_release_ignored": kind_kosdaq_release_ignored,
         },
     )
     _LOG.info(
         "[DATA] stage=market_actions actions=%d cancellations=%d kind_actions=%d "
-        "kind_cancellations=%d kind_unresolved_rows=%d kind_other_share_class=%d",
+        "kind_cancellations=%d kind_unresolved_rows=%d kind_other_share_class=%d "
+        "kind_kosdaq_release_ignored=%d",
         sum(1 for row in rows if not row["cancellation"]),
         sum(1 for row in rows if row["cancellation"]),
         kind_actions,
         kind_cancellations,
         kind_unresolved_rows,
         kind_other_share_class,
+        kind_kosdaq_release_ignored,
     )
     return published.path

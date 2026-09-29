@@ -42,7 +42,7 @@ _ANSWERED: Final = frozenset(
 _TAG_RE: Final = re.compile(r"<[^>]+>")
 # 단축코드는 숫자로 시작하는 6자리이며 2024년 이후 신규 종목은 영문을 섞는다(예: A0001A0).
 _SHORT_CODE_RE: Final = re.compile(r"\bA([0-9][0-9A-Z]{5})\b")
-_LIQUIDATION_LABEL_RE: Final = re.compile(r"정리매매\s*허용\s*기간")
+_LIQUIDATION_LABEL_RE: Final = re.compile(r"정리매매\s*(?:허용\s*)?기간")
 _ISIN_AFTER_LABEL_RE: Final = re.compile(r"종목코드\s*[:\uFF1A]?\s*KR7([0-9][0-9A-Z]{5})[0-9A-Z]{3}\b")  # noqa: RUF001
 # 유가증권 양식은 `1.종목명 성지건설보통주`, 코스닥 양식은 `1.대상종목 하이에이아이1호스팩 주권 보통주`로
 # 라벨과 띄어쓰기가 다르다. 종목 표기는 다음 항목 번호(`2.`)나 다음 필드 라벨 앞까지 읽는다.
@@ -72,12 +72,13 @@ class KindDelistingForm:
         liquidation_start: First liquidation-trading session, or None when the form states ``-``.
         liquidation_end: Last liquidation-trading session, or None when the form states ``-``.
         delisting_date: Effective delisting date; the instrument trades on no session on or after it.
+            None when the exchange has decided but deferred the date (injunction, pending resolution).
     """
 
     tickers: tuple[str, ...]
     liquidation_start: date | None
     liquidation_end: date | None
-    delisting_date: date
+    delisting_date: date | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +151,7 @@ def parse_kind_delisting_form(html: str) -> KindDelistingForm:
 
     Raises:
         PITDataError: no ``A``-prefixed short code in ``단축코드`` and no ``KR7`` ISIN after
-            ``종목코드``, no ``상장폐지일``, an unparseable date, or a
+            ``종목코드``, no ``상장폐지일`` field, an unparseable date, or a
             liquidation start without an end (or the reverse).
     """
     text = _plain_text(html)
@@ -164,10 +165,11 @@ def parse_kind_delisting_form(html: str) -> KindDelistingForm:
         tickers = tuple(dict.fromkeys(_ISIN_AFTER_LABEL_RE.findall(text)))
     if not tickers:
         raise PITDataError("KIND delisting form carries no A-prefixed short code")
+    # 가처분 등으로 정리매매가 보류된 결정은 `상장폐지일 -`로 온다. 결정 사실은 유효하므로 종료일 없는 결정으로 본다.
     delisting_raw = _extract_dated_value(text, "상장폐지일")
-    if delisting_raw is None or delisting_raw == "-":
-        raise PITDataError("KIND delisting form carries no 상장폐지일")
-    delisting_date = _parse_kind_date(delisting_raw)
+    if delisting_raw is None:
+        raise PITDataError("KIND delisting form carries no 상장폐지일 field")
+    delisting_date = None if delisting_raw == "-" else _parse_kind_date(delisting_raw)
     # 양식은 '상장폐지 예고기간'과 '정리매매 허용기간'에 같은 시작일/종료일 라벨을 쓰므로
     # 정리매매 허용기간 라벨부터 상장폐지일 전까지만 읽는다. 라벨이 없으면 정리매매 기간 미기재로 본다.
     liquidation = _LIQUIDATION_LABEL_RE.search(text)
@@ -177,7 +179,10 @@ def parse_kind_delisting_form(html: str) -> KindDelistingForm:
         section_end = text.find("상장폐지일", liquidation.end())
         section = text[liquidation.end(): section_end if section_end >= 0 else None]
         start_raw = _extract_dated_value(section, "시작일")
+        # 코스닥 양식은 종료 라벨이 `만료일`이다.
         end_raw = _extract_dated_value(section, "종료일")
+        if end_raw is None:
+            end_raw = _extract_dated_value(section, "만료일")
     start: date | None = None
     end: date | None = None
     if start_raw is not None and start_raw != "-":

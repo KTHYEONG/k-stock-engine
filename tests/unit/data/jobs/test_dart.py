@@ -411,7 +411,10 @@ def test_open_window_stays_pending_after_run(tmp_path: Path) -> None:
     assert collector.list_calls
     after = {unit.natural_key for unit in spec.pending(ctx)}
     assert open_keys <= after
-    assert [line["phase"] for line in emitted] == ["plan", "chunk", "done"]
+    phases = [line["phase"] for line in emitted]
+    assert phases[0] == "plan"
+    assert phases[-1] == "done"
+    assert set(phases[1:-1]) == {"chunk"}
 
 
 def test_disclosure_window_records_round_trip(tmp_path: Path) -> None:
@@ -1221,3 +1224,63 @@ def test_refresh_reraises_unexpected_step_error(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         run_collection_jobs(ctx, dry_run=False, emit=lambda _p: None, steps=(("dart_facts", _boom),))
+
+
+def _listing_collector(*, broken_index: int | None = None):  # type: ignore[no-untyped-def]
+    from src.integrations.dart.client import DisclosureListing
+
+    class _Windows(_Collector):
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            code = disclosure_filter.code if disclosure_filter is not None else detail_type
+            self.list_calls.append((start, end, code))
+            rows = [
+                {
+                    "rcept_no": f"{start:%Y%m%d}{len(self.list_calls):06d}", "rcept_dt": f"{start:%Y%m%d}",
+                    "corp_code": CORP, "corp_name": "Test Co", "report_nm": "사업보고서 (2015.12)", "rm": "",
+                }
+            ]
+            declared = 5 if broken_index is not None and len(self.list_calls) == broken_index else len(rows)
+            return DisclosureListing(records=tuple(rows), reported_total=declared, raw_rows=len(rows))
+
+    return _Windows()
+
+
+def test_disclosure_chunks_are_capped_so_completed_windows_are_saved_early(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DartDisclosuresJob
+    from src.data.jobs.runner import run_job
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    ctx = _ctx(runtime, _provider(), collector=_listing_collector())
+    spec = DartDisclosuresJob()
+    total = len(spec.pending(ctx))
+    emitted: list[dict] = []
+
+    run_job(spec, ctx, chunk_size=500, max_chunks=None, dry_run=False, emit=emitted.append)
+
+    chunks = [event for event in emitted if event["phase"] == "chunk"]
+    assert total > spec.max_chunk_units
+    assert len(chunks) == -(-total // spec.max_chunk_units)
+    assert chunks[0]["done"] == spec.max_chunk_units
+
+
+def test_incomplete_window_keeps_every_earlier_chunk_saved(tmp_path: Path) -> None:
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.dart import DartDisclosuresJob
+    from src.data.jobs.runner import run_job
+
+    runtime = _runtime(tmp_path)
+    _disclosure_fixtures(runtime)
+    spec = DartDisclosuresJob()
+    seed_ctx = _ctx(runtime, _provider(), collector=_listing_collector())
+    pending_before = len(spec.pending(seed_ctx))
+    broken_call = spec.max_chunk_units * 2 + 1
+    ctx = _ctx(runtime, _provider(), collector=_listing_collector(broken_index=broken_call))
+
+    with pytest.raises(PITDataError, match="incomplete"):
+        run_job(spec, ctx, chunk_size=500, max_chunks=None, dry_run=False, emit=lambda _event: None)
+
+    saved = pending_before - len(spec.pending(seed_ctx))
+    assert saved == spec.max_chunk_units * 2
