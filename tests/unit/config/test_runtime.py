@@ -28,9 +28,18 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
         config.market_rules,
         config.reference_benchmarks,
         config.engine,
+        config.research_protocol,
         config.strategies_root,
     ):
         assert path.is_absolute()
+
+
+def test_research_protocol_path_resolved_and_exists() -> None:
+    from src.config import load_runtime_config
+
+    config = load_runtime_config()
+    assert config.research_protocol.is_absolute()
+    assert config.research_protocol.is_file()
 
 
 def test_unknown_key_fails_closed(tmp_path: Path) -> None:
@@ -57,6 +66,7 @@ def test_missing_referenced_file_fails_closed_with_key_name(tmp_path: Path) -> N
         ("logs_root", "logs"),
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("engine", "config/backtest/default_engine.toml"),
+        ("research_protocol", "config/research/protocol.toml"),
         ("strategies_root", "config/strategy"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
@@ -97,6 +107,7 @@ def test_missing_strategies_dir_fails_closed(tmp_path: Path) -> None:
         ("logs_root", "logs"),
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("engine", "config/backtest/default_engine.toml"),
+        ("research_protocol", "config/research/protocol.toml"),
         ("strategies_root", "config/strategy"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')

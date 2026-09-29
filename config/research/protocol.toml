@@ -1,0 +1,39 @@
+# Research protocol: segments, multiplicity accounting, benchmarks and promotion gates.
+version = "research-protocol-v1"
+# First session month with trailing-four-quarter fundamentals for most issuers (2016 facts start).
+discovery_start = "2017-04-01"
+max_finalists = 3
+# Trials evaluated during the 2026-09-29 probe before the registry existed; counted in N for DSR.
+prior_trials = 415
+sessions_per_year = 252
+# Capital of screening trials; ledger gates add the full capital grid below.
+primary_capital_krw = 10_000_000
+
+[benchmarks]
+# Equal-weight benchmark universe (same filters as the probe) and an all-eligible cap-weight index.
+universe_min_adtv20_krw = 500_000_000
+universe_min_price_krw = 1_000
+rebalance = "M"
+
+[statistics]
+bootstrap_block_sessions = 63
+bootstrap_draws = 4000
+bootstrap_seed = 20260929
+cscv_blocks = 8
+
+[gates]
+min_delay_retention = 0.7
+stress_extra_slippage = 0.002
+min_active_t = 2.0
+max_bootstrap_loss_probability = 0.05
+min_dsr = 0.95
+max_pbo = 0.5
+min_plateau_positive_share = 0.8
+min_positive_year_fraction = 0.7
+max_single_year_share = 0.5
+holdout_min_percentile = 0.05
+perturbation_cuts = 3
+perturbation_seed = 7
+ledger_capitals = [1_000_000, 10_000_000, 100_000_000]
+parity_max_gap = 0.002
+parity_max_capital = 10_000_000
