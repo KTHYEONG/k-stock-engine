@@ -852,3 +852,14 @@ def test_build_market_actions_command_registers_dataset(tmp_path, monkeypatch, c
     assert main(_dataset_cli_args("build-market-actions", runtime)) == 0
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["dataset_id"] == "market_actions_0123456789abcdef"
+
+
+def test_earnings_releases_commands_resolve() -> None:
+    from src.data.cli import _ensure_registered
+    from src.data.cli.registry import commands
+
+    _ensure_registered()
+
+    names = {command.name for command in commands()}
+    assert "build-earnings-releases" in names
+    assert "benchmark-earnings-releases" in names

@@ -1,0 +1,7 @@
+usage: cli.py benchmark-earnings-releases [-h] [--scope-config SCOPE_CONFIG]
+                                          [--data-root DATA_ROOT]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT

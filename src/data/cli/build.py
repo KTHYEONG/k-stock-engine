@@ -368,6 +368,52 @@ def _run_dividends(args: argparse.Namespace) -> Mapping[str, object]:
     return {"dataset_id": path.name, "dataset_path": str(path)}
 
 
+def _run_earnings_releases(args: argparse.Namespace) -> Mapping[str, object]:
+    from datetime import datetime
+
+    from src.config import load_provider_policy, load_runtime_config
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+    from src.data.earnings_releases import materialize_earnings_releases
+
+    runtime = scoped_runtime(args)
+    path = materialize_earnings_releases(
+        catalog=scoped_catalog(runtime),
+        silver_root=runtime.workspace.silver_root, calendar=xkrx_calendar_through(datetime.now(KRX_TZ).date()),
+        policy=load_provider_policy(load_runtime_config()).earnings_releases,
+    )
+    register_dataset(runtime, "earnings_releases", path.name)
+    return {"dataset_id": path.name, "dataset_path": str(path)}
+
+
+def _run_earnings_benchmark(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.earnings_releases import benchmark_earnings_releases
+
+    runtime = scoped_runtime(args)
+    registry = DatasetRegistry(runtime.workspace.state_root)
+    releases_id = registered_id(registry, "earnings_releases", None)
+    facts_id = registered_id(registry, "financial_facts", None)
+    report = benchmark_earnings_releases(
+        releases_path=runtime.workspace.silver_root / releases_id,
+        facts_path=runtime.workspace.silver_root / facts_id,
+    )
+    return {
+        "releases": releases_id,
+        "facts": facts_id,
+        "benchmarks": [
+            {
+                "metric": entry.metric,
+                "matched": entry.matched,
+                "within_1pct": entry.within_1pct,
+                "within_5pct": entry.within_5pct,
+                "median_abs_rel_error": entry.median_abs_rel_error,
+            }
+            for entry in report
+        ],
+    }
+
+
 def _run_market_actions(args: argparse.Namespace) -> Mapping[str, object]:
     from datetime import datetime
 
@@ -418,6 +464,8 @@ BUILD_COMMANDS: tuple[Command, ...] = (
     Command("build-investor-flow-union", "Union certified LS flow and its KIS supplement into one dataset", _add_flow_union, _run_flow_union),
     Command("build-financial-quality", "Build certified financial-quality evidence from facts and quarantine", _add_quality, _run_quality),
     Command("build-dividend-events", "Build Silver cash-dividend events from dated decision filings", _add_scoped_only, _run_dividends),
+    Command("build-earnings-releases", "Build Silver early-earnings releases from preliminary filings", _add_scoped_only, _run_earnings_releases),
+    Command("benchmark-earnings-releases", "Report preliminary-vs-filed agreement", _add_scoped_only, _run_earnings_benchmark),
     Command("build-market-actions", "Build Silver exchange market actions from DART, KIND and daily flags", _add_scoped_only, _run_market_actions),
     Command("build-industry-classification-silver", "Build the certified industry classification Silver snapshot", _add_scoped_only, _run_industry_silver),
 )

@@ -700,3 +700,12 @@ def test_reparse_and_fetch_documents_dry_run(tmp_path, capsys) -> None:
     summary = _cli_json_lines(capsys)[-1]
     assert summary["job"] == "dart_document_fetch"
     assert summary["status"] == "dry_run"
+
+
+def test_collect_earnings_releases_command_resolves() -> None:
+    from src.data.cli import _ensure_registered
+    from src.data.cli.registry import commands
+
+    _ensure_registered()
+
+    assert "collect-earnings-releases" in {command.name for command in commands()}
