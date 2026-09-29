@@ -24,6 +24,7 @@ __all__ = [
     "DART_DISCLOSURE_WINDOWS_SOURCE",
     "DART_DOCUMENT_SOURCE",
     "DIVIDEND_DECISION_SOURCE",
+    "EARNINGS_RELEASE_SOURCE",
     "FINANCIAL_FACTS_SOURCE",
     "KIND_NOTICE_DOCUMENT_SOURCE",
     "KIND_NOTICE_SEARCH_SOURCE",
@@ -53,6 +54,7 @@ DART_DISCLOSURES_SOURCE = "dart_disclosures"
 DART_CORP_DISCLOSURES_SOURCE = "dart_corp_disclosures"
 DART_DISCLOSURE_WINDOWS_SOURCE = "dart_disclosure_windows"
 DIVIDEND_DECISION_SOURCE = "opendart:dividend_decision"
+EARNINGS_RELEASE_SOURCE = "opendart:earnings_release"
 DART_CORP_CODES_SOURCE = "dart_corp_codes"
 DART_DOCUMENT_SOURCE = "dart_documents"
 KIND_NOTICE_SEARCH_SOURCE = "kind_notice_search"
@@ -223,6 +225,16 @@ SOURCE_CONTRACTS: Final[Mapping[str, SourceContract]] = {
         SourceContract(
             source=DIVIDEND_DECISION_SOURCE,
             kind=EvidenceKind.CORPORATE_ACTIONS,
+            provider="DART",
+            endpoints=frozenset(),
+            envelope=EnvelopeFormat.NATIVE,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset(),
+            query_fields=frozenset(),
+        ),
+        SourceContract(
+            source=EARNINGS_RELEASE_SOURCE,
+            kind=EvidenceKind.DISCLOSURES,
             provider="DART",
             endpoints=frozenset(),
             envelope=EnvelopeFormat.NATIVE,

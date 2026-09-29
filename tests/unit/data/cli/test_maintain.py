@@ -635,3 +635,42 @@ def test_cli_parse_and_prune_unreadable_apply_boundaries(tmp_path, monkeypatch, 
     assert cli_module.main(_dataset_cli_args("prune-datasets", runtime, "--apply")) == 1
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert any(line.get("status") == "delete_failed" for line in lines)
+
+
+def test_earnings_releases_cli_build_and_benchmark_dispatch(tmp_path, monkeypatch, capsys) -> None:
+    import src.data.cli as cli_module
+    import src.data.earnings_releases as earnings_module
+    from src.data.dataset_registry import DatasetRegistry
+
+    runtime = _dataset_runtime(tmp_path)
+    monkeypatch.setattr("src.data.cli.build.register_dataset", lambda *_args: None)
+
+    build_calls: list[dict[str, object]] = []
+
+    def _fake_build(**kwargs: object) -> Path:
+        build_calls.append(kwargs)
+        return tmp_path / "earnings_releases_0123456789abcdef"
+
+    monkeypatch.setattr(earnings_module, "materialize_earnings_releases", _fake_build)
+    assert cli_module.main(_dataset_cli_args("build-earnings-releases", runtime)) == 0
+    assert json.loads(capsys.readouterr().out)["dataset_id"] == "earnings_releases_0123456789abcdef"
+    assert build_calls[0]["policy"] is not None
+
+    releases = _publish_cli_dataset(runtime, "earnings_releases")
+    facts = _publish_cli_dataset(runtime, "financial_facts")
+    registry = DatasetRegistry(runtime.workspace.state_root)
+    registry.register("earnings_releases", releases.dataset_id)
+    registry.register("financial_facts", facts.dataset_id)
+    monkeypatch.setattr(
+        earnings_module,
+        "benchmark_earnings_releases",
+        lambda **_kwargs: (earnings_module.EarningsReleaseBenchmark(
+            metric="sales", matched=2, within_1pct=1.0, within_5pct=1.0,
+            median_abs_rel_error=0.0,
+        ),),
+    )
+    assert cli_module.main(_dataset_cli_args("benchmark-earnings-releases", runtime)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["releases"] == releases.dataset_id
+    assert payload["facts"] == facts.dataset_id
+    assert payload["benchmarks"][0]["matched"] == 2

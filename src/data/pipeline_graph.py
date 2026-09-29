@@ -317,6 +317,23 @@ def _build_dividend_events(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pu
     return _published(path)
 
 
+def _build_earnings_releases(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+    """Build Silver early-earnings releases from preliminary and profit-change filings."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.earnings_releases import materialize_earnings_releases
+
+    _ = inputs
+    runtime = ctx.runtime
+    policy = load_provider_policy(load_runtime_config()).earnings_releases
+    path = materialize_earnings_releases(
+        catalog=ctx.catalog,
+        silver_root=runtime.workspace.silver_root,
+        calendar=_build_calendar(ctx),
+        policy=policy,
+    )
+    return _published(path)
+
+
 def _build_reference_benchmarks(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build frictionless Gold reference benchmarks from the resolved panel."""
     from src.config.runtime import load_runtime_config
@@ -694,6 +711,62 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
     )
 
 
+def _preview_earnings_releases(ctx: RefreshContext) -> DatasetIdentity:
+    """Compute the would-be earnings-releases identity from release envelopes."""
+    import json as _json
+
+    from src.core.time import KRX_TZ
+    from src.data.datasets import DatasetLayer as _Layer
+    from src.data.earnings_releases import (
+        POLICY_VERSION as _EARNINGS_POLICY_VERSION,
+    )
+    from src.data.earnings_releases import _iter_release_envelopes, earnings_release_dataset_inputs
+
+    envelopes = _iter_release_envelopes(ctx.catalog)
+    ordered = sorted(envelopes, key=lambda item: str(item.get("rcept_no", "")))
+    seen: set[str] = set()
+    unique: list[dict[str, object]] = []
+    for envelope in ordered:
+        key = str(envelope.get("rcept_no", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(envelope)
+    envelope_hashes = [
+        hashlib.sha256(
+            _json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+        for envelope in unique
+    ]
+    try:
+        from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
+
+        _, bridge_receipt_hash = _read_bridge(ctx.catalog)
+    except PITDataError:  # pragma: no cover - missing bridge preview fallback
+        bridge_receipt_hash = ""
+    from src.config import load_provider_policy, load_runtime_config
+
+    policy = load_provider_policy(load_runtime_config()).earnings_releases
+    calendar = _build_calendar(ctx)
+    return DatasetIdentity(
+        kind="earnings_releases",
+        layer=_Layer.SILVER,
+        policy_version=_EARNINGS_POLICY_VERSION,
+        inputs=earnings_release_dataset_inputs(
+            bronze_earnings_releases=dataset_digest(envelope_hashes),
+            corp_code_bridge=dataset_digest([bridge_receipt_hash]),
+        ),
+        params={
+            "calendar_digest": hashlib.sha256(
+                "\n".join(
+                    session.astimezone(KRX_TZ).date().isoformat() for session in calendar.sessions
+                ).encode("utf-8")
+            ).hexdigest(),
+            "max_filing_lag_days": policy.max_filing_lag_days,
+        },
+    )
+
+
 def _preview_reference_benchmarks(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be benchmarks identity from the resolved panel."""
     import json as _json
@@ -736,6 +809,7 @@ _PREVIEW_FNS: Final[dict[str, Callable[[RefreshContext], DatasetIdentity]]] = {
     "financial_facts": _preview_financial_facts,
     "financial_quality": _preview_financial_quality,
     "dividend_events": _preview_dividend_events,
+    "earnings_releases": _preview_earnings_releases,
     "reference_benchmarks": _preview_reference_benchmarks,
 }
 
@@ -755,6 +829,7 @@ SCOPE_GRAPH: Final[tuple[BuildNode, ...]] = (
         bronze_sources=("corporate_actions",),
         build=_build_dividend_events,
     ),
+    BuildNode(kind="earnings_releases", inputs=(), bronze_sources=("disclosures",), build=_build_earnings_releases),
     BuildNode(
         kind="investor_flow_ls",
         inputs=("ordinary_universe",),
@@ -1186,6 +1261,12 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
             "dividend_decisions",
             lambda ctx, *, dry_run, emit: _run_dart_collection_step(
                 ctx, "dividend_decisions", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "earnings_releases",
+            lambda ctx, *, dry_run, emit: _run_dart_collection_step(
+                ctx, "earnings_releases", dry_run=dry_run, emit=emit
             ),
         ),
         (

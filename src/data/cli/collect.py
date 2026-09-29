@@ -404,6 +404,8 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_dart_job(args, job_name="dart_facts")),
     Command("collect-dividend-decisions", "Collect DART cash-dividend decision archives", _add_dart_job,
             lambda args: _run_dart_job(args, job_name="dividend_decisions")),
+    Command("collect-earnings-releases", "Collect DART preliminary-result and profit-change archives", _add_dart_job,
+            lambda args: _run_dart_job(args, job_name="earnings_releases")),
     Command("reparse-dart-documents", "Re-derive document fact pages from stored archives", _add_document_reparse_job,
             lambda args: _run_document_job(args, job_name="dart_document_reparse")),
     Command("collect-dart-documents", "Fetch document archives for relevant document-path identities", _add_document_fetch_job,

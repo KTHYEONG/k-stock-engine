@@ -338,7 +338,7 @@ def test_resolve_dart_job_registry() -> None:
     from src.core.pit import PITDataError
     from src.data.jobs.dart import DART_JOBS, resolve_dart_job
 
-    assert set(DART_JOBS) == {"dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions", "dart_document_reparse", "dart_document_fetch", "dart_benchmark_documents"}
+    assert set(DART_JOBS) == {"dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions", "earnings_releases", "dart_document_reparse", "dart_document_fetch", "dart_benchmark_documents"}
     assert resolve_dart_job("dart_facts").name == "dart_facts"
     assert resolve_dart_job("dart_corp_codes").name == "dart_corp_codes"
     assert resolve_dart_job("dart_document_reparse").name == "dart_document_reparse"
@@ -370,7 +370,7 @@ def test_disclosures_skip_per_corp_covered_windows(tmp_path: Path) -> None:
     units = DartDisclosuresJob().pending(ctx)
 
     assert units
-    assert {unit.payload["detail_type"] for unit in units} == {"A", "I001", "I003"}
+    assert {unit.payload["detail_type"] for unit in units} == {"A", "I001", "I002", "I003"}
     assert min(unit.payload["window_start"] for unit in units) >= "2019-07-01"
     assert all(unit.max_requests > 0 for unit in units)
 
@@ -1284,3 +1284,145 @@ def test_incomplete_window_keeps_every_earlier_chunk_saved(tmp_path: Path) -> No
 
     saved = pending_before - len(spec.pending(seed_ctx))
     assert saved == spec.max_chunk_units * 2
+
+
+# --- earnings releases job ------------------------------------------------------
+
+
+def _release_record(rcept_no: str, rcept_dt: str, report_nm: str) -> dict:
+    return _per_corp_record(rcept_no, rcept_dt, report_nm)
+
+
+def test_earnings_only_release_titles_of_eligible_corps_planned(tmp_path: Path) -> None:
+    from src.data.jobs.dart import EarningsReleasesJob
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    _write_disclosure_page(
+        runtime.workspace.bronze_root,
+        _per_corp_page(
+            [
+                _release_record("20190131000001", "20190131", "연결재무제표기준영업(잠정)실적(공정공시)"),
+                _release_record("20210201000002", "20210201", "매출액또는손익구조30%(대규모법인은15%)이상변경"),
+                _release_record("20210201000003", "20210201", "연결재무제표기준영업실적등에대한전망(공정공시)"),
+                _release_record("20300101000005", "20300101", "영업(잠정)실적(공정공시)"),
+                _release_record("20150101000006", "20150101", "영업(잠정)실적(공정공시)"),
+                {
+                    "corp_code": "99999999", "corp_name": "Other Co", "rcept_no": "20190131000004",
+                    "rcept_dt": "20190131", "report_nm": "영업(잠정)실적(공정공시)", "rm": "",
+                },
+            ]
+        ),
+    )
+    ctx = _ctx(runtime, _provider())
+
+    units = EarningsReleasesJob().pending(ctx)
+
+    assert [unit.natural_key for unit in units] == ["20190131000001", "20210201000002"]
+
+
+def test_earnings_job_health_check_delegates_to_collector(tmp_path: Path) -> None:
+    from src.data.jobs.dart import EarningsReleasesJob
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    ctx = _ctx(runtime, _provider(), collector=_Collector(healthy=True))
+
+    EarningsReleasesJob().health_check(ctx)
+
+
+def test_earnings_answered_receipts_not_replanned(tmp_path: Path) -> None:
+    from src.core.pit import EvidenceKind
+    from src.data.evidence_sources import EARNINGS_RELEASE_SOURCE
+    from src.data.jobs.dart import EarningsReleasesJob
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.data.scoped_ingestion import ScopedRawPayload
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    _write_disclosure_page(
+        runtime.workspace.bronze_root,
+        _per_corp_page(
+            [
+                _release_record("20190131000001", "20190131", "영업(잠정)실적(공정공시)"),
+                _release_record("20210201000002", "20210201", "매출액또는손익구조30%(대규모법인은15%)이상변경"),
+            ]
+        ),
+    )
+    ctx = _ctx(runtime, _provider())
+    assert [unit.natural_key for unit in EarningsReleasesJob().pending(ctx)] == [
+        "20190131000001", "20210201000002",
+    ]
+    ctx.writer.persist(
+        ScopedRawPayload(
+            kind=EvidenceKind.DISCLOSURES,
+            source=EARNINGS_RELEASE_SOURCE,
+            natural_key="20190131000001",
+            as_of=date(2019, 1, 31),
+            fiscal_period=None,
+            status=EvidenceStatus.SUCCESS,
+            payload=b"{}",
+            retrieved_at=NOW,
+            source_label="test:answered",
+        )
+    )
+
+    assert [unit.natural_key for unit in EarningsReleasesJob().pending(ctx)] == ["20210201000002"]
+
+
+def test_earnings_non_zip_body_stored_empty(tmp_path: Path) -> None:
+    from src.data.jobs.dart import EarningsReleasesJob
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    _write_disclosure_page(
+        runtime.workspace.bronze_root,
+        _per_corp_page([_release_record("20190131000001", "20190131", "영업(잠정)실적(공정공시)")]),
+    )
+    absent = b'<?xml version="1.0"?><response><status>014</status><message>absent</message></response>'
+    ctx = _ctx(runtime, _provider(), collector=_Collector(archives={"20190131000001": absent}))
+    spec = EarningsReleasesJob()
+    (unit,) = spec.pending(ctx)
+
+    (payload,) = spec.fetch(ctx, [unit])
+
+    assert payload.status.value == "empty"
+    assert json.loads(payload.payload)["document_status"] == "unavailable"
+    assert payload.kind.value == "disclosures"
+
+
+def test_dividend_envelope_unchanged_by_helper_rename(tmp_path: Path) -> None:
+    import base64
+    import hashlib
+
+    from src.data.jobs.dart import DividendDecisionsJob
+
+    runtime = _runtime(tmp_path)
+    _bridge(runtime.workspace.bronze_root)
+    _universe(runtime)
+    _write_disclosure_page(
+        runtime.workspace.bronze_root, _per_corp_page([_decision_record("20170330876543", "20170330")])
+    )
+    archive = b"PK\x03\x04dividend-zip-bytes"
+    ctx = _ctx(runtime, _provider(), collector=_Collector(archives={"20170330876543": archive}))
+    (unit,) = DividendDecisionsJob().pending(ctx)
+
+    (payload,) = DividendDecisionsJob().fetch(ctx, [unit])
+
+    expected = json.dumps(
+        {
+            "rcept_no": "20170330876543",
+            "corp_code": CORP,
+            "received_on": "2017-03-30",
+            "report_nm": "현금배당결정",
+            "archive_b64": base64.b64encode(archive).decode("ascii"),
+            "archive_sha256": hashlib.sha256(archive).hexdigest(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    assert payload.payload == expected
