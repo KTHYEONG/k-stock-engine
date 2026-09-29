@@ -25,6 +25,7 @@ class RuntimeConfig(BaseModel):
     market_rules: Path
     reference_benchmarks: Path
     engine: Path
+    research_protocol: Path
     strategies_root: Path
 
 
