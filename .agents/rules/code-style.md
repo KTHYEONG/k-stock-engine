@@ -11,7 +11,7 @@
 - **Explicit Configuration:** Keep runtime settings externalized and validated at application boundaries; never hardcode environment-dependent secrets or endpoints.
 - **Toolchain Alignment:** Use the repository's declared environment and quality tooling (linters, type-checkers, and test runners); do not introduce competing toolchains unnecessarily.
 
-## 3. Polyglot & Native Extensions
-- **Equivalence of Rigor:** Any introduced non-Python or native extension component must meet equivalent quality baselines: static compiler checks, idiomatic linting, and risk-appropriate testing.
-- **FFI Boundary & Safety:** Explicitly define memory ownership and error semantics across language boundaries. Safely translate recoverable native errors to host exceptions without crashing the process.
-- **Contract Continuity:** Expose typed interface boundaries (such as type stubs or bindings) so end-to-end verification remains seamless from the host runtime.
+## 3. Polyglot Architecture & Cross-Language Boundaries
+- **Equivalence of Rigor:** Any introduced subsystem, module, or polyglot extension must meet equivalent first-class engineering baselines: static compilation or type checks, idiomatic linting, and rigorous automated testing.
+- **FFI & Inter-Service Safety:** Explicitly define memory ownership, concurrency safety, and error semantics across language or process boundaries. Safely translate recoverable errors without crashing host or client runtimes.
+- **Contract Continuity:** Maintain explicit, machine-verifiable typed interface boundaries across subsystem boundaries so end-to-end verification remains seamless across all integrated components.
