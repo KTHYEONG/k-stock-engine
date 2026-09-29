@@ -55,6 +55,7 @@ logs/
 
 # Scratch directory for AI experimentation and probe scripts
 scratch/
+docs/specs/
 
 # Project-only temp root (pytest/tempfile/TMPDIR pinned via tests/conftest.py)
 tmp/
