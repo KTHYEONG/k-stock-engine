@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date
 from pathlib import Path
 
 from src.core.pit import PITDataError
@@ -26,7 +26,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--no-dividends", action="store_true", default=False)
     parser.add_argument("--start", type=str, required=True)
     parser.add_argument("--end", type=str, required=True)
-    parser.add_argument("--allow-forward", action="store_true", default=False)
     return parser.parse_args(argv)
 
 
@@ -77,8 +76,8 @@ def _load_deposits(path: Path | None) -> dict[date, int]:
     return deposits
 
 
-def _resolve_runtime_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
-    """Resolve scope, data, strategy, engine, and rules paths from flags or ``config/runtime.toml``."""
+def _resolve_runtime_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path, Path]:
+    """Resolve scope, data, strategy, engine, rules, and protocol paths from flags or ``config/runtime.toml``."""
     from src.config.runtime import load_runtime_config
 
     runtime_config = load_runtime_config()
@@ -89,7 +88,7 @@ def _resolve_runtime_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, 
     else:
         strategy_config = Path(runtime_config.strategies_root) / f"{args.strategy}.toml"
     engine_config = Path(args.engine_config) if args.engine_config is not None else runtime_config.engine
-    return scope_config, data_root, strategy_config, engine_config, runtime_config.market_rules
+    return scope_config, data_root, strategy_config, engine_config, runtime_config.market_rules, runtime_config.research_protocol
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -111,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         from src.data.research_scope import load_research_scope
 
-        scope_config, data_root_arg, strategy_config, engine_config, rules_path = _resolve_runtime_paths(args)
+        scope_config, data_root_arg, strategy_config, engine_config, rules_path, protocol_path = _resolve_runtime_paths(args)
         scope = load_research_scope(Path(scope_config))
         data_root = Path(data_root_arg)
         if not data_root.is_absolute():
@@ -120,11 +119,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         end = date.fromisoformat(str(args.end))
         if start > end:
             raise ValueError(f"run window [{start}, {end}] must satisfy start <= end")
-        if (end > scope.holdout_end or start > scope.holdout_end) and not bool(args.allow_forward):
-            raise ValueError(
-                f"end {end.isoformat()} is beyond holdout_end {scope.holdout_end.isoformat()}; "
-                "pass --allow-forward to run on sealed forward dates"
-            )
+        from datetime import datetime
+
+        from src.data.research_protocol import LockboxLedger, load_research_protocol
+
+        protocol = load_research_protocol(Path(protocol_path), scope)
+        ledger = LockboxLedger(
+            state_root=data_root / "state" / scope.scope_id,
+            protocol=protocol,
+            now=lambda: datetime.now(UTC),
+        )
+        ledger.authorize(start=start, end=end, spec_hash=None)
         capitals: list[int] = list(args.capitals or [])
         if bool(getattr(args, "no_dividends", False)) and args.dividends_dataset_id is not None:
             raise ValueError("--no-dividends cannot be combined with --dividends-dataset-id")

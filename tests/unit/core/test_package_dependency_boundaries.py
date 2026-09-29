@@ -20,6 +20,7 @@ ALLOWED: dict[str, frozenset[str]] = {
     "integrations": frozenset({"core", "config"}),
     "data": frozenset({"core", "config", "integrations"}),
     "backtest": frozenset({"core", "config", "data"}),
+    "research": frozenset({"core", "config", "data", "backtest"}),
 }
 
 # (importing file relative to repo root, imported top-level package)
