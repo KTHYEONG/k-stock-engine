@@ -233,6 +233,8 @@ class DartDisclosuresJob:
     """Market-wide ``list.json`` windows for the types the other jobs consume."""
 
     name = "dart_disclosures"
+    # 창 하나가 수십~수백 페이지라 청크를 작게 잡아 완료된 창을 바로 저장한다(중단 시 손실 최소화).
+    max_chunk_units = 4
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
         bridge = corp_code_bridge(ctx)

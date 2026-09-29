@@ -14,7 +14,9 @@ _FAKE_SOURCE = "dart_disclosures"
 
 
 def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  # type: ignore[no-untyped-def]
-    from src.config.providers import DartKeyPolicy, DartPolicy, KisPolicy, KrxPolicy, LsPolicy, ProviderPolicy
+    from src.config.providers import (
+        DartKeyPolicy, DartPolicy, KindPolicy, KisPolicy, KrxPolicy, LsPolicy, ProviderPolicy,
+    )
 
     return ProviderPolicy(
         dart=DartPolicy(
@@ -57,6 +59,13 @@ def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  
             max_sessions_per_request=700,
             min_interval_seconds=1.05,
             daily_limit=10000,
+        ),
+        kind=KindPolicy(
+            circuit_threshold=3,
+            min_interval_seconds=1.0,
+            daily_limit=5000,
+            search_keywords=("상장폐지",),
+            document_titles=("상장폐지",),
         ),
     )
 

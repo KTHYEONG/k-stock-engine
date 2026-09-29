@@ -493,6 +493,8 @@ _LIVE_SUBCOMMANDS = frozenset(
         "benchmark-dart-documents",
         "collect-krx-daily-market",
         "collect-krx-security-master",
+        "collect-kind-notices",
+        "collect-kind-documents",
         "collect-ls-investor-flow",
         "collect-kis-investor-flow",
         "collect-industry-classification",

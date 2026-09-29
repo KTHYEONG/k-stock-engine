@@ -527,3 +527,38 @@ def test_require_coverage_with_unparseable_window_fails_closed(tmp_path: Path) -
             _catalog(runtime), keywords=("상장폐지",),
             through=date(2024, 4, 2), start=date(2024, 1, 2),
         )
+
+
+def test_deferred_delisting_form_is_an_open_ended_decision() -> None:
+    # 실측: 가처분 등으로 정리매매가 보류되면 `상장폐지일 -`, `정리매매 허용기간 시작일 - 종료일 -`로 온다.
+    html = (
+        "<html><body>2.상장폐지 주권 종류 및 주식수 주권종류 주식수 단축코드 보통주 7,022,839 A005450 "
+        "3.상장폐지 사유 감사의견 의견거절 2년 계속 4.상장폐지 예고기간 시작일 - - 종료일 - "
+        "5.정리매매 허용기간 시작일 - - 종료일 - 6.상장폐지일 - 7.근거규정 제48조</body></html>"
+    )
+    form = parse_kind_delisting_form(html)
+    assert form.tickers == ("005450",)
+    assert form.delisting_date is None
+    assert form.liquidation_start is None
+    assert form.liquidation_end is None
+
+
+def test_live_kosdaq_deferred_form_is_open_ended() -> None:
+    form = parse_kind_delisting_form(kind_fixture("body_delisting_kosdaq_deferred.html"))
+    assert form.tickers == ("058220",)
+    assert form.delisting_date is None
+    assert form.liquidation_start is None
+    assert form.liquidation_end is None
+
+
+def test_kosdaq_delisting_form_reads_its_liquidation_labels() -> None:
+    # 코스닥 양식: `정리매매기간 시작일 … 만료일 …`(공백 없음, 종료 라벨이 만료일).
+    html = (
+        "<html><body>2.주권종류 및 발행주식수 주권종류 단축코드 주식수(주) 상장일 보통주 A058220 38,974,244 2005-08-05 "
+        "5.상장폐지사유 감사의견 거절 6.정리매매기간 시작일 2021-12-01 - 만료일 2021-12-09 "
+        "7.상장폐지일 2021-12-10 8.근거규정 제54조</body></html>"
+    )
+    form = parse_kind_delisting_form(html)
+    assert form.liquidation_start == date(2021, 12, 1)
+    assert form.liquidation_end == date(2021, 12, 9)
+    assert form.delisting_date == date(2021, 12, 10)

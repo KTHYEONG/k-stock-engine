@@ -394,6 +394,12 @@ def test_collect_disclosures_command_runs_with_fake_collector(
         def health_check(self) -> None:
             return None
 
+        def list_disclosure_window(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
+            from src.integrations.dart.client import DisclosureListing
+
+            rows = self.list_disclosures(start, end, disclosure_filter=disclosure_filter, detail_type=detail_type)
+            return DisclosureListing(records=tuple(rows), reported_total=len(rows), raw_rows=len(rows))
+
         def list_disclosures(self, start, end, *, disclosure_filter=None, detail_type=None):  # type: ignore[no-untyped-def]
             filt = disclosure_filter if disclosure_filter is not None else detail_type
             code = getattr(filt, "code", filt)
