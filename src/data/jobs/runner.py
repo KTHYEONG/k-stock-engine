@@ -85,6 +85,8 @@ class JobContext:
 class JobSpec(Protocol):
     """One resumable provider job: plan from the catalog, fetch units, check health.
 
+    A spec may set ``max_chunk_units`` to cap how many units one chunk holds, so a job whose units
+    are expensive checkpoints after each few units instead of after the whole plan.
     A spec may set ``fail_fast = True`` to abort the run on the first transport
     failure instead of tolerating it up to the circuit threshold. Failing fast
     keeps chunk retries aligned with per-chunk Bronze checkpoints: a failed
@@ -291,6 +293,10 @@ def _run_locked(
             spec_name=spec.name, emit=emit, status="provider_unreachable", done=0,
             pending_left=len(pending), requests_used=max(0, start_remaining - _ledger_remaining(ctx)),
         )
+    # 단위 하나가 비싼 잡(창 수집)은 청크를 작게 지정해 완료분이 즉시 저장되게 한다.
+    spec_limit = getattr(spec, "max_chunk_units", None)
+    if spec_limit is not None:
+        chunk_size = min(chunk_size, int(spec_limit))
     threshold = ctx.runner.circuit_threshold
     windows = ctx.runner.avoid_windows_kst
     fail_fast = bool(getattr(spec, "fail_fast", False))

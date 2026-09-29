@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "market_actions_kind_acceptance",
+      "date": "2026-09-29",
+      "adr_id": "ADR_20260929_market_actions_kind_acceptance",
+      "domain": "data",
+      "title": "Market actions real-data acceptance: KIND classification fixes and limitless-move audit at zero",
+      "why": "Real-data rebuild exposed KIND classification gaps (partial-cause releases, reversed-injunction resumptions, deferred or stale delisting schedules) and a KOSDAQ release conflict with daily flags.",
+      "resolution": "Fixed those classifications, bounded the KIND coverage horizon at the last observed session, and made the KRX flag the sole KOSDAQ release authority.",
+      "impact": "Unexplained limitless moves dropped from 45 to 0, KOSPI administrative designations rose from 0 to 113, and no previously blocked row was unblocked.",
+      "caveat": "KOSPI administrative releases trust KIND titles because no flag exists to cross-check partial-cause releases."
+    },
+    {
       "task_id": "market_actions_kind_integrity",
       "date": "2026-09-28",
       "adr_id": "ADR_20260928_market_actions_kind_integrity",

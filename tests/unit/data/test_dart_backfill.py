@@ -57,6 +57,7 @@ def _capped_provider(*, daily_budget, daily_reserve, batch_identities):  # type:
         kis=_provider().kis,
         krx=_provider().krx,
         ls=_provider().ls,
+        kind=_provider().kind,
     )
 
 
