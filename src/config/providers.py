@@ -18,6 +18,7 @@ __all__ = [
     "DisclosureFilter",
     "DividendPlausibilityPolicy",
     "DocumentParserPolicy",
+    "EarningsReleasePolicy",
     "KindPolicy",
     "KisPolicy",
     "KrxPolicy",
@@ -119,6 +120,30 @@ class DividendPlausibilityPolicy(BaseModel):
     def _check_window(cls, value: int) -> int:
         if isinstance(value, bool) or int(value) < 0:
             raise ValueError(f"invalid correction_window_days {value!r}: must be a non-negative integer")
+        return int(value)
+
+
+class EarningsReleasePolicy(BaseModel):
+    """Acceptance policy for early earnings releases entering Silver.
+
+    A preliminary result whose labelled fiscal quarter is implausibly far from its receipt date is
+    withheld, never re-dated: the label is the only period evidence in the filing, and a stale or
+    mislabelled period would place numbers at the wrong point in time.
+
+    Attributes:
+        max_filing_lag_days: Largest allowed distance in days from the labelled quarter end to the
+            receipt date of an original (non-correction) preliminary filing.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_filing_lag_days: int = 135
+
+    @field_validator("max_filing_lag_days")
+    @classmethod
+    def _check_lag(cls, value: int) -> int:
+        if isinstance(value, bool) or int(value) < 1:
+            raise ValueError(f"invalid max_filing_lag_days {value!r}: must be a positive integer")
         return int(value)
 
 
@@ -336,6 +361,7 @@ class ProviderPolicy(BaseModel):
     ls: LsPolicy
     kind: KindPolicy
     dividends: DividendPlausibilityPolicy = DividendPlausibilityPolicy()
+    earnings_releases: EarningsReleasePolicy = EarningsReleasePolicy()
 
     @property
     def primary_key_env(self) -> str:

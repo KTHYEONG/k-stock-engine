@@ -1,6 +1,17 @@
 {
   "tasks": [
     {
+      "task_id": "RESEARCH_STACK_EARNINGS_CUBE",
+      "date": "2026-09-29",
+      "adr_id": "ADR_20260929_RESEARCH_STACK_EARNINGS_CUBE",
+      "domain": "research",
+      "title": "Research stack: early earnings releases, protocol lockbox, PIT cube, simulator, gates",
+      "why": "Strategy discovery lacked early-earnings data, sealed holdout enforcement, trial accounting and a causal feature store.",
+      "resolution": "Added DART I002/I001 release parsing and Silver, lockbox and trial registry with DSR/PBO, vectorized PIT cube and features, weight-space simulator with ledger bridge, and G1-G5 gates with a research CLI.",
+      "impact": "Strategy candidates are screened on discovery only and promoted through mechanical gates before a one-shot holdout.",
+      "caveat": "Earnings releases are not yet collected on real data, so acceptance benchmarks and the full cube budget remain unverified."
+    },
+    {
       "task_id": "market_actions_kind_acceptance",
       "date": "2026-09-29",
       "adr_id": "ADR_20260929_market_actions_kind_acceptance",

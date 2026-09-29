@@ -251,5 +251,8 @@
   "src/data/market_actions.py": {
     "testing": "tests/unit/data/test_market_actions.py",
     "architecture": "docs/architecture/engineering-decisions.md"
+  },
+  "src/research/cube.py": {
+    "testing": "tests/unit/research/test_cube.py"
   }
 }

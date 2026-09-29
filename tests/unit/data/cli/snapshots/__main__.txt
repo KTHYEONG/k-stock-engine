@@ -1,11 +1,11 @@
 usage: cli.py [-h]
-              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
               ...
 
 PIT dataset foundation CLI
 
 positional arguments:
-  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
     normalize-dart-facts
                         Incremental DART fact refresh
     audit-ordinary-universe-prices
@@ -38,6 +38,9 @@ positional arguments:
                         filings
     collect-dividend-decisions
                         Collect DART cash-dividend decision archives
+    collect-earnings-releases
+                        Collect DART preliminary-result and profit-change
+                        archives
     reparse-dart-documents
                         Re-derive document fact pages from stored archives
     collect-dart-documents
@@ -73,6 +76,11 @@ positional arguments:
     build-dividend-events
                         Build Silver cash-dividend events from dated decision
                         filings
+    build-earnings-releases
+                        Build Silver early-earnings releases from preliminary
+                        filings
+    benchmark-earnings-releases
+                        Report preliminary-vs-filed agreement
     build-market-actions
                         Build Silver exchange market actions from DART, KIND
                         and daily flags
