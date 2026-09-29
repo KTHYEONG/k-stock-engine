@@ -94,4 +94,44 @@ class EqualWeightLiquid(Strategy):
         return Targets(weights=dict.fromkeys(selected, weight))
 
 
+class PrecomputedTargets(Strategy):
+    """Replay target weights decided upstream (research screening) inside the ledger engine.
+
+    The engine still owns execution, integer shares, costs and settlement, so any divergence from
+    the screening simulator measures the simulator's approximation, not a different strategy.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        targets: Mapping[int, Mapping[int, float]],
+        params: Mapping[str, str | int | float | bool],
+    ) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"name must be a non-empty string, got {name!r}")
+        cleaned: dict[int, dict[int, float]] = {}
+        for row, weights in targets.items():
+            if isinstance(row, bool) or not isinstance(row, int):
+                raise ValueError(f"target row must be an int, got {row!r}")
+            cleaned[int(row)] = dict(weights)
+        self._name = name
+        self._targets = cleaned
+        self._params = dict(params)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def params(self) -> Mapping[str, str | int | float | bool]:
+        return dict(self._params)
+
+    def is_rebalance(self, view: PITView) -> bool:
+        return view.t in self._targets
+
+    def decide(self, view: PITView, portfolio: PortfolioSnapshot) -> Targets:
+        _ = portfolio
+        return Targets(weights=dict(self._targets[view.t]))
+
+
 STRATEGIES: Mapping[str, Callable[..., Strategy]] = {"equal_weight_liquid": EqualWeightLiquid}

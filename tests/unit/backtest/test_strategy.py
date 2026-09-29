@@ -140,3 +140,75 @@ def test_strategies_registry_exposes_baseline() -> None:
     assert strategy.name == "equal_weight_liquid"
     assert strategy.params() == {"min_adtv20_krw": 0, "max_names": 5}
     assert all(isinstance(v, (str, int, float, bool)) for v in strategy.params().values())
+
+
+def test_precomputed_targets_replayed_only_on_their_rows(tmp_path: Any) -> None:
+    from datetime import timedelta
+
+    from src.backtest.market import load_market_arrays
+    from src.backtest.strategy import PrecomputedTargets
+    from src.backtest.view import PITView
+
+    sessions = [date(2020, 1, 6) + timedelta(days=i) for i in range(8)]
+    rows: list[dict[str, Any]] = []
+    for day in sessions:
+        rows.append(_mrow(day, "KRX:A"))
+        rows.append(_mrow(day, "KRX:B"))
+    panel = _write_panel(tmp_path / "gold", "market_panel_pre", rows)
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+
+    def _at(t: int) -> PITView:
+        return PITView(
+            arrays=arrays,
+            t=t,
+            decision_time=datetime.combine(sessions[t], time(18, 0), tzinfo=KRX_TZ),
+            asof_tables={},
+        )
+
+    view3 = _at(3)
+    view4 = _at(4)
+    view7 = _at(7)
+    strategy = PrecomputedTargets(
+        name="precomputed", targets={3: {0: 0.6, 1: 0.4}, 7: {1: 1.0}}, params={"capital_krw": 1000},
+    )
+    assert strategy.is_rebalance(view3) is True
+    assert strategy.is_rebalance(view4) is False
+    assert strategy.is_rebalance(view7) is True
+    assert strategy.decide(view3, _snapshot()).weights == {0: 0.6, 1: 0.4}
+    assert strategy.decide(view7, _snapshot()).weights == {1: 1.0}
+
+
+def test_precomputed_targets_invalid_weights_rejected(tmp_path: Any) -> None:
+    from datetime import timedelta
+
+    from src.backtest.market import load_market_arrays
+    from src.backtest.strategy import PrecomputedTargets
+    from src.backtest.view import PITView
+
+    sessions = [date(2020, 1, 6) + timedelta(days=i) for i in range(4)]
+    rows = [_mrow(day, "KRX:A") for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_bad", rows)
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    view = PITView(
+        arrays=arrays,
+        t=2,
+        decision_time=datetime.combine(sessions[2], time(18, 0), tzinfo=KRX_TZ),
+        asof_tables={},
+    )
+    strategy = PrecomputedTargets(
+        name="precomputed", targets={2: {0: 0.7, 1: 0.5}}, params={},
+    )
+    with pytest.raises(ValueError, match="above 1"):
+        strategy.decide(view, _snapshot())
+
+
+def test_precomputed_targets_validation_and_accessors() -> None:
+    from src.backtest.strategy import PrecomputedTargets
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        PrecomputedTargets(name="  ", targets={}, params={})
+    with pytest.raises(ValueError, match="must be an int"):
+        PrecomputedTargets(name="p", targets={True: {}}, params={})  # type: ignore[dict-item]
+    strategy = PrecomputedTargets(name="p", targets={}, params={"a": 1})
+    assert strategy.name == "p"
+    assert strategy.params() == {"a": 1}
