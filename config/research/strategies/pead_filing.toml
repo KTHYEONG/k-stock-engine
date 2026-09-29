@@ -1,0 +1,16 @@
+family = "pead"
+n = 20
+keep_rank_multiple = 2.0
+rebalance = "M"
+
+[universe]
+min_adtv20_krw = 500000000
+min_price_krw = 1000
+
+[junk]
+features = ["lowturn", "lowvol", "max21"]
+min_rank = 0.2
+
+[score]
+sue_op = 1.0
+sue_ni = 1.0
