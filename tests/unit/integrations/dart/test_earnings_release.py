@@ -426,19 +426,50 @@ def test_profit_change_unit_fallback_row() -> None:
     assert by_key[("operating_profit", ReleaseSpan.ANNUAL)].current_krw == 127086173 * 1e3
 
 
-def test_value_columns_follow_header_labels_not_fixed_positions() -> None:
+def test_value_columns_follow_change_group_width() -> None:
     rows = [
-        ["1. 연결실적내용", "단위 : 백만원, %"],
-        ["구분", "당기실적", "전년동기실적", "전년동기대비증감율(%)"],
-        ["('18.4Q)", "('17.4Q)"],
-        ["매출액", "당해실적", "500", "400", "25.0"],
-        ["누계실적", "2,000", "1,600", "25.0"],
+        ["1. 연결실적내용", "구분(단위 : 백만원, %)"],
+        ["구분", "당기실적", "전기실적", "전기대비", "전년동기실적", "전년동기대비"],
+        ["(2026년 1분기)", "(2025년 4분기)", "증감율(%)", "흑자적자전환여부", "(2025년 1분기)", "증감율(%)", "흑자적자전환여부"],
+        ["영업이익", "당해실적", "10,160", "-4,923", "-", "흑자전환", "5,186", "95.91", "-"],
+        ["누계실적", "10,160", "-", "-", "-", "5,186", "95.91", "-"],
     ]
+
+    release = _parse(rows, received_on=date(2026, 4, 23))
+
+    by_key = {(item.metric, item.span): item for item in release.values}
+    assert by_key[("operating_profit", ReleaseSpan.QUARTER)].current_krw == 10160 * 1e6
+    assert by_key[("operating_profit", ReleaseSpan.QUARTER)].prior_year_krw == 5186 * 1e6
+    assert by_key[("operating_profit", ReleaseSpan.CUMULATIVE)].prior_year_krw == 5186 * 1e6
+
+
+def test_unrecognizable_value_row_widths_are_skipped() -> None:
+    rows = _preliminary_rows()
+    rows[4] = ["매출액", "당해실적", "1", "2", "3", "4"]
 
     release = _parse(rows)
 
-    by_key = {(item.metric, item.span): item for item in release.values}
-    assert by_key[("sales", ReleaseSpan.QUARTER)].current_krw == 500 * 1e6
-    assert by_key[("sales", ReleaseSpan.QUARTER)].prior_year_krw == 400 * 1e6
-    assert by_key[("sales", ReleaseSpan.CUMULATIVE)].current_krw == 2000 * 1e6
-    assert by_key[("sales", ReleaseSpan.CUMULATIVE)].prior_year_krw == 1600 * 1e6
+    assert ("sales", ReleaseSpan.QUARTER) not in {(item.metric, item.span) for item in release.values}
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("(2025.10.01~2025.12.31)", (2025, 4)),
+        ("(2025.04.01 ~ 2025.06.30)", (2025, 2)),
+        ("(2022.4.1~ 2022.6.30)", (2022, 2)),
+        ("2024.01.01 ~2024.03.31 (1/4분기)", (2024, 1)),
+        ("(2024 3Q)", (2024, 3)),
+        ("(4Q25)", (2025, 4)),
+        ("(2025.10.01~2026.03.31)", None),
+        ("(2025.10.02~2025.12.31)", None),
+        ("(2024년)", None),
+        ("(2018.9월)", None),
+        ("(-)", None),
+        ("( )", None),
+    ],
+)
+def test_period_label_forms_and_ambiguous_labels(label: str, expected: tuple[int, int] | None) -> None:
+    from src.integrations.dart.earnings_release import _parse_period_label
+
+    assert _parse_period_label(label) == expected
