@@ -6,7 +6,7 @@
 ![Data Engine](https://img.shields.io/badge/Data-Polars%20%7C%20Parquet%20%7C%20SQLite3-cd792c.svg)
 ![Concurrency](https://img.shields.io/badge/Concurrency-asyncio%20%7C%20Quota%20Ledger-darkgreen.svg)
 ![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20Ports%20%26%20Adapters-blueviolet.svg)
-![Quality](https://img.shields.io/badge/Tests-987%20Passed%20%7C%20AST%20Guarded-success.svg)
+![Quality](https://img.shields.io/badge/Tests-1804%20Passed%20%7C%20AST%20Guarded-success.svg)
 ![Deployment](https://img.shields.io/badge/Production-Fail--Closed%20Gate-2496ed.svg)
 
 ---
@@ -15,12 +15,12 @@
 
 | 핵심 엔지니어링 지표 | 실측 성과 / 보장 기준 | 아키텍처 불변식 및 강제 장치 |
 | :--- | :---: | :--- |
-| 📈 **자본 보존형 복리 성과** | **`CAGR +25.38%` / `MDD 11.83%`** | 변동성 관리 레버리지 슬리브(2.0x) 및 10일 보유 호라이즌 자본 배분 모델 |
+| 📈 **발견 단계 상태** | **`pending evaluation, holdout sealed`** | 단일 전략 경로(`panel → scorer → policy → simulator/ledger → criteria C1-C4`) 및 밀봉 홀드아웃 단일 시도 |
 | 🛡️ **금융 회계 무결성** | **`부동소수점 오차 0원` / `미수금 0건`** | 전 계좌 원 단위 정수 원장(`Integer KRW Ledger`) 및 매도 우선 T+2 정산 추적 |
 | ⚡ **데이터 저장소 최적화** | **`99.8% 용량 압축` (`23GB` $\to$ `39.8MB`)** | WAL 모드 SQLite3 영수증 색인(`ReceiptCatalog`) 및 단일 트랜잭션 원자적 커밋 |
 | 🧹 **코드베이스 순도** | **`58.6% 부채 제거` (`42.8k` $\to$ `17.7k LOC`)** | 레거시 격리(`legacy/`), 단일 실행 파이프라인 통폐합, 불필요 중간 레이어 제거 |
 | ⏱️ **공급자 API 안정성** | **`IP 차단 0건` (`5 req/s` 안전 제어)** | `ProviderQuotaStateStore` 영속 원장, 16,000건/일 예산 관리 및 KST 자정 리셋 |
-| 🔒 **정적 아키텍처 품질** | **`987 Tests Green` / `AST 위반 0.00%`** | Python AST 기반 패키지 계층 위계(`core` $\to$ `backtest`) 기계적 래칫 검증 |
+| 🔒 **정적 아키텍처 품질** | **`1804 Tests Green` / `AST 위반 0.00%`** | Python AST 기반 패키지 계층 위계(`core` $\to$ `backtest`) 기계적 래칫 검증 |
 
 ---
 
@@ -103,25 +103,25 @@ flowchart TD
 
 ---
 
-## 5. Verified Performance Matrix (실측 정본 성과)
+## 5. Discovery Status (발견 단계 상태)
 
-> **검증 기준**: `config/research/kr_swing_2019_v1.toml` 및 단일 원장 백테스트 엔진  
-> **시장 마찰 조건**: 편도 수수료 **`0.015%`**, 거래세 **`0.18% ~ 0.30%`**(법정 연도별 레짐), 시장 충격 계수 **`k=0.1`**, 최대 참여율 **`1.0%`**
+> **단일 전략 경로**: `panel → scorer → policy → simulator/ledger → criteria C1-C4`  
+> **실행**: `uv run python -m src.research backtest --spec config/research/strategies/ml_trend_cash.toml`
 
-| 모델 / 전략 구성 | 실행 모드 | 연환산 복리(CAGR) | 최대 낙폭(MDD) | 샤프 지수(Sharpe) | 실측 검증 판정 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **기준 모델 (단순 동일가중)** | Base (1.0x) | **`+4.12%`** | **`38.50%`** | `0.31` | 시장 벤치마크 추종 수준 |
-| **Q/V/E/F 팩터 알파 모델** | Long-Only (1.0x) | **`+15.78%`** | **`21.38%`** | `0.88` | OOS 초과수익 입증 |
-| **변동성 제어 레버리지 슬리브** | Vol-Managed (2.0x) | **`+25.38%`** | **`11.83%`** | **`1.42`** | **CAGR +21.26%p / MDD -26.67%p 개선** |
+| 단계 | 상태 | 비고 |
+| :--- | :---: | :--- |
+| Discovery (C1–C3) | `pending evaluation, holdout sealed` | 백테스트 실행 후 발견 결과 기재 |
+| Holdout (C4) | `sealed` | 최종 후보 1건, 단일 시도 |
+| Forward | `sealed` | 홀드아웃 통과 verdict 이후에만 개방 |
 
-*단, 기준 하한 CAGR이 음수로 떨어질 경우 자본 보호 원칙에 따라 실거래 승격을 즉시 거부(`NO_TRADE`)하는 엄격한 Fail-Closed 방어벽이 상시 작동합니다.*
+*발견 단계가 `backtest` 실행으로 완료되기 전까지는 성과 수치를 공표하지 않으며, 홀드아웃은 밀봉 상태를 유지합니다. 기준 미달 시 자본 보호 원칙에 따라 실거래 승격을 즉시 거부(`NO_TRADE`)합니다.*
 
 ---
 
 ## 6. Architecture Layer Contracts
 
 ```text
-Layer 4: [CLI & Orchestrators]  -->  src/backtest/cli.py, src/data/cli/
+Layer 4: [CLI & Orchestrators]  -->  src/research/cli.py, src/data/cli/
    ↓ (downward only)
 Layer 3: [Domain Engines]        -->  src/backtest/, src/execution/, src/data/
    ↓ (downward only)
@@ -151,6 +151,6 @@ uv sync
 uv run ruff check src tests
 uv run mypy src
 
-# 3. 987개 전수 단위/통합 테스트 검증
+# 3. 1804개 전수 단위/통합 테스트 검증
 uv run pytest
 ```

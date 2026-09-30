@@ -5,4 +5,3 @@ commission_rate = "0.00015"
 dividend_withholding_rate = "0.154"
 impact_k = 0.1
 cash_buffer = 0.005
-allow_static_industry = false

@@ -20,7 +20,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
     assert config.market_rules == repo / "config" / "market" / "krx_market_rules.toml"
     assert config.reference_benchmarks == repo / "config" / "data" / "reference_benchmarks.toml"
     assert config.engine == repo / "config" / "backtest" / "default_engine.toml"
-    assert config.strategies_root == repo / "config" / "strategy"
+    assert config.strategies_root == repo / "config" / "research" / "strategies"
     for path in (
         config.data_root,
         config.default_scope,
@@ -67,7 +67,7 @@ def test_missing_referenced_file_fails_closed_with_key_name(tmp_path: Path) -> N
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("engine", "config/backtest/default_engine.toml"),
         ("research_protocol", "config/research/protocol.toml"),
-        ("strategies_root", "config/strategy"),
+        ("strategies_root", "config/research/strategies"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
     document = document.replace(
@@ -108,10 +108,10 @@ def test_missing_strategies_dir_fails_closed(tmp_path: Path) -> None:
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("engine", "config/backtest/default_engine.toml"),
         ("research_protocol", "config/research/protocol.toml"),
-        ("strategies_root", "config/strategy"),
+        ("strategies_root", "config/research/strategies"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
-    document = document.replace(f'"{repo / "config/strategy"}"', f'"{tmp_path / "absent-strategies"}"')
+    document = document.replace(f'"{repo / "config/research/strategies"}"', f'"{tmp_path / "absent-strategies"}"')
     (tmp_path / "config" / "market").mkdir(parents=True)
     (tmp_path / "config" / "market" / "krx_market_rules.toml").write_bytes(
         (repo / "config/market/krx_market_rules.toml").read_bytes()

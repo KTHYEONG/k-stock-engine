@@ -1,1 +1,1 @@
-"""New point-in-time backtest engine (does not use ``src.engine``)."""
+"""Replay-only backtest engine over dense market arrays with an integer KRW ledger."""

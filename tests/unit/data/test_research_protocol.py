@@ -89,9 +89,10 @@ def test_no_finalists_after_opening(tmp_path: Path) -> None:
 
 def test_finalist_cap_enforced(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
+    ledger.register_finalists([_finalist("only")])
+    assert len(ledger.finalists()) == 1
     with pytest.raises(LockboxError):
-        ledger.register_finalists([_finalist(f"hash-{i}") for i in range(4)])
-    assert ledger.finalists() == ()
+        ledger.register_finalists([_finalist("second")])
 
 
 def test_forward_requires_holdout_pass(tmp_path: Path) -> None:
@@ -231,13 +232,13 @@ def test_lockbox_invalid_shape_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(LockboxError):
         LockboxLedger(state_root=tmp_path / "state", protocol=protocol, now=lambda: datetime.now(UTC))
     (lockbox_dir / "lockbox.json").write_text(
-        '{"protocol_version": "research-protocol-v1", "finalists": [{}], "verdicts": {}, "audit": []}',
+        '{"protocol_version": "research-protocol-v2", "finalists": [{}], "verdicts": {}, "audit": []}',
         encoding="utf-8",
     )
     with pytest.raises(LockboxError):
         LockboxLedger(state_root=tmp_path / "state", protocol=protocol, now=lambda: datetime.now(UTC))
     (lockbox_dir / "lockbox.json").write_text(
-        '{"protocol_version": "research-protocol-v1", "finalists": [], "verdicts": [], "audit": []}',
+        '{"protocol_version": "research-protocol-v2", "finalists": [], "verdicts": [], "audit": []}',
         encoding="utf-8",
     )
     with pytest.raises(LockboxError):
@@ -256,14 +257,6 @@ def test_lockbox_write_failure_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(LockboxError):
         ledger.register_finalists([_finalist("w")])
     (tmp_path / "state" / "research").unlink()
-
-
-def test_check_ratio_rejects_non_number() -> None:
-    from src.config import ConfigError
-    from src.data.research_protocol import _check_ratio
-
-    with pytest.raises(ConfigError):
-        _check_ratio("min_dsr", True)  # type: ignore[arg-type]
 
 
 def _protocol_text_with(patch: str) -> str:
@@ -311,20 +304,22 @@ def test_load_discovery_bounds_and_sections(tmp_path: Path) -> None:
         load_research_protocol(late, scope)
     nogates = tmp_path / "nogates.toml"
     nogates.write_text(
-        'version = "research-protocol-v1"\ndiscovery_start = "2017-04-01"\nmax_finalists = 3\n'
-        'prior_trials = 415\nsessions_per_year = 252\nprimary_capital_krw = 10000000\n'
-        '[benchmarks]\nuniverse_min_adtv20_krw = 1\nuniverse_min_price_krw = 1\nrebalance = "M"\n',
+        'version = "research-protocol-v2"\ndiscovery_start = "2017-04-01"\nmax_finalists = 1\n'
+        'prior_trials = 1533\nsessions_per_year = 252\nprimary_capital_krw = 10000000\n'
+        '[statistics]\nbootstrap_block_sessions = 63\nbootstrap_draws = 4000\n'
+        'bootstrap_seed = 20260929\ncscv_blocks = 8\n',
         encoding="utf-8",
     )
     with pytest.raises(ConfigError):
         load_research_protocol(nogates, scope)
-    bad_model = tmp_path / "bad-model.toml"
-    bad_model.write_text(text.replace('rebalance = "M"', 'rebalance = "Q"'), encoding="utf-8")
+    legacy_gates = tmp_path / "legacy-gates.toml"
+    legacy_text = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+    legacy_gates.write_text(legacy_text + '\n[gates]\nmin_dsr = 0.95\n', encoding="utf-8")
     with pytest.raises(ConfigError):
-        load_research_protocol(bad_model, scope)
+        load_research_protocol(legacy_gates, scope)
 
 
-def test_load_gate_domains(tmp_path: Path) -> None:
+def test_load_protocol_domains(tmp_path: Path) -> None:
     from src.config import ConfigError
     from src.data.research_scope import load_research_scope
 
@@ -337,30 +332,90 @@ def test_load_gate_domains(tmp_path: Path) -> None:
         return path
 
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("max_finalists = 3", "max_finalists = 0"), scope)
+        load_research_protocol(_bad("max_finalists = 1", "max_finalists = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("prior_trials = 415", "prior_trials = -1"), scope)
+        load_research_protocol(_bad("prior_trials = 1533", "prior_trials = -1"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("sessions_per_year = 252", "sessions_per_year = 0"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("primary_capital_krw = 10_000_000", "primary_capital_krw = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("universe_min_adtv20_krw = 500_000_000", "universe_min_adtv20_krw = 0"), scope)
-    with pytest.raises(ConfigError):
         load_research_protocol(_bad("bootstrap_block_sessions = 63", "bootstrap_block_sessions = 0"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("cscv_blocks = 8", "cscv_blocks = 3"), scope)
+
+
+def test_criteria_loads_with_spec_defaults() -> None:
+    protocol, _ = _protocol()
+    criteria = protocol.criteria
+    assert criteria.bootstrap.block_sessions == 63
+    assert criteria.bootstrap.draws == 2000
+    assert criteria.bootstrap.seed == 20260930
+    assert criteria.bootstrap.horizon_sessions == 1260
+    assert criteria.bootstrap.mdd_limit == pytest.approx(-0.5)
+    assert criteria.c1.stress_extra_slippage == pytest.approx(0.001)
+    assert criteria.c1.stress_execution_delay == 1
+    assert criteria.c1.max_p_cagr_le_zero == pytest.approx(0.05)
+    assert criteria.c2.min_point_calmar == pytest.approx(1.2)
+    assert criteria.c2.min_p_calmar == pytest.approx(0.75)
+    assert criteria.c2.max_p_mdd_below_limit == pytest.approx(0.05)
+    assert criteria.c2.max_underwater_median_sessions == 252
+    assert criteria.c2.max_underwater_p95_sessions == 630
+    assert criteria.c2.min_worst_phase_calmar == pytest.approx(1.0)
+    assert criteria.c3.stress_min_point_calmar == pytest.approx(1.0)
+    assert criteria.c3.ledger_capitals == (10_000_000,)
+    assert criteria.c3.ledger_min_calmar == pytest.approx(1.0)
+    assert criteria.c3.parity_max_growth_gap == pytest.approx(0.01)
+    assert criteria.c4.holdout_max_p_mean_le_zero == pytest.approx(0.05)
+    assert criteria.c4.holdout_min_point_calmar == pytest.approx(0.7)
+    assert criteria.prior_trials == 1533
+    assert criteria.prior_effective_trials == pytest.approx(100.0)
+    assert criteria.prior_trial_sharpe_std_annual == pytest.approx(0.42)
+    assert protocol.prior_trials == 1533
+    assert protocol.max_finalists == 1
+    assert protocol.version == "research-protocol-v2"
+
+
+def test_criteria_rejects_bad_domains(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+
+    def _bad(old: str, new: str) -> Path:
+        path = tmp_path / f"criteria-bad-{abs(hash(old + new)) % 100000}.toml"
+        path.write_text(base.replace(old, new), encoding="utf-8")
+        return path
+
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("min_dsr = 0.95", "min_dsr = 1.5"), scope)
+        load_research_protocol(_bad("draws = 2000", "draws = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("min_dsr = 0.95", 'min_dsr = "high"'), scope)
+        load_research_protocol(_bad("seed = 20260930", "seed = -1"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("stress_extra_slippage = 0.002", "stress_extra_slippage = -0.5"), scope)
+        load_research_protocol(_bad("min_point_calmar = 1.2", "min_point_calmar = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("perturbation_cuts = 3", "perturbation_cuts = 0"), scope)
+        load_research_protocol(_bad("min_p_calmar = 0.75", "min_p_calmar = 1.5"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("ledger_capitals = [1_000_000, 10_000_000, 100_000_000]", "ledger_capitals = []"), scope)
+        load_research_protocol(_bad("mdd_limit = -0.5", "mdd_limit = 0.0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("parity_max_capital = 10_000_000", "parity_max_capital = 0"), scope)
+        load_research_protocol(_bad("ledger_capitals = [10_000_000]", "ledger_capitals = []"), scope)
+
+
+def test_criteria_unknown_key_and_hash(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+    unknown = tmp_path / "criteria-unknown.toml"
+    unknown.write_text(base.replace("draws = 2000", "draws = 2000\nbogus_key = 9"), encoding="utf-8")
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("min_active_t = 2.0", "min_active_t = -1.0"), scope)
+        load_research_protocol(unknown, scope)
+    first, _ = _protocol()
+    second, _ = _protocol()
+    assert first.content_hash == second.content_hash
+    assert len(first.content_hash) == 64
+    shifted = tmp_path / "criteria-shifted.toml"
+    shifted.write_text(base.replace("draws = 2000", "draws = 2001"), encoding="utf-8")
+    assert load_research_protocol(shifted, scope).content_hash != first.content_hash
