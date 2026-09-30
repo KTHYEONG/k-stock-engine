@@ -8,7 +8,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 
@@ -17,12 +17,7 @@ from src.backtest.events import EngineEvents, ExitKind
 from src.backtest.execution import ExecutionConfig, Fill, Order, Reject, price_orders
 from src.backtest.ledger import JournalEntry, Ledger, NavRecord
 from src.backtest.market import MarketArrays
-from src.backtest.strategy import PortfolioSnapshot, Strategy
-from src.backtest.view import AsOfTable, PITView
 from src.core.market_rules import KrxMarketRules
-from src.core.time import KRX_TZ
-
-_DECISION_AT = time(18, 0)
 
 
 class DelistPolicy(StrEnum):
@@ -37,7 +32,6 @@ class EngineConfig:
     costs: CostConfig
     halted_exit_policy: DelistPolicy
     cash_buffer: float
-    allow_static_industry: bool = False
 
     def __post_init__(self) -> None:
         buffer = self.cash_buffer
@@ -47,8 +41,6 @@ class EngineConfig:
             or not 0.0 <= float(buffer) < 1.0
         ):
             raise ValueError(f"cash_buffer must be in [0, 1), got {buffer!r}")
-        if not isinstance(self.allow_static_industry, bool):
-            raise ValueError(f"allow_static_industry must be a bool, got {self.allow_static_industry!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +51,6 @@ class BacktestResult:
     journal: tuple[JournalEntry, ...]
     dividends_integrated: bool
     ledger_hash: str
-    assumptions: tuple[str, ...] = ()
 
 
 def _target_orders(
@@ -148,31 +139,69 @@ def _apply_fills(
     return (applied, rejects, carried)
 
 
+def _validate_targets(
+    targets: Mapping[int, Mapping[int, float]], *, lo: int, hi: int, n_instruments: int,
+) -> dict[int, dict[int, float]]:
+    cleaned: dict[int, dict[int, float]] = {}
+    for row, weights in targets.items():
+        if isinstance(row, bool) or not isinstance(row, int):
+            raise ValueError(f"target row must be an int, got {row!r}")
+        d = int(row)
+        if d < max(0, lo - 1) or d > hi - 1:
+            raise ValueError(f"target row {d} is outside the run window")
+        if not isinstance(weights, Mapping):
+            raise ValueError(f"target weights at row {d} must be a mapping")
+        total = 0.0
+        row_weights: dict[int, float] = {}
+        for instrument_idx, weight in weights.items():
+            if isinstance(instrument_idx, bool) or not isinstance(instrument_idx, int):
+                raise ValueError(f"target instrument must be an int at row {d}, got {instrument_idx!r}")
+            n = int(instrument_idx)
+            if not 0 <= n < n_instruments:
+                raise ValueError(f"target instrument {n} at row {d} is outside the panel")
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                raise ValueError(f"target weight must be a finite number at row {d}, got {weight!r}")
+            w = float(weight)
+            if not math.isfinite(w) or w < 0.0:
+                raise ValueError(f"target weight must be finite and non-negative at row {d}, got {weight!r}")
+            total += w
+            row_weights[n] = w
+        if total > 1.0 + 1e-9:
+            raise ValueError(f"target weights at row {d} sum to {total}, above 1")
+        cleaned[d] = row_weights
+    return cleaned
+
+
 def run_backtest(
     *,
     arrays: MarketArrays,
     events: EngineEvents,
-    strategy: Strategy,
+    targets: Mapping[int, Mapping[int, float]],
     config: EngineConfig,
     deposits: Mapping[date, int],
-    asof_tables: Mapping[str, AsOfTable],
     rules: KrxMarketRules,
     start: date,
     end: date,
 ) -> BacktestResult:
-    """Simulate one strategy over [start, end] on the fixed session timeline.
+    """Replay pre-decided target weights on the fixed session timeline.
 
-    Per session: pre-open events (share factors, dividend entitlements on
-    ex-sessions, dividend payments, exits, deposits); execution of orders
-    decided at the previous session (sells before buys, integer shares, no
-    negative cash); close mark; then, on rebalance sessions, a decision on a
-    PIT view whose orders execute next session.
+    ``targets`` maps a decision session index d to instrument-index weights (fractions of decision-session
+    NAV; the remainder is cash). Orders for row d execute at session d+1 (open auction), sells before buys,
+    integer shares, no negative cash, T+2-consistent ledger. Per session order is unchanged: share factors,
+    dividend entitlements, dividend payments, exits, deposits, execution, close mark, then decision rows.
+    Why replay-only: decisions are produced upstream from the causal panel; the ledger's job is accounting
+    truth at 10M KRW (integer shares, costs, settlement), not strategy logic.
+
+    Raises: ValueError for a window outside the panel, a target row outside ``[start-1, end)``, or weights that
+    are negative, non-finite or sum above 1.
     """
     sessions = list(arrays.sessions)
     session_index = {session: idx for idx, session in enumerate(sessions)}
     if start not in session_index or end not in session_index or session_index[start] > session_index[end]:
         raise ValueError(f"run window [{start}, {end}] is not within the panel sessions")
     lo, hi = session_index[start], session_index[end]
+    n_instruments = len(arrays.instrument_ids)
+    schedule = _validate_targets(targets, lo=lo, hi=hi, n_instruments=n_instruments)
     deposits_by_session: dict[int, int] = {}
     for pay_date, amount in deposits.items():
         idx = session_index.get(pay_date, bisect.bisect_right(sessions, pay_date))
@@ -188,7 +217,13 @@ def run_backtest(
     rejects: list[Reject] = []
     records: list[NavRecord] = []
     buffer_scale = 1.0 - float(config.cash_buffer)
-    run_assumptions: set[str] = set()
+    if lo - 1 in schedule and lo > 0:
+        pending.extend(
+            _target_orders(
+                weights=schedule[lo - 1], arrays=arrays, t=lo - 1, holdings={},
+                nav=config.initial_cash, buffer_scale=buffer_scale,
+            )
+        )
     for t in range(lo, hi + 1):
         for instrument_idx, factor, base_price in events.share_factor_by_session.get(t, ()):
             ledger.apply_share_factor(
@@ -238,25 +273,13 @@ def run_backtest(
             present=arrays.bool_fields["present"][t],
         )
         records.append(record)
-        view = PITView(
-            arrays=arrays,
-            t=t,
-            decision_time=datetime.combine(sessions[t], _DECISION_AT, tzinfo=KRX_TZ),
-            asof_tables=asof_tables,
-            allow_static_industry=config.allow_static_industry,
-        )
-        new_orders: list[Order] = []
-        if strategy.is_rebalance(view):
-            snapshot = PortfolioSnapshot(
-                session_idx=t, cash=record.cash, nav=record.nav, positions=ledger.positions()
-            )
-            targets = strategy.decide(view, snapshot)
-            new_orders = _target_orders(
-                weights=targets.weights, arrays=arrays, t=t, holdings=ledger.positions(),
+        if t in schedule and t >= lo:
+            pending = carried + _target_orders(
+                weights=schedule[t], arrays=arrays, t=t, holdings=ledger.positions(),
                 nav=record.nav, buffer_scale=buffer_scale,
             )
-        run_assumptions.update(view.assumptions)
-        pending = carried + new_orders
+        else:
+            pending = carried
     journal = ledger.journal
     payload = {
         "journal": [
@@ -291,5 +314,4 @@ def run_backtest(
         journal=journal,
         dividends_integrated=events.dividends_integrated,
         ledger_hash=ledger_hash,
-        assumptions=tuple(sorted(run_assumptions)),
     )

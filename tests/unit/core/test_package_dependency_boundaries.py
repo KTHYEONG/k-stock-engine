@@ -77,14 +77,29 @@ def test_layering_detects_lazy_imports() -> None:
 # test_import_boundaries): the retired-prefix ban and the legacy quarantine
 # layout are still live because ``legacy/`` exists.
 
-_RETIRED_PREFIXES = ("src.legacy", "src.stocks", "src.etfs", "legacy.stocks", "legacy.etfs")
+_RETIRED_PREFIXES = (
+    "src.legacy",
+    "src.stocks",
+    "src.etfs",
+    "legacy.stocks",
+    "legacy.etfs",
+    "src.backtest.strategy",
+    "src.backtest.view",
+    "src.backtest.manifest",
+    "src.backtest.metrics",
+    "src.backtest.cli",
+    "src.research.features",
+    "src.research.strategy",
+    "src.research.gates",
+    "src.research.evaluator",
+)
 
 
 def test_no_retired_prefix_references() -> None:
     import re
 
     root = SRC.parent
-    pat = re.compile(r"(?:src\.legacy|src\.stocks|src\.etfs|legacy\.stocks|legacy\.etfs)")
+    pat = re.compile(r"(?:{})".format("|".join(re.escape(prefix) for prefix in _RETIRED_PREFIXES)))
     active_files = [
         p
         for p in [*SRC.rglob("*.py"), *(root / "tests").rglob("*.py")]

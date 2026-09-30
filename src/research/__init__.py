@@ -1,1 +1,1 @@
-"""Research stack (feature cube, screening simulator, trial registry, statistics, gates)."""
+"""Research stack (causal panel, scorer, policy, simulator, ledger bridge, criteria)."""

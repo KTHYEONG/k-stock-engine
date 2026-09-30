@@ -20,7 +20,6 @@ from src.backtest.engine import DelistPolicy, EngineConfig, run_backtest
 from src.backtest.events import build_engine_events
 from src.backtest.execution import ExecutionConfig, ExecutionScenario
 from src.backtest.market import load_market_arrays
-from src.backtest.strategy import PrecomputedTargets
 from src.core.market_rules import KrxMarketRules
 from src.core.pit import PITDataError
 from src.data.research_protocol import LockboxAuthorization, LockboxError
@@ -41,7 +40,7 @@ class LedgerOutcome:
     ledger_hash: str
 
 
-def _engine_parts(path: Path) -> tuple[ExecutionConfig, CostConfig, float, bool]:
+def _engine_parts(path: Path) -> tuple[ExecutionConfig, CostConfig, float]:
     import tomllib
 
     with open(path, "rb") as handle:
@@ -79,9 +78,6 @@ def _engine_parts(path: Path) -> tuple[ExecutionConfig, CostConfig, float, bool]
     buffer_raw = _pick("cash_buffer")
     if isinstance(buffer_raw, bool) or not isinstance(buffer_raw, (int, float)):
         raise ValueError(f"cash_buffer must be a number, got {buffer_raw!r}")
-    static_raw = _pick("allow_static_industry")
-    if not isinstance(static_raw, bool):
-        raise ValueError(f"allow_static_industry must be a bool, got {static_raw!r}")
     execution = ExecutionConfig(
         scenario=scenario, max_participation=float(participation_raw), carry_unfilled=carry_raw,
     )
@@ -90,7 +86,7 @@ def _engine_parts(path: Path) -> tuple[ExecutionConfig, CostConfig, float, bool]
         impact_k=float(impact_raw),
         dividend_withholding_rate=withholding_rate,
     )
-    return (execution, costs, float(buffer_raw), static_raw)
+    return (execution, costs, float(buffer_raw))
 
 
 def run_ledger(
@@ -121,14 +117,13 @@ def run_ledger(
         cube.instrument_ids
     ):
         raise PITDataError("research cube sessions or instruments differ from the panel")
-    execution, costs, cash_buffer, allow_static = _engine_parts(Path(engine_config_path))
+    execution, costs, cash_buffer = _engine_parts(Path(engine_config_path))
     config = EngineConfig(
         initial_cash=capital_krw,
         execution=execution,
         costs=costs,
         halted_exit_policy=halted_exit_policy,
         cash_buffer=cash_buffer,
-        allow_static_industry=allow_static,
     )
     frame = dividends
     dividends_arg: pl.DataFrame | None = frame
@@ -143,14 +138,12 @@ def run_ledger(
     for row, weights in targets.items():
         arr = np.asarray(weights, dtype=np.float64)
         sparse[int(row)] = {n: float(arr[n]) for n in np.flatnonzero(arr > 0.0).tolist()}
-    strategy = PrecomputedTargets(name="precomputed", targets=sparse, params={"capital_krw": capital_krw})
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=strategy,
+        targets=sparse,
         config=config,
         deposits={},
-        asof_tables={},
         rules=rules,
         start=start,
         end=end,

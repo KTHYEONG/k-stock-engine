@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-from datetime import date
 
 import numpy as np
 from scipy.stats import norm
@@ -48,24 +47,6 @@ def test_dsr_degenerate_n() -> None:
     assert value == pytest.approx(float(norm.cdf(sharpe * math.sqrt(len(candidate) - 1) / denom)))
 
 
-def test_pbo_of_dominant_column_is_zero() -> None:
-    from src.research.stats import cscv_pbo
-
-    rng = np.random.default_rng(17)
-    noise = rng.normal(scale=0.01, size=(800, 4))
-    dominant = rng.normal(loc=0.005, scale=0.01, size=800)
-    matrix = np.column_stack([dominant, noise])
-    assert cscv_pbo(matrix, blocks=4).pbo == 0.0
-
-
-def test_pbo_of_pure_noise_near_one_half() -> None:
-    from src.research.stats import cscv_pbo
-
-    rng = np.random.default_rng(19)
-    matrix = rng.normal(size=(800, 20))
-    assert 0.3 <= cscv_pbo(matrix, blocks=4).pbo <= 0.7
-
-
 def test_bootstrap_reproducible() -> None:
     from src.research.stats import block_bootstrap_annualized_means
 
@@ -85,14 +66,6 @@ def test_max_drawdown_of_known_path() -> None:
     assert max_drawdown(x) == pytest.approx(-0.75)
 
 
-def test_yearly_active_sums() -> None:
-    from src.research.stats import yearly_active_log
-
-    sessions = [date(2022, 12, 30), date(2023, 1, 2), date(2023, 6, 1)]
-    active = np.array([0.01, 0.02, -0.005])
-    assert yearly_active_log(sessions, active) == {2022: pytest.approx(0.01), 2023: pytest.approx(0.015)}
-
-
 def test_annualized_growth_and_validation() -> None:
     from src.research.stats import annualized_log_growth
 
@@ -109,24 +82,6 @@ def test_max_drawdown_rejects_empty() -> None:
 
     with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
         max_drawdown(np.array([]))
-
-
-def test_information_ratio_and_t_stat() -> None:
-    from src.research.stats import active_t_stat, information_ratio
-
-    rng = np.random.default_rng(29)
-    x = rng.normal(loc=0.001, scale=0.01, size=100)
-    assert information_ratio(x, sessions_per_year=252) == pytest.approx(
-        float(np.mean(x) / np.std(x, ddof=1) * math.sqrt(252))
-    )
-    assert active_t_stat(x) == pytest.approx(float(np.mean(x) / np.std(x, ddof=1) * math.sqrt(100)))
-    flat = np.full(10, 0.5)
-    assert information_ratio(flat, sessions_per_year=252) == 0.0
-    assert active_t_stat(flat) == 0.0
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        information_ratio(np.array([0.1]), sessions_per_year=252)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        active_t_stat(np.array([0.1]))
 
 
 def test_bootstrap_validation() -> None:
@@ -173,29 +128,91 @@ def test_dsr_validation() -> None:
         deflated_sharpe_ratio(np.full(10, 0.5), trial_sharpes=trials, n_trials=5)
 
 
-def test_sharpe_of_branches() -> None:
-    from src.research.stats import _sharpe_of
+def test_point_metrics_on_known_path() -> None:
+    from src.research.stats import point_metrics
 
-    assert _sharpe_of(np.array([0.1])) == 0.0
-    assert _sharpe_of(np.full(5, 0.01)) == 0.0
-    assert _sharpe_of(np.array([0.01, 0.02, 0.03])) > 0.0
-
-
-def test_cscv_validation() -> None:
-    from src.research.stats import cscv_pbo
-
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        cscv_pbo(np.ones(10), blocks=2)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        cscv_pbo(np.ones((10, 2)), blocks=3)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        cscv_pbo(np.ones((10, 1)), blocks=2)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        cscv_pbo(np.ones((2, 3)), blocks=4)
+    x = np.log(np.array([1.1, 0.8, 1.3]))
+    metrics = point_metrics(x, sessions_per_year=252)
+    assert metrics.max_drawdown == pytest.approx(-0.2)
+    assert metrics.calmar == pytest.approx(metrics.cagr / 0.2)
+    assert metrics.underwater_sessions == 1
+    assert metrics.log_growth == pytest.approx(float(np.mean(x) * 252))
+    assert metrics.cagr == pytest.approx(math.exp(metrics.log_growth) - 1.0)
+    with pytest.raises(ValueError, match="non-empty"):
+        point_metrics(np.array([]), sessions_per_year=252)
+    with pytest.raises(ValueError, match="non-empty"):
+        point_metrics(np.zeros((2, 2)), sessions_per_year=252)
 
 
-def test_yearly_length_mismatch() -> None:
-    from src.research.stats import yearly_active_log
+def test_zero_drawdown_calmar_is_infinite() -> None:
+    from src.research.stats import point_metrics
 
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        yearly_active_log([date(2023, 1, 2)], np.array([0.01, 0.02]))
+    metrics = point_metrics(np.full(100, 0.001), sessions_per_year=252)
+    assert metrics.calmar == math.inf
+    assert metrics.max_drawdown == 0.0
+    assert metrics.underwater_sessions == 0
+
+
+def test_bootstrap_profile_determinism() -> None:
+    from src.research.stats import bootstrap_profile
+
+    rng = np.random.default_rng(31)
+    x = rng.normal(loc=0.0005, scale=0.01, size=252)
+    kwargs = {"block": 21, "draws": 30, "seed": 7, "horizon": 60, "mdd_limit": -0.5, "sessions_per_year": 252}
+    first = bootstrap_profile(x, **kwargs)
+    second = bootstrap_profile(x, **kwargs)
+    assert first == second
+    with pytest.raises(ValueError, match="non-empty"):
+        bootstrap_profile(np.array([]), **kwargs)
+    with pytest.raises(ValueError, match="bootstrap requires"):
+        bootstrap_profile(x, **{**kwargs, "block": 500})
+    with pytest.raises(ValueError, match="bootstrap requires"):
+        bootstrap_profile(x, **{**kwargs, "draws": 0})
+
+
+def test_bootstrap_extremes() -> None:
+    from src.research.stats import bootstrap_profile
+
+    rng = np.random.default_rng(37)
+    rising = rng.normal(loc=0.005, scale=0.001, size=500)
+    kwargs = {"block": 21, "draws": 50, "seed": 3, "horizon": 126, "mdd_limit": -0.5, "sessions_per_year": 252}
+    up = bootstrap_profile(rising, **kwargs)
+    assert up.p_cagr_ge_abs_mdd > 0.9
+    assert up.p_cagr_le_zero < 0.1
+    down = bootstrap_profile(-rising, **kwargs)
+    assert down.p_cagr_ge_abs_mdd < 0.1
+    assert down.p_cagr_le_zero > 0.9
+
+
+def test_underwater_quantiles_reflect_long_drawdown() -> None:
+    from src.research.stats import bootstrap_profile, point_metrics
+
+    x = np.concatenate([np.full(50, 0.01), np.full(100, -0.005), np.full(50, 0.02)])
+    assert point_metrics(x, sessions_per_year=252).underwater_sessions == 125
+    profile = bootstrap_profile(x, block=10, draws=40, seed=5, horizon=200, mdd_limit=-0.5, sessions_per_year=252)
+    assert profile.underwater_median_sessions >= 50
+    assert profile.underwater_p95_sessions >= 100
+    assert profile.underwater_p95_sessions >= profile.underwater_median_sessions
+
+
+def test_dsr_from_dispersion_monotonic_and_guards() -> None:
+    from src.research.stats import deflated_sharpe_ratio_from_dispersion
+
+    rng = np.random.default_rng(41)
+    candidate = rng.normal(loc=0.001, scale=0.01, size=750)
+    values = [
+        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.3, n_trials=n)
+        for n in (1, 2, 50, 500)
+    ]
+    assert all(0.0 < value < 1.0 for value in values)
+    assert values[0] > values[1] > values[2] > values[3]
+    with pytest.raises(ValueError, match="n_trials"):
+        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.3, n_trials=0)
+    with pytest.raises(ValueError, match="dispersion"):
+        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.0, n_trials=50)
+    with pytest.raises(ValueError, match="dispersion"):
+        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=float("nan"), n_trials=50)
+    with pytest.raises(ValueError, match="positive variance"):
+        deflated_sharpe_ratio_from_dispersion(np.full(10, 0.5), sharpe_std_per_period=0.3, n_trials=50)
+    with pytest.raises(ValueError, match="at least 2 sessions"):
+        deflated_sharpe_ratio_from_dispersion(np.array([0.1]), sharpe_std_per_period=0.3, n_trials=50)

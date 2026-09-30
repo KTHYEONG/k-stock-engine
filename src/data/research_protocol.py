@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 from collections.abc import Callable, Sequence
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -20,9 +21,13 @@ from src.core.pit import PITDataError
 from src.data.research_scope import ResearchScope
 
 __all__ = [
-    "BenchmarkPolicy",
+    "CriteriaBootstrap",
+    "CriteriaC1",
+    "CriteriaC2",
+    "CriteriaC3",
+    "CriteriaC4",
+    "CriteriaPolicy",
     "FinalistRecord",
-    "GatePolicy",
     "LockboxAuthorization",
     "LockboxError",
     "LockboxLedger",
@@ -45,14 +50,6 @@ class LockboxError(PITDataError):
     """A run touched a sealed segment without a valid authorization."""
 
 
-class BenchmarkPolicy(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    universe_min_adtv20_krw: int
-    universe_min_price_krw: int
-    rebalance: Literal["M"]
-
-
 class StatisticsPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -62,24 +59,64 @@ class StatisticsPolicy(BaseModel):
     cscv_blocks: int
 
 
-class GatePolicy(BaseModel):
+class CriteriaBootstrap(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    min_delay_retention: float
+    block_sessions: int
+    draws: int
+    seed: int
+    horizon_sessions: int
+    mdd_limit: float
+
+
+class CriteriaC1(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     stress_extra_slippage: float
-    min_active_t: float
-    max_bootstrap_loss_probability: float
-    min_dsr: float
-    max_pbo: float
-    min_plateau_positive_share: float
-    min_positive_year_fraction: float
-    max_single_year_share: float
-    holdout_min_percentile: float
+    stress_execution_delay: int
+    max_p_cagr_le_zero: float
     perturbation_cuts: int
     perturbation_seed: int
+
+
+class CriteriaC2(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_point_calmar: float
+    min_p_calmar: float
+    max_p_mdd_below_limit: float
+    max_underwater_median_sessions: int
+    max_underwater_p95_sessions: int
+    min_worst_phase_calmar: float
+
+
+class CriteriaC3(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stress_min_point_calmar: float
     ledger_capitals: tuple[int, ...]
-    parity_max_gap: float
-    parity_max_capital: int
+    ledger_min_calmar: float
+    parity_max_growth_gap: float
+
+
+class CriteriaC4(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    holdout_max_p_mean_le_zero: float
+    holdout_min_point_calmar: float
+
+
+class CriteriaPolicy(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bootstrap: CriteriaBootstrap
+    c1: CriteriaC1
+    c2: CriteriaC2
+    c3: CriteriaC3
+    c4: CriteriaC4
+    prior_trials: int
+    prior_effective_trials: float
+    prior_trial_sharpe_std_annual: float
 
 
 class ResearchProtocol(BaseModel):
@@ -101,9 +138,8 @@ class ResearchProtocol(BaseModel):
     prior_trials: int
     sessions_per_year: int
     primary_capital_krw: int
-    benchmarks: BenchmarkPolicy
     statistics: StatisticsPolicy
-    gates: GatePolicy
+    criteria: CriteriaPolicy
 
     def segment_of(self, day: date) -> Segment:
         if day <= self.discovery_end:
@@ -121,11 +157,10 @@ class ResearchProtocol(BaseModel):
     @property
     def content_hash(self) -> str:
         payload = {
-            "benchmarks": self.benchmarks.model_dump(mode="json"),
+            "criteria": self.criteria.model_dump(mode="json"),
             "discovery_end": self.discovery_end.isoformat(),
             "discovery_start": self.discovery_start.isoformat(),
             "forward_start": self.forward_start.isoformat(),
-            "gates": self.gates.model_dump(mode="json"),
             "holdout_end": self.holdout_end.isoformat(),
             "holdout_start": self.holdout_start.isoformat(),
             "max_finalists": self.max_finalists,
@@ -137,13 +172,6 @@ class ResearchProtocol(BaseModel):
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _check_ratio(name: str, value: float, *, low: float = 0.0, high: float = 1.0) -> None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ConfigError(f"research protocol gate {name!r} must be a number")
-    if not low <= float(value) <= high:
-        raise ConfigError(f"research protocol gate {name!r} outside [{low}, {high}]")
 
 
 def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol:
@@ -170,9 +198,8 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
         "prior_trials",
         "sessions_per_year",
         "primary_capital_krw",
-        "benchmarks",
         "statistics",
-        "gates",
+        "criteria",
     }
     unknown = set(raw) - allowed_top
     if unknown:
@@ -185,15 +212,13 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
         raise ConfigError("research protocol discovery_start must be after scope.evidence_start")
     if discovery_start > scope.validation_end:
         raise ConfigError("research protocol discovery_start must be on or before scope.validation_end")
-    benchmarks_raw = raw.get("benchmarks")
     statistics_raw = raw.get("statistics")
-    gates_raw = raw.get("gates")
-    if not isinstance(benchmarks_raw, dict) or not isinstance(statistics_raw, dict) or not isinstance(gates_raw, dict):
-        raise ConfigError("research protocol must declare [benchmarks], [statistics], and [gates]")
+    criteria_raw = raw.get("criteria")
+    if not isinstance(statistics_raw, dict) or not isinstance(criteria_raw, dict):
+        raise ConfigError("research protocol must declare [statistics] and [criteria]")
     try:
-        benchmarks = BenchmarkPolicy.model_validate(benchmarks_raw)
         statistics = StatisticsPolicy.model_validate(statistics_raw)
-        gates = GatePolicy.model_validate(gates_raw)
+        criteria = CriteriaPolicy.model_validate(criteria_raw)
         protocol = ResearchProtocol(
             version=str(raw.get("version")),
             discovery_start=discovery_start,
@@ -205,9 +230,8 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
             prior_trials=int(raw["prior_trials"]),
             sessions_per_year=int(raw["sessions_per_year"]),
             primary_capital_krw=int(raw["primary_capital_krw"]),
-            benchmarks=benchmarks,
             statistics=statistics,
-            gates=gates,
+            criteria=criteria,
         )
     except (ValueError, TypeError, KeyError) as exc:
         raise ConfigError(f"research protocol is invalid: {exc}") from exc
@@ -219,34 +243,76 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
         raise ConfigError("research protocol sessions_per_year must be positive")
     if protocol.primary_capital_krw <= 0:
         raise ConfigError("research protocol primary_capital_krw must be positive")
-    if protocol.benchmarks.universe_min_adtv20_krw <= 0 or protocol.benchmarks.universe_min_price_krw <= 0:
-        raise ConfigError("research protocol benchmark universe thresholds must be positive")
     if protocol.statistics.bootstrap_block_sessions <= 0 or protocol.statistics.bootstrap_draws <= 0:
         raise ConfigError("research protocol bootstrap policy must be positive")
     if protocol.statistics.cscv_blocks < 2 or protocol.statistics.cscv_blocks % 2 != 0:
         raise ConfigError("research protocol cscv_blocks must be an even integer >= 2")
-    _check_ratio("min_delay_retention", gates.min_delay_retention)
-    if not gates.stress_extra_slippage >= 0.0:
-        raise ConfigError("research protocol gate 'stress_extra_slippage' must be >= 0")
-    _check_ratio("max_bootstrap_loss_probability", gates.max_bootstrap_loss_probability)
-    _check_ratio("min_dsr", gates.min_dsr)
-    _check_ratio("max_pbo", gates.max_pbo)
-    _check_ratio("min_plateau_positive_share", gates.min_plateau_positive_share)
-    _check_ratio("min_positive_year_fraction", gates.min_positive_year_fraction)
-    _check_ratio("max_single_year_share", gates.max_single_year_share)
-    _check_ratio("holdout_min_percentile", gates.holdout_min_percentile)
-    _check_ratio("parity_max_gap", gates.parity_max_gap)
-    if gates.perturbation_cuts <= 0:
-        raise ConfigError("research protocol gate 'perturbation_cuts' must be positive")
-    if not gates.ledger_capitals or any(
-        isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in gates.ledger_capitals
-    ):
-        raise ConfigError("research protocol gate 'ledger_capitals' must be non-empty positive ints")
-    if gates.parity_max_capital <= 0:
-        raise ConfigError("research protocol gate 'parity_max_capital' must be positive")
-    if gates.min_active_t < 0.0:
-        raise ConfigError("research protocol gate 'min_active_t' must be >= 0")
+    _check_criteria(protocol.criteria)
     return protocol
+
+
+def _check_criteria_int(name: str, value: object, *, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f"research protocol criteria {name!r} must be an int >= {minimum}")
+
+
+def _check_criteria_number(name: str, value: object, *, minimum: float, above: bool = False) -> None:
+    amount = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else math.nan
+    if not math.isfinite(amount) or (amount <= minimum if above else amount < minimum):
+        raise ConfigError(f"research protocol criteria {name!r} must be a finite number {'>' if above else '>='} {minimum}")
+
+
+def _check_criteria(criteria: CriteriaPolicy) -> None:
+    """Validate termination-criteria domains (ratios, positivity, session counts)."""
+    positive_ints: list[tuple[str, object]] = [
+        ("block_sessions", criteria.bootstrap.block_sessions),
+        ("draws", criteria.bootstrap.draws),
+        ("horizon_sessions", criteria.bootstrap.horizon_sessions),
+        ("perturbation_cuts", criteria.c1.perturbation_cuts),
+        ("max_underwater_median_sessions", criteria.c2.max_underwater_median_sessions),
+        ("max_underwater_p95_sessions", criteria.c2.max_underwater_p95_sessions),
+    ]
+    for name, value in positive_ints:
+        _check_criteria_int(name, value, minimum=1)
+    nonneg_ints: list[tuple[str, object]] = [
+        ("seed", criteria.bootstrap.seed),
+        ("perturbation_seed", criteria.c1.perturbation_seed),
+        ("stress_execution_delay", criteria.c1.stress_execution_delay),
+        ("prior_trials", criteria.prior_trials),
+    ]
+    for name, value in nonneg_ints:
+        _check_criteria_int(name, value, minimum=0)
+    positive_numbers: list[tuple[str, object]] = [
+        ("min_point_calmar", criteria.c2.min_point_calmar),
+        ("min_worst_phase_calmar", criteria.c2.min_worst_phase_calmar),
+        ("stress_min_point_calmar", criteria.c3.stress_min_point_calmar),
+        ("ledger_min_calmar", criteria.c3.ledger_min_calmar),
+        ("holdout_min_point_calmar", criteria.c4.holdout_min_point_calmar),
+        ("prior_trial_sharpe_std_annual", criteria.prior_trial_sharpe_std_annual),
+        ("prior_effective_trials", criteria.prior_effective_trials),
+    ]
+    for name, value in positive_numbers:
+        _check_criteria_number(name, value, minimum=0.0, above=True)
+    nonneg_numbers: list[tuple[str, object]] = [
+        ("stress_extra_slippage", criteria.c1.stress_extra_slippage),
+        ("parity_max_growth_gap", criteria.c3.parity_max_growth_gap),
+    ]
+    for name, value in nonneg_numbers:
+        _check_criteria_number(name, value, minimum=0.0)
+    for name, value in (
+        ("max_p_cagr_le_zero", criteria.c1.max_p_cagr_le_zero),
+        ("min_p_calmar", criteria.c2.min_p_calmar),
+        ("max_p_mdd_below_limit", criteria.c2.max_p_mdd_below_limit),
+        ("holdout_max_p_mean_le_zero", criteria.c4.holdout_max_p_mean_le_zero),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+            raise ConfigError(f"research protocol criteria {name!r} must be a number in [0, 1]")
+    if not -1.0 <= float(criteria.bootstrap.mdd_limit) < 0.0:
+        raise ConfigError("research protocol criteria 'mdd_limit' must satisfy -1 <= mdd_limit < 0")
+    if not criteria.c3.ledger_capitals or any(
+        isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in criteria.c3.ledger_capitals
+    ):
+        raise ConfigError("research protocol criteria 'ledger_capitals' must be non-empty positive ints")
 
 
 @dataclass(frozen=True, slots=True)

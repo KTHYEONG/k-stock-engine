@@ -1,19 +1,13 @@
-# Research protocol: segments, multiplicity accounting, benchmarks and promotion gates.
-version = "research-protocol-v1"
+# Research protocol: segments, multiplicity accounting and termination criteria C1-C4.
+version = "research-protocol-v2"
 # First session month with trailing-four-quarter fundamentals for most issuers (2016 facts start).
 discovery_start = "2017-04-01"
-max_finalists = 3
-# Trials evaluated during the 2026-09-29 probe before the registry existed; counted in N for DSR.
-prior_trials = 415
+max_finalists = 1
+# Trials evaluated before the registry existed; counted in N for DSR.
+prior_trials = 1533
 sessions_per_year = 252
-# Capital of screening trials; ledger gates add the full capital grid below.
+# Capital of screening trials; the C3 ledger check replays the capital grid below.
 primary_capital_krw = 10_000_000
-
-[benchmarks]
-# Equal-weight benchmark universe (same filters as the probe) and an all-eligible cap-weight index.
-universe_min_adtv20_krw = 500_000_000
-universe_min_price_krw = 1_000
-rebalance = "M"
 
 [statistics]
 bootstrap_block_sessions = 63
@@ -21,19 +15,40 @@ bootstrap_draws = 4000
 bootstrap_seed = 20260929
 cscv_blocks = 8
 
-[gates]
-min_delay_retention = 0.7
-stress_extra_slippage = 0.002
-min_active_t = 2.0
-max_bootstrap_loss_probability = 0.05
-min_dsr = 0.95
-max_pbo = 0.5
-min_plateau_positive_share = 0.8
-min_positive_year_fraction = 0.7
-max_single_year_share = 0.5
-holdout_min_percentile = 0.05
+[criteria]
+# Termination criteria C1-C4; raw logged evaluations incl. 415 pre-registry trials.
+prior_trials = 1533
+prior_effective_trials = 100
+prior_trial_sharpe_std_annual = 0.42
+
+[criteria.bootstrap]
+block_sessions = 63
+draws = 2000
+seed = 20260930
+horizon_sessions = 1260
+mdd_limit = -0.5
+
+[criteria.c1]
+stress_extra_slippage = 0.001
+stress_execution_delay = 1
+max_p_cagr_le_zero = 0.05
 perturbation_cuts = 3
 perturbation_seed = 7
-ledger_capitals = [1_000_000, 10_000_000, 100_000_000]
-parity_max_gap = 0.002
-parity_max_capital = 10_000_000
+
+[criteria.c2]
+min_point_calmar = 1.2
+min_p_calmar = 0.75
+max_p_mdd_below_limit = 0.05
+max_underwater_median_sessions = 252
+max_underwater_p95_sessions = 630
+min_worst_phase_calmar = 1.0
+
+[criteria.c3]
+stress_min_point_calmar = 1.0
+ledger_capitals = [10_000_000]
+ledger_min_calmar = 1.0
+parity_max_growth_gap = 0.01
+
+[criteria.c4]
+holdout_max_p_mean_le_zero = 0.05
+holdout_min_point_calmar = 0.7

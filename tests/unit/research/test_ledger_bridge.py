@@ -15,7 +15,6 @@ from src.data.research_protocol import LockboxAuthorization, Segment
 from src.research.cube import ResearchCube
 from src.research.ledger_bridge import run_ledger
 from src.research.simulator import SimConfig, simulate
-from src.research.strategy import StrategySpec, target_weights
 from src.core.pit import PITDataError
 from tests.fixtures.synthetic_panel import (
     synthetic_cube,
@@ -74,18 +73,10 @@ def test_parity_on_synthetic_panel(tmp_path: Path) -> None:
     size = np.zeros((len(sessions), len(instruments)))
     for n in range(len(instruments)):
         size[:, n] = float(n)
-    spec = StrategySpec.model_validate(
-        {
-            "family": "parity",
-            "universe": {"min_adtv20_krw": 0, "min_price_krw": 0},
-            "junk": None,
-            "score": {"size": 1.0},
-            "n": 2,
-            "keep_rank_multiple": 1.0,
-            "rebalance": "M",
-        }
-    )
-    targets = target_weights(spec, cube, {"size": size}, lo=0, hi=len(sessions))
+    targets = {
+        row: np.array([0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
+        for row in range(0, len(sessions) - 1, 21)
+    }
     auth = _auth(sessions)
     sim_config = SimConfig.from_engine_toml(ENGINE_TOML, capital_krw=10_000_000)
     fast = simulate(cube, targets, start=sessions[0], end=sessions[-1], config=sim_config, authorization=auth)
@@ -99,6 +90,9 @@ def test_parity_on_synthetic_panel(tmp_path: Path) -> None:
     fast_g = float(np.mean(fast.log_returns) * 252)
     ledger_g = float(np.mean(outcome.log_returns) * 252)
     assert abs(fast_g - ledger_g) <= 0.002
+    assert len(outcome.log_returns) == len(sessions)
+    assert isinstance(outcome.reject_counts, dict)
+    assert len(outcome.ledger_hash) == 64
 
 
 def test_ledger_validation_and_dividends(tmp_path: Path) -> None:
@@ -140,7 +134,7 @@ def test_ledger_validation_and_dividends(tmp_path: Path) -> None:
     nested_engine.write_text(
         '[execution]\nscenario = "open_auction"\nmax_participation = 0.1\ncarry_unfilled = false\n'
         '[costs]\ncommission_rate = "0.001"\ndividend_withholding_rate = "0.1"\nimpact_k = 0.1\n'
-        'cash_buffer = 0.0\nallow_static_industry = false\n',
+        'cash_buffer = 0.0\n',
         encoding="utf-8",
     )
     nested_outcome = run_ledger(
@@ -159,7 +153,6 @@ def test_ledger_validation_and_dividends(tmp_path: Path) -> None:
         "dividend_withholding_rate": '"0.154"',
         "impact_k": "0.1",
         "cash_buffer": "0.005",
-        "allow_static_industry": "false",
     }
     bad_values: dict[str, str] = {
         "max_participation": '"bad"',
@@ -168,7 +161,6 @@ def test_ledger_validation_and_dividends(tmp_path: Path) -> None:
         "dividend_withholding_rate": '"bad"',
         "impact_k": '"bad"',
         "cash_buffer": '"bad"',
-        "allow_static_industry": '"yes"',
     }
     for bad_key, bad_value in bad_values.items():
         broken = tmp_path / f"broken_{bad_key}.toml"

@@ -39,7 +39,7 @@ __all__ = [
     "research_cube_id",
 ]
 
-CUBE_POLICY_VERSION = "research-cube-v1"
+CUBE_POLICY_VERSION = "research-cube-v2"
 
 _LOG = logging.getLogger(__name__)
 
@@ -839,6 +839,37 @@ def _check_references(
             raise PITDataError(f"{label} references unknown instrument: {inst}")
 
 
+def _fact_instruments_outside_panel(facts: pl.DataFrame, panel_ids: set[str]) -> set[str]:
+    """Instruments named by financial facts that have no panel row (never listed in the universe)."""
+    if "company_id" not in facts.columns:
+        return set()
+    columns = [key for key in ("company_id", "ticker") if key in facts.columns]
+    rows = facts.select(columns).unique().to_dicts()
+    found = {_instrument_of(row) for row in rows}
+    return {inst for inst in found if inst is not None and inst not in panel_ids}
+
+
+def _panel_float_columns(
+    panel_dir: Path, names: Sequence[str], sessions: Sequence[date], instrument_ids: Sequence[str]
+) -> dict[str, NDArray[np.float64]]:
+    """Dense arrays of panel columns that ``load_market_arrays`` does not carry."""
+    from src.data.datasets import dataset_partition_paths
+
+    paths = [str(path) for path in dataset_partition_paths(panel_dir) if path.suffix == ".parquet"
+             and path.name != "instrument_exits.parquet"]
+    frame = pl.scan_parquet(paths).select(["session", "instrument_id", *names]).collect()
+    session_index = {day: idx for idx, day in enumerate(sessions)}
+    instrument_index = {inst: idx for idx, inst in enumerate(instrument_ids)}
+    rows = frame["session"].replace_strict(session_index, return_dtype=pl.Int64).to_numpy()
+    cols = frame["instrument_id"].replace_strict(instrument_index, return_dtype=pl.Int64).to_numpy()
+    out: dict[str, NDArray[np.float64]] = {}
+    for name in names:
+        dense = np.full((len(sessions), len(instrument_ids)), np.nan, dtype=np.float64)
+        dense[rows, cols] = frame[name].cast(pl.Float64).fill_null(float("nan")).to_numpy()
+        out[name] = dense
+    return out
+
+
 def _build_market_arrays(
     inputs: CubeInputs, sessions: tuple[date, ...], instrument_ids: tuple[str, ...]
 ) -> dict[str, NDArray[Any]]:
@@ -871,9 +902,12 @@ def _build_market_arrays(
     close = _f("close")
     base = _f("base_price")
     volume = _f("volume")
-    trading_value = _f("trading_value")
-    market_cap = _f("market_cap")
-    listed_shares = _f("listed_shares")
+    panel_floats = _panel_float_columns(
+        Path(inputs.market_panel), ("trading_value", "market_cap", "listed_shares"), sessions, instrument_ids
+    )
+    trading_value = panel_floats["trading_value"]
+    market_cap = panel_floats["market_cap"]
+    listed_shares = panel_floats["listed_shares"]
     adtv20 = _f("adtv20")
     ret_vol60 = _f("ret_vol60")
     sell_tax = _f("sell_tax_rate")
@@ -885,22 +919,20 @@ def _build_market_arrays(
     market = np.asarray(arrays.market, dtype=np.int8)
     tick_at_open = np.zeros(shape, dtype=np.float64)
     for t, day in enumerate(sessions):
-        for n in range(n_n):
-            px = open_px[t, n]
-            if px > 0 and np.isfinite(px):
-                code = int(market[t, n])
-                if code == 1:
-                    mkt = KrxMarket.KOSPI
-                elif code == 2:
-                    mkt = KrxMarket.KOSDAQ
-                else:
-                    continue
-                try:
-                    tick_at_open[t, n] = float(
-                        inputs.market_rules.tick_size(session=day, market=mkt, price=int(px))
-                    )
-                except PITDataError:  # pragma: no cover
-                    tick_at_open[t, n] = 0.0
+        try:
+            regime = inputs.market_rules.tick_regime_at(day)
+        except PITDataError:  # pragma: no cover - session precedes the rules' coverage
+            continue
+        quotable = (open_px[t] > 0) & np.isfinite(open_px[t])
+        for code, market_key in ((1, KrxMarket.KOSPI), (2, KrxMarket.KOSDAQ)):
+            mask = quotable & (market[t] == code)
+            if not mask.any():
+                continue
+            bands = regime.bands[market_key]
+            lowers = np.asarray([band.lower_price_inclusive for band in bands], dtype=np.float64)
+            ticks = np.asarray([band.tick for band in bands], dtype=np.float64)
+            position = np.searchsorted(lowers, np.floor(open_px[t, mask]), side="right") - 1
+            tick_at_open[t, mask] = ticks[np.clip(position, 0, len(bands) - 1)]
     traded = present & (volume > 0) & (open_px > 0)
     ret_cc = np.zeros(shape, dtype=np.float64)
     valid_px = present & (close > 0) & (base > 0) & np.isfinite(close) & np.isfinite(base)
@@ -1018,15 +1050,10 @@ def build_research_cube(inputs: CubeInputs) -> ResearchCube:
         (releases, "earnings releases"),
     ):
         _check_references(frame, panel_ids, label)
-    if "company_id" in facts.columns:
-        try:
-            company_rows = facts.select(["company_id"]).to_dicts()
-        except (ValueError, pl.exceptions.PolarsError) as exc:  # pragma: no cover
-            raise PITDataError(f"invalid financial facts keys: {exc}") from exc
-        for row in company_rows:
-            inst = _instrument_of(row)
-            if inst is not None and inst not in panel_ids:
-                raise PITDataError(f"financial facts reference unknown instrument: {inst}")
+    outside = _fact_instruments_outside_panel(facts, panel_ids)
+    if outside:
+        # 시세가 없는 비유니버스 종목의 공시라 매매 대상이 될 수 없다. 조용히 버리지 않고 규모를 남긴다.
+        _LOG.info("[DATA] stage=facts_outside_panel instruments=%d skipped", len(outside))
     market_part = _build_market_arrays(inputs, sessions, instrument_ids)
     shape = (len(sessions), len(instrument_ids))
     base = np.asarray(market_part["base_price"], dtype=np.float64)
