@@ -1,10 +1,10 @@
-"""Engine loop: timeline order, fills, exits, determinism, and benchmark parity."""
+"""Replay engine: timeline order, fills, exits, determinism, and benchmark parity."""
 
 from __future__ import annotations
 
 import itertools
+import math
 
-import random
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -18,8 +18,6 @@ from src.backtest.engine import BacktestResult, DelistPolicy, EngineConfig, run_
 from src.backtest.events import build_engine_events
 from src.backtest.execution import ExecutionConfig, ExecutionScenario
 from src.backtest.market import MarketArrays, load_market_arrays
-from src.backtest.strategy import EqualWeightLiquid, PortfolioSnapshot, Targets
-from src.backtest.view import PITView
 from src.core.market_rules import KrxMarketRules, load_krx_market_rules
 from tests.unit.backtest.test_events import _div_frame, _div_row, _exit_row, _write_exits
 from tests.unit.backtest.test_market import _mrow, _write_panel
@@ -94,23 +92,6 @@ def _config(
     )
 
 
-class _ScriptedStrategy:
-    """Rebalance on scheduled sessions toward fixed weight maps."""
-
-    def __init__(self, schedule: dict[int, dict[int, float]]) -> None:
-        self._schedule = schedule
-        self.name = "scripted"
-
-    def params(self) -> dict[str, str | int | float | bool]:
-        return {"sessions": ",".join(str(t) for t in sorted(self._schedule))}
-
-    def is_rebalance(self, view: PITView) -> bool:
-        return view.t in self._schedule
-
-    def decide(self, view: PITView, portfolio: PortfolioSnapshot) -> Targets:
-        return Targets(weights=dict(self._schedule[view.t]))
-
-
 def _positions_at(journal: Any, t: int, *, strict: bool) -> dict[int, int]:
     pos: dict[int, int] = {}
     for entry in journal:
@@ -135,10 +116,9 @@ def _conservation_run(tmp_path: Path) -> tuple[MarketArrays, BacktestResult, lis
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=EqualWeightLiquid(min_adtv20_krw=0, max_names=2),
+        targets={0: {0: 1.0 / 3.0, 1: 1.0 / 3.0, 2: 1.0 / 3.0}},
         config=_config(),
         deposits={sessions[0]: 1_000_000, date(2020, 1, 1): 2_000_000, sessions[15]: 500_000},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -181,10 +161,9 @@ def test_orders_execute_next_session(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 0.01}}),
+        targets={0: {0: 0.01}},
         config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -194,6 +173,29 @@ def test_orders_execute_next_session(tmp_path: Path) -> None:
     assert buys[0].session_idx == 1
     assert buys[0].cash_delta == -100 * 105
     assert buys[0].quantity_delta == 100
+
+
+def test_decision_before_window_executes_first_session(tmp_path: Path) -> None:
+    sessions = _sessions(3)
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_pre", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+    result = run_backtest(
+        arrays=arrays,
+        events=events,
+        targets={0: {0: 0.5}},
+        config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
+        deposits={},
+        rules=_rules(),
+        start=sessions[1],
+        end=sessions[-1],
+    )
+    buys = [e for e in result.journal if e.kind.value == "buy"]
+    assert len(buys) == 1
+    assert buys[0].session_idx == 1
+    assert [r.session_idx for r in result.nav] == [1, 2]
 
 
 def test_sale_proceeds_fund_same_session_buys(tmp_path: Path) -> None:
@@ -207,10 +209,9 @@ def test_sale_proceeds_fund_same_session_buys(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 1.0}, 2: {1: 1.0}}),
+        targets={0: {0: 1.0}, 2: {1: 1.0}},
         config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -239,10 +240,9 @@ def test_halted_exit_scenarios_differ_only_by_exit_value(tmp_path: Path) -> None
         results[policy] = run_backtest(
             arrays=arrays,
             events=events,
-            strategy=_ScriptedStrategy({0: {1: 1.0}}),
+            targets={0: {1: 1.0}},
             config=_config(initial_cash=1_500_000, impact_k=0.0, commission="0", policy=policy),
             deposits={},
-            asof_tables={},
             rules=_rules(),
             start=sessions[0],
             end=sessions[-1],
@@ -264,10 +264,9 @@ def test_deterministic_ledger_hash(tmp_path: Path) -> None:
     second = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=EqualWeightLiquid(min_adtv20_krw=0, max_names=2),
+        targets={0: {0: 1.0 / 3.0, 1: 1.0 / 3.0, 2: 1.0 / 3.0}},
         config=_config(),
         deposits={sessions[0]: 1_000_000, date(2020, 1, 1): 2_000_000, sessions[15]: 500_000},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -287,7 +286,6 @@ def test_lookahead_free_end_to_end(tmp_path: Path) -> None:
     arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
     events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
 
-    rng = random.Random(0)  # noqa: S311 - deterministic test perturbation, not cryptography
     perturbed: list[dict[str, Any]] = []
     for t, day in enumerate(sessions):
         for inst, base in (("KRX:A", 100 + t), ("KRX:B", 200 - t)):
@@ -298,19 +296,19 @@ def test_lookahead_free_end_to_end(tmp_path: Path) -> None:
     arrays2 = load_market_arrays(panel_dir=panel2, cache_root=tmp_path / "cache")
     events2 = build_engine_events(arrays=arrays2, panel_dir=panel2, dividends=None)
 
+    schedule = {t: {0: 0.5, 1: 0.5} for t in range(11)}
     kwargs: dict[str, Any] = {
         "deposits": {},
-        "asof_tables": {},
         "rules": _rules(),
         "start": sessions[0],
         "end": sessions[-1],
     }
     base = run_backtest(
-        arrays=arrays, events=events, strategy=_ScriptedStrategy({t: {0: 0.5, 1: 0.5} for t in range(12)}),
+        arrays=arrays, events=events, targets=schedule,
         config=_config(impact_k=0.0, commission="0"), **kwargs,
     )
     other = run_backtest(
-        arrays=arrays2, events=events2, strategy=_ScriptedStrategy({t: {0: 0.5, 1: 0.5} for t in range(12)}),
+        arrays=arrays2, events=events2, targets=schedule,
         config=_config(impact_k=0.0, commission="0"), **kwargs,
     )
     assert [f for f in base.fills if f.order.decision_session_idx < 8] == [
@@ -330,10 +328,9 @@ def test_delisted_orders_rejected(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {1: 1.0}}),
+        targets={0: {1: 1.0}},
         config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -355,10 +352,9 @@ def test_carried_halted_order_executes_next_session(tmp_path: Path) -> None:
         results[carry] = run_backtest(
             arrays=arrays,
             events=events,
-            strategy=_ScriptedStrategy({0: {0: 1.0}}),
+            targets={0: {0: 1.0}},
             config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0", carry=carry),
             deposits={},
-            asof_tables={},
             rules=_rules(),
             start=sessions[0],
             end=sessions[-1],
@@ -383,10 +379,9 @@ def test_reverse_split_shortfall_rejected_as_cash(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 1.0}, 1: {1: 1.0}}),
+        targets={0: {0: 1.0}, 1: {1: 1.0}},
         config=_config(initial_cash=1_000, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -407,10 +402,9 @@ def test_buy_shortfall_uses_commission_aware_reduction(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 1.0}}),
+        targets={0: {0: 1.0}},
         config=_config(initial_cash=905, impact_k=0.0, commission="0.01"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -430,10 +424,9 @@ def test_unaffordable_buy_rejected_as_cash(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 1.0}}),
+        targets={0: {0: 1.0}},
         config=_config(initial_cash=150, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -452,10 +445,9 @@ def test_zero_close_target_skipped(tmp_path: Path) -> None:
     result = run_backtest(
         arrays=arrays,
         events=events,
-        strategy=_ScriptedStrategy({0: {0: 1.0}}),
+        targets={0: {0: 1.0}},
         config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
         deposits={},
-        asof_tables={},
         rules=_rules(),
         start=sessions[0],
         end=sessions[-1],
@@ -472,17 +464,16 @@ def test_bad_window_and_deposits_rejected(tmp_path: Path) -> None:
     _write_exits(panel, [])
     arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
     events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
-    strategy = _ScriptedStrategy({})
     config = _config()
     with pytest.raises(ValueError, match="not within the panel sessions"):
         run_backtest(
-            arrays=arrays, events=events, strategy=strategy, config=config, deposits={},
-            asof_tables={}, rules=_rules(), start=date(2020, 1, 5), end=sessions[-1],
+            arrays=arrays, events=events, targets={}, config=config, deposits={},
+            rules=_rules(), start=date(2020, 1, 5), end=sessions[-1],
         )
     with pytest.raises(ValueError, match="after the run end"):
         run_backtest(
-            arrays=arrays, events=events, strategy=strategy, config=config,
-            deposits={sessions[-1] + timedelta(days=1): 100}, asof_tables={}, rules=_rules(),
+            arrays=arrays, events=events, targets={}, config=config,
+            deposits={sessions[-1] + timedelta(days=1): 100}, rules=_rules(),
             start=sessions[0], end=sessions[-1],
         )
     with pytest.raises(ValueError, match="cash_buffer"):
@@ -490,12 +481,41 @@ def test_bad_window_and_deposits_rejected(tmp_path: Path) -> None:
             initial_cash=1, execution=_execution(), costs=_costs(),
             halted_exit_policy=DelistPolicy.LAST_CLOSE, cash_buffer=1.0,
         )
-    with pytest.raises(ValueError, match="allow_static_industry"):
-        EngineConfig(
-            initial_cash=1, execution=_execution(), costs=_costs(),
-            halted_exit_policy=DelistPolicy.LAST_CLOSE, cash_buffer=0.0,
-            allow_static_industry="yes",  # type: ignore[arg-type]
-        )
+
+
+def test_invalid_target_schedules_fail_fast(tmp_path: Path) -> None:
+    sessions = _sessions(4)
+    panel = _write_panel(
+        tmp_path / "gold", "market_panel_targets", [_flat_row(day, "KRX:A", 100) for day in sessions]
+    )
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+    config = _config()
+    base: dict[str, Any] = {
+        "arrays": arrays, "events": events, "config": config, "deposits": {},
+        "rules": _rules(), "start": sessions[0], "end": sessions[-1],
+    }
+    with pytest.raises(ValueError, match="non-negative"):
+        run_backtest(targets={0: {0: -0.5}}, **base)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite"):
+        run_backtest(targets={0: {0: math.inf}}, **base)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="above 1"):
+        run_backtest(targets={0: {0: 1.5}}, **base)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="outside the run window"):
+        run_backtest(targets={3: {0: 0.5}}, **base)
+    with pytest.raises(ValueError, match="outside the run window"):
+        run_backtest(targets={-1: {0: 0.5}}, **base)
+    with pytest.raises(ValueError, match="outside the panel"):
+        run_backtest(targets={0: {9: 0.5}}, **base)
+    with pytest.raises(ValueError, match="must be an int"):
+        run_backtest(targets={True: {0: 0.5}}, **base)  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="must be a mapping"):
+        run_backtest(targets={0: [0.5]}, **base)  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="must be an int"):
+        run_backtest(targets={0: {True: 0.5}}, **base)  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="finite number"):
+        run_backtest(targets={0: {0: True}}, **base)  # type: ignore[dict-item]
 
 
 @pytest.mark.slow

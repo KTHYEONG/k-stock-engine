@@ -3,11 +3,8 @@
 # ruff: noqa: RUF002
 from __future__ import annotations
 
-import itertools
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
 from typing import Final
 
 import numpy as np
@@ -16,25 +13,19 @@ from scipy.stats import norm
 
 __all__ = [
     "EULER_GAMMA",
-    "PboResult",
-    "active_t_stat",
+    "BootstrapProfile",
+    "PointMetrics",
     "annualized_log_growth",
     "block_bootstrap_annualized_means",
-    "cscv_pbo",
+    "bootstrap_profile",
     "deflated_sharpe_ratio",
+    "deflated_sharpe_ratio_from_dispersion",
     "effective_trial_count",
-    "information_ratio",
     "max_drawdown",
-    "yearly_active_log",
+    "point_metrics",
 ]
 
 EULER_GAMMA: Final = 0.5772156649015329
-
-
-@dataclass(frozen=True, slots=True)
-class PboResult:
-    pbo: float
-    logits: NDArray[np.float64]
 
 
 def annualized_log_growth(log_returns: NDArray[np.float64], *, sessions_per_year: int) -> float:
@@ -54,28 +45,6 @@ def max_drawdown(log_returns: NDArray[np.float64]) -> float:
     peak = np.maximum.accumulate(wealth)
     drawdown = wealth / peak - 1.0
     return float(np.min(drawdown))
-
-
-def information_ratio(active: NDArray[np.float64], *, sessions_per_year: int) -> float:
-    """Annualized mean active log return per unit of tracking volatility."""
-    x = np.asarray(active, dtype=np.float64)
-    if x.ndim != 1 or x.size < 2:
-        raise ValueError("active must be a 1-D array with at least 2 sessions")
-    std = float(np.std(x, ddof=1))
-    if std == 0.0:
-        return 0.0
-    return float(np.mean(x) / std * math.sqrt(sessions_per_year))
-
-
-def active_t_stat(active: NDArray[np.float64]) -> float:
-    """t-statistic of the mean active log return."""
-    x = np.asarray(active, dtype=np.float64)
-    if x.ndim != 1 or x.size < 2:
-        raise ValueError("active must be a 1-D array with at least 2 sessions")
-    std = float(np.std(x, ddof=1))
-    if std == 0.0:
-        return 0.0
-    return float(np.mean(x) / std * math.sqrt(x.size))
 
 
 def block_bootstrap_annualized_means(
@@ -177,64 +146,144 @@ def deflated_sharpe_ratio(
     return float(norm.cdf((sharpe - expected_best) * math.sqrt(x.size - 1) / math.sqrt(denominator)))
 
 
-def _sharpe_of(block_values: NDArray[np.float64]) -> float:
-    if block_values.size < 2:
-        return 0.0
-    std = float(np.std(block_values, ddof=1))
-    if std == 0.0:
-        return 0.0
-    return float(np.mean(block_values) / std)
+@dataclass(frozen=True, slots=True)
+class PointMetrics:
+    """Point path statistics of one log-return stream."""
+
+    cagr: float
+    log_growth: float
+    max_drawdown: float
+    calmar: float
+    sharpe: float
+    underwater_sessions: int
 
 
-def cscv_pbo(returns: NDArray[np.float64], *, blocks: int) -> PboResult:
-    """Combinatorial symmetric cross-validation PBO over contiguous blocks.
-
-    Units: daily log returns in, annualized by ``sessions_per_year`` only through the
-    per-period Sharpe below.
-
-    CSCV splits into ``blocks`` contiguous equal-as-possible blocks. Over all C(S, S/2) splits
-    it picks the in-sample best Sharpe (ties go to the lowest column), ranks it out of sample
-    as ``ω = rank/(K+1)`` with ``rank = 1 + #{OOS Sharpe < chosen}``, and sets
-    ``λ = ln(ω/(1-ω))``. PBO is the share of splits with ``λ ≤ 0``.
-    """
-    matrix = np.asarray(returns, dtype=np.float64)
-    if matrix.ndim != 2:
-        raise ValueError("returns must be a 2-D array")
-    n_rows, n_cols = matrix.shape
-    if blocks < 2 or blocks % 2 != 0:
-        raise ValueError("blocks must be an even integer >= 2")
-    if n_cols < 2:
-        raise ValueError("returns must have at least 2 columns")
-    if blocks > n_rows:
-        raise ValueError("blocks must not exceed the session count")
-    base, extra = divmod(n_rows, blocks)
-    boundaries = [0]
-    for i in range(blocks):
-        boundaries.append(boundaries[-1] + base + (1 if i < extra else 0))
-    chunks = [np.arange(boundaries[i], boundaries[i + 1]) for i in range(blocks)]
-    half = blocks // 2
-    logits: list[float] = []
-    for in_sample in itertools.combinations(range(blocks), half):
-        in_set = set(in_sample)
-        in_idx = np.concatenate([chunks[b] for b in sorted(in_set)])
-        out_idx = np.concatenate([chunks[b] for b in range(blocks) if b not in in_set])
-        is_sharpes = np.array([_sharpe_of(matrix[in_idx, k]) for k in range(n_cols)], dtype=np.float64)
-        oos_sharpes = np.array([_sharpe_of(matrix[out_idx, k]) for k in range(n_cols)], dtype=np.float64)
-        chosen = int(np.argmax(is_sharpes))
-        rank = 1 + int(np.sum(oos_sharpes < oos_sharpes[chosen]))
-        omega = rank / (n_cols + 1)
-        logits.append(math.log(omega / (1.0 - omega)))
-    logits_array = np.array(logits, dtype=np.float64)
-    return PboResult(pbo=float(np.mean(logits_array <= 0.0)), logits=logits_array)
+def _longest_underwater_run(wealth: NDArray[np.float64]) -> int:
+    peak = np.maximum.accumulate(wealth)
+    below = wealth[1:] < peak[1:]
+    longest = 0
+    run = 0
+    for flag in below:
+        run = run + 1 if flag else 0
+        longest = max(longest, run)
+    return int(longest)
 
 
-def yearly_active_log(sessions: Sequence[date], active: NDArray[np.float64]) -> dict[int, float]:
-    """Per-calendar-year sums of active log returns."""
-    values = np.asarray(active, dtype=np.float64)
-    days = list(sessions)
-    if len(days) != values.size:
-        raise ValueError("sessions and active must have equal length")
-    totals: dict[int, float] = {}
-    for day, value in zip(days, values, strict=True):
-        totals[day.year] = totals.get(day.year, 0.0) + float(value)
-    return totals
+def point_metrics(log_returns: NDArray[np.float64], *, sessions_per_year: int) -> PointMetrics:
+    """CAGR = exp(mean*spy)-1; max_drawdown <= 0 on the wealth path; calmar = cagr/|max_drawdown|
+    (+inf when the drawdown is 0); sharpe annualized from daily log returns; underwater_sessions = longest
+    run of sessions with wealth below its running peak. Raises ValueError for empty/non-1-D input."""
+    x = np.asarray(log_returns, dtype=np.float64)
+    if x.ndim != 1 or x.size == 0:
+        raise ValueError("log_returns must be a non-empty 1-D array")
+    growth = float(np.mean(x) * sessions_per_year)
+    cagr = float(math.exp(growth) - 1.0)
+    drawdown = float(max_drawdown(x))
+    calmar = float(cagr / abs(drawdown)) if drawdown != 0.0 else math.inf
+    std = float(np.std(x, ddof=1)) if x.size >= 2 else 0.0
+    sharpe = float(np.mean(x) / std * math.sqrt(sessions_per_year)) if std > 0.0 else 0.0
+    wealth = np.concatenate(([1.0], np.exp(np.cumsum(x))))
+    return PointMetrics(
+        cagr=cagr,
+        log_growth=growth,
+        max_drawdown=drawdown,
+        calmar=calmar,
+        sharpe=sharpe,
+        underwater_sessions=_longest_underwater_run(wealth),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapProfile:
+    """Horizon path-statistic profile from resampled blocks."""
+
+    p_cagr_ge_abs_mdd: float
+    p_cagr_le_zero: float
+    cagr_p5: float
+    mdd_p5: float
+    p_mdd_below_limit: float
+    underwater_median_sessions: float
+    underwater_p95_sessions: float
+
+
+def bootstrap_profile(
+    log_returns: NDArray[np.float64],
+    *,
+    block: int,
+    draws: int,
+    seed: int,
+    horizon: int,
+    mdd_limit: float,
+    sessions_per_year: int,
+) -> BootstrapProfile:
+    """Resample ``horizon`` sessions from contiguous blocks (uniform block starts, seeded) and summarize
+    path statistics of each draw: P(CAGR >= |MDD|), P(CAGR <= 0), 5th percentile CAGR, 5th percentile
+    (worst) MDD, P(MDD < mdd_limit), median/95th percentile longest underwater run.
+    Why: a single historical path's Calmar is one draw; the question is how often the compounding
+    condition holds over a 5-year horizon. Raises ValueError for block>len, draws<=0, horizon<=0."""
+    values = np.asarray(log_returns, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("log_returns must be a non-empty 1-D array")
+    if block <= 0 or block > values.size or draws <= 0 or horizon <= 0:
+        raise ValueError("bootstrap requires 0 < block <= len(x), draws > 0 and horizon > 0")
+    rng = np.random.default_rng(seed)
+    upper = values.size - block
+    cagrs = np.empty(draws, dtype=np.float64)
+    mdds = np.empty(draws, dtype=np.float64)
+    underwaters = np.empty(draws, dtype=np.float64)
+    for i in range(draws):
+        pieces: list[NDArray[np.float64]] = []
+        filled = 0
+        while filled < horizon:
+            start = int(rng.integers(0, upper + 1))
+            chunk = values[start : start + block][: horizon - filled]
+            pieces.append(chunk)
+            filled += chunk.size
+        path = np.concatenate(pieces)
+        growth = float(np.mean(path) * sessions_per_year)
+        cagrs[i] = float(math.exp(growth) - 1.0)
+        wealth = np.concatenate(([1.0], np.exp(np.cumsum(path))))
+        peak = np.maximum.accumulate(wealth)
+        mdds[i] = float(np.min(wealth / peak - 1.0))
+        underwaters[i] = float(_longest_underwater_run(wealth))
+    return BootstrapProfile(
+        p_cagr_ge_abs_mdd=float(np.mean(cagrs >= np.abs(mdds))),
+        p_cagr_le_zero=float(np.mean(cagrs <= 0.0)),
+        cagr_p5=float(np.percentile(cagrs, 5.0)),
+        mdd_p5=float(np.percentile(mdds, 5.0)),
+        p_mdd_below_limit=float(np.mean(mdds < mdd_limit)),
+        underwater_median_sessions=float(np.median(underwaters)),
+        underwater_p95_sessions=float(np.percentile(underwaters, 95.0)),
+    )
+
+
+def deflated_sharpe_ratio_from_dispersion(
+    candidate: NDArray[np.float64], *, sharpe_std_per_period: float, n_trials: float
+) -> float:
+    """DSR with an externally supplied dispersion of trial Sharpes (per-period units), for multiplicity
+    that predates the trial registry. Raises ValueError for n_trials < 1 or non-positive variance."""
+    x = np.asarray(candidate, dtype=np.float64)
+    dispersion = float(sharpe_std_per_period)
+    if x.ndim != 1 or x.size < 2:
+        raise ValueError("candidate must be a 1-D array with at least 2 sessions")
+    if not n_trials >= 1 or not math.isfinite(dispersion) or dispersion <= 0.0:
+        raise ValueError("n_trials must be >= 1 with positive finite dispersion")
+    std = float(np.std(x, ddof=1))
+    if not std > 1e-12:
+        raise ValueError("candidate must have positive variance")
+    sharpe = float(np.mean(x) / std)
+    centered = x - np.mean(x)
+    moment2 = float(np.mean(centered**2))
+    skew = float(np.mean(centered**3) / moment2**1.5) if moment2 > 0 else 0.0
+    kurt = float(np.mean(centered**4) / moment2**2) if moment2 > 0 else 3.0
+    if n_trials < 2:
+        expected_best = 0.0
+    else:
+        expected_best = dispersion * (
+            (1.0 - EULER_GAMMA) * norm.ppf(1.0 - 1.0 / n_trials)
+            + EULER_GAMMA * norm.ppf(1.0 - 1.0 / (n_trials * math.e))
+        )
+    denominator = 1.0 - skew * sharpe + (kurt - 1.0) / 4.0 * sharpe**2
+    if denominator <= 0.0:  # pragma: no cover
+        raise ValueError("non-positive DSR denominator")
+    return float(norm.cdf((sharpe - expected_best) * math.sqrt(x.size - 1) / math.sqrt(denominator)))

@@ -151,7 +151,7 @@ flowchart TD
     classDef l1 fill:#f3f0ff,stroke:#7950f2,stroke-width:2px,color:#3b0764;
     classDef l0 fill:#e7f5ff,stroke:#1971c2,stroke-width:2px,color:#0c4a6e;
 
-    L4["Layer 4: CLI 진입점 & 오케스트레이션 (src/backtest/cli.py, src/data/cli/)"]:::l4
+    L4["Layer 4: CLI 진입점 & 오케스트레이션 (src/research/cli.py, src/data/cli/)"]:::l4
     L3["Layer 3: 도메인 서비스 & 백테스트 (src/backtest/, src/execution/, src/data/)"]:::l3
     L2["Layer 2: 외부 연동 어댑터 & 쿼터 원장 (src/integrations/)"]:::l2
     L1["Layer 1: 설정 계약 (src/config/)"]:::l1
@@ -179,3 +179,28 @@ flowchart TD
 uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 ```
 * **래칫(Ratchet) 메커니즘**: 기존의 알려진 위반 사항(`KNOWN_VIOLATIONS`)은 신규 추가가 엄격히 차단되며, 해결된 항목은 즉시 목록에서 제거되어 오직 단조 감소(Monotonic Shrinking)만 허용됩니다.
+
+---
+
+## 6. Single Strategy Path (단일 전략 경로)
+
+리서치부터 원장 검증까지 정확히 하나의 전략 경로만 존재한다: `panel → scorer → policy → simulator/ledger → criteria C1-C4`.
+
+* **Panel (`src/research/panel.py`)**: 인과적 피처 패널. 결정 세션 `T`의 모든 피처·라벨은 `T` 이전에 관측 가능한 데이터로만 구성되며, 전월(全月) 재무·수급 사실을 사용한다.
+* **Scorer (`src/research/model.py`)**: 워크포워드 LightGBM 호라이즌 앙상블. 연도별 폴드는 테스트 연도 이전 데이터로만 학습하고, purge 구간으로 라벨 중첩을 제거한다.
+* **Policy (`src/research/policy.py`)**: ML 상위 20선(`n=20`) + 종목별 자체 추세 현금 규칙. `dev_ma20`·`ret_21`이 모두 양수인 선택 종목만 편입하고 나머지는 현금으로 보유한다.
+* **Simulator / Ledger (`src/research/simulator.py`, `src/research/ledger_bridge.py`, `src/backtest/engine.py`)**: 시뮬레이터는 가중치 공간 스크리닝용 근사이고, 승격 판정은 정수 원장(`src/backtest/engine.py` 리플레이: 목표 비중을 다음 세션 시가에 매도 우선·정수주·음수 현금 금지로 집행)으로만 수행한다.
+* **Criteria (`src/research/criteria.py`)**: 종료 기준 C1(스트레스·섭동·DSR 보고)–C2(집중·낙폭)–C3(원장 정합·패리티)–C4(밀봉 홀드아웃 단일 시도). 기준 미달 시 `NO_TRADE`로 실거래 승격을 거부한다.
+
+```bash
+# 발견 단계 실행 (단일 사전 등록 스펙)
+uv run python -m src.research backtest --spec config/research/strategies/ml_trend_cash.toml
+```
+
+### 6.1 Discovery Status (발견 단계 상태)
+
+| 단계 | 상태 | 비고 |
+| :--- | :---: | :--- |
+| Discovery (C1–C3) | `pending evaluation, holdout sealed` | `uv run python -m src.research backtest` 실행 후 결과 기재 |
+| Holdout (C4) | `sealed` | 최종 후보 1건, 단일 시도 |
+| Forward | `sealed` | 홀드아웃 통과 verdict 이후에만 개방 |
