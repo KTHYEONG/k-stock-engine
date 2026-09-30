@@ -44,8 +44,6 @@ _BARE_WON_RE = re.compile(r"(?<![천백만십억])원")
 
 _QUARTER_END_MONTH_DAY: dict[int, tuple[int, int]] = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
 
-_PERIOD_RE = re.compile(r"(\d{2,4})\s*[.\년]\s*([1-4])\s*(?:Q|분기)")
-
 _CORRECTION_MARKS = ("[기재정정]", "[첨부정정]")
 _TITLE_MARKERS = ("[기재정정]", "[첨부정정]", "[첨부추가]")
 
@@ -195,23 +193,52 @@ def _unit_multiplier(unit_text: str) -> float | None:
     return None
 
 
+_RANGE_RE = re.compile(
+    r"(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*~\s*(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})"
+)
+_QUARTER_FIRST_YEAR_RE = re.compile(r"(?<!\d)(\d{2,4})\s*[.\년]?\s*([1-4])\s*(?:Q|분기)")
+_QUARTER_FIRST_RE = re.compile(r"(?<!\d)([1-4])\s*Q\s*(\d{2,4})(?!\d)")
+
+
+def _full_year(text: str) -> int | None:
+    if len(text) == 2:
+        return 2000 + int(text)
+    if len(text) == 4:
+        return int(text)
+    return None
+
+
 def _parse_period_label(label: str) -> tuple[int, int] | None:
     """Parse a period label into ``(fiscal_year, fiscal_quarter)``.
 
-    Accepted forms are a 4-digit or 2-digit year (2-digit implies 2000+YY), followed by ``.``
-    or ``년``, then a quarter ``1-4`` suffixed by ``Q`` or ``분기``.
+    Accepted forms: a date range covering exactly one calendar quarter (``2025.10.01~2025.12.31``),
+    a 2- or 4-digit year followed by a quarter (``2022.4Q``, ``22년 4분기``, ``2024 3Q``), or a
+    quarter-first form (``4Q25``). Year-only, month-only and blank labels stay unrecognized because
+    the covered quarter would have to be guessed.
     """
-    match = _PERIOD_RE.search(str(label or ""))
-    if match is None:
+    text = str(label or "")
+    ranged = _RANGE_RE.search(text)
+    if ranged is not None:
+        start_year, start_month, start_day, end_year, end_month, end_day = (int(v) for v in ranged.groups())
+        quarter, remainder = divmod(end_month, 3)
+        if (
+            remainder == 0
+            and start_year == end_year
+            and start_month == end_month - 2
+            and start_day == 1
+            and (end_month, end_day) == _QUARTER_END_MONTH_DAY[quarter]
+        ):
+            return end_year, quarter
         return None
-    year_text, quarter_text = match.group(1), match.group(2)
-    if len(year_text) == 2:
-        year = 2000 + int(year_text)
-    elif len(year_text) == 4:
-        year = int(year_text)
-    else:
-        return None
-    return year, int(quarter_text)
+    match = _QUARTER_FIRST_YEAR_RE.search(text)
+    if match is not None:
+        year = _full_year(match.group(1))
+        return None if year is None else (year, int(match.group(2)))
+    match = _QUARTER_FIRST_RE.search(text)
+    if match is not None:
+        year = _full_year(match.group(2))
+        return None if year is None else (year, int(match.group(1)))
+    return None
 
 
 def _quarter_end(fiscal_year: int, fiscal_quarter: int) -> date:
@@ -298,10 +325,6 @@ def _parse_preliminary(
     )
     if header_at is None or header_at + 1 >= len(table):
         raise EarningsReleaseParseError("no_result_table", "preliminary archive carries no period row")
-    header = table[header_at]
-    # 병합 셀 때문에 지표명 칸이 빠진 연속 행이 있어 열 위치는 헤더 레이블 기준 오른쪽 정렬로 잡는다.
-    current_offset = header.index("당기실적") - len(header)
-    prior_offset = header.index("전년동기실적") - len(header)
     period_row = table[header_at + 1]
     first_label = next((cell for cell in period_row if cell.strip()), "")
     parsed_period = _parse_period_label(first_label)
@@ -317,23 +340,28 @@ def _parse_preliminary(
     values: list[EarningsReleaseValue] = []
     current_metric: str | None = None
     for row in table[header_at + 2 :]:
-        if len(row) < len(header):
-            continue
         if "당해실적" in row:
             metric = _METRIC_BY_LABEL.get(_normalize_metric_label(row[0]))
             if metric is None:
                 continue
             current_metric = metric
             span = ReleaseSpan.QUARTER
+            cells = row[row.index("당해실적") + 1 :]
         elif "누계실적" in row:
             if current_metric is None:
                 continue
             metric = current_metric
             span = ReleaseSpan.CUMULATIVE
+            cells = row[row.index("누계실적") + 1 :]
         else:
             continue
-        current = _parse_amount_cell(row[current_offset])
-        prior_year = _parse_amount_cell(row[prior_offset])
+        # 값 열은 당기, 전기, 전기대비(w), 전년동기, 전년동기대비(w) 순이고 w는 서식마다 다르다
+        # (증감율만이면 1, 흑자적자전환여부가 붙으면 2). 헤더 열 수가 아니라 값 열 수로 w를 구한다.
+        change_width, remainder = divmod(len(cells) - 3, 2)
+        if remainder or change_width < 1:
+            continue
+        current = _parse_amount_cell(cells[0])
+        prior_year = _parse_amount_cell(cells[2 + change_width])
         values.append(
             EarningsReleaseValue(
                 metric=metric,
