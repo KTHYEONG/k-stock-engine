@@ -538,6 +538,10 @@ def test_build_assembles_market_returns_and_exits(monkeypatch: pytest.MonkeyPatc
     )
     fake.market[0, 1] = 0
     monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: fake)
+    monkeypatch.setattr(
+        cube_mod, "_panel_float_columns",
+        lambda _dir, names, sessions, ids: {n: np.full((len(sessions), len(ids)), 5.0) for n in names},
+    )
     monkeypatch.setattr(cube_mod, "_require_kind", lambda _path, _kind: None)
     avail = _dt(sessions[1])
     facts = pl.DataFrame(
@@ -936,12 +940,27 @@ def test_build_facts_unknown_instrument(
         market=np.zeros(shape, dtype=np.int8),
     )
     monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: fake)
+    monkeypatch.setattr(
+        cube_mod, "_panel_float_columns",
+        lambda _dir, names, sessions, ids: {n: np.full((len(sessions), len(ids)), 5.0) for n in names},
+    )
     monkeypatch.setattr(cube_mod, "_require_kind", lambda _path, _kind: None)
     facts = pl.DataFrame(
         [{"company_id": "KRX:999999", "fiscal_period": "2020Q1", "fact": "equity", "value": 1.0,
           "available_at": _dt(sessions[0]), "ticker": "999999"}]
     )
-    monkeypatch.setattr(cube_mod, "_read_frame", lambda _p, columns=None: facts)
+    empty_flows = pl.DataFrame(
+        schema={"instrument_id": pl.String, "session": pl.Date, "foreign_net_shares": pl.Int64,
+                "institution_net_shares": pl.Int64, "individual_net_shares": pl.Int64,
+                "available_at": pl.Datetime("us", "Asia/Seoul")}
+    )
+
+    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+        if path.name == "f":
+            return facts
+        return empty_flows if path.name == "i" else pl.DataFrame([])
+
+    monkeypatch.setattr(cube_mod, "_read_frame", _frame)
     rules = load_krx_market_rules(Path("config/market/krx_market_rules.toml"))
     inputs = cube_mod.CubeInputs(
         market_panel=tmp_path, dividend_events=tmp_path / "d",
@@ -949,8 +968,21 @@ def test_build_facts_unknown_instrument(
         earnings_releases=tmp_path / "e", market_rules=rules,
         dividend_withholding_rate=Decimal("0"),
     )
-    with pytest.raises(PITDataError, match="unknown instrument"):
-        cube_mod.build_research_cube(inputs)
+    cube = cube_mod.build_research_cube(inputs)
+    assert bool(np.isnan(cube.arrays["f_equity"]).all())
+
+
+def test_fact_instruments_outside_panel_are_reported() -> None:
+    """Facts of instruments that never traded are identified, not treated as build errors."""
+    facts = pl.DataFrame(
+        [
+            {"company_id": "000001", "ticker": "000001"},
+            {"company_id": "000800", "ticker": "000800"},
+        ]
+    )
+
+    assert cube_mod._fact_instruments_outside_panel(facts, {INST}) == {"KRX:000800"}
+    assert cube_mod._fact_instruments_outside_panel(pl.DataFrame({"x": [1]}), {INST}) == set()
 
 
 def test_cache_hit_returns_verified_cube(
@@ -1021,3 +1053,38 @@ def test_empty_flow_frame_yields_nan_arrays() -> None:
     )
     out = assemble_flows(empty, np.full((3, 1), 5000.0), sessions=sessions, instrument_ids=[INST])
     assert all(bool(np.isnan(arr).all()) for arr in out.values())
+
+
+def test_panel_float_columns_read_real_parquet_partitions(tmp_path: Path) -> None:
+    """Market cap, trading value and listed shares come from the panel parquet, not the dense loader."""
+    import hashlib
+    import json
+
+    sessions = _sessions(2)
+    ids = [INST, INST2]
+    dataset = tmp_path / "market_panel_x"
+    rows = [
+        {"session": sessions[0], "instrument_id": INST, "trading_value": 10, "market_cap": 1000, "listed_shares": 7},
+        {"session": sessions[1], "instrument_id": INST, "trading_value": 20, "market_cap": 2000, "listed_shares": 7},
+        {"session": sessions[1], "instrument_id": INST2, "trading_value": 30, "market_cap": None, "listed_shares": 9},
+    ]
+    part = dataset / "year=2020" / "part.parquet"
+    part.parent.mkdir(parents=True)
+    frame = pl.DataFrame(rows)
+    frame.write_parquet(part)
+    (dataset / "manifest.json").write_text(
+        json.dumps(
+            {"dataset_id": dataset.name, "partitions": [{
+                "year": 2020, "path": "year=2020/part.parquet", "row_count": frame.height,
+                "parquet_sha256": hashlib.sha256(part.read_bytes()).hexdigest()}]},
+        ),
+        encoding="utf-8",
+    )
+
+    out = cube_mod._panel_float_columns(dataset, ("market_cap", "trading_value"), sessions, ids)
+
+    assert out["market_cap"][0, 0] == 1000.0
+    assert out["market_cap"][1, 0] == 2000.0
+    assert bool(np.isnan(out["market_cap"][1, 1]))
+    assert out["trading_value"][1, 1] == 30.0
+    assert bool(np.isnan(out["trading_value"][0, 1]))

@@ -279,7 +279,7 @@ def test_config_validation_rejects_bad_inputs(tmp_path) -> None:
     nested.write_text(
         '[execution]\nscenario = "open_auction"\nmax_participation = 0.1\ncarry_unfilled = false\n'
         '[costs]\ncommission_rate = "0.001"\ndividend_withholding_rate = "0.1"\nimpact_k = 0.1\n'
-        'cash_buffer = 0.0\nallow_static_industry = false\n',
+        'cash_buffer = 0.0\n',
         encoding="utf-8",
     )
     assert SimConfig.from_engine_toml(nested, capital_krw=100).commission_rate == pytest.approx(0.001)
