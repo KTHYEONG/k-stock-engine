@@ -43,7 +43,7 @@ __all__ = [
     "materialize_earnings_releases",
 ]
 
-POLICY_VERSION = "earnings-releases-v1"
+POLICY_VERSION = "earnings-releases-v2"
 _QUARANTINE_FILENAME = "quarantine.json"
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
 _BENCHMARK_METRICS: tuple[str, ...] = ("sales", "operating_profit")
