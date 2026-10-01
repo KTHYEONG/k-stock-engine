@@ -24,6 +24,7 @@ class RuntimeConfig(BaseModel):
     logs_root: Path
     market_rules: Path
     reference_benchmarks: Path
+    hedge_series: Path
     engine: Path
     research_protocol: Path
     strategies_root: Path

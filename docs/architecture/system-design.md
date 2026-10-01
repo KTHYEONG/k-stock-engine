@@ -184,17 +184,22 @@ uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 
 ## 6. Single Strategy Path (단일 전략 경로)
 
-리서치부터 원장 검증까지 정확히 하나의 전략 경로만 존재한다: `panel → scorer → policy → simulator/ledger → criteria C1-C4`.
+리서치부터 원장 검증까지 정확히 하나의 전략 경로만 존재한다: `panel → scorer → policy → sleeves/book → simulator + hedge overlay → ledger → criteria C1-C4`.
 
 * **Panel (`src/research/panel.py`)**: 인과적 피처 패널. 결정 세션 `T`의 모든 피처·라벨은 `T` 이전에 관측 가능한 데이터로만 구성되며, 전월(全月) 재무·수급 사실을 사용한다.
 * **Scorer (`src/research/model.py`)**: 워크포워드 LightGBM 호라이즌 앙상블. 연도별 폴드는 테스트 연도 이전 데이터로만 학습하고, purge 구간으로 라벨 중첩을 제거한다.
-* **Policy (`src/research/policy.py`)**: ML 상위 20선(`n=20`) + 종목별 자체 추세 현금 규칙. `dev_ma20`·`ret_21`이 모두 양수인 선택 종목만 편입하고 나머지는 현금으로 보유한다.
-* **Simulator / Ledger (`src/research/simulator.py`, `src/research/ledger_bridge.py`, `src/backtest/engine.py`)**: 시뮬레이터는 가중치 공간 스크리닝용 근사이고, 승격 판정은 정수 원장(`src/backtest/engine.py` 리플레이: 목표 비중을 다음 세션 시가에 매도 우선·정수주·음수 현금 금지로 집행)으로만 수행한다.
-* **Criteria (`src/research/criteria.py`)**: 종료 기준 C1(스트레스·섭동·DSR 보고)–C2(집중·낙폭)–C3(원장 정합·패리티)–C4(밀봉 홀드아웃 단일 시도). 기준 미달 시 `NO_TRADE`로 실거래 승격을 거부한다.
+* **Policy (`src/research/policy.py`)**: ML 상위 20선(`n=20`) + `ret21 > 0` 단일 추세 현금 규칙(`dev_ma20` 구간은 비활성화). 규칙을 통과한 선택 종목만 편입하고 나머지는 현금으로 보유한다.
+* **Sleeves/Book (`src/research/book.py`)**: 리밸런스 위상별 5개 슬리브(각자 주식 자본의 1/5로 목표 산출·시뮬레이션)와 전진충전 평균 결합북. 위상 운(phase luck)을 구조적으로 제거한다.
+* **Hedge overlay (`src/research/hedge.py`, Silver `hedge_series`)**: KOSDAQ 150 롤링 베타에 대한 베타중립 숏 헤지. 지수선물 정수 계약을 핵심으로, 계약 미만 잔여는 실물 인버스 ETF로 충당한다. 증거금·위탁 비용과 세율(지수선물 이익 11%, 연 250만원 공제, 손실 이월 없음; 인버스 ETF 이익 15.4%, 손실 상계 없음)을 NAV 시뮬레이션에 반영한다.
+* **Simulator / Ledger (`src/research/simulator.py`, `src/research/ledger_bridge.py`, `src/backtest/engine.py`)**: 슬리브 시뮬레이터는 가중치 공간 스크리닝용 근사이고, 승격 판정은 정수 원장(`src/backtest/engine.py` 리플레이: 결합 주식북 목표를 다음 세션 시가에 매도 우선·정수주·음수 현금 금지로 집행)으로만 수행한다. 헤지는 슬리브 평균 수익률 스트림에만 적용되며 원장 리플레이에는 적용하지 않는다.
+* **Criteria (`src/research/criteria.py`)**: 종료 기준 C1(스트레스·섭동·DSR 보고)–C2(집중·낙폭)–C3(원장 정합·패리티)–C4(밀봉 홀드아웃 단일 시도). 기준 미달 시 `NO_TRADE`로 실거래 승격을 거부한다. 발견 단계의 증거 위상(evidence phase) 5개는 단일 헤지북의 헤지 결정격자 오프셋(0–4)이며, 운용 오프셋은 0이다.
 
 ```bash
+# 헤지 시계열 수집·정제 (Part 1)
+uv run python -m src.data.cli collect-krx-hedge-series
+uv run python -m src.data.cli build-hedge-series-silver
 # 발견 단계 실행 (단일 사전 등록 스펙)
-uv run python -m src.research backtest --spec config/research/strategies/ml_trend_cash.toml
+uv run python -m src.research backtest --spec config/research/strategies/ml_sleeve_hedge.toml
 ```
 
 ### 6.1 Discovery Status (발견 단계 상태)

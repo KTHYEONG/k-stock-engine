@@ -92,6 +92,11 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
     from src.data.datasets import read_dataset
 
     dividends = read_dataset(runtime.workspace.silver_root / dividend_id).collect()
+    hedge_id = registry.require("hedge_series")
+    hedge_frame = read_dataset(runtime.workspace.silver_root / hedge_id).collect()
+    from src.research.hedge import hedge_inputs_from_frame
+
+    hedge_inputs = hedge_inputs_from_frame(hedge_frame, sessions=list(cube.sessions))
     context = PipelineContext(
         protocol=protocol,
         cube=cube,
@@ -99,6 +104,7 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
         lockbox=lockbox,
         panel_dir=runtime.workspace.gold_root / market_id,
         dividends=dividends,
+        hedge_inputs=hedge_inputs,
         rules=load_krx_market_rules(runtime_config.market_rules),
         engine_config_path=runtime_config.engine,
         market_cache_root=state_root / "research" / "market_cache",
