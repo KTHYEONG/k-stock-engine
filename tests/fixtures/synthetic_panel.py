@@ -37,7 +37,7 @@ _PANEL_SCHEMA: dict[str, Any] = {
     "entry_blocked": pl.Boolean,
 }
 
-__all__ = ["synthetic_cube", "synthetic_panel_row", "synthetic_sessions", "write_synthetic_panel"]
+__all__ = ["synthetic_cube", "synthetic_hedge_inputs", "synthetic_panel_row", "synthetic_sessions", "write_synthetic_panel"]
 
 
 def synthetic_sessions(n: int, start: date = date(2020, 1, 6)) -> list[date]:
@@ -147,4 +147,25 @@ def synthetic_cube(
         arrays=arrays,
         exit_at=np.full(n_n, -1, dtype=np.int64),
         exit_halted=np.zeros(n_n, dtype=np.bool_),
+    )
+
+
+def synthetic_hedge_inputs(
+    sessions: list[date],
+    *,
+    index_level: float = 1500.0,
+    inverse_close: float = 8000.0,
+) -> Any:
+    """Flat synthetic hedge series with one lead session before the run window."""
+    from datetime import timedelta
+
+    from src.research.hedge import HedgeInputs
+
+    lead = sessions[0] - timedelta(days=1)
+    full = [lead, *sessions]
+    n = len(full)
+    return HedgeInputs(
+        sessions=tuple(full),
+        index_level=np.full(n, float(index_level), dtype=np.float64),
+        inverse_close=np.full(n, float(inverse_close), dtype=np.float64),
     )

@@ -11,10 +11,17 @@ import pytest
 def _write_spec(path: Path, **overrides: object) -> Path:
     policy_n = overrides.get("n", 2)
     path.write_text(
-        f'[policy]\nfamily = "ml_trend_cash"\nn = {policy_n}\n'
+        f'[policy]\nfamily = "ml_trend_cash"\nn = {policy_n}\nrebalance_every_sessions = 5\n'
         "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
         "[scorer]\nfirst_test_year = 2019\nmin_train_rows = 1\nmin_cross_section = 1\n"
-        "num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\n",
+        "num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\n"
+        "[book]\nsleeves = 5\nstock_capital_fraction = 0.75\n"
+        "[hedge]\nhedge_ratio = 1.0\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
+        "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
+        "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"
+        "futures_cost_rate = 0.0003\ninverse_cost_rate = 0.0007\nresize_sell_cost_rate = 0.0025\n"
+        "resize_buy_cost_rate = 0.0005\nfutures_tax_rate = 0.11\nfutures_annual_deduction_krw = 2500000\n"
+        "inverse_tax_rate = 0.154\n",
         encoding="utf-8",
     )
     return path
@@ -230,6 +237,10 @@ def test_spec_identity(tmp_path: Path) -> None:
     second = _write_spec(tmp_path / "b.toml", n=3)
     assert load_strategy_spec(first).spec_hash != load_strategy_spec(second).spec_hash
     bad = tmp_path / "bad.toml"
-    bad.write_text('[policy]\nfamily = "ml_trend_cash"\n[unknown]\nx = 1\n[scorer]\n', encoding="utf-8")
+    bad.write_text(
+        '[policy]\nfamily = "ml_trend_cash"\nrebalance_every_sessions = 5\n[unknown]\nx = 1\n[scorer]\n'
+        "[book]\nsleeves = 5\nstock_capital_fraction = 0.75\n[hedge]\nhedge_ratio = 1.0\n",
+        encoding="utf-8",
+    )
     with pytest.raises(ValueError, match="unknown"):
         load_strategy_spec(bad)

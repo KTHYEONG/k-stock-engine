@@ -25,6 +25,7 @@ from src.data.jobs.kind import (
 from src.data.jobs.krx import (
     KRX_JOBS,
     KrxDailyMarketJob,
+    KrxHedgeSeriesJob,
     KrxSecurityMasterJob,
     build_krx_job_context,
     resolve_krx_job,
@@ -49,6 +50,7 @@ __all__ = [
     "KindNoticeSearchJob",
     "KisInvestorFlowJob",
     "KrxDailyMarketJob",
+    "KrxHedgeSeriesJob",
     "KrxSecurityMasterJob",
     "LsInvestorFlowJob",
     "build_job_context",

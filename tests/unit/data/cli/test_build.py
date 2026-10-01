@@ -854,6 +854,65 @@ def test_build_market_actions_command_registers_dataset(tmp_path, monkeypatch, c
     assert emitted["dataset_id"] == "market_actions_0123456789abcdef"
 
 
+def test_build_hedge_series_silver_command_emits_dataset_counts(tmp_path, capsys) -> None:
+    import hashlib
+    import json
+
+    from src.data.cli import main
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.runtime import load_data_runtime
+    from datetime import UTC, date, datetime
+
+    import polars as pl
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
+    universe = _publish_cli_fixture(
+        runtime.workspace.silver_root,
+        "ordinary_universe",
+        {
+            "session=2026-03-04/part.parquet": pl.DataFrame(
+                {"session": [date(2026, 3, 4)], "instrument_id": ["KRX:005930"], "eligible": [True]}
+            ),
+        },
+    )
+    records = [
+        {"_endpoint": "index", "IDX_CLSS": "KOSDAQ", "IDX_NM": "코스닥 150",
+         "BAS_DD": "20260304", "CLSPRC_IDX": "1000.5"},
+        {"_endpoint": "etf", "ISU_CD": "251340", "ISU_SRT_CD": "251340",
+         "BAS_DD": "20260304", "TDD_CLSPRC": "5000"},
+    ]
+    raw = json.dumps({"session": "2026-03-04", "records": records}, sort_keys=True).encode("utf-8")
+    page_path = runtime.workspace.bronze_root / "krx-hedge-page.json"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_bytes(raw)
+    seed_receipts(
+        ReceiptCatalog(runtime.workspace.bronze_root / "catalog"),
+        [
+            ReceiptIndexEntry(
+                source="krx_hedge_series",
+                natural_key="2026-03-04",
+                as_of=date(2026, 3, 4),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(raw).hexdigest(),
+                retrieved_at=datetime(2026, 3, 5, tzinfo=UTC),
+                payload_path=page_path,
+            )
+        ],
+    )
+    _register_cli_current(runtime, "ordinary_universe", universe)
+    assert main([
+        "build-hedge-series-silver",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["dataset_id"].startswith("hedge_series_")
+    assert emitted["sessions"] == 1
+    assert emitted["inverse_listing_session"] == "2026-03-04"
+
+
 def test_earnings_releases_commands_resolve() -> None:
     from src.data.cli import _ensure_registered
     from src.data.cli.registry import commands

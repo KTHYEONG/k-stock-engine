@@ -231,3 +231,128 @@ def test_master_records_reject_non_date_session() -> None:
 
     with pytest.raises(ValueError, match="as_of"):
         client.fetch_master_records("2026-01-05")  # type: ignore[arg-type]
+
+
+def _hedge_handler(etf_rows, index_rows):  # type: ignore[no-untyped-def]
+    def _handle(endpoint, params):  # type: ignore[no-untyped-def]
+        if endpoint == "etp/etf_bydd_trd":
+            return _FakeResponse({"OutBlock_1": [dict(row) for row in etf_rows]})
+        if endpoint == "idx/kosdaq_dd_trd":
+            return _FakeResponse({"OutBlock_1": [dict(row) for row in index_rows]})
+        raise AssertionError(f"unexpected endpoint {endpoint}")
+
+    return _handle
+
+
+def _hedge_etf_row(**overrides):  # type: ignore[no-untyped-def]
+    row = {"ISU_CD": "251340", "ISU_SRT_CD": "251340", "BAS_DD": "20260105", "TDD_CLSPRC": "5000"}
+    row.update(overrides)
+    return row
+
+
+def _hedge_index_row(**overrides):  # type: ignore[no-untyped-def]
+    row = {"IDX_CLSS": "KOSDAQ", "IDX_NM": "코스닥 150", "BAS_DD": "20260105", "CLSPRC_IDX": "1234.56"}
+    row.update(overrides)
+    return row
+
+
+def test_hedge_records_return_tagged_rows() -> None:
+    etf_rows = [_hedge_etf_row(), {"ISU_CD": "999999", "BAS_DD": "20260105", "TDD_CLSPRC": "1"}]
+    index_rows = [_hedge_index_row(), {"IDX_CLSS": "KOSDAQ", "IDX_NM": "코스닥 소형", "BAS_DD": "20260105"}]
+    client = _client(_hedge_handler(etf_rows, index_rows))
+
+    records = client.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+    assert len(records) == 2
+    by_tag = {record["_endpoint"]: record for record in records}
+    assert set(by_tag) == {"etf", "index"}
+    assert by_tag["etf"]["ISU_CD"] == "251340"
+    assert by_tag["index"]["IDX_NM"] == "코스닥 150"
+    assert by_tag["etf"]["TDD_CLSPRC"] == "5000"
+    assert by_tag["index"]["CLSPRC_IDX"] == "1234.56"
+
+
+def test_hedge_records_tolerate_pre_listing() -> None:
+    other_etf = {"ISU_CD": "999999", "ISU_SRT_CD": "999999", "BAS_DD": "20260105", "TDD_CLSPRC": "7000"}
+    client = _client(_hedge_handler([other_etf], [_hedge_index_row()]))
+
+    records = client.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+    assert len(records) == 1
+    assert records[0]["_endpoint"] == "index"
+
+
+def test_hedge_records_reject_incomplete_page() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    only_etf = _client(_hedge_handler([_hedge_etf_row()], []))
+    with pytest.raises(ProviderTerminalError):
+        only_etf.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    only_index = _client(_hedge_handler([], [_hedge_index_row()]))
+    with pytest.raises(ProviderTerminalError):
+        only_index.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    both_empty = _client(_hedge_handler([], []))
+    assert both_empty.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150") == []
+
+
+def test_hedge_records_reject_date_mismatch_and_duplicates() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    bad_date = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(BAS_DD="20260106")]))
+    with pytest.raises(ProviderTerminalError):
+        bad_date.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    duplicated = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(), _hedge_index_row()]))
+    with pytest.raises(ProviderTerminalError):
+        duplicated.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    dup_etf = _client(_hedge_handler([_hedge_etf_row(), _hedge_etf_row()], [_hedge_index_row()]))
+    with pytest.raises(ProviderTerminalError):
+        dup_etf.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    non_positive = _client(_hedge_handler([_hedge_etf_row(TDD_CLSPRC="0")], [_hedge_index_row()]))
+    with pytest.raises(ProviderTerminalError):
+        non_positive.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+
+def test_hedge_records_holiday_passthrough() -> None:
+    from src.integrations.krx.client import KrxHolidayError
+
+    payload = {"OutBlock_1": [], "RESULT": {"MESSAGE": "휴장일로 거래가 없습니다"}}
+    client = _client(lambda endpoint, params: _FakeResponse(payload))
+
+    with pytest.raises(KrxHolidayError):
+        client.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+
+def test_hedge_records_reject_invalid_arguments() -> None:
+    client = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row()]))
+
+    with pytest.raises(ValueError, match="as_of"):
+        client.fetch_hedge_records("2026-01-05", etf_tickers=("251340",), index_name="코스닥 150")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="index_name"):
+        client.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="  ")
+    with pytest.raises(ValueError, match="etf_tickers"):
+        client.fetch_hedge_records(SESSION, etf_tickers=("  ",), index_name="코스닥 150")
+
+
+def test_hedge_records_reject_malformed_bas_dd() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    malformed = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(BAS_DD="2026-01-05")]))
+    with pytest.raises(ProviderTerminalError):
+        malformed.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    impossible = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(BAS_DD="20261301")]))
+    with pytest.raises(ProviderTerminalError):
+        impossible.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+
+def test_hedge_records_reject_bad_prices() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    bad_index = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(CLSPRC_IDX="abc")]))
+    with pytest.raises(ProviderTerminalError):
+        bad_index.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    zero_index = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row(CLSPRC_IDX="0")]))
+    with pytest.raises(ProviderTerminalError):
+        zero_index.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+    bad_etf = _client(_hedge_handler([_hedge_etf_row(TDD_CLSPRC="abc")], [_hedge_index_row()]))
+    with pytest.raises(ProviderTerminalError):
+        bad_etf.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")

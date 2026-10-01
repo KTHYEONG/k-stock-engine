@@ -702,6 +702,22 @@ def test_reparse_and_fetch_documents_dry_run(tmp_path, capsys) -> None:
     assert summary["status"] == "dry_run"
 
 
+def test_collect_krx_hedge_series_dry_run(tmp_path, capsys) -> None:
+    from src.data.cli import main
+
+    scope_config = Path("config/research/kr_swing_2019_v1.toml")
+    assert main([
+        "collect-krx-hedge-series",
+        "--scope-config", str(scope_config),
+        "--data-root", str(tmp_path / "data"),
+        "--dry-run",
+    ]) == 0
+    summary = _cli_json_lines(capsys)[-1]
+    assert summary["job"] == "krx_hedge_series"
+    assert summary["status"] == "dry_run"
+    assert summary["pending_left"] > 0
+
+
 def test_collect_earnings_releases_command_resolves() -> None:
     from src.data.cli import _ensure_registered
     from src.data.cli.registry import commands

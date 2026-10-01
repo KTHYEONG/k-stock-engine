@@ -105,8 +105,9 @@ flowchart TD
 
 ## 5. Discovery Status (발견 단계 상태)
 
-> **단일 전략 경로**: `panel → scorer → policy → simulator/ledger → criteria C1-C4`  
-> **실행**: `uv run python -m src.research backtest --spec config/research/strategies/ml_trend_cash.toml`
+> **단일 전략 경로**: `panel → scorer → policy → sleeves/book → simulator + hedge overlay → ledger → criteria C1-C4`  
+> **평가 단위**: ML 상위 20선 + `ret21 > 0` 추세 규칙의 5-슬리브 주식북에 KOSDAQ 150 베타중립 헤지 오버레이(지수선물 정수 계약 + 인버스 ETF 잔여, 증거금·비용·파생/ETF 세율 반영)를 얹은 헤지 5-슬리브 북  
+> **실행**: `uv run python -m src.research backtest --spec config/research/strategies/ml_sleeve_hedge.toml`
 
 | 단계 | 상태 | 비고 |
 | :--- | :---: | :--- |
@@ -115,6 +116,7 @@ flowchart TD
 | Forward | `sealed` | 홀드아웃 통과 verdict 이후에만 개방 |
 
 *발견 단계가 `backtest` 실행으로 완료되기 전까지는 성과 수치를 공표하지 않으며, 홀드아웃은 밀봉 상태를 유지합니다. 기준 미달 시 자본 보호 원칙에 따라 실거래 승격을 즉시 거부(`NO_TRADE`)합니다.*
+*헤지 데이터 작업: `uv run python -m src.data.cli collect-krx-hedge-series` → `uv run python -m src.data.cli build-hedge-series-silver`. 세율: 지수선물 이익 11%(연 250만원 공제, 손실 이월 없음), 인버스 ETF 이익 15.4%(손실 상계 없음). 최소 자본 근거: 총 NAV 약 100M, 하한 50M.*
 
 ---
 

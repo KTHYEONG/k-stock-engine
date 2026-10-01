@@ -1,0 +1,5 @@
+# Hedge-series collection and Silver policy.
+collection_start = 2017-01-02   # first session collected; before it the KRX index page has holes (2016-12-30 empty)
+index_name = "코스닥 150"        # KRX KOSDAQ index row used as the futures underlying
+inverse_ticker = "251340"        # KODEX KOSDAQ150 inverse ETF
+available_time = "18:00:00"      # session data becomes available at this KST time (same as daily market)

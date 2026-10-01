@@ -133,6 +133,8 @@ def _protocol_for(sessions: list[date]) -> Any:
 
 
 def _spec(**overrides: Any) -> Any:
+    from src.research.book import BookSpec
+    from src.research.hedge import HedgeSpec
     from src.research.pipeline import StrategySpec
     from src.research.policy import TrendCashPolicy
     from src.research.model import ScorerConfig
@@ -146,11 +148,33 @@ def _spec(**overrides: Any) -> Any:
         "min_data_in_leaf": 2,
         "num_threads": 1,
     }
+    book_kw: dict[str, Any] = {"sleeves": 5, "stock_capital_fraction": 0.75}
+    hedge_kw: dict[str, Any] = {
+        "hedge_ratio": 1.0,
+        "beta_window_sessions": 10,
+        "beta_min_sessions": 2,
+        "beta_cap": 2.0,
+        "rebalance_every_sessions": 5,
+        "use_futures": True,
+        "contract_multiplier_krw": 10000,
+        "initial_margin_rate": 0.2175,
+        "margin_buffer_rate": 0.10,
+        "margin_topup_trigger_fraction": 0.75,
+        "futures_cost_rate": 0.0003,
+        "inverse_cost_rate": 0.0007,
+        "resize_sell_cost_rate": 0.0025,
+        "resize_buy_cost_rate": 0.0005,
+        "futures_tax_rate": 0.11,
+        "futures_annual_deduction_krw": 2500000,
+        "inverse_tax_rate": 0.154,
+    }
     policy_kw.update(overrides.pop("policy", {}))
     scorer_kw.update(overrides.pop("scorer", {}))
+    book_kw.update(overrides.pop("book", {}))
+    hedge_kw.update(overrides.pop("hedge", {}))
     policy = TrendCashPolicy(**policy_kw)  # type: ignore[arg-type]
     scorer = ScorerConfig(**scorer_kw)  # type: ignore[arg-type]
-    return StrategySpec(policy=policy, scorer=scorer)
+    return StrategySpec(policy=policy, scorer=scorer, book=BookSpec(**book_kw), hedge=HedgeSpec(**hedge_kw))  # type: ignore[arg-type]
 
 
 def _context(tmp_path: Path, sessions: list[date], cube: ResearchCube | None = None) -> Any:
@@ -163,6 +187,8 @@ def _context(tmp_path: Path, sessions: list[date], cube: ResearchCube | None = N
     cube = cube if cube is not None else _full_cube(sessions)
     registry = TrialRegistry(tmp_path / "trials_ml")
     lockbox = LockboxLedger(state_root=tmp_path / "state", protocol=protocol, now=lambda: _NOW)
+    from tests.fixtures.synthetic_panel import synthetic_hedge_inputs
+
     ctx = PipelineContext(
         protocol=protocol,
         cube=cube,
@@ -170,6 +196,7 @@ def _context(tmp_path: Path, sessions: list[date], cube: ResearchCube | None = N
         lockbox=lockbox,
         panel_dir=tmp_path / "panel",
         dividends=pl.DataFrame(),
+        hedge_inputs=synthetic_hedge_inputs(sessions),
         rules=load_krx_market_rules(Path("config/market/krx_market_rules.toml")),
         engine_config_path=Path("config/backtest/default_engine.toml"),
         market_cache_root=tmp_path / "mcache",
@@ -473,20 +500,49 @@ def test_spec_identity(tmp_path: Path) -> None:
 
     good = tmp_path / "a.toml"
     good.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nn=20\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
-        "[scorer]\nfirst_test_year=2019\n",
+        '[policy]\nfamily="ml_trend_cash"\nn=20\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
+        "[scorer]\nfirst_test_year=2019\n"
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
+        "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
+        "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
+        "resize_sell_cost_rate=0.0025\nresize_buy_cost_rate=0.0005\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\ninverse_tax_rate=0.154\n",
         encoding="utf-8",
     )
     other = tmp_path / "b.toml"
     other.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nn=20\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
-        "[scorer]\nfirst_test_year=2019\nseed=99\n",
+        '[policy]\nfamily="ml_trend_cash"\nn=20\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
+        "[scorer]\nfirst_test_year=2019\nseed=99\n"
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
+        "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
+        "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
+        "resize_sell_cost_rate=0.0025\nresize_buy_cost_rate=0.0005\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\ninverse_tax_rate=0.154\n",
         encoding="utf-8",
     )
     assert load_strategy_spec(good).spec_hash != load_strategy_spec(other).spec_hash
+    changed_book = tmp_path / "bb.toml"
+    changed_book.write_text(
+        good.read_text(encoding="utf-8").replace("stock_capital_fraction=0.75", "stock_capital_fraction=0.5"),
+        encoding="utf-8",
+    )
+    assert load_strategy_spec(good).spec_hash != load_strategy_spec(changed_book).spec_hash
+    changed_hedge = tmp_path / "bh.toml"
+    changed_hedge.write_text(
+        good.read_text(encoding="utf-8").replace("hedge_ratio=1.0", "hedge_ratio=0.5"), encoding="utf-8"
+    )
+    assert load_strategy_spec(good).spec_hash != load_strategy_spec(changed_hedge).spec_hash
+    mismatched = tmp_path / "mm.toml"
+    mismatched.write_text(
+        good.read_text(encoding="utf-8").replace("sleeves=5", "sleeves=3"), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="sleeves"):
+        load_strategy_spec(mismatched)
     bad = tmp_path / "c.toml"
     bad.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nn=20\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[nope]\nx=1\n[scorer]\n',
+        '[policy]\nfamily="ml_trend_cash"\nn=20\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[nope]\nx=1\n[scorer]\n[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="unknown"):
@@ -503,18 +559,74 @@ def test_spec_identity(tmp_path: Path) -> None:
         load_strategy_spec(missing_table)
     bad_policy = tmp_path / "bp.toml"
     bad_policy.write_text(
-        '[policy]\nfamily=""\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n',
+        '[policy]\nfamily=""\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="invalid \\[policy\\]"):
         load_strategy_spec(bad_policy)
     bad_scorer = tmp_path / "bs.toml"
     bad_scorer.write_text(
-        '[policy]\nfamily="ml_trend_cash"\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\nhorizons=[]\n',
+        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\nhorizons=[]\n'
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="invalid \\[scorer\\]"):
         load_strategy_spec(bad_scorer)
+    bad_book = tmp_path / "bb2.toml"
+    bad_book.write_text(
+        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
+        "[book]\nsleeves=0\n[hedge]\nhedge_ratio=1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid \\[book\\]"):
+        load_strategy_spec(bad_book)
+    bad_hedge = tmp_path / "bh2.toml"
+    bad_hedge.write_text(
+        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=-1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid \\[hedge\\]"):
+        load_strategy_spec(bad_hedge)
+
+
+def test_trial_metrics_without_capital_reports_raw_hedge_totals() -> None:
+    from src.research.pipeline import _trial_metrics
+
+    metrics = _trial_metrics(np.full(10, 0.001), np.zeros(10), np.zeros(10), 252)
+    assert metrics["hedge_cost"] == 0.0
+    assert metrics["tax"] == 0.0
+    assert np.isfinite(metrics["cagr"])
+
+
+def test_hedge_perturbation_counts_stale_leg_mismatches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    protocol = pipe._ctx.protocol
+    start = next(d for d in sessions if d.year == spec.scorer.first_test_year)
+    end = [d for d in sessions if d <= protocol.discovery_end][-1]
+    from src.research.pipeline import _window_indices
+
+    lo, hi = _window_indices(sessions, start, end)
+    window = tuple(sessions[lo : hi + 1])
+    width = hi - lo + 1
+    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
+    zeros = np.zeros(width)
+    zeros_int = np.zeros(width, dtype=np.int64)
+    rng = np.random.default_rng(3)
+    mismatches = pipe._hedge_perturbation_mismatches(
+        spec, np.zeros(width), window, lo, lo, zeros, zeros_int, zeros,
+        int(protocol.primary_capital_krw), auth, rng,
+    )
+    assert mismatches == 0
+    stale = pipe._hedge_perturbation_mismatches(
+        spec, np.zeros(width), window, lo, lo, np.ones(width), np.ones(width, dtype=np.int64), np.ones(width),
+        int(protocol.primary_capital_krw), auth, rng,
+    )
+    assert stale == 3
 
 
 def test_window_helpers_and_panel_guards(tmp_path: Path) -> None:
@@ -640,3 +752,123 @@ def test_scores_identity_depends_on_universe_and_scorer() -> None:
     assert _scores_identity(base) == _scores_identity(_spec())
     assert _scores_identity(base) != _scores_identity(wider)
     assert _scores_identity(base) != _scores_identity(retuned)
+
+
+def test_hedged_stream_equals_overlay_on_sleeve_mean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.book import build_sleeve_targets, mean_sleeve_returns
+    from src.research.hedge import simulate_hedged_book
+    from src.research.model import ScoreMatrix
+    from src.research.policy import universe_mask
+    from types import SimpleNamespace
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    protocol = pipe._ctx.protocol
+    start = next(d for d in sessions if d.year == spec.scorer.first_test_year)
+    end = [d for d in sessions if d <= protocol.discovery_end][-1]
+    lo = sessions.index(start)
+    hi = sessions.index(end)
+    panel = pipe.panel_for(hi)
+    scores = pipe.scores(spec, segment=Segment.DISCOVERY)
+    base_scores = np.asarray(scores.scores, dtype=float)
+    uni = np.asarray(universe_mask(pipe._ctx.cube, spec.policy.universe), dtype=bool)[: hi + 1]
+    close = np.asarray(pipe._ctx.cube.arrays["close"], dtype=float)[: hi + 1]
+    from src.research.book import sleeve_capital_krw as _sleeve_cap
+
+    sleeve_cap = _sleeve_cap(int(protocol.primary_capital_krw), spec.book)
+    proxy = SimpleNamespace(arrays={"close": close})
+    fake = ScoreMatrix(
+        scores=np.ascontiguousarray(base_scores, dtype=np.float32),
+        test_years=(0,),
+        config_hash="pipeline",
+        last_row=panel.last_row,
+    )
+    sleeves = build_sleeve_targets(
+        spec.policy, proxy, panel, fake, uni, sessions=sessions, sleeves=5,  # type: ignore[arg-type]
+        lo=lo, hi=hi + 1, sleeve_capital_krw=sleeve_cap, cash_buffer=0.005,
+    )
+    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
+    logs = []
+    for sleeve_map in sleeves:
+        from src.research.simulator import simulate
+
+        cfg = pipe._base_sim_config().model_copy(update={"capital_krw": sleeve_cap})
+        executable = {r: w for r, w in sleeve_map.items() if lo - 1 <= r <= hi - 1}
+        logs.append(np.asarray(simulate(pipe._ctx.cube, executable, start=start, end=end, config=cfg, authorization=auth).log_returns))
+    expected = simulate_hedged_book(
+        mean_sleeve_returns(logs), tuple(sessions[lo : hi + 1]), pipe._ctx.hedge_inputs, spec.hedge,
+        capital_krw=int(protocol.primary_capital_krw), rebalance_offset=0, authorization=auth,
+    )
+    report = pipe.evaluate_discovery(spec)
+    stored = pipe._ctx.registry.returns(report.trial_id)
+    assert np.allclose(np.asarray(stored.net), np.asarray(expected.log_returns), atol=1e-12)
+
+
+def test_ledger_replay_uses_combined_stock_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    calls: list[dict[str, object]] = []
+    ledger = pipe._ctx.ledger_runner
+
+    def _spy(**kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        return ledger(**kwargs)  # type: ignore[arg-type]
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    pipe.evaluate_discovery(spec)
+    capitals = {int(call["capital_krw"]) for call in calls}  # type: ignore[arg-type]
+    assert capitals == {int(c) for c in pipe._ctx.protocol.criteria.c3.ledger_capitals}
+    assert len(calls) == 2 * len(capitals)
+    first_targets = calls[0]["targets"]
+    assert isinstance(first_targets, dict)
+    assert len(first_targets) > 0
+
+
+def test_missing_hedge_data_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import math
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    levels = np.asarray(pipe._ctx.hedge_inputs.index_level).copy()
+    levels[5] = math.nan
+    from src.research.hedge import HedgeInputs
+
+    object.__setattr__(
+        pipe._ctx,
+        "hedge_inputs",
+        HedgeInputs(
+            sessions=tuple(pipe._ctx.hedge_inputs.sessions),
+            index_level=np.ascontiguousarray(levels),
+            inverse_close=np.ascontiguousarray(np.asarray(pipe._ctx.hedge_inputs.inverse_close)),
+        ),
+    )
+    with pytest.raises(Exception, match=r"missing|non-positive|subsequence"):
+        pipe.evaluate_discovery(spec)
+    assert list((tmp_path / "reports").glob("*_discovery.json")) == []
+
+
+def test_holdout_records_single_hedged_trial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    pipe.evaluate_discovery(spec)
+    pipe.register_finalist(spec)
+    report = pipe.holdout(spec)
+    trials = pipe._ctx.registry.trials(segment=Segment.HOLDOUT)
+    assert len(trials) == 1
+    assert trials[0].trial_id == report.trial_id
+    payload = _json.loads(trials[0].sim_config_json)
+    assert payload["offset"] == 0
+    assert trials[0].metrics["hedge_cost"] >= 0.0
+    assert trials[0].metrics["tax"] >= 0.0
