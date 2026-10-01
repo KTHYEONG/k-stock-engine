@@ -390,6 +390,8 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_krx_job(args, job_name="krx_daily_market")),
     Command("collect-krx-security-master", "Collect KRX security-master snapshots for completed sessions", _add_krx_job,
             lambda args: _run_krx_job(args, job_name="krx_security_master")),
+    Command("collect-krx-hedge-series", "Collect KRX hedge-series pages (KOSDAQ150 index, inverse ETF) for completed sessions", _add_krx_job,
+            lambda args: _run_krx_job(args, job_name="krx_hedge_series")),
     Command("collect-kind-notices", "Collect KIND exchange-notice search windows", _add_krx_job,
             lambda args: _run_kind_job(args, job_name="kind_notice_search")),
     Command("collect-kind-documents", "Collect KIND exchange-notice bodies", _add_krx_job,

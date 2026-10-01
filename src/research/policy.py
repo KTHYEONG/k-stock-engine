@@ -71,8 +71,8 @@ class TrendCashPolicy(BaseModel):
     keep_rank_multiple: float = 3.0
     rebalance_every_sessions: int = 5
     universe: UniverseRule = UniverseRule(min_adtv20_krw=500_000_000, min_price_krw=1_000)
-    trend_min_dev_ma20: float = 0.0
-    trend_min_ret21: float = 0.0
+    trend_min_dev_ma20: float | None = None
+    trend_min_ret21: float | None = None
     min_units_per_slot: int = 3
 
     @field_validator("family")
@@ -113,7 +113,9 @@ class TrendCashPolicy(BaseModel):
 
     @field_validator("trend_min_dev_ma20", "trend_min_ret21")
     @classmethod
-    def _finite_threshold(cls, value: object) -> float:
+    def _finite_threshold(cls, value: object) -> float | None:
+        if value is None:
+            return None
         threshold = float(value)  # type: ignore[arg-type]
         if not math.isfinite(threshold):
             raise ValueError(f"trend threshold must be finite, got {value!r}")
@@ -173,23 +175,32 @@ def build_targets(
 
     Per row: candidates are universe names with a finite score that satisfy ``min_units_per_slot``;
     rank by score descending (stable, ties by instrument index); keep previous selections whose rank is
-    below ``n * keep_rank_multiple`` (up to n), fill the rest by rank; then every selected name whose
-    ``dev_ma20 > trend_min_dev_ma20`` and ``ret_21 > trend_min_ret21`` (both finite) receives weight 1/n,
-    all others receive 0 (cash). Incumbency is tracked on the selection BEFORE the trend rule.
-    Fewer than n candidates: all-zero row and incumbents reset.
+    below ``n * keep_rank_multiple`` (up to n), fill the rest by rank; then a selected name receives
+    weight 1/n when every enabled trend leg passes: ``dev_ma20 > trend_min_dev_ma20`` (enabled when
+    the threshold is not None, feature must be finite) and ``ret_21 > trend_min_ret21`` (same). With
+    both legs disabled every selected name receives 1/n; names are never dropped for a disabled leg,
+    even when its feature is NaN. Others receive 0 (cash). Incumbency is tracked on the selection
+    before the trend rule. Fewer than n candidates: all-zero row and incumbents reset.
 
     Raises: ValueError if a row has no score row in ``scores`` or ``capital_krw``/``cash_buffer`` invalid.
     """
     score_mat = np.asarray(scores.scores, dtype=np.float64)
     n_scored, n_names = score_mat.shape
     uni = np.asarray(universe, dtype=bool)
-    dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
-    ret = np.asarray(panel.features["ret_21"], dtype=np.float64)
+    dev_enabled = policy.trend_min_dev_ma20 is not None
+    ret_enabled = policy.trend_min_ret21 is not None
+    dev: NDArray[np.float64] | None = None
+    ret: NDArray[np.float64] | None = None
+    if dev_enabled:
+        dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
+        if dev.shape != (n_scored, n_names):
+            raise ValueError("universe, panel features and cube close must match the scores shape")
+    if ret_enabled:
+        ret = np.asarray(panel.features["ret_21"], dtype=np.float64)
+        if ret.shape != (n_scored, n_names):
+            raise ValueError("universe, panel features and cube close must match the scores shape")
     close = np.asarray(cube.arrays["close"], dtype=np.float64)
-    if uni.shape != (n_scored, n_names) or dev.shape != (n_scored, n_names) or ret.shape != (
-        n_scored,
-        n_names,
-    ) or close.shape != (n_scored, n_names):
+    if uni.shape != (n_scored, n_names) or close.shape != (n_scored, n_names):
         raise ValueError("universe, panel features and cube close must match the scores shape")
     for t in rows:
         if isinstance(t, bool) or not isinstance(t, int) or not 0 <= int(t) < n_scored:
@@ -231,12 +242,28 @@ def build_targets(
                 if int(k) not in kept_set:
                     kept_set.add(int(k))
                     kept.append(int(k))
-            passing = (
-                np.isfinite(dev[row, kept])
-                & np.isfinite(ret[row, kept])
-                & (dev[row, kept] > float(policy.trend_min_dev_ma20))
-                & (ret[row, kept] > float(policy.trend_min_ret21))
-            )
+            kept_arr = np.asarray(kept, dtype=np.int64)
+            if dev_enabled and ret_enabled:
+                assert dev is not None
+                assert ret is not None
+                passing = (
+                    np.isfinite(dev[row, kept_arr])
+                    & np.isfinite(ret[row, kept_arr])
+                    & (dev[row, kept_arr] > float(policy.trend_min_dev_ma20))  # type: ignore[arg-type]
+                    & (ret[row, kept_arr] > float(policy.trend_min_ret21))  # type: ignore[arg-type]
+                )
+            elif dev_enabled:
+                assert dev is not None
+                passing = np.isfinite(dev[row, kept_arr]) & (
+                    dev[row, kept_arr] > float(policy.trend_min_dev_ma20)  # type: ignore[arg-type]
+                )
+            elif ret_enabled:
+                assert ret is not None
+                passing = np.isfinite(ret[row, kept_arr]) & (
+                    ret[row, kept_arr] > float(policy.trend_min_ret21)  # type: ignore[arg-type]
+                )
+            else:
+                passing = np.ones(len(kept), dtype=bool)
             for pos_k, k in enumerate(kept):
                 if bool(passing[pos_k]):
                     weights[int(k)] = weight

@@ -10,6 +10,7 @@ from src.core.pit import EvidenceKind, PITDataError
 from src.data.evidence_sources import (
     KIS_FLOW_SOURCE,
     KIS_INDUSTRY_SOURCE,
+    KRX_HEDGE_SERIES_SOURCE,
     LS_FLOW_SOURCE,
     SOURCE_CONTRACTS,
     CoverageShape,
@@ -68,7 +69,7 @@ def test_unregistered_source_is_rejected() -> None:
 
 
 def test_every_registered_source_declares_one_shape() -> None:
-    assert set(SOURCE_CONTRACTS) >= {LS_FLOW_SOURCE, KIS_FLOW_SOURCE, KIS_INDUSTRY_SOURCE}
+    assert set(SOURCE_CONTRACTS) >= {LS_FLOW_SOURCE, KIS_FLOW_SOURCE, KIS_INDUSTRY_SOURCE, KRX_HEDGE_SERIES_SOURCE}
     for contract in SOURCE_CONTRACTS.values():
         assert contract.coverage in set(CoverageShape)
         assert contract.envelope in set(EnvelopeFormat)
@@ -79,6 +80,11 @@ def test_every_registered_source_declares_one_shape() -> None:
     assert source_contract(KIS_INDUSTRY_SOURCE).envelope is EnvelopeFormat.NATIVE
     assert source_contract(LS_FLOW_SOURCE).endpoint_label() == "t1702"
     assert source_contract(KIS_FLOW_SOURCE).endpoint_label() == "investor-trade-by-stock-daily"
+    hedge = source_contract(KRX_HEDGE_SERIES_SOURCE)
+    assert hedge.kind is EvidenceKind.DAILY_MARKET
+    assert hedge.provider == "KRX"
+    assert hedge.envelope is EnvelopeFormat.NATIVE
+    assert hedge.coverage is CoverageShape.KEYED
 
 
 def test_kis_value_only_row_is_not_evidence() -> None:
@@ -258,6 +264,45 @@ def test_endpoint_label_requires_exactly_one_pinned_endpoint() -> None:
         source_contract(KIS_INDUSTRY_SOURCE).endpoint_label()
     with pytest.raises(PITDataError, match="does not pin exactly one endpoint"):
         source_contract("krx_daily_market").endpoint_label()
+    with pytest.raises(PITDataError, match="does not pin exactly one endpoint"):
+        source_contract(KRX_HEDGE_SERIES_SOURCE).endpoint_label()
+
+
+def test_hedge_and_daily_sources_do_not_bleed(tmp_path) -> None:
+    """Receipts under krx_daily_market and krx_hedge_series stay source-scoped."""
+    import hashlib
+    import json
+    from datetime import UTC, date, datetime
+
+    from tests.fixtures import seed_receipts
+    from src.data.evidence_sources import KRX_DAILY_MARKET_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+    entries: list[ReceiptIndexEntry] = []
+    for source in (KRX_DAILY_MARKET_SOURCE, KRX_HEDGE_SERIES_SOURCE):
+        raw = json.dumps({"session": "2026-01-05", "records": []}, sort_keys=True).encode("utf-8")
+        payload_path = tmp_path / f"{source}.json"
+        payload_path.write_bytes(raw)
+        entries.append(
+            ReceiptIndexEntry(
+                source=source,
+                natural_key="2026-01-05",
+                as_of=date(2026, 1, 5),
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=hashlib.sha256(raw).hexdigest(),
+                retrieved_at=datetime(2026, 1, 6, tzinfo=UTC),
+                payload_path=payload_path,
+            )
+        )
+    seed_receipts(catalog, entries)
+    daily = catalog.latest(source=KRX_DAILY_MARKET_SOURCE, natural_keys={"2026-01-05"})
+    hedge = catalog.latest(source=KRX_HEDGE_SERIES_SOURCE, natural_keys={"2026-01-05"})
+    assert set(daily) == {"2026-01-05"}
+    assert set(hedge) == {"2026-01-05"}
+    assert daily["2026-01-05"].source == KRX_DAILY_MARKET_SOURCE
+    assert hedge["2026-01-05"].source == KRX_HEDGE_SERIES_SOURCE
 
 
 def test_unserializable_row_value_fails_closed() -> None:
