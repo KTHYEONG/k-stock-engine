@@ -30,6 +30,7 @@ def _protocol(**overrides: object) -> ResearchProtocol:
         "c1": CriteriaC1(
             stress_extra_slippage=0.001,
             stress_execution_delay=1,
+            hedge_stress_extra_cost=0.0005,
             max_p_cagr_le_zero=0.05,
             perturbation_cuts=3,
             perturbation_seed=7,

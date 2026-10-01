@@ -259,3 +259,143 @@ def test_daily_records_are_persisted_as_success(monkeypatch: pytest.MonkeyPatch,
     assert {key: entry.status for key, entry in entries.items()} == {
         day.isoformat(): EvidenceStatus.SUCCESS for day in SESSIONS
     }
+
+
+class _HedgeCollector:
+    """Scripted stand-in for the hedge-series collector surface."""
+
+    def __init__(self, pages=None):  # type: ignore[no-untyped-def]
+        self._pages = {day: [dict(row) for row in rows] for day, rows in dict(pages or {}).items()}
+        self.fetch_calls: list = []
+
+    def fetch_hedge_records(self, session, *, etf_tickers, index_name):  # type: ignore[no-untyped-def]
+        self.fetch_calls.append((session, tuple(etf_tickers), index_name))
+        return [dict(row) for row in self._pages.get(session, ())]
+
+    def health_check(self) -> None:
+        return None
+
+
+def _hedge_index_record(session):  # type: ignore[no-untyped-def]
+    return {
+        "_endpoint": "index",
+        "IDX_CLSS": "KOSDAQ",
+        "IDX_NM": "코스닥 150",
+        "BAS_DD": session.strftime("%Y%m%d"),
+        "CLSPRC_IDX": "1000.5",
+    }
+
+
+def _hedge_etf_record(session):  # type: ignore[no-untyped-def]
+    return {
+        "_endpoint": "etf",
+        "ISU_CD": "251340",
+        "BAS_DD": session.strftime("%Y%m%d"),
+        "TDD_CLSPRC": "5000",
+    }
+
+
+def test_hedge_pending_skips_answered_and_honors_start(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import src.data.jobs.krx as krx_jobs
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    ctx = _ctx(runtime, provider, collector=_HedgeCollector())
+
+    units = krx_jobs.KrxHedgeSeriesJob().pending(ctx)
+
+    assert [unit.natural_key for unit in units] == [day.isoformat() for day in SESSIONS]
+    assert all(unit.max_requests == 2 for unit in units)
+    ctx.writer.persist_many(
+        (
+            krx_jobs.krx_hedge_series_scoped_payload(
+                records=[_hedge_index_record(SESSIONS[0])],
+                session=SESSIONS[0],
+                retrieved_at=NOW_AFTER_CLOSE,
+            ),
+        )
+    )
+    remaining = krx_jobs.KrxHedgeSeriesJob().pending(ctx)
+
+    assert [unit.natural_key for unit in remaining] == [day.isoformat() for day in SESSIONS[1:]]
+
+
+def test_hedge_empty_page_is_recorded_as_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import src.data.jobs.krx as krx_jobs
+    from src.data.receipt_catalog import EvidenceStatus
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    ctx = _ctx(runtime, provider, collector=_HedgeCollector())
+
+    report, _ = _run(krx_jobs.KrxHedgeSeriesJob(), ctx)
+
+    assert report.status == "complete"
+    assert report.done == 3
+    entries = ctx.catalog.latest(
+        source=krx_jobs.KRX_HEDGE_SERIES_SOURCE, natural_keys={day.isoformat() for day in SESSIONS}
+    )
+    assert {key: entry.status for key, entry in entries.items()} == {
+        day.isoformat(): EvidenceStatus.EMPTY for day in SESSIONS
+    }
+
+
+def test_hedge_job_registered() -> None:
+    import src.data.jobs.krx as krx_jobs
+    from src.core.pit import PITDataError
+
+    assert isinstance(krx_jobs.resolve_krx_job("krx_hedge_series"), krx_jobs.KrxHedgeSeriesJob)
+    with pytest.raises(PITDataError, match="unknown KRX job"):
+        krx_jobs.resolve_krx_job("krx_nope")
+
+
+def test_hedge_pending_empty_before_collection_start(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import src.data.jobs.krx as krx_jobs
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+
+    early = datetime(2017, 1, 1, 9, 1, tzinfo=UTC)
+    assert krx_jobs.KrxHedgeSeriesJob().pending(_ctx(runtime, provider, now=lambda: early)) == ()
+
+
+def test_hedge_fetch_persists_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import src.data.jobs.krx as krx_jobs
+    from src.data.jobs.runner import JobUnit
+    from src.data.receipt_catalog import EvidenceStatus
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    pages = {
+        day: [_hedge_index_record(day), _hedge_etf_record(day)] for day in SESSIONS
+    }
+    collector = _HedgeCollector(pages=pages)
+    ctx = _ctx(runtime, provider, collector=collector)
+
+    report, _ = _run(krx_jobs.KrxHedgeSeriesJob(), ctx)
+
+    assert report.status == "complete"
+    assert report.done == 3
+    assert collector.fetch_calls[0] == (SESSIONS[0], ("251340",), "코스닥 150")
+    entries = ctx.catalog.latest(
+        source=krx_jobs.KRX_HEDGE_SERIES_SOURCE, natural_keys={day.isoformat() for day in SESSIONS}
+    )
+    assert {key: entry.status for key, entry in entries.items()} == {
+        day.isoformat(): EvidenceStatus.SUCCESS for day in SESSIONS
+    }
+    payloads = krx_jobs.KrxHedgeSeriesJob().fetch(
+        ctx,
+        [
+            JobUnit(
+                source=krx_jobs.KRX_HEDGE_SERIES_SOURCE,
+                natural_key=SESSIONS[0].isoformat(),
+                payload={"session": SESSIONS[0].isoformat()},
+                max_requests=2,
+            )
+        ],
+    )
+    assert [payload.source_label for payload in payloads] == [f"krx:hedge-series:{SESSIONS[0].isoformat()}"]

@@ -15,7 +15,7 @@ from typing import Any, Final
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from src.backtest.engine import DelistPolicy
 from src.core.pit import PITDataError
@@ -25,6 +25,13 @@ from src.data.research_protocol import (
     LockboxError,
     ResearchProtocol,
     Segment,
+)
+from src.research.book import (
+    BookSpec,
+    build_sleeve_targets,
+    combine_sleeve_targets,
+    mean_sleeve_returns,
+    sleeve_capital_krw,
 )
 from src.research.criteria import (
     CriteriaReport,
@@ -37,6 +44,7 @@ from src.research.criteria import (
     evaluate_holdout as _evaluate_holdout_criteria,
 )
 from src.research.cube import ResearchCube
+from src.research.hedge import HedgeInputs, HedgeSpec, simulate_hedged_book
 from src.research.ledger_bridge import LedgerOutcome
 from src.research.model import ScoreMatrix, ScorerConfig, walk_forward_scores
 from src.research.panel import FEATURE_NAMES, HORIZONS, FeaturePanel, build_panel
@@ -63,16 +71,26 @@ _LOG = logging.getLogger(__name__)
 
 
 class StrategySpec(BaseModel):
-    """One pre-registered strategy: selection policy plus frozen scorer."""
+    """One pre-registered strategy: selection policy plus frozen scorer, sleeves and hedge overlay."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     policy: TrendCashPolicy
     scorer: ScorerConfig
+    book: BookSpec
+    hedge: HedgeSpec
+
+    @model_validator(mode="after")
+    def _check_sleeves(self) -> StrategySpec:
+        if int(self.book.sleeves) != int(self.policy.rebalance_every_sessions):
+            raise ValueError("book.sleeves must equal policy.rebalance_every_sessions")
+        return self
 
     def canonical_json(self) -> str:
         payload = {
+            "book": json.loads(self.book.canonical_json()),
             "feature_names": list(FEATURE_NAMES),
+            "hedge": json.loads(self.hedge.canonical_json()),
             "horizons": list(HORIZONS),
             "policy": json.loads(self.policy.canonical_json()),
             "scorer": json.loads(self.scorer.canonical_json()),
@@ -85,7 +103,7 @@ class StrategySpec(BaseModel):
 
 
 def load_strategy_spec(path: Path) -> StrategySpec:
-    """Load a TOML with ``[policy]`` and ``[scorer]`` tables."""
+    """Load a TOML with ``[policy]``, ``[scorer]``, ``[book]`` and ``[hedge]`` tables."""
     import tomllib
 
     try:
@@ -97,12 +115,12 @@ def load_strategy_spec(path: Path) -> StrategySpec:
         raise ValueError(f"invalid strategy TOML: {path}: {exc}") from exc
     if not isinstance(raw, dict):  # pragma: no cover - tomllib always returns a dict
         raise ValueError(f"invalid strategy TOML: {path}")
-    allowed = {"policy", "scorer"}
+    allowed = {"policy", "scorer", "book", "hedge"}
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
-    if "policy" not in raw or "scorer" not in raw:
-        raise ValueError("strategy TOML must declare [policy] and [scorer] tables")
+    if "policy" not in raw or "scorer" not in raw or "book" not in raw or "hedge" not in raw:
+        raise ValueError("strategy TOML must declare [policy], [scorer], [book] and [hedge] tables")
     try:
         policy = TrendCashPolicy.model_validate(raw["policy"])
     except Exception as exc:
@@ -111,7 +129,18 @@ def load_strategy_spec(path: Path) -> StrategySpec:
         scorer = ScorerConfig.model_validate(raw["scorer"])
     except Exception as exc:
         raise ValueError(f"invalid [scorer] table: {exc}") from exc
-    return StrategySpec(policy=policy, scorer=scorer)
+    try:
+        book = BookSpec.model_validate(raw["book"])
+    except Exception as exc:
+        raise ValueError(f"invalid [book] table: {exc}") from exc
+    try:
+        hedge = HedgeSpec.model_validate(raw["hedge"])
+    except Exception as exc:
+        raise ValueError(f"invalid [hedge] table: {exc}") from exc
+    try:
+        return StrategySpec(policy=policy, scorer=scorer, book=book, hedge=hedge)
+    except Exception as exc:
+        raise ValueError(f"invalid strategy spec: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +151,7 @@ class PipelineContext:
     lockbox: Any
     panel_dir: Path
     dividends: pl.DataFrame
+    hedge_inputs: HedgeInputs
     rules: Any
     engine_config_path: Path
     market_cache_root: Path
@@ -166,10 +196,15 @@ def _trial_metrics(
     turnover: NDArray[np.float64],
     cost: NDArray[np.float64],
     sessions_per_year: int,
+    *,
+    hedge_cost_krw: float = 0.0,
+    hedge_tax_krw: float = 0.0,
+    capital_krw: int | None = None,
+    n_sessions: int | None = None,
 ) -> dict[str, float]:
     values = np.asarray(log_returns, dtype=np.float64)
     pm = point_metrics(values, sessions_per_year=sessions_per_year)
-    return {
+    metrics = {
         "cagr": float(pm.cagr),
         "mdd": float(pm.max_drawdown),
         "calmar": float(pm.calmar),
@@ -177,10 +212,18 @@ def _trial_metrics(
         "turnover": float(_annualized_mean(turnover, sessions_per_year)),
         "cost": float(_annualized_mean(cost, sessions_per_year)),
     }
+    if capital_krw is not None and n_sessions:
+        scale = float(sessions_per_year) / (float(capital_krw) * float(n_sessions))
+        metrics["hedge_cost"] = float(hedge_cost_krw) * scale
+        metrics["tax"] = float(hedge_tax_krw) * scale
+    else:
+        metrics["hedge_cost"] = float(hedge_cost_krw)
+        metrics["tax"] = float(hedge_tax_krw)
+    return metrics
 
 
 def _sim_json_for_trial(config: SimConfig, phase: int) -> str:
-    payload = {"phase": int(phase), "sim_config": json.loads(config.canonical_json())}
+    payload = {"offset": int(phase), "phase": int(phase), "sim_config": json.loads(config.canonical_json())}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -324,65 +367,144 @@ class Pipeline:
         base_config = self._base_sim_config()
         buffer = float(base_config.cash_buffer)
         primary = int(protocol.primary_capital_krw)
-        every = int(spec.policy.rebalance_every_sessions)
-        n_phases = every
+        n_offsets = int(spec.hedge.rebalance_every_sessions)
+        sleeve_capital = sleeve_capital_krw(primary, spec.book)
+        sleeve_config = base_config.model_copy(update={"capital_krw": sleeve_capital})
 
-        base_targets: dict[int, dict[int, NDArray[np.float64]]] = {}
+        proxy = SimpleNamespace(arrays={"close": np.asarray(close_full, dtype=np.float64)})
+        sleeve_targets = build_sleeve_targets(
+            spec.policy,
+            proxy,  # type: ignore[arg-type]
+            panel,
+            ScoreMatrix(
+                scores=np.ascontiguousarray(np.asarray(base_scores, dtype=np.float64), dtype=np.float32),
+                test_years=(0,),
+                config_hash="pipeline",
+                last_row=panel.last_row,
+            ),
+            np.asarray(uni, dtype=bool),
+            sessions=sessions,
+            sleeves=int(spec.book.sleeves),
+            lo=lo_sim,
+            hi=hi_sim + 1,
+            sleeve_capital_krw=sleeve_capital,
+            cash_buffer=buffer,
+        )
+        window_sessions = tuple(sessions[lo_sim : hi_sim + 1])
+        n_win = hi_sim - lo_sim + 1
+        slip_extra = float(protocol.criteria.c1.stress_extra_slippage)
+        delay_n = int(protocol.criteria.c1.stress_execution_delay)
+        hedge_extra = float(protocol.criteria.c1.hedge_stress_extra_cost)
+
+        base_sleeve_logs: list[NDArray[np.float64]] = []
+        slip_sleeve_logs: list[NDArray[np.float64]] = []
+        delay_sleeve_logs: list[NDArray[np.float64]] = []
+        sleeve_turnovers: list[NDArray[np.float64]] = []
+        sleeve_costs: list[NDArray[np.float64]] = []
+        for sleeve_map in sleeve_targets:
+            _LOG.info("[ALGO] discovery sleeve=%d targets=%d", len(base_sleeve_logs), len(sleeve_map))
+            exec_base = {r: w for r, w in sleeve_map.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
+            res_base = simulate(ctx.cube, exec_base, start=start, end=end, config=sleeve_config, authorization=auth)
+            base_sleeve_logs.append(np.ascontiguousarray(res_base.log_returns))
+            sleeve_turnovers.append(np.ascontiguousarray(res_base.turnover))
+            sleeve_costs.append(np.ascontiguousarray(res_base.cost))
+            slip_cfg = sleeve_config.model_copy(update={"extra_slippage": slip_extra})
+            res_slip = simulate(ctx.cube, exec_base, start=start, end=end, config=slip_cfg, authorization=auth)
+            slip_sleeve_logs.append(np.ascontiguousarray(res_slip.log_returns))
+            delay_cfg = sleeve_config.model_copy(update={"execution_delay": delay_n})
+            exec_delay = {
+                r: w for r, w in sleeve_map.items() if lo_sim - 1 - delay_n <= int(r) <= hi_sim - 1 - delay_n
+            }
+            res_delay = simulate(ctx.cube, exec_delay, start=start, end=end, config=delay_cfg, authorization=auth)
+            delay_sleeve_logs.append(np.ascontiguousarray(res_delay.log_returns))
+
+        mean_base = mean_sleeve_returns(base_sleeve_logs)
+        mean_slip = mean_sleeve_returns(slip_sleeve_logs)
+        mean_delay = mean_sleeve_returns(delay_sleeve_logs)
+        turnover_mean = np.ascontiguousarray(np.mean(np.stack(sleeve_turnovers, axis=0), axis=0))
+        cost_mean = np.ascontiguousarray(np.mean(np.stack(sleeve_costs, axis=0), axis=0))
+
         base_streams: list[NDArray[np.float64]] = []
         slip_streams: list[NDArray[np.float64]] = []
         delay_streams: list[NDArray[np.float64]] = []
-        turnovers: list[NDArray[np.float64]] = []
-        costs: list[NDArray[np.float64]] = []
+        hedge_costs: list[float] = []
+        hedge_taxes: list[float] = []
         trial_ids: list[str] = []
-        slip_extra = float(protocol.criteria.c1.stress_extra_slippage)
-        delay_n = int(protocol.criteria.c1.stress_execution_delay)
-        for phase in range(n_phases):
-            _LOG.info("[ALGO] discovery phase=%d/%d", phase, n_phases)
-            rows = decision_rows(sessions, lo=lo_sim, hi=hi_sim + 1, every=every, phase=phase)
-            targets = self._targets_for(spec.policy, close_full, panel, base_scores, uni, list(rows), primary, buffer)
-            base_targets[phase] = targets
-            exec_base = {r: w for r, w in targets.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
-            res_base = simulate(ctx.cube, exec_base, start=start, end=end, config=base_config, authorization=auth)
-            base_streams.append(np.ascontiguousarray(res_base.log_returns))
-            slip_cfg = base_config.model_copy(update={"extra_slippage": slip_extra})
-            res_slip = simulate(ctx.cube, exec_base, start=start, end=end, config=slip_cfg, authorization=auth)
-            slip_streams.append(np.ascontiguousarray(res_slip.log_returns))
-            delay_cfg = base_config.model_copy(update={"execution_delay": delay_n})
-            exec_delay = {r: w for r, w in targets.items() if lo_sim - 1 - delay_n <= int(r) <= hi_sim - 1 - delay_n}
-            res_delay = simulate(ctx.cube, exec_delay, start=start, end=end, config=delay_cfg, authorization=auth)
-            delay_streams.append(np.ascontiguousarray(res_delay.log_returns))
-            metrics = _trial_metrics(res_base.log_returns, res_base.turnover, res_base.cost, spy)
+        for offset in range(n_offsets):
+            _LOG.info("[ALGO] discovery hedge offset=%d/%d", offset, n_offsets)
+            hedged = simulate_hedged_book(
+                mean_base, window_sessions, ctx.hedge_inputs, spec.hedge,
+                capital_krw=primary, rebalance_offset=offset, authorization=auth,
+            )
+            base_streams.append(np.ascontiguousarray(hedged.log_returns))
+            hedge_costs.append(float(hedged.cost_krw))
+            hedge_taxes.append(float(hedged.tax_krw))
+            hedged_slip = simulate_hedged_book(
+                mean_slip, window_sessions, ctx.hedge_inputs, spec.hedge,
+                capital_krw=primary, rebalance_offset=offset, extra_cost_rate=hedge_extra,
+                authorization=auth,
+            )
+            slip_streams.append(np.ascontiguousarray(hedged_slip.log_returns))
+            hedged_delay = simulate_hedged_book(
+                mean_delay, window_sessions, ctx.hedge_inputs, spec.hedge,
+                capital_krw=primary, rebalance_offset=offset, execution_delay=delay_n,
+                authorization=auth,
+            )
+            delay_streams.append(np.ascontiguousarray(hedged_delay.log_returns))
+            metrics = _trial_metrics(
+                hedged.log_returns, turnover_mean, cost_mean, spy,
+                hedge_cost_krw=float(hedged.cost_krw), hedge_tax_krw=float(hedged.tax_krw),
+                capital_krw=primary, n_sessions=n_win,
+            )
             record = ctx.registry.record(
                 family=spec.policy.family,
                 spec_hash=spec.spec_hash,
                 spec_json=spec.canonical_json(),
                 segment=Segment.DISCOVERY,
-                sim_config_json=_sim_json_for_trial(base_config, phase),
+                sim_config_json=_sim_json_for_trial(sleeve_config, offset),
                 cube_id=ctx.cube.cube_id,
                 returns=TrialReturns(
-                    sessions=res_base.sessions,
-                    net=np.ascontiguousarray(res_base.log_returns),
+                    sessions=tuple(window_sessions),
+                    net=np.ascontiguousarray(hedged.log_returns),
                     benchmarks={},
                 ),
                 metrics=metrics,
                 now=ctx.now(),
             )
             trial_ids.append(record.trial_id)
-            turnovers.append(np.ascontiguousarray(res_base.turnover))
-            costs.append(np.ascontiguousarray(res_base.cost))
 
-        phase0_targets = base_targets[PRODUCTION_PHASE]
         fast_growth: dict[tuple[int, str], float] = {}
         ledger_returns: dict[tuple[int, str], NDArray[np.float64]] = {}
         for capital in protocol.criteria.c3.ledger_capitals:
             cap = int(capital)
+            per_sleeve_cap = max(int(cap) // int(spec.book.sleeves), 1)
+            cap_targets = build_sleeve_targets(
+                spec.policy,
+                proxy,  # type: ignore[arg-type]
+                panel,
+                ScoreMatrix(
+                    scores=np.ascontiguousarray(np.asarray(base_scores, dtype=np.float64), dtype=np.float32),
+                    test_years=(0,),
+                    config_hash="pipeline",
+                    last_row=panel.last_row,
+                ),
+                np.asarray(uni, dtype=bool),
+                sessions=sessions,
+                sleeves=int(spec.book.sleeves),
+                lo=lo_sim,
+                hi=hi_sim + 1,
+                sleeve_capital_krw=per_sleeve_cap,
+                cash_buffer=buffer,
+            )
+            combined = combine_sleeve_targets(cap_targets, lo=max(lo_sim, 1), hi=hi_sim + 1)
+            executable = {r: w for r, w in combined.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
             for policy_name, halted_val, delist in (
                 ("zero", 0.0, DelistPolicy.ZERO),
                 ("last_close", 1.0, DelistPolicy.LAST_CLOSE),
             ):
                 match_cfg = base_config.model_copy(update={"capital_krw": cap, "halted_exit_value": halted_val})
                 match_res = simulate(
-                    ctx.cube, phase0_targets, start=start, end=end, config=match_cfg, authorization=auth
+                    ctx.cube, executable, start=start, end=end, config=match_cfg, authorization=auth
                 )
                 fast_growth[(cap, policy_name)] = float(
                     annualized_log_growth(np.asarray(match_res.log_returns), sessions_per_year=spy)
@@ -390,7 +512,7 @@ class Pipeline:
                 _LOG.info("[EXEC] ledger replay capital=%d policy=%s", cap, policy_name)
                 outcome = ctx.ledger_runner(
                     cube=ctx.cube,
-                    targets=phase0_targets,
+                    targets=executable,
                     panel_dir=Path(ctx.panel_dir),
                     dividends=ctx.dividends,
                     engine_config_path=Path(ctx.engine_config_path),
@@ -405,18 +527,36 @@ class Pipeline:
                 ledger_returns[(cap, policy_name)] = np.ascontiguousarray(outcome.log_returns)
 
         nocap_policy = spec.policy.model_copy(update={"min_units_per_slot": 0})
-        rows0 = decision_rows(sessions, lo=lo_sim, hi=hi_sim + 1, every=every, phase=PRODUCTION_PHASE)
-        nocap_targets = self._targets_for(
-            nocap_policy, close_full, panel, base_scores, uni, list(rows0), primary, buffer
+        nocap_targets = build_sleeve_targets(
+            nocap_policy,
+            proxy,  # type: ignore[arg-type]
+            panel,
+            ScoreMatrix(
+                scores=np.ascontiguousarray(np.asarray(base_scores, dtype=np.float64), dtype=np.float32),
+                test_years=(0,),
+                config_hash="pipeline",
+                last_row=panel.last_row,
+            ),
+            np.asarray(uni, dtype=bool),
+            sessions=sessions,
+            sleeves=int(spec.book.sleeves),
+            lo=lo_sim,
+            hi=hi_sim + 1,
+            sleeve_capital_krw=sleeve_capital,
+            cash_buffer=buffer,
         )
-        exec_nocap = {r: w for r, w in nocap_targets.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
-        g_base = float(annualized_log_growth(base_streams[PRODUCTION_PHASE], sessions_per_year=spy))
-        res_nocap = simulate(ctx.cube, exec_nocap, start=start, end=end, config=base_config, authorization=auth)
-        g_nocap = float(annualized_log_growth(np.asarray(res_nocap.log_returns), sessions_per_year=spy))
+        nocap_logs: list[NDArray[np.float64]] = []
+        for sleeve_map in nocap_targets:
+            exec_map = {r: w for r, w in sleeve_map.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
+            res = simulate(ctx.cube, exec_map, start=start, end=end, config=sleeve_config, authorization=auth)
+            nocap_logs.append(np.ascontiguousarray(res.log_returns))
+        g_base = float(annualized_log_growth(mean_base, sessions_per_year=spy))
+        g_nocap = float(annualized_log_growth(mean_sleeve_returns(nocap_logs), sessions_per_year=spy))
         price_delta = float(g_base - g_nocap) if np.isfinite(g_base) and np.isfinite(g_nocap) else float("nan")
 
         mismatches = self._perturbation_mismatches(
-            spec, panel, base_scores, uni, close_full, base_targets, sessions, start, end, last_row, auth
+            spec, panel, base_scores, uni, close_full, sleeve_targets, mean_base,
+            sessions, start, end, last_row, auth,
         )
         effective = self._effective_registry_trials(spec.policy.family)
         evidence = DiscoveryEvidence(
@@ -488,29 +628,64 @@ class Pipeline:
         uni_full = np.asarray(universe_mask(ctx.cube, spec.policy.universe), dtype=bool)
         uni = np.ascontiguousarray(uni_full[: last_row + 1])
         close_full = np.asarray(ctx.cube.arrays["close"], dtype=np.float64)[: last_row + 1]
-        every = int(spec.policy.rebalance_every_sessions)
-        rows = decision_rows(sessions, lo=lo_sim, hi=hi_sim + 1, every=every, phase=PRODUCTION_PHASE)
         base_config = self._base_sim_config()
         buffer = float(base_config.cash_buffer)
         primary = int(protocol.primary_capital_krw)
-        targets = self._targets_for(spec.policy, close_full, panel, scores_arr, uni, list(rows), primary, buffer)
-        executable = {r: w for r, w in targets.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
-        _LOG.info("[ALGO] holdout phase=%d rows=%d", PRODUCTION_PHASE, len(executable))
-        result = simulate(ctx.cube, executable, start=start, end=end, config=base_config, authorization=auth)
-        metrics = _trial_metrics(result.log_returns, result.turnover, result.cost, protocol.sessions_per_year)
+        sleeve_capital = sleeve_capital_krw(primary, spec.book)
+        sleeve_config = base_config.model_copy(update={"capital_krw": sleeve_capital})
+        proxy = SimpleNamespace(arrays={"close": np.asarray(close_full, dtype=np.float64)})
+        fake = ScoreMatrix(
+            scores=np.ascontiguousarray(scores_arr, dtype=np.float32),
+            test_years=(0,),
+            config_hash="pipeline",
+            last_row=panel.last_row,
+        )
+        sleeve_targets = build_sleeve_targets(
+            spec.policy, proxy, panel, fake,  # type: ignore[arg-type]
+            np.asarray(uni, dtype=bool),
+            sessions=sessions,
+            sleeves=int(spec.book.sleeves),
+            lo=lo_sim,
+            hi=hi_sim + 1,
+            sleeve_capital_krw=sleeve_capital,
+            cash_buffer=buffer,
+        )
+        sleeve_logs: list[NDArray[np.float64]] = []
+        sleeve_turnovers: list[NDArray[np.float64]] = []
+        sleeve_costs: list[NDArray[np.float64]] = []
+        for sleeve_map in sleeve_targets:
+            executable = {r: w for r, w in sleeve_map.items() if lo_sim - 1 <= int(r) <= hi_sim - 1}
+            _LOG.info("[ALGO] holdout sleeve rows=%d", len(executable))
+            result = simulate(ctx.cube, executable, start=start, end=end, config=sleeve_config, authorization=auth)
+            sleeve_logs.append(np.ascontiguousarray(result.log_returns))
+            sleeve_turnovers.append(np.ascontiguousarray(result.turnover))
+            sleeve_costs.append(np.ascontiguousarray(result.cost))
+        mean_stock = mean_sleeve_returns(sleeve_logs)
+        window_sessions = tuple(sessions[lo_sim : hi_sim + 1])
+        hedged = simulate_hedged_book(
+            mean_stock, window_sessions, ctx.hedge_inputs, spec.hedge,
+            capital_krw=primary, rebalance_offset=PRODUCTION_PHASE, authorization=auth,
+        )
+        turnover_mean = np.ascontiguousarray(np.mean(np.stack(sleeve_turnovers, axis=0), axis=0))
+        cost_mean = np.ascontiguousarray(np.mean(np.stack(sleeve_costs, axis=0), axis=0))
+        metrics = _trial_metrics(
+            hedged.log_returns, turnover_mean, cost_mean, protocol.sessions_per_year,
+            hedge_cost_krw=float(hedged.cost_krw), hedge_tax_krw=float(hedged.tax_krw),
+            capital_krw=primary, n_sessions=hi_sim - lo_sim + 1,
+        )
         record = ctx.registry.record(
             family=spec.policy.family,
             spec_hash=spec.spec_hash,
             spec_json=spec.canonical_json(),
             segment=Segment.HOLDOUT,
-            sim_config_json=_sim_json_for_trial(base_config, PRODUCTION_PHASE),
+            sim_config_json=_sim_json_for_trial(sleeve_config, PRODUCTION_PHASE),
             cube_id=ctx.cube.cube_id,
-            returns=TrialReturns(sessions=result.sessions, net=np.ascontiguousarray(result.log_returns), benchmarks={}),
+            returns=TrialReturns(sessions=tuple(window_sessions), net=np.ascontiguousarray(hedged.log_returns), benchmarks={}),
             metrics=metrics,
             now=ctx.now(),
         )
         report = _evaluate_holdout_criteria(
-            np.ascontiguousarray(result.log_returns), protocol, spec_hash=spec.spec_hash, trial_id=record.trial_id
+            np.ascontiguousarray(hedged.log_returns), protocol, spec_hash=spec.spec_hash, trial_id=record.trial_id
         )
         self._write_report(spec.spec_hash, "holdout", report)
         ctx.lockbox.record_holdout_verdict(spec_hash=spec.spec_hash, passed=report.passed, report_digest=report.digest)
@@ -580,7 +755,8 @@ class Pipeline:
         base_scores: NDArray[np.float64],
         universe_sliced: NDArray[np.bool_],
         close_sliced: NDArray[np.float64],
-        base_targets: Mapping[int, Mapping[int, NDArray[np.float64]]],
+        sleeve_targets: Sequence[Mapping[int, NDArray[np.float64]]],
+        mean_stock_returns: NDArray[np.float64],
         sessions: list[date],
         start: date,
         end: date,
@@ -605,6 +781,16 @@ class Pipeline:
         every = int(spec.policy.rebalance_every_sessions)
         buffer = float(self._base_sim_config().cash_buffer)
         primary = int(protocol.primary_capital_krw)
+        sleeve_capital = sleeve_capital_krw(primary, spec.book)
+        window_sessions = tuple(sessions[lo_sim : hi_sim + 1])
+        clean = simulate_hedged_book(
+            np.ascontiguousarray(mean_stock_returns, dtype=np.float64), window_sessions,
+            self._ctx.hedge_inputs, spec.hedge,
+            capital_krw=primary, rebalance_offset=PRODUCTION_PHASE, authorization=auth,
+        )
+        clean_beta = np.asarray(clean.beta)
+        clean_contracts = np.asarray(clean.futures_contracts)
+        clean_inverse = np.asarray(clean.inverse_notional_krw)
         total = 0
         for pos, cut in enumerate(edges):
             rng = np.random.default_rng(seed + pos)
@@ -630,10 +816,10 @@ class Pipeline:
             year_rows = [r for r in range(last_row + 1) if sessions[r].year == cut_year]
             for r in year_rows:
                 merged[r] = pert_arr[r]
-            for phase, base_map in base_targets.items():
-                rows = decision_rows(sessions, lo=lo_sim, hi=hi_sim + 1, every=every, phase=int(phase))
+            for sleeve_index, base_map in enumerate(sleeve_targets):
+                rows = decision_rows(sessions, lo=lo_sim, hi=hi_sim + 1, every=every, phase=int(sleeve_index))
                 pert_map = self._targets_for(
-                    spec.policy, pert_close, pert_panel, merged, pert_uni, list(rows), primary, buffer
+                    spec.policy, pert_close, pert_panel, merged, pert_uni, list(rows), sleeve_capital, buffer
                 )
                 for row, base_w in base_map.items():
                     if int(row) > int(cut):
@@ -644,7 +830,67 @@ class Pipeline:
                         continue
                     diff = np.abs(np.asarray(base_w, dtype=np.float64) - np.asarray(other, dtype=np.float64)) > 1e-12
                     total += int(np.count_nonzero(diff))
+            hedge_rng = np.random.default_rng(seed + 100003 + pos)
+            total += self._hedge_perturbation_mismatches(
+                spec, mean_stock_returns, window_sessions, lo_sim, cut,
+                clean_beta, clean_contracts, clean_inverse, primary, auth, hedge_rng,
+            )
         return int(total)
+
+    def _hedge_perturbation_mismatches(
+        self,
+        spec: StrategySpec,
+        mean_stock_returns: NDArray[np.float64],
+        window_sessions: tuple[date, ...],
+        lo_sim: int,
+        cut: int,
+        clean_beta: NDArray[np.float64],
+        clean_contracts: NDArray[np.int64],
+        clean_inverse: NDArray[np.float64],
+        primary: int,
+        auth: LockboxAuthorization,
+        rng: Any,
+    ) -> int:
+        """Corrupt the hedge leg after ``cut`` and count differing elements at positions ``<= cut``."""
+        base = np.asarray(mean_stock_returns, dtype=np.float64)
+        width = int(base.shape[0])
+        inputs = self._ctx.hedge_inputs
+        levels = np.asarray(inputs.index_level, dtype=np.float64).copy()
+        inverses = np.asarray(inputs.inverse_close, dtype=np.float64).copy()
+        index_of = {day: pos for pos, day in enumerate(list(inputs.sessions))}
+        cut_offset = int(cut) - int(lo_sim)
+        noisy_returns = base.copy()
+        for window_pos in range(width):
+            if lo_sim + window_pos > cut:
+                noisy_returns[window_pos] = (1.0 + float(base[window_pos])) * float(np.exp(0.1 * float(rng.standard_normal()))) - 1.0
+        for window_pos in range(width):
+            if lo_sim + window_pos > cut:
+                hit = index_of.get(window_sessions[window_pos])
+                if hit is not None:
+                    if np.isfinite(levels[hit]):
+                        levels[hit] = float(levels[hit]) * float(np.exp(0.1 * float(rng.standard_normal())))
+                    if np.isfinite(inverses[hit]):
+                        inverses[hit] = float(inverses[hit]) * float(np.exp(0.1 * float(rng.standard_normal())))
+        noisy_inputs = HedgeInputs(
+            sessions=tuple(inputs.sessions),
+            index_level=np.ascontiguousarray(levels, dtype=np.float64),
+            inverse_close=np.ascontiguousarray(inverses, dtype=np.float64),
+        )
+        rerun = simulate_hedged_book(
+            np.ascontiguousarray(noisy_returns, dtype=np.float64), window_sessions,
+            noisy_inputs, spec.hedge,
+            capital_krw=int(primary), rebalance_offset=PRODUCTION_PHASE, authorization=auth,
+        )
+        mismatches = 0
+        horizon = min(cut_offset, width - 1)
+        for window_pos in range(horizon + 1):
+            if float(np.asarray(rerun.beta)[window_pos]) != float(clean_beta[window_pos]):
+                mismatches += 1
+            if int(np.asarray(rerun.futures_contracts)[window_pos]) != int(clean_contracts[window_pos]):
+                mismatches += 1
+            if float(np.asarray(rerun.inverse_notional_krw)[window_pos]) != float(clean_inverse[window_pos]):
+                mismatches += 1
+        return int(mismatches)
 
     @staticmethod
     def _corrupt_cube(cube: ResearchCube, cut: int, rng: Any) -> ResearchCube:

@@ -304,8 +304,8 @@ def test_load_discovery_bounds_and_sections(tmp_path: Path) -> None:
         load_research_protocol(late, scope)
     nogates = tmp_path / "nogates.toml"
     nogates.write_text(
-        'version = "research-protocol-v2"\ndiscovery_start = "2017-04-01"\nmax_finalists = 1\n'
-        'prior_trials = 1533\nsessions_per_year = 252\nprimary_capital_krw = 10000000\n'
+        'version = "research-protocol-v3"\ndiscovery_start = "2017-04-01"\nmax_finalists = 1\n'
+        'prior_trials = 1850\nsessions_per_year = 252\nprimary_capital_krw = 100000000\n'
         '[statistics]\nbootstrap_block_sessions = 63\nbootstrap_draws = 4000\n'
         'bootstrap_seed = 20260929\ncscv_blocks = 8\n',
         encoding="utf-8",
@@ -334,11 +334,11 @@ def test_load_protocol_domains(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("max_finalists = 1", "max_finalists = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("prior_trials = 1533", "prior_trials = -1"), scope)
+        load_research_protocol(_bad("prior_trials = 1850", "prior_trials = -1"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("sessions_per_year = 252", "sessions_per_year = 0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("primary_capital_krw = 10_000_000", "primary_capital_krw = 0"), scope)
+        load_research_protocol(_bad("primary_capital_krw = 100_000_000", "primary_capital_krw = 0"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("bootstrap_block_sessions = 63", "bootstrap_block_sessions = 0"), scope)
     with pytest.raises(ConfigError):
@@ -355,6 +355,7 @@ def test_criteria_loads_with_spec_defaults() -> None:
     assert criteria.bootstrap.mdd_limit == pytest.approx(-0.5)
     assert criteria.c1.stress_extra_slippage == pytest.approx(0.001)
     assert criteria.c1.stress_execution_delay == 1
+    assert criteria.c1.hedge_stress_extra_cost == pytest.approx(0.0005)
     assert criteria.c1.max_p_cagr_le_zero == pytest.approx(0.05)
     assert criteria.c2.min_point_calmar == pytest.approx(1.2)
     assert criteria.c2.min_p_calmar == pytest.approx(0.75)
@@ -363,17 +364,18 @@ def test_criteria_loads_with_spec_defaults() -> None:
     assert criteria.c2.max_underwater_p95_sessions == 630
     assert criteria.c2.min_worst_phase_calmar == pytest.approx(1.0)
     assert criteria.c3.stress_min_point_calmar == pytest.approx(1.0)
-    assert criteria.c3.ledger_capitals == (10_000_000,)
+    assert criteria.c3.ledger_capitals == (75_000_000,)
     assert criteria.c3.ledger_min_calmar == pytest.approx(1.0)
     assert criteria.c3.parity_max_growth_gap == pytest.approx(0.01)
     assert criteria.c4.holdout_max_p_mean_le_zero == pytest.approx(0.05)
     assert criteria.c4.holdout_min_point_calmar == pytest.approx(0.7)
-    assert criteria.prior_trials == 1533
+    assert criteria.prior_trials == 1850
     assert criteria.prior_effective_trials == pytest.approx(100.0)
     assert criteria.prior_trial_sharpe_std_annual == pytest.approx(0.42)
-    assert protocol.prior_trials == 1533
+    assert protocol.prior_trials == 1850
+    assert protocol.primary_capital_krw == 100_000_000
     assert protocol.max_finalists == 1
-    assert protocol.version == "research-protocol-v2"
+    assert protocol.version == "research-protocol-v3"
 
 
 def test_criteria_rejects_bad_domains(tmp_path: Path) -> None:
@@ -399,7 +401,9 @@ def test_criteria_rejects_bad_domains(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("mdd_limit = -0.5", "mdd_limit = 0.0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("ledger_capitals = [10_000_000]", "ledger_capitals = []"), scope)
+        load_research_protocol(_bad("ledger_capitals = [75_000_000]", "ledger_capitals = []"), scope)
+    with pytest.raises(ConfigError):
+        load_research_protocol(_bad("hedge_stress_extra_cost = 0.0005", "hedge_stress_extra_cost = -0.1"), scope)
 
 
 def test_criteria_unknown_key_and_hash(tmp_path: Path) -> None:

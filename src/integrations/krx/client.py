@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, ClassVar, Final
@@ -99,6 +99,8 @@ class KrxApiClient:
         "KOSDAQ_INFO": "sto/ksq_isu_base_info",
         "KOSPI_TRADE": "sto/stk_bydd_trd",
         "KOSDAQ_TRADE": "sto/ksq_bydd_trd",
+        "ETF_TRADE": "etp/etf_bydd_trd",
+        "KOSDAQ_INDEX": "idx/kosdaq_dd_trd",
     }
 
     def __init__(
@@ -206,6 +208,116 @@ class KrxApiClient:
         if records:
             _validate_master_records(records, session=as_of)
         return records
+
+    def fetch_hedge_records(
+        self, as_of: date, *, etf_tickers: Sequence[str], index_name: str
+    ) -> list[dict[str, Any]]:
+        """Return the validated hedge-series records of one session: the requested ETF rows (tagged
+        ``"_endpoint": "etf"``) and the KOSDAQ index row named ``index_name`` (tagged ``"_endpoint": "index"``).
+
+        Empty list only when both pages are empty without a holiday message. Raises KrxHolidayError (via the
+        shared page reader) on a reported holiday, ProviderTerminalError when exactly one of the two pages is
+        empty, the index row is missing/duplicated, a requested ETF row is duplicated, or ``BAS_DD`` differs
+        from ``as_of`` or a price field is not positive.
+        """
+        if not isinstance(as_of, date):
+            raise ValueError("as_of must be a date")
+        if not isinstance(index_name, str) or not index_name.strip():
+            raise ValueError("index_name must be a non-empty string")
+        wanted = tuple(str(ticker).strip() for ticker in etf_tickers)
+        if any(not ticker for ticker in wanted):
+            raise ValueError("etf_tickers must contain non-empty strings")
+        etf_page = self._records(self.ENDPOINTS["ETF_TRADE"], as_of)
+        index_page = self._records(self.ENDPOINTS["KOSDAQ_INDEX"], as_of)
+        if not etf_page and not index_page:
+            return []
+        if not etf_page or not index_page:
+            raise ProviderTerminalError(
+                f"KRX hedge-series page is incomplete for {as_of.isoformat()}",
+                provider=_PROVIDER,
+                endpoint=self.ENDPOINTS["ETF_TRADE"] if not etf_page else self.ENDPOINTS["KOSDAQ_INDEX"],
+            )
+        index_rows = [
+            record
+            for record in index_page
+            if str(record.get("IDX_CLSS") or "").strip() == "KOSDAQ"
+            and str(record.get("IDX_NM") or "") == index_name
+        ]
+        if len(index_rows) != 1:
+            raise ProviderTerminalError(
+                f"KRX hedge-series index row is missing or duplicated for {as_of.isoformat()}",
+                provider=_PROVIDER,
+                endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+            )
+        out: list[dict[str, Any]] = []
+        for ticker in wanted:
+            matches = [record for record in etf_page if str(record.get("ISU_CD") or "").strip() == ticker]
+            if len(matches) > 1:
+                raise ProviderTerminalError(
+                    f"KRX hedge-series ETF row is duplicated for {as_of.isoformat()}: {ticker}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            for record in matches:
+                tagged = dict(record)
+                tagged["_endpoint"] = "etf"
+                out.append(tagged)
+        tagged_index = dict(index_rows[0])
+        tagged_index["_endpoint"] = "index"
+        out.append(tagged_index)
+        for record in out:
+            bas_dd = str(record.get("BAS_DD") or "").strip()
+            if len(bas_dd) != 8 or not bas_dd.isdigit():
+                raise ProviderTerminalError(
+                    f"KRX hedge-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            try:
+                page_day = date(int(bas_dd[:4]), int(bas_dd[4:6]), int(bas_dd[6:8]))
+            except ValueError as exc:
+                raise ProviderTerminalError(
+                    f"KRX hedge-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                ) from exc
+            if page_day != as_of:
+                raise ProviderTerminalError(
+                    f"KRX hedge-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            if record.get("_endpoint") == "index":
+                try:
+                    level = float(str(record.get("CLSPRC_IDX")).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    raise ProviderTerminalError(
+                        f"KRX hedge-series index level is not positive for {as_of.isoformat()}",
+                        provider=_PROVIDER,
+                        endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+                    ) from None
+                if not level > 0:
+                    raise ProviderTerminalError(
+                        f"KRX hedge-series index level is not positive for {as_of.isoformat()}",
+                        provider=_PROVIDER,
+                        endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+                    )
+            else:
+                try:
+                    close = float(str(record.get("TDD_CLSPRC")).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    raise ProviderTerminalError(
+                        f"KRX hedge-series ETF close is not positive for {as_of.isoformat()}",
+                        provider=_PROVIDER,
+                        endpoint=self.ENDPOINTS["ETF_TRADE"],
+                    ) from None
+                if not close > 0:
+                    raise ProviderTerminalError(
+                        f"KRX hedge-series ETF close is not positive for {as_of.isoformat()}",
+                        provider=_PROVIDER,
+                        endpoint=self.ENDPOINTS["ETF_TRADE"],
+                    )
+        return out
 
     def health_check(self) -> None:
         """Confirm collection credentials were verified without spending quota."""

@@ -1,13 +1,13 @@
 # Research protocol: segments, multiplicity accounting and termination criteria C1-C4.
-version = "research-protocol-v2"
+version = "research-protocol-v3"
 # First session month with trailing-four-quarter fundamentals for most issuers (2016 facts start).
 discovery_start = "2017-04-01"
 max_finalists = 1
 # Trials evaluated before the registry existed; counted in N for DSR.
-prior_trials = 1533
+prior_trials = 1850
 sessions_per_year = 252
-# Capital of screening trials; the C3 ledger check replays the capital grid below.
-primary_capital_krw = 10_000_000
+# Total NAV of the hedged book; sleeves and the hedge overlay are sized from it.
+primary_capital_krw = 100_000_000
 
 [statistics]
 bootstrap_block_sessions = 63
@@ -17,7 +17,7 @@ cscv_blocks = 8
 
 [criteria]
 # Termination criteria C1-C4; raw logged evaluations incl. 415 pre-registry trials.
-prior_trials = 1533
+prior_trials = 1850
 prior_effective_trials = 100
 prior_trial_sharpe_std_annual = 0.42
 
@@ -31,6 +31,7 @@ mdd_limit = -0.5
 [criteria.c1]
 stress_extra_slippage = 0.001
 stress_execution_delay = 1
+hedge_stress_extra_cost = 0.0005
 max_p_cagr_le_zero = 0.05
 perturbation_cuts = 3
 perturbation_seed = 7
@@ -45,7 +46,7 @@ min_worst_phase_calmar = 1.0
 
 [criteria.c3]
 stress_min_point_calmar = 1.0
-ledger_capitals = [10_000_000]
+ledger_capitals = [75_000_000]
 ledger_min_calmar = 1.0
 parity_max_growth_gap = 0.01
 

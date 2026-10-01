@@ -74,6 +74,7 @@ class CriteriaC1(BaseModel):
 
     stress_extra_slippage: float
     stress_execution_delay: int
+    hedge_stress_extra_cost: float
     max_p_cagr_le_zero: float
     perturbation_cuts: int
     perturbation_seed: int
@@ -295,6 +296,7 @@ def _check_criteria(criteria: CriteriaPolicy) -> None:
         _check_criteria_number(name, value, minimum=0.0, above=True)
     nonneg_numbers: list[tuple[str, object]] = [
         ("stress_extra_slippage", criteria.c1.stress_extra_slippage),
+        ("hedge_stress_extra_cost", criteria.c1.hedge_stress_extra_cost),
         ("parity_max_growth_gap", criteria.c3.parity_max_growth_gap),
     ]
     for name, value in nonneg_numbers:
