@@ -1,55 +1,32 @@
-# Research protocol: segments, multiplicity accounting and termination criteria C1-C4.
-version = "research-protocol-v3"
-# First session month with trailing-four-quarter fundamentals for most issuers (2016 facts start).
-discovery_start = "2017-04-01"
-max_finalists = 1
-# Trials evaluated before the registry existed; counted in N for DSR.
-prior_trials = 1850
+# Research protocol v4: data-window guard, report-card policy and scenario definitions.
+version = "research-protocol-v4"
+# Earliest session a run window may start (first month with trailing-four-quarter fundamentals for most
+# issuers). Model training may still read earlier PIT cube rows; this bounds run windows only.
+evaluation_start = "2017-04-01"
 sessions_per_year = 252
-# Total NAV of the hedged book; sleeves and the hedge overlay are sized from it.
 primary_capital_krw = 100_000_000
 
-[statistics]
-bootstrap_block_sessions = 63
-bootstrap_draws = 4000
-bootstrap_seed = 20260929
-cscv_blocks = 8
-
-[criteria]
-# Termination criteria C1-C4; raw logged evaluations incl. 415 pre-registry trials.
-prior_trials = 1850
-prior_effective_trials = 100
-prior_trial_sharpe_std_annual = 0.42
-
-[criteria.bootstrap]
+[evaluation]
 block_sessions = 63
-draws = 2000
-seed = 20260930
+draws = 4000
+seed = 20261001
 horizon_sessions = 1260
-mdd_limit = -0.5
+objective_quantile = 0.10
+ruin_mdd_limit = -0.5
+max_p_ruin = 0.05
+max_p_growth_le_zero = 0.05
+report_mdd_limits = [-0.3, -0.5]
+recent_sessions = 252
 
-[criteria.c1]
+[scenarios]
+cost_grid_ticks = [0.0, 0.5, 1.0, 1.5]
 stress_extra_slippage = 0.001
-stress_execution_delay = 1
-hedge_stress_extra_cost = 0.0005
-max_p_cagr_le_zero = 0.05
+stress_hedge_extra_cost = 0.0005
+stress_delay_sessions = 1
+placebo_seed = 7
 perturbation_cuts = 3
 perturbation_seed = 7
 
-[criteria.c2]
-min_point_calmar = 1.2
-min_p_calmar = 0.75
-max_p_mdd_below_limit = 0.05
-max_underwater_median_sessions = 252
-max_underwater_p95_sessions = 630
-min_worst_phase_calmar = 1.0
-
-[criteria.c3]
-stress_min_point_calmar = 1.0
-ledger_capitals = [75_000_000]
-ledger_min_calmar = 1.0
-parity_max_growth_gap = 0.01
-
-[criteria.c4]
-holdout_max_p_mean_le_zero = 0.05
-holdout_min_point_calmar = 0.7
+[champion]
+alpha = 0.05
+require_neighbors = true

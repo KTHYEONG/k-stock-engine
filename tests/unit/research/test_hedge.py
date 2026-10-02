@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 
 from src.core.pit import PITDataError
-from src.data.research_protocol import LockboxAuthorization, LockboxError, Segment
+from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.hedge import (
     HedgeInputs,
     HedgeSpec,
@@ -71,8 +71,8 @@ def _world(seed: int = 1) -> tuple[list[date], np.ndarray, HedgeInputs, np.ndarr
     return days, stock, HedgeInputs(sessions=tuple(days), index_level=level, inverse_close=inverse), idx_ret
 
 
-def _auth(days: list[date]) -> LockboxAuthorization:
-    return LockboxAuthorization(segment=Segment.DISCOVERY, start=days[1], end=days[-1], spec_hash=None, evidence=False)
+def _auth(days: list[date]) -> WindowAuthorization:
+    return WindowAuthorization(start=days[1], end=days[-1])
 
 
 def _run(spec: HedgeSpec, seed: int = 1, **kwargs: Any) -> Any:
@@ -269,12 +269,10 @@ def test_execution_delay_makes_beta_stale() -> None:
     assert np.all(delayed.beta[:42] == 0.0)
 
 
-def test_lockbox_window_enforced() -> None:
+def test_run_window_outside_authorization_rejected() -> None:
     days, stock, inputs, _ = _world()
-    narrow = LockboxAuthorization(
-        segment=Segment.DISCOVERY, start=days[1], end=days[100], spec_hash=None, evidence=False
-    )
-    with pytest.raises(LockboxError):
+    narrow = WindowAuthorization(start=days[1], end=days[100])
+    with pytest.raises(WindowError):
         simulate_hedged_book(stock, days[1:], inputs, _spec(), capital_krw=CAPITAL, authorization=narrow)
 
 
@@ -303,9 +301,7 @@ def test_fail_closed_on_bad_inputs() -> None:
             inputs,
             _spec(),
             capital_krw=CAPITAL,
-            authorization=LockboxAuthorization(
-                segment=Segment.DISCOVERY, start=days[0], end=days[-1], spec_hash=None, evidence=False
-            ),
+            authorization=WindowAuthorization(start=days[0], end=days[-1]),
         )
     nan_inverse = np.asarray(inputs.inverse_close).copy()
     nan_inverse[:] = np.nan
@@ -450,3 +446,127 @@ def test_extra_cost_rate_must_be_non_negative_and_margin_total_below_one() -> No
         )
     with pytest.raises(ValueError, match="must be < 1"):
         _spec(initial_margin_rate=0.6, margin_buffer_rate=0.5)
+
+
+def _overlay_state(idx: int, stock: np.ndarray, index: np.ndarray, **overrides: object) -> object:
+    from src.backtest.overlay import OverlayState
+
+    params: dict[str, object] = {
+        "session_idx": idx,
+        "nav": 100_000_000,
+        "stock_book_nav": 100_000_000,
+        "stock_book_returns": stock[: idx + 1],
+        "index_returns": index[: idx + 1],
+        "index_level": 1500.0,
+        "contracts": 0,
+        "inverse_units": 0,
+    }
+    params.update(overrides)
+    return OverlayState(**params)  # type: ignore[arg-type]
+
+
+def test_beta_neutral_overlay_uses_session_own_return() -> None:
+    from src.research.hedge import BetaNeutralOverlay, _frictionless_split
+
+    rng = np.random.default_rng(0)
+    index = rng.normal(0, 0.01, 60)
+    stock = 0.5 * index
+    overlay = BetaNeutralOverlay(_spec(beta_window_sessions=60, beta_min_sessions=40), rebalance_offset=4)
+    target = None
+    for i in range(60):
+        out = overlay.target(_overlay_state(i, stock, index))
+        if i == 59:
+            target = out
+    assert target is not None
+    _, contracts, inverse = _frictionless_split(100_000_000, 0.5, 10_000 * 1500.0, 0.3175, True)
+    assert target.contracts == contracts
+    assert target.inverse_value_krw == int(np.floor(inverse))
+
+
+def test_beta_neutral_overlay_guards() -> None:
+    from src.backtest.overlay import OverlayState
+    from src.core.pit import PITDataError
+    from src.research.hedge import BetaNeutralOverlay, derivative_config
+
+    rng = np.random.default_rng(1)
+    index = rng.normal(0, 0.01, 30)
+    stock = 0.5 * index
+    few = BetaNeutralOverlay(_spec(beta_min_sessions=40), rebalance_offset=0)
+    out = None
+    for i in range(30):
+        got = few.target(_overlay_state(i, stock, index))
+        if i == 25:
+            out = got
+    assert out is not None
+    assert (out.contracts, out.inverse_value_krw) == (0, 0)
+
+    grid = BetaNeutralOverlay(_spec(rebalance_every_sessions=5), rebalance_offset=2)
+    for i in range(15):
+        got = grid.target(_overlay_state(i, stock, stock))
+        assert (got is not None) == (i % 5 == 2)
+
+    zero = BetaNeutralOverlay(_spec(hedge_ratio=0.0), rebalance_offset=0)
+    assert zero.target(_overlay_state(0, stock, index)).contracts == 0  # type: ignore[union-attr]
+
+    stale_base = np.concatenate([rng.normal(0, 0.01, 59), [0.05]])
+    stale_stock = np.concatenate([0.5 * stale_base[:59], [0.2]])
+    plain = BetaNeutralOverlay(
+        _spec(beta_window_sessions=60, beta_min_sessions=2, rebalance_every_sessions=100),
+        rebalance_offset=59,
+    )
+    delayed = BetaNeutralOverlay(
+        _spec(beta_window_sessions=60, beta_min_sessions=2, rebalance_every_sessions=100),
+        rebalance_offset=59,
+        execution_delay=1,
+    )
+    last_plain = last_delayed = None
+    for i in range(60):
+        last_plain = plain.target(_overlay_state(i, stale_stock, stale_base))
+        last_delayed = delayed.target(_overlay_state(i, stale_stock, stale_base))
+    assert last_plain != last_delayed
+
+    only_inverse = BetaNeutralOverlay(_spec(use_futures=False), rebalance_offset=0)
+    held = only_inverse.target(_overlay_state(5, stock, index))
+    assert held is not None
+    assert held.contracts == 0
+
+    bad_level = BetaNeutralOverlay(_spec(beta_min_sessions=2), rebalance_offset=0)
+    with pytest.raises(PITDataError):
+        bad_level.target(_overlay_state(29, stock, index, index_level=float("nan")))
+    flat = BetaNeutralOverlay(_spec(), rebalance_offset=0)
+    assert flat.target(_overlay_state(0, np.zeros(3), np.zeros(3))).contracts == 0  # type: ignore[union-attr]
+    from src.research.hedge import _ols_beta_tail
+
+    assert _ols_beta_tail(stock, np.zeros_like(stock), window=30, min_sessions=2, cap=2.0) == 0.0
+    empty_nav = BetaNeutralOverlay(_spec(beta_min_sessions=2), rebalance_offset=0)
+    assert empty_nav.target(_overlay_state(29, stock, index, nav=0)).contracts == 0  # type: ignore[union-attr]
+    with pytest.raises(ValueError, match="equal-length"):
+        flat.target(
+            OverlayState(
+                session_idx=100,
+                nav=1,
+                stock_book_nav=1,
+                stock_book_returns=np.zeros(3),
+                index_returns=np.zeros(2),
+                index_level=1.0,
+                contracts=0,
+                inverse_units=0,
+            )
+        )
+    with pytest.raises(ValueError, match="rebalance_offset"):
+        BetaNeutralOverlay(_spec(), rebalance_offset=5)
+    with pytest.raises(ValueError, match="rebalance_offset"):
+        BetaNeutralOverlay(_spec(), rebalance_offset=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="execution_delay"):
+        BetaNeutralOverlay(_spec(), rebalance_offset=0, execution_delay=-1)
+    with pytest.raises(ValueError, match="execution_delay"):
+        BetaNeutralOverlay(_spec(), rebalance_offset=0, execution_delay=False)  # type: ignore[arg-type]
+    rewind = BetaNeutralOverlay(_spec(), rebalance_offset=0)
+    rewind.target(_overlay_state(5, stock, index))
+    with pytest.raises(ValueError, match="before the run start"):
+        rewind.target(_overlay_state(2, stock, index))
+
+    config = derivative_config(_spec())
+    assert config.contract_multiplier_krw == 10_000
+    assert str(config.futures_tax_rate) == "0.11"
+    assert str(config.inverse_tax_rate) == "0.154"

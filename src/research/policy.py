@@ -63,6 +63,10 @@ class TrendCashPolicy(BaseModel):
     Why: drawdowns are market-driven; picks whose own 1-month trend has failed are the earliest,
     bottom-up signal of a risk-off state, and holding cash for them cut the probe drawdown from -47% to -15%
     without any index timing. The rule only works on ML picks (random picks + the same rule lost money).
+
+    ``redistribute_cap_multiple`` (None = off): names that pass the trend rule share the weight of failed slots
+    equally, each capped at ``redistribute_cap_multiple / n``; any remainder stays cash. Why a cap: without it
+    two passing names in a weak market would hold 50% each. 1.0 reproduces the legacy 1/n weights exactly.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -73,6 +77,7 @@ class TrendCashPolicy(BaseModel):
     universe: UniverseRule = UniverseRule(min_adtv20_krw=500_000_000, min_price_krw=1_000)
     trend_min_dev_ma20: float | None = None
     trend_min_ret21: float | None = None
+    redistribute_cap_multiple: float | None = None
     min_units_per_slot: int = 3
 
     @field_validator("family")
@@ -120,6 +125,16 @@ class TrendCashPolicy(BaseModel):
         if not math.isfinite(threshold):
             raise ValueError(f"trend threshold must be finite, got {value!r}")
         return threshold
+
+    @field_validator("redistribute_cap_multiple")
+    @classmethod
+    def _redistribution_cap(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        cap = float(value)  # type: ignore[arg-type]
+        if not math.isfinite(cap) or cap < 1.0:
+            raise ValueError(f"redistribute_cap_multiple must be finite and >= 1.0, got {value!r}")
+        return cap
 
     def canonical_json(self) -> str:
         """Canonical JSON of the policy with sorted keys and compact separators."""
@@ -181,6 +196,10 @@ def build_targets(
     both legs disabled every selected name receives 1/n; names are never dropped for a disabled leg,
     even when its feature is NaN. Others receive 0 (cash). Incumbency is tracked on the selection
     before the trend rule. Fewer than n candidates: all-zero row and incumbents reset.
+
+    With ``redistribute_cap_multiple`` set, the m passing names instead split the failed slots equally:
+    each receives ``min(1/m, cap / n)``; failed names stay 0 and the uncapped remainder stays cash
+    (m = 0 leaves the row all-zero). The selection, incumbency and trend tests are unaffected.
 
     Raises: ValueError if a row has no score row in ``scores`` or ``capital_krw``/``cash_buffer`` invalid.
     """
@@ -264,9 +283,12 @@ def build_targets(
                 )
             else:
                 passing = np.ones(len(kept), dtype=bool)
+            n_pass = int(np.count_nonzero(passing))
+            cap = policy.redistribute_cap_multiple
+            unit = min(1.0 / float(n_pass), float(cap) / float(policy.n)) if cap is not None and n_pass > 0 else weight
             for pos_k, k in enumerate(kept):
                 if bool(passing[pos_k]):
-                    weights[int(k)] = weight
+                    weights[int(k)] = unit
             incumbents = set(kept)
         else:
             incumbents = set()

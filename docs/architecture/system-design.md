@@ -184,28 +184,36 @@ uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 
 ## 6. Single Strategy Path (단일 전략 경로)
 
-리서치부터 원장 검증까지 정확히 하나의 전략 경로만 존재한다: `panel → scorer → policy → sleeves/book → simulator + hedge overlay → ledger → criteria C1-C4`.
+리서치부터 원장 검증까지 정확히 하나의 전략 경로만 존재한다: `panel → scorer → policy → sleeves/book → account engine (ledger) → report card`.
 
 * **Panel (`src/research/panel.py`)**: 인과적 피처 패널. 결정 세션 `T`의 모든 피처·라벨은 `T` 이전에 관측 가능한 데이터로만 구성되며, 전월(全月) 재무·수급 사실을 사용한다.
 * **Scorer (`src/research/model.py`)**: 워크포워드 LightGBM 호라이즌 앙상블. 연도별 폴드는 테스트 연도 이전 데이터로만 학습하고, purge 구간으로 라벨 중첩을 제거한다.
 * **Policy (`src/research/policy.py`)**: ML 상위 20선(`n=20`) + `ret21 > 0` 단일 추세 현금 규칙(`dev_ma20` 구간은 비활성화). 규칙을 통과한 선택 종목만 편입하고 나머지는 현금으로 보유한다.
 * **Sleeves/Book (`src/research/book.py`)**: 리밸런스 위상별 5개 슬리브(각자 주식 자본의 1/5로 목표 산출·시뮬레이션)와 전진충전 평균 결합북. 위상 운(phase luck)을 구조적으로 제거한다.
 * **Hedge overlay (`src/research/hedge.py`, Silver `hedge_series`)**: KOSDAQ 150 롤링 베타에 대한 베타중립 숏 헤지. 지수선물 정수 계약을 핵심으로, 계약 미만 잔여는 실물 인버스 ETF로 충당한다. 증거금·위탁 비용과 세율(지수선물 이익 11%, 연 250만원 공제, 손실 이월 없음; 인버스 ETF 이익 15.4%, 손실 상계 없음)을 NAV 시뮬레이션에 반영한다.
-* **Simulator / Ledger (`src/research/simulator.py`, `src/research/ledger_bridge.py`, `src/backtest/engine.py`)**: 슬리브 시뮬레이터는 가중치 공간 스크리닝용 근사이고, 승격 판정은 정수 원장(`src/backtest/engine.py` 리플레이: 결합 주식북 목표를 다음 세션 시가에 매도 우선·정수주·음수 현금 금지로 집행)으로만 수행한다. 헤지는 슬리브 평균 수익률 스트림에만 적용되며 원장 리플레이에는 적용하지 않는다.
-* **Criteria (`src/research/criteria.py`)**: 종료 기준 C1(스트레스·섭동·DSR 보고)–C2(집중·낙폭)–C3(원장 정합·패리티)–C4(밀봉 홀드아웃 단일 시도). 기준 미달 시 `NO_TRADE`로 실거래 승격을 거부한다. 발견 단계의 증거 위상(evidence phase) 5개는 단일 헤지북의 헤지 결정격자 오프셋(0–4)이며, 운용 오프셋은 0이다.
+* **Account engine (`src/backtest/engine.py`, `src/research/ledger_bridge.py`)**: 평가 대상은 정수 원장 하나뿐이다. 결합 5-슬리브 주식 목표를 다음 세션 시가에 매도 우선·정수주·음수 현금 금지로 집행하며, KQ150 선물·인버스 ETF·현금 수익까지 한 계좌에서 정산한다. 네 시나리오(base·stress_slippage·stress_delay·cost grid)와 unhedged·placebo가 모두 이 엔진에서 나온다.
+* **Weight simulator (`src/research/simulator.py`)**: 가중치 공간 스크리칭·인과적 섭동 검사용 근사. 평가는 하지 않으며 계정 엔진과의 성장률 차이(`fast_sim_gap`)는 보고 항목으로만 남는다.
+* **Report card (`src/research/evaluation.py`, `src/research/stats.py`)**: 단일 목적함수 J(5년 블록 부트스트랩 성장률의 하위 10% 분위수)를 더 나쁜 스트레스 스트림에서 계산하고, 파산 가드 두 개(P(5y MDD ≤ −50%) ≤ 5%, P(5y g ≤ 0) ≤ 5%)와 무결성(섭동 불일치 0, 스트림 정렬·유한성)만 승격을 막는다. 나머지 수치(연율, 변동성, MDD, calmar, 연도·레짐별 성장, 비용 그리드, 손익분기 틱, placebo·EW 벤치마크, 최근 252세션)는 진단 보고용이며 판정에 영향을 주지 않는다.
+* **Window guard (`src/data/research_protocol.py`)**: 프로토콜 v4는 `[evaluation_start, 마지막 인증 세션]` 밖의 구간 실행만 금지한다. 밀봉 홀드아웃·최종 후보·시행 회수 벌점은 없다 — 선택 편향은 챔피언/챌린저 페어드 비교·이웃 평탄부·비용 그리드로 통제한다.
+* **Champion store (`src/research/champion.py`)**: 챌린저와 현 챔피언을 **같은 세션·같은 스트레스 스트림**에서 페어드 블록 부트스트랩 Δg로 비교한다(공통 시장 노이즈가 상쇄). 승격 조건은 ① 챌린저 보고 카드 통과 ② 페어드 Δg 하한(α, 한쪽) > 0 ③ 챌린저 J ≥ 챔피언 J ④ 숫자 노브(`policy`/`book`/`hedge`) 변경 시 노브별 이웃 변형이 모두 평균 Δg > 0(`scorer` 변경 exempt). `<state>/research/champion/`에 `current.json`(원자 교체)·`history.jsonl`·`decisions/<digest>.json`(추가 전용)으로 남기며, 승격 기록의 신원은 TOML 경로가 아니라 저장된 `spec_json`이다.
 
 ```bash
 # 헤지 시계열 수집·정제 (Part 1)
 uv run python -m src.data.cli collect-krx-hedge-series
 uv run python -m src.data.cli build-hedge-series-silver
-# 발견 단계 실행 (단일 사전 등록 스펙)
-uv run python -m src.research backtest --spec config/research/strategies/ml_sleeve_hedge.toml
+# 평가 실행 (단일 사전 등록 스펙) → 리포트 카드 JSON
+uv run python -m src.research evaluate --spec config/research/strategies/ml_sleeve_hedge.toml
+# 챔피언 최초 등록 / 대결 판정(상태 불변) / 승격 / 현재 상태
+uv run python -m src.research promote --spec config/research/strategies/ml_sleeve_hedge.toml --bootstrap
+uv run python -m src.research challenge --spec <challenger.toml> --neighbors <neighbor.toml ...>
+uv run python -m src.research promote --spec <challenger.toml>
+uv run python -m src.research champion
 ```
 
-### 6.1 Discovery Status (발견 단계 상태)
+### 6.1 Champion Status (챔피언 상태)
 
-| 단계 | 상태 | 비고 |
+| 항목 | 상태 | 비고 |
 | :--- | :---: | :--- |
-| Discovery (C1–C3) | `pending evaluation, holdout sealed` | `uv run python -m src.research backtest` 실행 후 결과 기재 |
-| Holdout (C4) | `sealed` | 최종 후보 1건, 단일 시도 |
-| Forward | `sealed` | 홀드아웃 통과 verdict 이후에만 개방 |
+| Champion | `none` | `promote --spec <PATH> --bootstrap`으로 최초 등록, 이후 승격은 저장된 판정(`challenge`)이 있을 때만 |
+| Challenger | `unevaluated` | 같은 세션에서 페어드 블록 부트스트랩 Δg와 이웃 평탄부로 판정 |
+| Forward evidence | `out of scope` | 라이브 매매 시작 시 스펙 01과 함께 재개 |

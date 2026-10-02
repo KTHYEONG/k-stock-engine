@@ -5,9 +5,11 @@ from __future__ import annotations
 import bisect
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +42,11 @@ __all__ = [
 ]
 
 CUBE_POLICY_VERSION = "research-cube-v2"
+
+#: Cache layout version. Format 1 was a single ``<cube_id>.npz``; format 2 is a directory of ``.npy`` arrays
+#: that can be memory-mapped instead of read into anonymous memory.
+_CACHE_FORMAT = 2
+_CHECKSUM_CHUNK_BYTES = 1 << 23
 
 _LOG = logging.getLogger(__name__)
 
@@ -1120,67 +1127,215 @@ def build_research_cube(inputs: CubeInputs) -> ResearchCube:
     )
 
 
+def _update_digest(digest: Any, arr: NDArray[Any]) -> None:
+    """Feed one array's C-order bytes into ``digest`` in fixed-size chunks.
+
+    The cube is several GB and is memory-mapped on a cache hit, so hashing it must never call ``tobytes()`` on
+    a whole array: that would allocate a second full-size anonymous copy just to verify the cache.
+    """
+    flat = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)
+    for start in range(0, flat.size, _CHECKSUM_CHUNK_BYTES):
+        digest.update(flat[start : start + _CHECKSUM_CHUNK_BYTES].tobytes())
+
+
 def _array_checksum(arrays: Mapping[str, NDArray[Any]], exit_at: NDArray[np.int64], halted: NDArray[np.bool_]) -> str:
     digest = hashlib.sha256()
     for name in sorted(arrays):
         digest.update(name.encode("utf-8"))
-        digest.update(np.ascontiguousarray(arrays[name]).tobytes())
-    digest.update(np.ascontiguousarray(exit_at).tobytes())
-    digest.update(np.ascontiguousarray(halted).tobytes())
+        _update_digest(digest, arrays[name])
+    _update_digest(digest, exit_at)
+    _update_digest(digest, halted)
     return digest.hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class _CubeCache:
+    """One verified cache payload: the arrays plus the identity and digest they were stored under.
+
+    ``arrays`` is either memory-mapped (format 2) or anonymous (the legacy ``.npz``), so callers must not
+    assume either; what is guaranteed is that the bytes are the ones the checksum covers.
+    """
+
+    cube_id: str
+    sessions: tuple[date, ...]
+    instrument_ids: tuple[str, ...]
+    arrays: Mapping[str, NDArray[Any]]
+    exit_at: NDArray[np.int64]
+    exit_halted: NDArray[np.bool_]
+    checksum: str
+
+
+def _read_cache_dir(directory: Path, cube_id: str) -> _CubeCache | None:
+    """Verify and memory-map a format-2 cache directory, or return ``None`` when it is unusable."""
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or int(manifest["format"]) != _CACHE_FORMAT:
+            return None
+        if str(manifest["cube_id"]) != cube_id:
+            return None
+        names = [str(item) for item in manifest["array_names"]]
+        sessions = tuple(date.fromordinal(int(item)) for item in manifest["sessions"])
+        instrument_ids = tuple(str(item) for item in manifest["instruments"])
+        checksum = str(manifest["checksum"])
+        arrays: dict[str, NDArray[Any]] = {
+            name: np.load(directory / f"arr_{name}.npy", mmap_mode="r") for name in names
+        }
+        exit_at = np.load(directory / "exit_at.npy")
+        halted = np.load(directory / "exit_halted.npy")
+    except (OSError, ValueError, TypeError, KeyError, EOFError):
+        return None
+    shape = (len(sessions), len(instrument_ids))
+    if exit_at.dtype != np.int64 or halted.dtype != np.bool_:
+        return None
+    if exit_at.shape != (len(instrument_ids),) or halted.shape != (len(instrument_ids),):
+        return None
+    if any(arr.shape != shape or not arr.flags.c_contiguous for arr in arrays.values()):
+        return None
+    if _array_checksum(arrays, exit_at, halted) != checksum:
+        return None
+    return _CubeCache(cube_id, sessions, instrument_ids, arrays, exit_at, halted, checksum)
+
+
+def _read_cache_npz(path: Path, cube_id: str) -> _CubeCache | None:
+    """Read a format-1 ``.npz`` cache, or return ``None`` when it is corrupt or belongs to another cube."""
+    try:
+        with np.load(str(path), allow_pickle=True) as store:
+            if str(store["cube_id"]) != cube_id:
+                return None
+            checksum = str(store["checksum"])
+            sessions = tuple(date.fromordinal(int(item)) for item in np.asarray(store["sessions"]).tolist())
+            instrument_ids = tuple(str(item) for item in store["instruments"].tolist())
+            names = [str(item) for item in store["array_names"].tolist()]
+            arrays: dict[str, NDArray[Any]] = {name: np.asarray(store[f"arr_{name}"]) for name in names}
+            exit_at = np.asarray(store["exit_at"], dtype=np.int64)
+            halted = np.asarray(store["exit_halted"], dtype=np.bool_)
+    except Exception:  # noqa: BLE001 - an unreadable legacy cache is simply rebuilt
+        return None
+    if _array_checksum(arrays, exit_at, halted) != checksum:
+        return None
+    return _CubeCache(cube_id, sessions, instrument_ids, arrays, exit_at, halted, checksum)
+
+
+def _write_cache_dir(payload: _CubeCache, directory: Path) -> None:
+    """Write one ``.npy`` per array plus ``manifest.json`` into a fresh ``directory``."""
+    directory.mkdir(parents=True)
+    for name, arr in payload.arrays.items():
+        np.save(directory / f"arr_{name}.npy", np.ascontiguousarray(arr), allow_pickle=False)
+    np.save(directory / "exit_at.npy", np.asarray(payload.exit_at, dtype=np.int64), allow_pickle=False)
+    np.save(directory / "exit_halted.npy", np.asarray(payload.exit_halted, dtype=np.bool_), allow_pickle=False)
+    manifest = {
+        "array_names": sorted(payload.arrays),
+        "checksum": payload.checksum,
+        "cube_id": payload.cube_id,
+        "format": _CACHE_FORMAT,
+        "instruments": list(payload.instrument_ids),
+        "sessions": [day.toordinal() for day in payload.sessions],
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+
+def _publish_cache(payload: _CubeCache, directory: Path) -> bool:
+    """Write ``payload`` into a staged sibling directory and move it into place atomically.
+
+    Staging under a pid-tagged name means a crashed or losing writer never leaves a half-written directory at
+    the real path: readers only ever see a fully written, verified one.
+    """
+    temp = directory.parent / f".{directory.name}.{os.getpid()}.tmp"
+    try:
+        shutil.rmtree(temp, ignore_errors=True)
+        _write_cache_dir(payload, temp)
+        shutil.rmtree(directory, ignore_errors=True)
+        os.replace(temp, directory)
+    except OSError:
+        _LOG.warning("[DATA] cube cache could not be written: %s", directory)
+        return False
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+    return True
+
+
+def _payload_of(cube: ResearchCube) -> _CubeCache:
+    """The cube as a cache payload, sealed with the digest that identifies its bytes."""
+    return _CubeCache(
+        cube_id=cube.cube_id,
+        sessions=cube.sessions,
+        instrument_ids=cube.instrument_ids,
+        arrays=dict(cube.arrays),
+        exit_at=cube.exit_at,
+        exit_halted=cube.exit_halted,
+        checksum=_array_checksum(cube.arrays, cube.exit_at, cube.exit_halted),
+    )
+
+
+def _cube_from_cache(payload: _CubeCache) -> ResearchCube:
+    """Freeze a verified payload into a cube, leaving every array as it was read.
+
+    Deliberately not ``from_arrays``: that iterates the whole mapping to re-validate it and would flatten each
+    ``np.memmap`` back to a plain view, losing the read-only file-backed handle a copy-on-write consumer needs.
+    """
+    exit_at = np.ascontiguousarray(payload.exit_at, dtype=np.int64)
+    halted = np.ascontiguousarray(payload.exit_halted, dtype=np.bool_)
+    exit_at.flags.writeable = False
+    halted.flags.writeable = False
+    return ResearchCube(
+        cube_id=payload.cube_id,
+        sessions=payload.sessions,
+        instrument_ids=payload.instrument_ids,
+        arrays=dict(payload.arrays),
+        exit_at=exit_at,
+        exit_halted=halted,
+    )
+
+
 def load_research_cube(inputs: CubeInputs, *, cache_root: Path) -> ResearchCube:
-    """Return the cube from a checksum-verified cache, building and caching it on a miss."""
+    """Return the cube from a checksum-verified, memory-mapped cache, building and caching it on a miss.
+
+    Cache layout (format 2) is a directory ``<cache_root>/<cube_id>/`` holding ``manifest.json`` (``format``,
+    ``cube_id``, ``checksum``, ``sessions`` as ordinals, ``instruments``, ``array_names``) plus one ``.npy`` per
+    array (``arr_<name>.npy``, ``exit_at.npy``, ``exit_halted.npy``). Arrays are returned as read-only memory
+    maps rather than anonymous copies: the cube is several GB and almost entirely read-only, so file-backed
+    pages stay reclaimable under memory pressure, while a consumer that needs a modified view (the causal
+    perturbation) can copy on write only the pages it changes.
+
+    The checksum is the same digest as format 1 (array names in sorted order, then raw bytes, then the exit
+    arrays) and is computed over the mapped buffers without a second in-memory copy. A format-1 cache whose
+    checksum verifies is converted to format 2 once and its ``.npz`` is removed only after the new directory
+    verifies; a corrupt or mismatching cache of either format is removed and rebuilt.
+
+    Raises: whatever ``build_research_cube`` raises on a miss; never returns an unverified cube.
+    """
     root = Path(cache_root)
     root.mkdir(parents=True, exist_ok=True)
     cube_id = research_cube_id(inputs)
-    cache_path = root / f"{cube_id}.npz"
-    if cache_path.is_file():
-        try:
-            with np.load(str(cache_path), allow_pickle=True) as store:
-                if str(store["cube_id"]) != cube_id:
-                    raise ValueError("cube id mismatch")
-                checksum = str(store["checksum"])
-                sessions = tuple(date.fromordinal(int(item)) for item in np.asarray(store["sessions"]).tolist())
-                instruments = [str(item) for item in store["instruments"].tolist()]
-                names = [str(item) for item in store["array_names"].tolist()]
-                arrays: dict[str, NDArray[Any]] = {}
-                for name in names:
-                    arrays[name] = np.asarray(store[f"arr_{name}"])
-                exit_at = np.asarray(store["exit_at"], dtype=np.int64)
-                halted = np.asarray(store["exit_halted"], dtype=np.bool_)
-                cube = ResearchCube.from_arrays(
-                    cube_id=cube_id,
-                    sessions=sessions,
-                    instrument_ids=instruments,
-                    arrays=arrays,
-                    exit_at=exit_at,
-                    exit_halted=halted,
-                )
-                if _array_checksum(cube.arrays, cube.exit_at, cube.exit_halted) != checksum:
-                    raise ValueError("checksum mismatch")
-                return cube
-        except Exception:
+    directory = root / cube_id
+    legacy = root / f"{cube_id}.npz"
+
+    cached = _read_cache_dir(directory, cube_id)
+    if cached is not None:
+        return _cube_from_cache(cached)
+    if legacy.is_file():
+        payload = _read_cache_npz(legacy, cube_id)
+        promoted: _CubeCache | None = None
+        if payload is not None and _publish_cache(payload, directory):
+            # Re-read the published directory: the converted load must be memory-mapped like any other hit,
+            # and the ``.npz`` only disappears once the new layout has verified.
+            promoted = _read_cache_dir(directory, cube_id)
+        if promoted is not None or payload is None:
+            # A verified legacy file is only dropped once its replacement verifies; a corrupt one is dropped.
             with contextlib.suppress(OSError):
-                cache_path.unlink()
-    cube = build_research_cube(inputs)
-    payload: dict[str, Any] = {
-        "cube_id": np.asarray(cube.cube_id),
-        "checksum": np.asarray(_array_checksum(cube.arrays, cube.exit_at, cube.exit_halted)),
-        "sessions": np.asarray([day.toordinal() for day in cube.sessions], dtype=np.int64),
-        "instruments": np.asarray(list(cube.instrument_ids)),
-        "array_names": np.asarray(sorted(cube.arrays)),
-        "exit_at": np.asarray(cube.exit_at, dtype=np.int64),
-        "exit_halted": np.asarray(cube.exit_halted, dtype=np.bool_),
-    }
-    for name, arr in cube.arrays.items():
-        payload[f"arr_{name}"] = np.ascontiguousarray(arr)
-    tmp_path = root / f".{cube_id}.{os.getpid()}.tmp.npz"
+                legacy.unlink()
+        if promoted is not None:
+            return _cube_from_cache(promoted)
+    shutil.rmtree(directory, ignore_errors=True)
+    staged = root / f".{cube_id}.{os.getpid()}.tmp"
     try:
-        np.savez(str(tmp_path), **payload)
-        os.replace(tmp_path, cache_path)
+        cube = build_research_cube(inputs)
+        published = _publish_cache(_payload_of(cube), directory)
     finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink()
-    return cube
+        # A crash between staging and renaming, or a build that never reaches the publish, must not leave a
+        # directory the next run would have to unpick.
+        shutil.rmtree(staged, ignore_errors=True)
+    # Serve the miss from the published maps too: returning the anonymous build would leave the first run
+    # holding the whole cube in private memory and force full-size copies in the perturbation.
+    mapped = _read_cache_dir(directory, cube_id) if published else None
+    return _cube_from_cache(mapped) if mapped is not None else cube
