@@ -322,6 +322,110 @@ class KrxApiClient:
     def health_check(self) -> None:
         """Confirm collection credentials were verified without spending quota."""
 
+    def fetch_etf_rows(self, as_of: date, *, tickers: Sequence[str]) -> list[dict[str, Any]]:
+        """Return the ETF-page rows of ``tickers`` for one session, each tagged ``"_endpoint": "etf"``.
+
+        Empty list only when the ETF page is empty without a holiday message (a ticker absent from a
+        non-empty page is simply not returned; the Silver builder decides whether that is an error).
+
+        Raises:
+            ValueError: ``as_of`` not a date or a blank ticker.
+            KrxHolidayError: the shared page reader reports a holiday.
+            ProviderTerminalError: a requested ticker appears twice, ``BAS_DD`` differs from ``as_of``, or
+                ``TDD_CLSPRC`` of a returned row is not a positive integer.
+        """
+        if not isinstance(as_of, date):
+            raise ValueError("as_of must be a date")
+        wanted = tuple(str(ticker).strip() for ticker in tickers)
+        if any(not ticker for ticker in wanted):
+            raise ValueError("tickers must contain non-empty strings")
+        etf_page = self._records(self.ENDPOINTS["ETF_TRADE"], as_of)
+        if not etf_page:
+            return []
+        out: list[dict[str, Any]] = []
+        for ticker in wanted:
+            matches = [record for record in etf_page if str(record.get("ISU_CD") or "").strip() == ticker]
+            if len(matches) > 1:
+                raise ProviderTerminalError(
+                    f"KRX cash-series ETF row is duplicated for {as_of.isoformat()}: {ticker}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            for record in matches:
+                tagged = dict(record)
+                tagged["_endpoint"] = "etf"
+                out.append(tagged)
+        for record in out:
+            bas_dd = str(record.get("BAS_DD") or "").strip()
+            if len(bas_dd) != 8 or not bas_dd.isdigit():
+                raise ProviderTerminalError(
+                    f"KRX cash-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            try:
+                page_day = date(int(bas_dd[:4]), int(bas_dd[4:6]), int(bas_dd[6:8]))
+            except ValueError as exc:
+                raise ProviderTerminalError(
+                    f"KRX cash-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                ) from exc
+            if page_day != as_of:
+                raise ProviderTerminalError(
+                    f"KRX cash-series page date conflicts for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            raw_close = record.get("TDD_CLSPRC")
+            if raw_close is None or (isinstance(raw_close, str) and not raw_close.strip()):
+                raise ProviderTerminalError(
+                    f"KRX cash-series ETF close is not positive for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            if isinstance(raw_close, bool):
+                raise ProviderTerminalError(
+                    f"KRX cash-series ETF close is not positive for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+            try:
+                if isinstance(raw_close, int):
+                    close = raw_close
+                elif isinstance(raw_close, float):
+                    if not raw_close.is_integer():
+                        raise ValueError("non-integral close")
+                    close = int(raw_close)
+                else:
+                    text = str(raw_close).replace(",", "").strip()
+                    if not text.isdigit():
+                        # Allow decimal-integral forms like "5000.0" while rejecting fractions.
+                        from decimal import Decimal, InvalidOperation
+
+                        try:
+                            parsed = Decimal(text)
+                        except InvalidOperation:
+                            raise ValueError("invalid close") from None
+                        if parsed != parsed.to_integral_value() or parsed <= 0:
+                            raise ValueError("non-positive close")
+                        close = int(parsed)
+                    else:
+                        close = int(text)
+            except (TypeError, ValueError):
+                raise ProviderTerminalError(
+                    f"KRX cash-series ETF close is not positive for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                ) from None
+            if close <= 0:
+                raise ProviderTerminalError(
+                    f"KRX cash-series ETF close is not positive for {as_of.isoformat()}",
+                    provider=_PROVIDER,
+                    endpoint=self.ENDPOINTS["ETF_TRADE"],
+                )
+        return out
+
 
 def build_scoped_krx_client(
     *,

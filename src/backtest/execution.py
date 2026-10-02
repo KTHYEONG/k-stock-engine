@@ -108,6 +108,11 @@ def price_orders(
     at the single auction price, so no spread is paid, but an impact premium is
     charged. Sizing uses only decision-session (``t - 1``) liquidity, because
     the session-``t`` volume is unknown when the order is sent.
+
+    Fill price = base price moved adversely by ``base·(impact + extra_slippage) + auction_slippage_ticks·tick``
+    and rounded to whole KRW toward the adverse side, then clipped to the session price limits. The fill price
+    is an expected execution price, not necessarily on the tick grid; this keeps a fractional-tick slippage
+    assumption exact instead of silently rounding it to a full tick.
     """
     session = arrays.sessions[t]
     prev = t - 1
@@ -165,18 +170,20 @@ def price_orders(
             vol60=vol60,
             config=costs,
         )
-        adverse = base * (1.0 + fraction) if is_buy else base * (1.0 - fraction)
         tick = rules.tick_size(session=session, market=market, price=max(1, int(base)))
+        slip = float(costs.auction_slippage_ticks) * float(tick)
         if is_buy:
-            price = math.ceil(adverse / tick) * tick
+            price = math.ceil(base * (1.0 + fraction + float(costs.extra_slippage)) + slip)
             upper = int(arrays.int_fields["upper_limit"][t, n])
             if price > upper:
                 price = upper
         else:
-            price = math.floor(adverse / tick) * tick
+            price = math.floor(base * (1.0 - fraction - float(costs.extra_slippage)) - slip)
             lower = int(arrays.int_fields["lower_limit"][t, n])
             if price < lower:
                 price = lower
+            if price < 1:
+                price = 1
         fills.append(Fill(order, fill_quantity, price))
         if fill_quantity < order.quantity:
             rejects.append(Reject(order, "capacity"))

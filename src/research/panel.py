@@ -206,6 +206,10 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
     Raises:
         ValueError: ``last_row`` outside ``[0, len(cube.sessions) - 1]``.
         KeyError: a cube array required by ``FEATURE_NAMES`` is missing.
+
+    Memory: each feature is stored as float32 as soon as it is final, while every intermediate a later feature
+    reads stays a float64 local. The output is therefore bitwise identical to computing everything in float64
+    and casting at the end, but the full float64 feature set never exists at once.
     """
     n_sessions = len(cube.sessions)
     if last_row < 0 or last_row >= n_sessions:
@@ -238,82 +242,109 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
     w_lag = np.where(np.isfinite(_shift(mcap, 1)) & np.isfinite(rcc), _shift(mcap, 1), 0.0)
     mret = (w_lag * _fill(rcc)).sum(axis=1) / np.maximum(w_lag.sum(axis=1), 1.0)
     mret_col = mret[:, None] * np.ones((1, n_inst))
+    del w_lag, mret, mcap_raw
 
-    f: dict[str, NDArray[np.float64]] = {}
-    f["ret_1d"] = rcc
-    f["ret_5"] = _lag_ratio(tr, 5)
-    f["ret_10"] = _lag_ratio(tr, 10)
-    f["ret_21"] = _lag_ratio(tr, 21)
-    f["mom_63_21"] = np.where(
-        np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 63)),
-        _shift(tr, 21) / _shift(tr, 63) - 1.0,
-        np.nan,
+    out: dict[str, NDArray[np.float32]] = {}
+
+    def _keep(name: str, arr: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Store a final feature as float32; return the float64 array for later features to read."""
+        src = np.where(pres, arr, np.nan) if name in _PRICE_FEATURES else arr
+        out[name] = np.ascontiguousarray(src, dtype=np.float32)
+        return arr
+
+    _keep("ret_1d", rcc)
+    _keep("ret_5", _lag_ratio(tr, 5))
+    _keep("ret_10", _lag_ratio(tr, 10))
+    _keep("ret_21", _lag_ratio(tr, 21))
+    _keep(
+        "mom_63_21",
+        np.where(
+            np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 63)),
+            _shift(tr, 21) / _shift(tr, 63) - 1.0,
+            np.nan,
+        ),
     )
-    f["mom_126_21"] = np.where(
-        np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 126)),
-        _shift(tr, 21) / _shift(tr, 126) - 1.0,
-        np.nan,
+    _keep(
+        "mom_126_21",
+        np.where(
+            np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 126)),
+            _shift(tr, 21) / _shift(tr, 126) - 1.0,
+            np.nan,
+        ),
     )
-    f["mom_252_21"] = np.where(
-        np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 252)),
-        _shift(tr, 21) / _shift(tr, 252) - 1.0,
-        np.nan,
+    _keep(
+        "mom_252_21",
+        np.where(
+            np.isfinite(_shift(tr, 21)) & np.isfinite(_shift(tr, 252)),
+            _shift(tr, 21) / _shift(tr, 252) - 1.0,
+            np.nan,
+        ),
     )
     pk = _roll_max(px, 252, 126)
-    f["hi52"] = px / pk
-    f["lo52"] = px / _roll_min(px, 252, 126)
-    f["dist_hi20"] = px / _roll_max(px, 20, 10)
+    _keep("hi52", px / pk)
+    del pk
+    _keep("lo52", px / _roll_min(px, 252, 126))
+    _keep("dist_hi20", px / _roll_max(px, 20, 10))
     for wnd in (20, 60, 120):
-        f[f"dev_ma{wnd}"] = px / _roll_mean(px, wnd) - 1.0
-    f["vol20"] = _roll_std(rcc, 20, 10)
-    f["vol60"] = _roll_std(rcc, 60, 30)
-    f["vol_ratio"] = f["vol20"] / f["vol60"]
+        _keep(f"dev_ma{wnd}", px / _roll_mean(px, wnd) - 1.0)
+    del px
+    vol20 = _keep("vol20", _roll_std(rcc, 20, 10))
+    vol60 = _keep("vol60", _roll_std(rcc, 60, 30))
+    _keep("vol_ratio", vol20 / vol60)
     with np.errstate(divide="ignore", invalid="ignore"):
         park = np.log(np.where((hi > 0) & (lo > 0), hi / lo, np.nan)) ** 2 / (4 * np.log(2))
     park = np.where(pres, park, np.nan)
-    f["pvol20"] = np.sqrt(_roll_mean(park, 20, 10))
+    _keep("pvol20", np.sqrt(_roll_mean(park, 20, 10)))
+    del park
     with np.errstate(divide="ignore", invalid="ignore"):
         rng = np.where(cl > 0, (hi - lo) / cl, np.nan)
-    f["range20"] = _roll_mean(np.where(pres, rng, np.nan), 20, 10)
-    f["max21"] = _roll_max(rcc, 21, 10)
-    f["min21"] = _roll_min(rcc, 21, 10)
+    _keep("range20", _roll_mean(np.where(pres, rng, np.nan), 20, 10))
+    del rng, hi, lo, cl
+    _keep("max21", _roll_max(rcc, 21, 10))
+    _keep("min21", _roll_min(rcc, 21, 10))
     m1 = _roll_mean(rcc, 60, 30)
     m2 = _roll_mean(rcc**2, 60, 30)
     m3 = _roll_mean(rcc**3, 60, 30)
     sd = np.sqrt(np.maximum(m2 - m1**2, 1e-12))
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["skew60"] = (m3 - 3 * m1 * m2 + 2 * m1**3) / sd**3
+        _keep("skew60", (m3 - 3 * m1 * m2 + 2 * m1**3) / sd**3)
+    del m1, m2, m3, sd
     neg = np.where(rcc < 0, rcc, 0.0)
     neg = np.where(pres, neg, np.nan)
-    f["dvol60"] = np.sqrt(_roll_mean(neg**2, 60, 30))
+    _keep("dvol60", np.sqrt(_roll_mean(neg**2, 60, 30)))
+    del neg
     xm = _roll_mean(rcc * mret_col, 60, 30) - _roll_mean(rcc, 60, 30) * _roll_mean(mret_col, 60, 30)
     vm = _roll_mean(mret_col**2, 60, 30) - _roll_mean(mret_col, 60, 30) ** 2
     with np.errstate(divide="ignore", invalid="ignore"):
         beta = xm / np.where(vm > 1e-12, vm, np.nan)
-    f["beta60"] = beta
-    resid_var = np.maximum(f["vol60"] ** 2 - beta**2 * vm, 0)
-    f["ivol60"] = np.sqrt(resid_var)
-    f["on20"] = _roll_mean(ron, 20, 10)
-    f["id20"] = _roll_mean(rid, 20, 10)
-    f["on60"] = _roll_mean(ron, 60, 30)
-    f["id60"] = _roll_mean(rid, 60, 30)
-    f["gap1"] = ron
-    f["absgap20"] = _roll_mean(np.abs(ron), 20, 10)
+    _keep("beta60", beta)
+    resid_var = np.maximum(vol60**2 - beta**2 * vm, 0)
+    _keep("ivol60", np.sqrt(resid_var))
+    del xm, vm, beta, resid_var, vol20, vol60, mret_col
+    _keep("on20", _roll_mean(ron, 20, 10))
+    _keep("id20", _roll_mean(rid, 20, 10))
+    _keep("on60", _roll_mean(ron, 60, 30))
+    _keep("id60", _roll_mean(rid, 60, 30))
+    del rid
+    _keep("gap1", ron)
+    _keep("absgap20", _roll_mean(np.abs(ron), 20, 10))
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["size"] = np.log(mcap)
+        _keep("size", np.log(mcap))
     tv20 = _roll_mean(tv, 20, 10)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["lnadtv"] = np.log(np.where(tv20 > 0, tv20, np.nan))
-        f["turn20"] = tv20 / mcap
-        f["vol_surge5_60"] = _roll_mean(tv, 5, 3) / _roll_mean(tv, 60, 30)
+        _keep("lnadtv", np.log(np.where(tv20 > 0, tv20, np.nan)))
+        _keep("turn20", tv20 / mcap)
+        _keep("vol_surge5_60", _roll_mean(tv, 5, 3) / _roll_mean(tv, 60, 30))
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["tv_z1"] = tv / tv20
+        _keep("tv_z1", tv / tv20)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["amihud20"] = _roll_mean(np.where(tv > 0, np.abs(rcc) / (tv / 1e9), np.nan), 20, 10)
+        _keep("amihud20", _roll_mean(np.where(tv > 0, np.abs(rcc) / (tv / 1e9), np.nan), 20, 10))
+    del tv20
     upv = np.where(rcc > 0, tv, 0.0)
     upv = np.where(pres, upv, np.nan)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["upvol20"] = _roll_sum(upv, 20) / np.maximum(_roll_sum(tv, 20), 1.0)
+        _keep("upvol20", _roll_sum(upv, 20) / np.maximum(_roll_sum(tv, 20), 1.0))
+    del upv, tv, rcc
 
     for nm, key in (("for", "flow_for_krw"), ("ins", "flow_ins_krw"), ("ind", "flow_ind_krw")):
         fl = np.where(pres, _f(key), np.nan)
@@ -322,7 +353,9 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
                 val = _roll_sum(fl, wnd) / mcap
             cnt = _roll_cnt(fl, wnd)
             val[cnt < wnd * 0.6] = np.nan
-            f[f"fl_{nm}{wnd}"] = val
+            _keep(f"fl_{nm}{wnd}", val)
+            del cnt
+        del fl, val
 
     fresh = np.isfinite(_f("f_age_q")) & (_f("f_age_q") <= 2)
     eq = _f("f_equity")
@@ -333,20 +366,30 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
     niq = _f("f_net_income_q")
     niq_ly = _f("f_net_income_q_ly")
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["bm"] = np.where(fresh & (eq > 0), eq / mcap, np.nan)
-        f["ep"] = np.where(fresh, ni_ttm / mcap, np.nan)
-        f["roe"] = np.where(fresh & (eq > 0), ni_ttm / eq, np.nan)
-        f["opa"] = np.where(fresh & (assets > 0), _f("f_operating_profit_ttm") / assets, np.nan)
-        f["gpa"] = np.where(fresh & (assets > 0), _f("f_gross_profit_ttm") / assets, np.nan)
-        f["sue_op"] = np.where(fresh, (opq - opq_ly) / mcap, np.nan)
-        f["sue_ni"] = np.where(fresh, (niq - niq_ly) / mcap, np.nan)
-        f["asset_g"] = np.where(fresh & (_f("f_assets_ly") > 0), assets / _f("f_assets_ly") - 1.0, np.nan)
-        f["accrual"] = np.where(
-            fresh & (assets > 0), (ni_ttm - _f("f_operating_cash_flow_ttm")) / assets, np.nan
+        _keep("bm", np.where(fresh & (eq > 0), eq / mcap, np.nan))
+        _keep("ep", np.where(fresh, ni_ttm / mcap, np.nan))
+        _keep("roe", np.where(fresh & (eq > 0), ni_ttm / eq, np.nan))
+        _keep("opa", np.where(fresh & (assets > 0), _f("f_operating_profit_ttm") / assets, np.nan))
+        _keep("gpa", np.where(fresh & (assets > 0), _f("f_gross_profit_ttm") / assets, np.nan))
+        _keep("sue_op", np.where(fresh, (opq - opq_ly) / mcap, np.nan))
+        _keep("sue_ni", np.where(fresh, (niq - niq_ly) / mcap, np.nan))
+        _keep(
+            "asset_g",
+            np.where(fresh & (_f("f_assets_ly") > 0), assets / _f("f_assets_ly") - 1.0, np.nan),
         )
-        f["sales_g"] = np.where(
-            fresh & (_f("f_sales_ttm_ly") > 0), _f("f_sales_ttm") / _f("f_sales_ttm_ly") - 1.0, np.nan
+        _keep(
+            "accrual",
+            np.where(
+                fresh & (assets > 0), (ni_ttm - _f("f_operating_cash_flow_ttm")) / assets, np.nan
+            ),
         )
+        _keep(
+            "sales_g",
+            np.where(
+                fresh & (_f("f_sales_ttm_ly") > 0), _f("f_sales_ttm") / _f("f_sales_ttm_ly") - 1.0, np.nan
+            ),
+        )
+    del fresh, eq, ni_ttm, assets, opq, opq_ly, niq, niq_ly
 
     sess_qk = (
         np.asarray(
@@ -358,21 +401,31 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
     eqk = _f("earn_qk")
     e_fresh = np.isfinite(eqk) & ((sess_qk - eqk) <= 2)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["sue_op_e"] = np.where(
-            e_fresh, (_f("earn_operating_profit_q") - _f("earn_operating_profit_q_ly")) / mcap, np.nan
+        _keep(
+            "sue_op_e",
+            np.where(
+                e_fresh, (_f("earn_operating_profit_q") - _f("earn_operating_profit_q_ly")) / mcap, np.nan
+            ),
         )
-        f["sue_ni_e"] = np.where(
-            e_fresh, (_f("earn_net_income_q") - _f("earn_net_income_q_ly")) / mcap, np.nan
+        _keep(
+            "sue_ni_e",
+            np.where(
+                e_fresh, (_f("earn_net_income_q") - _f("earn_net_income_q_ly")) / mcap, np.nan
+            ),
         )
-        f["sue_sales_e"] = np.where(
-            e_fresh,
-            (_f("earn_sales_q") - _f("earn_sales_q_ly")) / np.abs(_f("earn_sales_q_ly")),
-            np.nan,
+        _keep(
+            "sue_sales_e",
+            np.where(
+                e_fresh,
+                (_f("earn_sales_q") - _f("earn_sales_q_ly")) / np.abs(_f("earn_sales_q_ly")),
+                np.nan,
+            ),
         )
+    del sess_qk, eqk, e_fresh, mcap
     ea = _f("earn_avail_t")
     idx = np.arange(n_out, dtype=np.float64)[:, None] * np.ones((1, n_inst))
     age = np.where(np.isfinite(ea), idx - ea, np.nan)
-    f["earn_age"] = age
+    _keep("earn_age", age)
     ok = np.isfinite(ea) & (age >= 0) & (age <= 60)
     ea_i = np.where(ok, ea, 0).astype(int)
     cols = np.arange(n_inst)[None, :] * np.ones((n_out, 1), dtype=int)
@@ -381,31 +434,30 @@ def build_panel(cube: ResearchCube, *, last_row: int) -> FeaturePanel:
     t_b = tr[rows_lo, cols]
     t_c = tr[rows_hi, cols]
     with np.errstate(divide="ignore", invalid="ignore"):
-        f["ear"] = np.where(ok & np.isfinite(t_b) & np.isfinite(t_c) & (t_b > 0), t_c / t_b - 1.0, np.nan)
-        f["post_ear"] = np.where(ok & np.isfinite(t_b) & (t_b > 0), tr / t_b - 1.0, np.nan)
-
-    for name in _PRICE_FEATURES:
-        f[name] = np.where(pres, f[name], np.nan)
+        _keep(
+            "ear",
+            np.where(ok & np.isfinite(t_b) & np.isfinite(t_c) & (t_b > 0), t_c / t_b - 1.0, np.nan),
+        )
+        _keep("post_ear", np.where(ok & np.isfinite(t_b) & (t_b > 0), tr / t_b - 1.0, np.nan))
+    del ea, idx, age, ok, ea_i, cols, rows_lo, rows_hi, t_b, t_c
 
     tr_ff = pd.DataFrame(tr).ffill().to_numpy(dtype=np.float64)
+    del tr
     with np.errstate(invalid="ignore"):
         uo = _shift(tr_ff, 1) * (1.0 + np.where(np.isfinite(ron), ron, 0.0))
-    labels: dict[int, NDArray[np.float64]] = {}
+    del tr_ff, ron
+    labels32: dict[int, NDArray[np.float32]] = {}
     for h in HORIZONS:
         num = _shift(uo, -(1 + h))
         den = _shift(uo, -1)
         with np.errstate(divide="ignore", invalid="ignore"):
             y = np.where(np.isfinite(num) & np.isfinite(den) & (den > 0), num / den - 1.0, np.nan)
-        labels[h] = y
+        labels32[h] = np.ascontiguousarray(y, dtype=np.float32)
+    del uo, num, den, y
 
-    features32: dict[str, NDArray[np.float32]] = {}
-    for name in FEATURE_NAMES:
-        features32[name] = np.ascontiguousarray(f[name], dtype=np.float32)
-        features32[name].flags.writeable = False
-    labels32: dict[int, NDArray[np.float32]] = {}
-    for h in HORIZONS:
-        labels32[h] = np.ascontiguousarray(labels[h], dtype=np.float32)
-        labels32[h].flags.writeable = False
+    features32: dict[str, NDArray[np.float32]] = {name: out[name] for name in FEATURE_NAMES}
+    for arr in list(features32.values()) + list(labels32.values()):
+        arr.flags.writeable = False
 
     _LOG.info("[DATA] panel rows=%d features=%d horizons=%s", n_out, len(FEATURE_NAMES), tuple(HORIZONS))
     return FeaturePanel(features=features32, labels=labels32, last_row=last_row)

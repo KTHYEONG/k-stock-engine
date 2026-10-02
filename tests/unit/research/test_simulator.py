@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from src.data.research_protocol import LockboxAuthorization, LockboxError, Segment
+from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.cube import ResearchCube
 from src.research.simulator import SimConfig, simulate
 from tests.fixtures.synthetic_panel import synthetic_cube, synthetic_sessions
@@ -16,8 +16,8 @@ from tests.fixtures.synthetic_panel import synthetic_cube, synthetic_sessions
 INSTRS = ["KRX:000001", "KRX:000002", "KRX:000003"]
 
 
-def _auth(start: date, end: date) -> LockboxAuthorization:
-    return LockboxAuthorization(segment=Segment.DISCOVERY, start=start, end=end, spec_hash=None, evidence=True)
+def _auth(start: date, end: date) -> WindowAuthorization:
+    return WindowAuthorization(start=start, end=end)
 
 
 def _config(**overrides: Any) -> SimConfig:
@@ -163,7 +163,7 @@ def test_sell_tax_and_commission_charged() -> None:
 
 
 def test_tick_floor_applies() -> None:
-    """Zero impact still pays the tick over open."""
+    """Zero impact pays no tick with s=0 and one tick with s=1."""
     sessions = synthetic_sessions(3)
     cube = synthetic_cube(sessions, INSTRS, close=1000.0, tick=5.0)
     weights = {0: np.array([1.0, 0.0, 0.0])}
@@ -171,7 +171,12 @@ def test_tick_floor_applies() -> None:
         cube, weights, start=sessions[0], end=sessions[-1],
         config=_config(), authorization=_auth(sessions[0], sessions[-1]),
     )
-    assert float(result.cost[1] / result.turnover[1]) == pytest.approx(0.005, abs=1e-12)
+    assert float(result.cost[1]) == pytest.approx(0.0, abs=1e-12)
+    one_tick = simulate(
+        cube, weights, start=sessions[0], end=sessions[-1],
+        config=_config(auction_slippage_ticks=1.0), authorization=_auth(sessions[0], sessions[-1]),
+    )
+    assert float(one_tick.cost[1] / one_tick.turnover[1]) == pytest.approx(0.005, abs=1e-12)
 
 
 def test_halted_exit_policy() -> None:
@@ -218,12 +223,12 @@ def test_execution_delay_shifts_fills() -> None:
     assert int(slow.holdings[2]) == 1
 
 
-def test_lockbox_window_enforced() -> None:
+def test_run_window_outside_authorization_rejected() -> None:
     """Runs outside the authorization fail closed."""
     sessions = synthetic_sessions(3)
     cube = synthetic_cube(sessions, INSTRS)
     auth = _auth(date(2023, 1, 1), date(2023, 12, 31))
-    with pytest.raises(LockboxError):
+    with pytest.raises(WindowError):
         simulate(
             cube, {}, start=sessions[0], end=date(2024, 1, 5),
             config=_config(), authorization=auth,
@@ -294,7 +299,7 @@ def test_simulate_validation_branches() -> None:
     sessions = synthetic_sessions(4)
     cube = synthetic_cube(sessions, INSTRS)
     auth = _auth(sessions[0], sessions[-1])
-    with pytest.raises(LockboxError):
+    with pytest.raises(WindowError):
         simulate(cube, {}, start=sessions[0], end=sessions[-1],
                  config=_config(), authorization=_auth(sessions[1], sessions[-1]))
     with pytest.raises(ValueError, match="within the cube"):
@@ -315,3 +320,42 @@ def test_simulate_validation_branches() -> None:
     with pytest.raises(ValueError, match="invalid target"):
         simulate(cube, {0: np.array([0.6, 0.6, 0.0])}, start=sessions[0], end=sessions[-1],
                  config=_config(), authorization=auth)
+
+
+def test_auction_slippage_validated_and_loaded(tmp_path) -> None:
+    """SimConfig validates the auction grid and reads the engine TOML key."""
+    with pytest.raises(ValueError, match="finite"):
+        _config(auction_slippage_ticks=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        _config(auction_slippage_ticks=-0.5)
+    assert _config(auction_slippage_ticks=0.5).auction_slippage_ticks == pytest.approx(0.5)
+    engine = tmp_path / "engine.toml"
+    engine.write_text(
+        'scenario = "open_auction"\nmax_participation = 0.1\ncarry_unfilled = false\n'
+        'commission_rate = "0.001"\ndividend_withholding_rate = "0.1"\nimpact_k = 0.0\n'
+        'cash_buffer = 0.0\nauction_slippage_ticks = 1.5\n',
+        encoding="utf-8",
+    )
+    from pathlib import Path as _Path
+
+    assert SimConfig.from_engine_toml(_Path(engine), capital_krw=100).auction_slippage_ticks == pytest.approx(1.5)
+    assert SimConfig.from_engine_toml(
+        _Path("config/backtest/default_engine.toml"), capital_krw=100
+    ).auction_slippage_ticks == pytest.approx(1.0)
+
+
+def test_simulator_ledger_pricing_parity() -> None:
+    """One-tick slippage prices the same fraction in both engines."""
+    sessions = synthetic_sessions(3)
+    cube = synthetic_cube(sessions, INSTRS, close=10000.0, tick=50.0)
+    weights = {0: np.array([1.0, 0.0, 0.0])}
+    one_tick = simulate(
+        cube, weights, start=sessions[0], end=sessions[-1],
+        config=_config(auction_slippage_ticks=1.0), authorization=_auth(sessions[0], sessions[-1]),
+    )
+    assert float(one_tick.cost[1] / one_tick.turnover[1]) == pytest.approx(50.0 / 10000.0, rel=1e-9)
+    half_tick = simulate(
+        cube, weights, start=sessions[0], end=sessions[-1],
+        config=_config(auction_slippage_ticks=0.5), authorization=_auth(sessions[0], sessions[-1]),
+    )
+    assert float(half_tick.cost[1] / half_tick.turnover[1]) == pytest.approx(25.0 / 10000.0, rel=1e-9)

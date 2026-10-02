@@ -16,7 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from src.data.research_protocol import LockboxAuthorization, LockboxError
+from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.panel import FEATURE_NAMES, FeaturePanel
 
 __all__ = ["ScoreMatrix", "ScorerConfig", "walk_forward_scores"]
@@ -27,8 +27,8 @@ _LOG = logging.getLogger(__name__)
 class ScorerConfig(BaseModel):
     """Frozen hyper-parameters of the ensemble scorer; its canonical JSON is part of the strategy identity.
 
-    Why frozen: every tuned value would be a multiple-testing trial. The defaults are the probe values and
-    are never re-tuned on discovery or holdout results.
+    Why frozen: a scorer change is a new strategy identity that must win a champion/challenger comparison;
+    silently re-tuning in place would make every stored run irreproducible.
 
     Fields (defaults): horizons=(5, 10, 21); num_boost_round=300; learning_rate=0.03; num_leaves=15;
     min_data_in_leaf=800; feature_fraction=0.7; bagging_fraction=0.7; bagging_freq=1; lambda_l2=50.0;
@@ -113,7 +113,7 @@ def _weekly_rows(sessions: Sequence[date], *, lo: int, hi: int) -> tuple[int, ..
 
 
 def _rank_stack(
-    feat_mats: Sequence[NDArray[np.float64]],
+    feat_mats: Sequence[NDArray[np.float32]],
     universe: NDArray[np.bool_],
     rows: Sequence[int],
     min_count: int,
@@ -151,7 +151,7 @@ def _rank_stack(
 
 
 def _winsor_z_by_date(
-    labels: NDArray[np.float64],
+    labels: NDArray[np.float32],
     rows: NDArray[np.int64],
     cols: NDArray[np.int64],
     low_pct: float,
@@ -245,7 +245,7 @@ def walk_forward_scores(
     config: ScorerConfig,
     *,
     test_years: Sequence[int],
-    authorization: LockboxAuthorization,
+    authorization: WindowAuthorization,
 ) -> ScoreMatrix:
     """Train one LightGBM regressor per horizon and year on strictly earlier data; score each test year.
 
@@ -260,8 +260,12 @@ def walk_forward_scores(
     Why ranked features + z target: the probe showed the alpha sits in the return tail; ordinal losses
     (LambdaRank, XENDCG, top-decile classification) and robust losses (L1, Huber) destroyed it.
 
+    Memory: feature matrices are read in the panel's float32 dtype. Only the rank-normalised design rows are
+    float64, built one session row at a time. A float32-to-float64 cast is exact, so scores are bitwise
+    identical to casting the whole panel first.
+
     Raises:
-        LockboxError: a test year ends after ``authorization.end``.
+        WindowError: a test year ends after ``authorization.end``.
         ValueError: a fold has fewer than ``min_train_rows`` training rows, ``test_years`` is empty, is
             not ascending, or begins before ``config.first_test_year``.
     """
@@ -272,7 +276,7 @@ def walk_forward_scores(
         raise ValueError(f"test_years {years} begins before first_test_year {config.first_test_year}")
     if list(years) != sorted(years) or len(set(years)) != len(years):
         raise ValueError(f"test_years must be strictly ascending, got {years}")
-    feat_mats = [np.asarray(panel.features[name], dtype=np.float64) for name in FEATURE_NAMES]
+    feat_mats = [np.asarray(panel.features[name]) for name in FEATURE_NAMES]
     shape = feat_mats[0].shape
     if any(mat.shape != shape for mat in feat_mats):
         raise ValueError("panel feature arrays have mismatched shapes")
@@ -289,13 +293,13 @@ def walk_forward_scores(
         if not members:
             raise ValueError(f"test year {year} has no sessions in the panel")
         if max(sess[r] for r in members) > authorization.end:
-            raise LockboxError(f"test year {year} ends after the authorization end {authorization.end}")
+            raise WindowError(f"test year {year} ends after the authorization end {authorization.end}")
         year_rows[year] = members
     weekly = list(_weekly_rows(sess, lo=0, hi=n_rows))
     train_x, train_r, train_i = _rank_stack(feat_mats, uni, weekly, config.min_cross_section)
     per_horizon: list[NDArray[np.float64]] = []
     for horizon in config.horizons:
-        lab = np.asarray(panel.labels[int(horizon)], dtype=np.float64)
+        lab = np.asarray(panel.labels[int(horizon)])
         if lab.shape != (n_rows, n_inst):
             raise ValueError(f"label array for horizon {horizon} has wrong shape {lab.shape}")
         target = _winsor_z_by_date(

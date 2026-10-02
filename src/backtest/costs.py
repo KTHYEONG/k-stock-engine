@@ -15,23 +15,40 @@ class Side(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CostConfig:
-    """Broker and market-impact parameters; all values come from run config.
+    """Broker, auction-slippage and market-impact parameters; all values come from run config.
 
     Attributes:
         commission_rate: Broker commission per side on notional.
-        impact_k: Coefficient of the square-root impact term.
-        dividend_withholding_rate: Combined income and local income tax withheld
-            on cash dividends, a fraction of the gross amount.
+        impact_k: Coefficient of the square-root impact term ``k·σ₆₀·√(notional/adtv20)``.
+        dividend_withholding_rate: Tax withheld on cash dividends.
+        auction_slippage_ticks: Adverse price offset per side at the open auction, in ticks of the base price
+            (fractional allowed). Why explicit: the auction has no spread, but our order moves the clearing
+            price; the size of that move cannot be measured from historical data, so it is a scenario parameter evaluated on a grid.
+        extra_slippage: Additional adverse price fraction per side (stress scenarios only; 0 in base runs).
+        cash_yield_tax_rate: Tax on the positive annual yield of the cash sweep (bond-ETF distribution tax).
     """
 
     commission_rate: Decimal
     impact_k: float
     dividend_withholding_rate: Decimal
+    auction_slippage_ticks: float = 0.0
+    extra_slippage: float = 0.0
+    cash_yield_tax_rate: Decimal = Decimal("0.154")
 
     def __post_init__(self) -> None:
         rate = self.dividend_withholding_rate
         if not Decimal(0) <= rate < Decimal(1):
             raise ValueError(f"dividend_withholding_rate must be in [0, 1), got {rate!r}")
+        for name in ("auction_slippage_ticks", "extra_slippage"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite number >= 0, got {value!r}")
+            out = float(value)
+            if not math.isfinite(out) or out < 0.0:
+                raise ValueError(f"{name} must be a finite number >= 0, got {value!r}")
+        tax = self.cash_yield_tax_rate
+        if not Decimal(0) <= tax < Decimal(1):
+            raise ValueError(f"cash_yield_tax_rate must be in [0, 1), got {tax!r}")
 
 
 @dataclass(frozen=True, slots=True)

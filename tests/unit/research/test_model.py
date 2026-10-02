@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import src.research.model as model_mod
-from src.data.research_protocol import LockboxAuthorization, LockboxError, Segment
+from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.model import ScoreMatrix, ScorerConfig, _ensemble_average, walk_forward_scores
 from src.research.panel import FEATURE_NAMES, FeaturePanel
 
@@ -49,10 +49,8 @@ def _tiny_config(**overrides: object) -> ScorerConfig:
     return ScorerConfig(**kwargs)  # type: ignore[arg-type]
 
 
-def _auth(sess: tuple[date, ...], end: date | None = None) -> LockboxAuthorization:
-    return LockboxAuthorization(
-        segment=Segment.DISCOVERY, start=sess[0], end=end or sess[-1], spec_hash=None, evidence=True
-    )
+def _auth(sess: tuple[date, ...], end: date | None = None) -> WindowAuthorization:
+    return WindowAuthorization(start=sess[0], end=end or sess[-1])
 
 
 def _universe(n_s: int = N_SESS, n_n: int = N_INST) -> np.ndarray:
@@ -213,7 +211,7 @@ def test_sealed_segment_refused(monkeypatch: pytest.MonkeyPatch) -> None:
         return _StubBooster()
 
     monkeypatch.setattr(model_mod, "_train_booster", _fake)
-    with pytest.raises(LockboxError, match="authorization"):
+    with pytest.raises(WindowError, match="ends after"):
         walk_forward_scores(
             _synthetic_panel(),
             _universe(),
@@ -349,3 +347,60 @@ def test_weekly_rows_reject_bad_window() -> None:
         model_mod._weekly_rows(sess, lo=-1, hi=10)
     with pytest.raises(ValueError, match="within"):
         model_mod._weekly_rows(sess, lo=0, hi=31)
+
+
+def _scores_digest(scores: np.ndarray) -> str:
+    import hashlib
+
+    arr = np.asarray(scores)
+    canon = np.where(np.isnan(arr), 0.0, arr)
+    return hashlib.sha256(np.ascontiguousarray(canon).tobytes()).hexdigest()
+
+
+def test_scores_bitwise_golden() -> None:
+    sess = _sessions()
+    out = walk_forward_scores(
+        _synthetic_panel(),
+        _universe(),
+        sess,
+        _tiny_config(),
+        test_years=(2018, 2019),
+        authorization=_auth(sess),
+    )
+    assert _scores_digest(np.asarray(out.scores)) == (
+        "09ac305158002f2bc78c1df638d92cae1374f0f318ecd3fdd8e35b8bf7a79bd3"
+    )
+
+
+def test_no_full_float64_feature_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gc
+    import tracemalloc
+
+    n_s, n_n = 300, 200
+    start = date(2017, 3, 8)
+    sess = tuple(start + timedelta(days=i) for i in range(n_s))
+    rng = np.random.default_rng(3)
+    feats = {
+        name: np.ascontiguousarray(rng.standard_normal((n_s, n_n)), dtype=np.float32)
+        for name in FEATURE_NAMES
+    }
+    labels = {5: np.ascontiguousarray(rng.standard_normal((n_s, n_n)) * 0.02, dtype=np.float32)}
+    panel = FeaturePanel(features=feats, labels=labels, last_row=n_s - 1)
+    uni = np.zeros((n_s, n_n), dtype=bool)
+    uni[:14, :] = True
+    uni[-1, :] = True
+    monkeypatch.setattr(model_mod, "_train_booster", lambda *a, **k: _StubBooster())
+    gc.collect()
+    tracemalloc.start()
+    before, _ = tracemalloc.get_traced_memory()
+    walk_forward_scores(
+        panel,
+        uni,
+        sess,
+        _tiny_config(horizons=(5,)),
+        test_years=(2018,),
+        authorization=_auth(sess),
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak - before < 0.25 * 62 * n_s * n_n * 8

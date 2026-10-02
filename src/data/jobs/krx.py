@@ -17,6 +17,7 @@ from src.config.providers import ProviderPolicy
 from src.core.pit import EvidenceKind, PITDataError
 from src.core.time import KRX_TZ
 from src.data.evidence_sources import (
+    KRX_CASH_SERIES_SOURCE,
     KRX_DAILY_MARKET_SOURCE,
     KRX_HEDGE_SERIES_SOURCE,
     KRX_SECURITY_MASTER_SOURCE,
@@ -29,16 +30,19 @@ from src.integrations.krx.client import KrxApiClient
 from src.integrations.quota import ProviderQuotaStateStore
 
 __all__ = [
+    "KRX_CASH_SERIES_SOURCE",
     "KRX_DAILY_MARKET_SOURCE",
     "KRX_HEDGE_SERIES_SOURCE",
     "KRX_JOBS",
     "KRX_QUOTA_PROVIDER",
     "KRX_SECURITY_MASTER_SOURCE",
+    "KrxCashSeriesJob",
     "KrxDailyMarketJob",
     "KrxHedgeSeriesJob",
     "KrxSecurityMasterJob",
     "build_krx_job_context",
     "completed_sessions",
+    "krx_cash_series_scoped_payload",
     "krx_daily_market_scoped_payload",
     "krx_hedge_series_scoped_payload",
     "krx_security_master_scoped_payload",
@@ -154,6 +158,28 @@ def krx_hedge_series_scoped_payload(
         payload=body,
         retrieved_at=retrieved_at,
         source_label=f"krx:hedge-series:{session.isoformat()}",
+    )
+
+
+def krx_cash_series_scoped_payload(
+    *, records: Sequence[Mapping[str, Any]], session: date, retrieved_at: datetime
+) -> ScopedRawPayload:
+    """Convert one validated KRX cash-series page to a scoped payload."""
+    body = json.dumps(
+        {"session": session.isoformat(), "records": [dict(record) for record in records]},
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return ScopedRawPayload(
+        kind=EvidenceKind.DAILY_MARKET,
+        source=KRX_CASH_SERIES_SOURCE,
+        natural_key=session.isoformat(),
+        as_of=session,
+        fiscal_period=None,
+        status=EvidenceStatus.SUCCESS,
+        payload=body,
+        retrieved_at=retrieved_at,
+        source_label=f"krx:cash-series:{session.isoformat()}",
     )
 
 
@@ -322,10 +348,68 @@ class KrxHedgeSeriesJob:
         ctx.collector.health_check()
 
 
+class KrxCashSeriesJob:
+    """Cash-ETF page rows for every completed session from ``CashSeriesConfig.collection_start``."""
+
+    name = "krx_cash_series"
+    source = KRX_CASH_SERIES_SOURCE
+    kind = EvidenceKind.DAILY_MARKET
+
+    def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
+        from src.config import load_runtime_config
+        from src.data.cash_series_silver import load_cash_series_config
+
+        cash = load_cash_series_config(load_runtime_config().cash_series)
+        sessions = completed_sessions(evidence_start=cash.collection_start, now=ctx.now())
+        if not sessions:
+            return ()
+        answered = ctx.catalog.latest(source=self.source, natural_keys={day.isoformat() for day in sessions})
+        units: list[JobUnit] = []
+        for day in sessions:
+            entry = answered.get(day.isoformat())
+            if entry is not None and entry.status in _ANSWERED:
+                continue
+            units.append(
+                JobUnit(
+                    source=self.source,
+                    natural_key=day.isoformat(),
+                    payload={"session": day.isoformat()},
+                    max_requests=_MAX_REQUESTS_PER_SESSION,
+                )
+            )
+        return units
+
+    def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
+        from src.config import load_runtime_config
+        from src.data.cash_series_silver import load_cash_series_config
+
+        cash = load_cash_series_config(load_runtime_config().cash_series)
+        retrieved_at = ctx.now()
+        out: list[ScopedRawPayload] = []
+        for unit in units:
+            session = date.fromisoformat(unit.payload["session"])
+            records = list(ctx.collector.fetch_etf_rows(session, tickers=(cash.ticker,)))
+            if not records:
+                out.append(
+                    _krx_empty_scoped_payload(
+                        kind=self.kind, source=self.source, session=session, retrieved_at=retrieved_at
+                    )
+                )
+                continue
+            out.append(
+                krx_cash_series_scoped_payload(records=records, session=session, retrieved_at=retrieved_at)
+            )
+        return out
+
+    def health_check(self, ctx: JobContext) -> None:
+        ctx.collector.health_check()
+
+
 KRX_JOBS: Mapping[str, JobSpec] = {
     KrxDailyMarketJob.name: KrxDailyMarketJob(),
     KrxSecurityMasterJob.name: KrxSecurityMasterJob(),
     KrxHedgeSeriesJob.name: KrxHedgeSeriesJob(),
+    KrxCashSeriesJob.name: KrxCashSeriesJob(),
 }
 
 

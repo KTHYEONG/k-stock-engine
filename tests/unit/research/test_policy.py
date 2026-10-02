@@ -1,6 +1,7 @@
 """Trend-cash selection policy invariants."""
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 import numpy as np
@@ -185,6 +186,125 @@ def test_spec_identity() -> None:
     assert base.spec_hash != other_n.spec_hash
     assert base.spec_hash == _policy(n=20).spec_hash
     assert "capital" not in base.canonical_json()
+
+
+def _wide_row(n: int, n_pass: int, *, row: int = 5) -> tuple[ResearchCube, FeaturePanel, ScoreMatrix, np.ndarray]:
+    """Cube/panel/scores of ``n`` names where the first ``n_pass`` pass the trend rule, and a full universe."""
+    shape = (S, n)
+    cube = ResearchCube.from_arrays(
+        cube_id="research_cube_0123456789abcdef",
+        sessions=list(_sessions()),
+        instrument_ids=[f"KRX:{i:06d}" for i in range(n)],
+        arrays={"close": np.full(shape, 5000.0)},
+        exit_at=np.full(n, -1, dtype=np.int64),
+        exit_halted=np.zeros(n, dtype=np.bool_),
+    )
+    ret = np.full(shape, 0.05, dtype=np.float32)
+    ret[row, n_pass:] = np.float32(-0.01)
+    panel = FeaturePanel(
+        features={"dev_ma20": np.full(shape, 0.05, dtype=np.float32), "ret_21": ret},
+        labels={},
+        last_row=S - 1,
+    )
+    scores = np.full(shape, 0.0, dtype=np.float64)
+    scores[row] = np.arange(n, 0, -1, dtype=np.float64)
+    return cube, panel, ScoreMatrix(
+        scores=np.ascontiguousarray(scores, dtype=np.float32),
+        test_years=(2020,),
+        config_hash="test",
+        last_row=S - 1,
+    ), np.ones(shape, dtype=bool)
+
+
+def _redist_weights(n: int, n_pass: int, cap: float | None) -> np.ndarray:
+    cube, panel, scores, uni = _wide_row(n, n_pass)
+    out = build_targets(
+        _policy(n=n, redistribute_cap_multiple=cap), cube, panel, scores, uni,
+        rows=[5], capital_krw=CAP, cash_buffer=0.0,
+    )
+    return np.asarray(out[5])
+
+
+def test_cap_one_reproduces_legacy_weights() -> None:
+    for n_pass in (0, 1, 8, 19, 20):
+        legacy = _redist_weights(20, n_pass, None)
+        capped = _redist_weights(20, n_pass, 1.0)
+        assert np.array_equal(capped, legacy)
+
+
+def test_failed_slots_spread_under_the_cap() -> None:
+    w = _redist_weights(20, 8, 2.0)
+    assert np.asarray(w[:8]) == pytest.approx([0.1] * 8)
+    assert np.asarray(w[8:]) == pytest.approx([0.0] * 12)
+    assert float(w.sum()) == pytest.approx(0.8)
+
+
+def test_enough_passing_names_fill_the_book() -> None:
+    w = _redist_weights(20, 15, 2.0)
+    assert np.asarray(w[:15]) == pytest.approx([1 / 15] * 15)
+    assert np.asarray(w[15:]) == pytest.approx([0.0] * 5)
+    assert float(w.sum()) == pytest.approx(1.0)
+
+
+def test_no_passing_names_stays_cash() -> None:
+    assert np.asarray(_redist_weights(20, 0, 2.0)) == pytest.approx([0.0] * 20)
+
+
+def test_uncapped_split_divides_the_whole_book() -> None:
+    w = _redist_weights(20, 3, 100.0)
+    assert np.asarray(w[:3]) == pytest.approx([1 / 3] * 3)
+    assert float(w.sum()) == pytest.approx(1.0)
+
+
+def test_redistribution_ignores_disabled_trend_legs() -> None:
+    cube, panel, scores, uni = _wide_row(20, 0)
+    plain = build_targets(
+        _policy(n=20, trend_min_ret21=None, redistribute_cap_multiple=None),
+        cube, panel, scores, uni, rows=[5], capital_krw=CAP, cash_buffer=0.0,
+    )
+    capped = build_targets(
+        _policy(n=20, trend_min_ret21=None, redistribute_cap_multiple=2.0),
+        cube, panel, scores, uni, rows=[5], capital_krw=CAP, cash_buffer=0.0,
+    )
+    assert np.array_equal(np.asarray(capped[5]), np.asarray(plain[5]))
+    assert float(np.asarray(capped[5]).sum()) == pytest.approx(1.0)
+
+
+def test_incumbency_survives_redistribution() -> None:
+    mat = _full_scores()
+    mat[4] = [0.9, 0.8, 0.7, 0.6, np.nan, np.nan]
+    mat[5] = [0.95, 0.05, 0.94, 0.93, np.nan, np.nan]
+    panel = _panel()
+    panel.features["ret_21"][4:, 1] = np.float32(-0.01)
+    uni = np.ones((S, N), dtype=bool)
+    kwargs: dict[str, object] = {"rows": [4, 5], "capital_krw": CAP, "cash_buffer": 0.0}
+    base = build_targets(
+        _policy(n=2, redistribute_cap_multiple=None), _cube(), panel, _scores(mat), uni, **kwargs
+    )
+    spread = build_targets(
+        _policy(n=2, redistribute_cap_multiple=2.0), _cube(), panel, _scores(mat), uni, **kwargs
+    )
+    # Only the weight differs; the selection set (name 1 kept at 0, name 2 crowded out) is identical.
+    assert np.asarray(base[5]) == pytest.approx([0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert np.asarray(spread[5]) == pytest.approx([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert np.asarray(spread[4]) == pytest.approx([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+def test_redistribute_cap_validation() -> None:
+    assert _policy(redistribute_cap_multiple=None).redistribute_cap_multiple is None
+    assert _policy(redistribute_cap_multiple=1).redistribute_cap_multiple == 1.0
+    with pytest.raises(ValueError, match="redistribute_cap_multiple"):
+        TrendCashPolicy(redistribute_cap_multiple=0.5)
+    with pytest.raises(ValueError, match="redistribute_cap_multiple"):
+        TrendCashPolicy(redistribute_cap_multiple=float("nan"))
+    with pytest.raises(ValueError, match="redistribute_cap_multiple"):
+        TrendCashPolicy(redistribute_cap_multiple=float("inf"))
+
+
+def test_redistribute_cap_is_part_of_the_identity() -> None:
+    base = _policy(n=20)
+    assert base.spec_hash != _policy(n=20, redistribute_cap_multiple=2.0).spec_hash
+    assert json.loads(base.canonical_json())["redistribute_cap_multiple"] is None
 
 
 def test_rule_and_policy_validation() -> None:

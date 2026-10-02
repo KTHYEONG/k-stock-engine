@@ -112,3 +112,37 @@ def test_dividend_withholding_rate_outside_unit_interval_rejected() -> None:
             impact_k=1.0,
             dividend_withholding_rate=Decimal("1"),
         )
+
+
+def test_auction_and_cash_yield_config_rejected() -> None:
+    base: dict[str, object] = {
+        "commission_rate": Decimal("0.00015"),
+        "impact_k": 0.0,
+        "dividend_withholding_rate": Decimal("0"),
+    }
+    with pytest.raises(ValueError, match="auction_slippage_ticks"):
+        CostConfig(**{**base, "auction_slippage_ticks": -0.1})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="auction_slippage_ticks"):
+        CostConfig(**{**base, "auction_slippage_ticks": float("inf")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="auction_slippage_ticks"):
+        CostConfig(**{**base, "auction_slippage_ticks": True})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="extra_slippage"):
+        CostConfig(**{**base, "extra_slippage": -0.001})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="extra_slippage"):
+        CostConfig(**{**base, "extra_slippage": float("nan")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="cash_yield_tax_rate"):
+        CostConfig(**{**base, "cash_yield_tax_rate": Decimal("1")})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="cash_yield_tax_rate"):
+        CostConfig(**{**base, "cash_yield_tax_rate": Decimal("-0.1")})  # type: ignore[arg-type]
+    ok = CostConfig(
+        commission_rate=Decimal("0.00015"),
+        impact_k=0.0,
+        dividend_withholding_rate=Decimal("0"),
+        auction_slippage_ticks=1.0,
+        extra_slippage=0.0,
+        cash_yield_tax_rate=Decimal("0.154"),
+    )
+    assert ok.auction_slippage_ticks == 1.0
+    assert fill_cost(
+        side=Side.BUY, quantity=1, price=10_000, sell_tax_rate=Decimal("0"), config=ok
+    ).commission == 1

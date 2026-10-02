@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from src.research.cube import ResearchCube
-from src.research.panel import FEATURE_NAMES, HORIZONS, build_panel
+from src.research.panel import FEATURE_NAMES, HORIZONS, FeaturePanel, build_panel
 
 INSTS = ("KRX:000001", "KRX:000002")
 
@@ -17,7 +17,7 @@ def _sessions(n: int) -> tuple[date, ...]:
     return tuple(start + timedelta(days=i) for i in range(n))
 
 
-def _synthetic_cube(n_s: int = 300, n_n: int = 2) -> ResearchCube:
+def _synthetic_cube(n_s: int = 300, n_n: int = 2, insts: list[str] | None = None) -> ResearchCube:
     rng = np.random.default_rng(7)
     shape = (n_s, n_n)
     close = 5000 + np.cumsum(rng.standard_normal(shape) * 20, axis=0)
@@ -78,7 +78,7 @@ def _synthetic_cube(n_s: int = 300, n_n: int = 2) -> ResearchCube:
     return ResearchCube.from_arrays(
         cube_id="research_cube_0123456789abcdef",
         sessions=list(_sessions(n_s)),
-        instrument_ids=list(INSTS[:n_n]),
+        instrument_ids=list(insts) if insts is not None else list(INSTS[:n_n]),
         arrays=arrays,
         exit_at=np.full(n_n, -1, dtype=np.int64),
         exit_halted=np.zeros(n_n, dtype=np.bool_),
@@ -230,3 +230,49 @@ def test_absent_rows_are_nan() -> None:
     panel = build_panel(rebuilt, last_row=59)
     for name in ("ret_1d", "vol20", "hi52", "size", "turn20", "gap1"):
         assert bool(np.isnan(np.asarray(panel.features[name])[30, 0]))
+
+
+def _panel_digest(panel: FeaturePanel) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for name in FEATURE_NAMES:
+        h.update(np.ascontiguousarray(panel.features[name]).tobytes())
+    for horizon in HORIZONS:
+        h.update(np.ascontiguousarray(panel.labels[horizon]).tobytes())
+    return h.hexdigest()
+
+
+def test_panel_bitwise_golden() -> None:
+    assert _panel_digest(build_panel(_synthetic_cube(), last_row=299)) == (
+        "46d19a38028c7d7b6430f78b6409d2f23ba2eb2100d5a51416a8479cb8379283"
+    )
+
+
+def test_panel_peak_memory_bounded() -> None:
+    import gc
+    import tracemalloc
+
+    cube = _synthetic_cube(n_s=300, n_n=200, insts=[f"KRX:{i:06d}" for i in range(200)])
+    probe = build_panel(cube, last_row=299)
+    output_bytes = sum(
+        arr.nbytes for arr in list(probe.features.values()) + list(probe.labels.values())
+    )
+    del probe
+    gc.collect()
+    tracemalloc.start()
+    before, _ = tracemalloc.get_traced_memory()
+    build_panel(cube, last_row=299)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak - before <= 2.5 * output_bytes
+
+
+def test_panel_outputs_are_read_only_float32() -> None:
+    panel = build_panel(_synthetic_cube(n_s=60, n_n=2), last_row=59)
+    for arr in list(panel.features.values()) + list(panel.labels.values()):
+        assert arr.dtype == np.float32
+        assert bool(arr.flags["C_CONTIGUOUS"])
+        assert not arr.flags.writeable
+    assert list(panel.features) == list(FEATURE_NAMES)
+    assert list(panel.labels) == list(HORIZONS)

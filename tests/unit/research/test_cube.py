@@ -1,6 +1,7 @@
 """Research cube point-in-time invariants."""
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ from src.research.cube import (
     assemble_flows,
     assemble_fundamentals,
     assemble_releases,
+    load_research_cube,
     research_cube_id,
 )
 
@@ -25,6 +27,7 @@ KRX = ZoneInfo("Asia/Seoul")
 
 INST = "KRX:000001"
 INST2 = "KRX:000002"
+CUBE_ID = "research_cube_0123456789abcdef"
 
 
 def _sessions(n: int = 8, start: date = date(2020, 3, 30)) -> list[date]:
@@ -354,49 +357,251 @@ def test_exit_indexing(tmp_path: Path) -> None:
     assert list(halted) == [False, False]
 
 
-def test_cache_integrity_rebuilds_on_flip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A single flipped cache byte forces a rebuild instead of silent reuse."""
-    from src.research.cube import load_research_cube
-
+def _tiny_cube(close: float = 1.0) -> ResearchCube:
+    """A small dense cube with a NaN payload, so byte identity covers more than finite values."""
     sessions = _sessions(4)
-    arrays = {"close": np.ones((4, 1)), "present": np.ones((4, 1), dtype=bool)}
-    cube = ResearchCube.from_arrays(
-        cube_id="research_cube_0123456789abcdef",
+    return ResearchCube.from_arrays(
+        cube_id=CUBE_ID,
         sessions=sessions,
         instrument_ids=[INST],
-        arrays=arrays,
-        exit_at=np.array([-1]),
+        arrays={
+            "close": np.array([[close], [close], [float("nan")], [close]], dtype=np.float64),
+            "present": np.ones((4, 1), dtype=bool),
+        },
+        exit_at=np.array([-1], dtype=np.int64),
         exit_halted=np.array([False]),
     )
+
+
+def _bind_cache(monkeypatch: pytest.MonkeyPatch, cube: ResearchCube) -> object:
+    """Pin the cube id and the builder so a test can count rebuilds against a real cache root."""
     monkeypatch.setattr(cube_mod, "research_cube_id", lambda _inputs: cube.cube_id)
     monkeypatch.setattr(cube_mod, "build_research_cube", lambda _inputs: cube)
-    inputs = object()
-    first = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
-    assert first.cube_id == cube.cube_id
-    cache_file = tmp_path / f"{cube.cube_id}.npz"
-    assert cache_file.is_file()
-    calls = {"n": 0}
-    rebuilt = ResearchCube.from_arrays(
-        cube_id=cube.cube_id,
-        sessions=sessions,
-        instrument_ids=[INST],
-        arrays={"close": np.full((4, 1), 2.0), "present": np.ones((4, 1), dtype=bool)},
-        exit_at=np.array([-1]),
-        exit_halted=np.array([False]),
+    return object()
+
+
+def _manifest_of(cache_root: Path, cube_id: str) -> dict[str, object]:
+    return json.loads((cache_root / cube_id / "manifest.json").read_text(encoding="utf-8"))
+
+
+def _write_manifest(cache_root: Path, cube_id: str, payload: dict[str, object]) -> None:
+    (cache_root / cube_id / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _npy_data_offset(path: Path) -> int:
+    """Offset of the first data byte inside a ``.npy`` file, so a test can flip a payload byte only."""
+    with open(path, "rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            np.lib.format.read_array_header_1_0(handle)
+        else:
+            np.lib.format.read_array_header_2_0(handle)
+        return int(handle.tell())
+
+
+def _write_legacy_npz(cube: ResearchCube, path: Path) -> None:
+    """Write a format-1 ``.npz`` cache, the layout this version migrates away from."""
+    payload = {
+        "cube_id": np.asarray(cube.cube_id),
+        "checksum": np.asarray(cube_mod._array_checksum(cube.arrays, cube.exit_at, cube.exit_halted)),
+        "sessions": np.asarray([day.toordinal() for day in cube.sessions], dtype=np.int64),
+        "instruments": np.asarray(list(cube.instrument_ids)),
+        "array_names": np.asarray(sorted(cube.arrays)),
+        "exit_at": np.asarray(cube.exit_at, dtype=np.int64),
+        "exit_halted": np.asarray(cube.exit_halted, dtype=np.bool_),
+    }
+    for name, arr in cube.arrays.items():
+        payload[f"arr_{name}"] = np.ascontiguousarray(arr)
+    np.savez(str(path), **payload)
+
+
+def test_cache_round_trip_is_byte_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cache hit maps every array read-only and returns the built cube bit for bit."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    built = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert isinstance(built.arrays["close"], np.memmap)  # a miss is served from the published maps too
+
+    def _forbid(_inputs: object) -> ResearchCube:
+        raise AssertionError("a verified cache hit must not rebuild")
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _forbid)
+    loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert loaded.cube_id == cube.cube_id
+    assert loaded.sessions == cube.sessions
+    assert loaded.instrument_ids == cube.instrument_ids
+    for name, expected in cube.arrays.items():
+        mapped = loaded.arrays[name]
+        assert isinstance(mapped, np.memmap)
+        assert mapped.flags.c_contiguous
+        assert not mapped.flags.writeable
+        assert mapped.dtype == expected.dtype
+        assert np.array_equal(mapped, expected, equal_nan=True)
+    assert loaded.exit_at.dtype == np.int64
+    assert loaded.exit_halted.dtype == np.bool_
+    assert _manifest_of(tmp_path, cube.cube_id)["checksum"] == cube_mod._array_checksum(
+        cube.arrays, cube.exit_at, cube.exit_halted
     )
+    assert _manifest_of(tmp_path, cube.cube_id)["format"] == 2
+
+
+def test_cached_arrays_are_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mapped cache array rejects mutation exactly like a built one."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="read-only"):
+        loaded.arrays["close"][0, 0] = 5.0
+
+
+def test_from_arrays_does_not_copy_a_contiguous_mapping(tmp_path: Path) -> None:
+    """``from_arrays`` keeps a memory map as a view; copying it would double the cube's resident memory."""
+    path = tmp_path / "close.npy"
+    np.save(path, np.arange(6, dtype=np.float64).reshape(3, 2))
+    mapped = np.load(path, mmap_mode="r")
+    cube = ResearchCube.from_arrays(
+        cube_id=CUBE_ID,
+        sessions=_sessions(3),
+        instrument_ids=[INST, INST2],
+        arrays={"close": mapped},
+        exit_at=np.array([-1, -1], dtype=np.int64),
+        exit_halted=np.array([False, False]),
+    )
+    assert np.shares_memory(cube.arrays["close"], mapped)
+    assert not cube.arrays["close"].flags.writeable
+
+
+def test_cache_integrity_rebuilds_on_flip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single flipped byte inside a cached array forces a rebuild instead of silent reuse."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    cached = tmp_path / cube.cube_id / "arr_close.npy"
+    calls = {"n": 0}
+    rebuilt = _tiny_cube(close=2.0)
 
     def _rebuild(_inputs: object) -> ResearchCube:
         calls["n"] += 1
         return rebuilt
 
     monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
-    raw = cache_file.read_bytes()
-    flipped = bytearray(raw)
-    flipped[len(flipped) // 2] ^= 1
-    cache_file.write_bytes(bytes(flipped))
+    raw = bytearray(cached.read_bytes())
+    raw[_npy_data_offset(cached)] ^= 1
+    cached.write_bytes(bytes(raw))
     loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
     assert calls["n"] == 1
     assert loaded.arrays["close"][0, 0] == pytest.approx(2.0)
+
+
+def test_manifest_mismatch_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A directory whose manifest names another cube is stale, so it is replaced by a fresh build."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    manifest = _manifest_of(tmp_path, cube.cube_id)
+    _write_manifest(tmp_path, cube.cube_id, {**manifest, "cube_id": "research_cube_ffffffffffffffff"})
+    calls = {"n": 0}
+
+    def _rebuild(_inputs: object) -> ResearchCube:
+        calls["n"] += 1
+        return cube
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
+    loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert calls["n"] == 1
+    assert _manifest_of(tmp_path, cube.cube_id)["cube_id"] == cube.cube_id
+    assert np.array_equal(loaded.arrays["close"], cube.arrays["close"], equal_nan=True)
+
+
+def test_legacy_npz_converts_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid format-1 cache is promoted to a directory once, then served as a normal memory-mapped hit."""
+    cube = _tiny_cube()
+    legacy = tmp_path / f"{cube.cube_id}.npz"
+    _write_legacy_npz(cube, legacy)
+    inputs = _bind_cache(monkeypatch, cube)
+
+    def _forbid(_inputs: object) -> ResearchCube:
+        raise AssertionError("a verified legacy cache must not rebuild")
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _forbid)
+    first = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert not legacy.exists()
+    assert (tmp_path / cube.cube_id / "manifest.json").is_file()
+    for name, expected in cube.arrays.items():
+        assert isinstance(first.arrays[name], np.memmap)
+        assert np.array_equal(first.arrays[name], expected, equal_nan=True)
+    second = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    for name in cube.arrays:
+        assert np.array_equal(second.arrays[name], first.arrays[name], equal_nan=True)
+
+
+def test_legacy_npz_survives_a_failed_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verified legacy cache is kept when its replacement cannot be written, and the miss falls back to a build."""
+    cube = _tiny_cube()
+    legacy = tmp_path / f"{cube.cube_id}.npz"
+    _write_legacy_npz(cube, legacy)
+    inputs = _bind_cache(monkeypatch, cube)
+    monkeypatch.setattr(cube_mod, "_publish_cache", lambda _payload, _directory: False)
+    loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert legacy.is_file()
+    assert not (tmp_path / cube.cube_id).exists()
+    assert not isinstance(loaded.arrays["close"], np.memmap)
+    for name, expected in cube.arrays.items():
+        assert np.array_equal(loaded.arrays[name], expected, equal_nan=True)
+
+
+def test_corrupt_legacy_npz_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A damaged format-1 cache is discarded, leaving no ``.npz`` and no half-converted directory behind."""
+    cube = _tiny_cube()
+    legacy = tmp_path / f"{cube.cube_id}.npz"
+    _write_legacy_npz(cube, legacy)
+    raw = bytearray(legacy.read_bytes())
+    raw[len(raw) // 2] ^= 1
+    legacy.write_bytes(bytes(raw))
+    inputs = _bind_cache(monkeypatch, cube)
+    calls = {"n": 0}
+
+    def _rebuild(_inputs: object) -> ResearchCube:
+        calls["n"] += 1
+        return cube
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
+    loaded = load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert calls["n"] == 1
+    assert not legacy.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+    assert cube_mod._read_cache_dir(tmp_path / cube.cube_id, cube.cube_id) is not None
+    assert np.array_equal(loaded.arrays["close"], cube.arrays["close"], equal_nan=True)
+
+
+def test_no_temp_residue_when_the_build_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed build propagates and leaves no staged directory behind for the next run to trip over."""
+    monkeypatch.setattr(cube_mod, "research_cube_id", lambda _inputs: CUBE_ID)
+
+    def _boom(_inputs: object) -> ResearchCube:
+        raise RuntimeError("cube build failed")
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _boom)
+    with pytest.raises(RuntimeError, match="cube build failed"):
+        load_research_cube(object(), cache_root=tmp_path)  # type: ignore[arg-type]
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_unwritable_cache_root_still_returns_the_built_cube(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cube that cannot be cached is still returned; only the cache write may fail."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    try:
+        loaded = load_research_cube(inputs, cache_root=blocked)  # type: ignore[arg-type]
+    finally:
+        blocked.chmod(0o700)
+    assert np.array_equal(loaded.arrays["close"], cube.arrays["close"], equal_nan=True)
 
 
 def test_arrays_are_read_only() -> None:
@@ -772,31 +977,37 @@ def test_build_validation_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
         cube_mod.build_research_cube(_inputs())
 
 
-def test_cache_id_and_checksum_mismatch(
+def test_legacy_npz_naming_another_cube_is_discarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stale cube ids and edited checksums never load silently."""
-    import numpy as np
-
-    sessions = _sessions(4)
-    arrays = {"close": np.ones((4, 1)), "present": np.ones((4, 1), dtype=bool)}
-    cube = ResearchCube.from_arrays(
-        cube_id="research_cube_0123456789abcdef",
-        sessions=sessions,
-        instrument_ids=[INST],
-        arrays=arrays,
-        exit_at=np.array([-1]),
-        exit_halted=np.array([False]),
-    )
-    monkeypatch.setattr(cube_mod, "research_cube_id", lambda _inputs: cube.cube_id)
-    monkeypatch.setattr(cube_mod, "build_research_cube", lambda _inputs: cube)
-    inputs = object()
-    cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
-    cache_file = tmp_path / f"{cube.cube_id}.npz"
-    with np.load(str(cache_file), allow_pickle=True) as store:
+    """A format-1 file written for a different cube never loads, and never survives the rebuild."""
+    cube = _tiny_cube()
+    legacy = tmp_path / f"{cube.cube_id}.npz"
+    _write_legacy_npz(cube, legacy)
+    with np.load(str(legacy), allow_pickle=True) as store:
         payload = {key: store[key] for key in store.files}
     payload["cube_id"] = np.asarray("research_cube_ffffffffffffffff")
-    np.savez(str(cache_file), **payload)
+    np.savez(str(legacy), **payload)
+    inputs = _bind_cache(monkeypatch, cube)
+    calls = {"n": 0}
+
+    def _rebuild(_inputs: object) -> ResearchCube:
+        calls["n"] += 1
+        return cube
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
+    loaded = cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert calls["n"] == 1
+    assert not legacy.exists()
+    assert np.array_equal(loaded.arrays["close"], cube.arrays["close"], equal_nan=True)
+
+
+def test_cache_checksum_mismatch_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A manifest whose digest does not cover the arrays on disk is stale, so the cube is rebuilt."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    _write_manifest(tmp_path, cube.cube_id, {**_manifest_of(tmp_path, cube.cube_id), "checksum": "0" * 64})
     calls = {"n": 0}
 
     def _rebuild(_inputs: object) -> ResearchCube:
@@ -806,12 +1017,84 @@ def test_cache_id_and_checksum_mismatch(
     monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
     cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
     assert calls["n"] == 1
-    with np.load(str(cache_file), allow_pickle=True) as store:
+    assert _manifest_of(tmp_path, cube.cube_id)["checksum"] != "0" * 64
+
+
+def test_cache_directory_with_malformed_metadata_is_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable manifest or a missing array file is treated as a miss rather than raised on."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    directory = tmp_path / cube.cube_id
+    (directory / "arr_close.npy").unlink()
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    (directory / "arr_close.npy").write_bytes(b"not a numpy file")
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    (directory / "manifest.json").write_text("{ not json", encoding="utf-8")
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    (directory / "manifest.json").write_text('{"format": 1}', encoding="utf-8")
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    (directory / "manifest.json").write_text(
+        json.dumps(
+            {
+                "array_names": ["close"],
+                "checksum": "0" * 64,
+                "cube_id": cube.cube_id,
+                "format": 2,
+                "instruments": [INST],
+                "sessions": [day.toordinal() for day in cube.sessions],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+
+
+def test_cache_directory_with_mismatched_array_metadata_is_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrong exit dtypes, exit lengths or array shapes make a directory unusable before the digest is read."""
+    cube = _tiny_cube()
+    inputs = _bind_cache(monkeypatch, cube)
+    cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    directory = tmp_path / cube.cube_id
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is not None
+    np.save(directory / "exit_at.npy", np.zeros(1, dtype=np.int32))
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    np.save(directory / "exit_halted.npy", np.zeros(1, dtype=np.int8))
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    np.save(directory / "exit_halted.npy", np.asarray(cube.exit_halted, dtype=np.bool_))
+    np.save(directory / "exit_at.npy", np.full(2, -1, dtype=np.int64))
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+    np.save(directory / "exit_at.npy", np.asarray(cube.exit_at, dtype=np.int64))
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is not None
+    np.save(directory / "arr_close.npy", np.ones((4, 2)))
+    assert cube_mod._read_cache_dir(directory, cube.cube_id) is None
+
+
+def test_legacy_npz_with_a_wrong_digest_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A format-1 cache whose stored digest does not cover its arrays is discarded, not trusted."""
+    cube = _tiny_cube()
+    legacy = tmp_path / f"{cube.cube_id}.npz"
+    _write_legacy_npz(cube, legacy)
+    with np.load(str(legacy), allow_pickle=True) as store:
         payload = {key: store[key] for key in store.files}
     payload["checksum"] = np.asarray("0" * 64)
-    np.savez(str(cache_file), **payload)
-    cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
-    assert calls["n"] == 2
+    np.savez(str(legacy), **payload)
+    inputs = _bind_cache(monkeypatch, cube)
+    calls = {"n": 0}
+
+    def _rebuild(_inputs: object) -> ResearchCube:
+        calls["n"] += 1
+        return cube
+
+    monkeypatch.setattr(cube_mod, "build_research_cube", _rebuild)
+    loaded = cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
+    assert calls["n"] == 1
+    assert not legacy.exists()
+    assert np.array_equal(loaded.arrays["close"], cube.arrays["close"], equal_nan=True)
 
 
 def test_exits_edge_cases(tmp_path: Path) -> None:
@@ -989,18 +1272,8 @@ def test_cache_hit_returns_verified_cube(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An untouched cache loads without rebuilding."""
-    sessions = _sessions(4)
-    cube = ResearchCube.from_arrays(
-        cube_id="research_cube_abcdef0123456789",
-        sessions=sessions,
-        instrument_ids=[INST],
-        arrays={"close": np.full((4, 1), 3.0), "present": np.ones((4, 1), dtype=bool)},
-        exit_at=np.array([-1]),
-        exit_halted=np.array([False]),
-    )
-    monkeypatch.setattr(cube_mod, "research_cube_id", lambda _inputs: cube.cube_id)
-    monkeypatch.setattr(cube_mod, "build_research_cube", lambda _inputs: cube)
-    inputs = object()
+    cube = _tiny_cube(close=3.0)
+    inputs = _bind_cache(monkeypatch, cube)
     cube_mod.load_research_cube(inputs, cache_root=tmp_path)  # type: ignore[arg-type]
 
     def _forbid(_inputs: object) -> ResearchCube:
