@@ -1,0 +1,4 @@
+# Cash-series collection and Silver policy.
+collection_start = 2017-01-02   # first session collected; KODEX 단기채권 (153130) listed since 2017-01-02
+ticker = "153130"               # KODEX 단기채권
+available_time = "18:00:00"     # session data becomes available at this KST time (same as daily market)

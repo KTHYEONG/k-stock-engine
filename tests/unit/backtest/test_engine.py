@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -272,7 +273,11 @@ def test_deterministic_ledger_hash(tmp_path: Path) -> None:
         end=sessions[-1],
     )
     assert first.ledger_hash == second.ledger_hash
-    assert first == second
+    assert first.nav == second.nav
+    assert first.fills == second.fills
+    assert first.rejects == second.rejects
+    assert first.journal == second.journal
+    assert np.array_equal(first.stock_book_returns, second.stock_book_returns, equal_nan=True)
 
 
 def test_lookahead_free_end_to_end(tmp_path: Path) -> None:
@@ -435,6 +440,65 @@ def test_unaffordable_buy_rejected_as_cash(tmp_path: Path) -> None:
     assert any(r.reason == "cash" for r in result.rejects)
 
 
+def test_sell_shortfall_carries_a_retry_order(tmp_path: Path) -> None:
+    """A reverse split shrinks the holding below the sell order; the unsold remainder is re-ordered."""
+    sessions = _sessions(5)
+    rows = [
+        _flat_row(day, "KRX:A", 100, share_factor=0.5 if day == sessions[2] else 1.0)
+        for day in sessions
+    ]
+    rows += [_flat_row(day, "KRX:B", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_carry_sell", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+
+    result = run_backtest(
+        arrays=arrays,
+        events=events,
+        targets={0: {0: 1.0}, 1: {1: 1.0}},
+        config=_config(initial_cash=1_000, impact_k=0.0, commission="0", carry=True),
+        deposits={},
+        rules=_rules(),
+        start=sessions[0],
+        end=sessions[-1],
+    )
+
+    sells = [e for e in result.journal if e.kind.value == "sell"]
+    assert [(e.session_idx, e.quantity_delta) for e in sells] == [(2, -5)]
+    unsold = [
+        (r.order.decision_session_idx, r.order.quantity)
+        for r in result.rejects
+        if r.reason == "cash" and r.order.instrument_idx == 0
+    ]
+    assert unsold == [(1, 10), (2, 5), (3, 5)]
+
+
+def test_cash_shortfall_carries_a_retry_order(tmp_path: Path) -> None:
+    """A cash-truncated buy is journaled as a reject and, with carry, re-ordered for the next session."""
+    sessions = _sessions(5)
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    rows[1] = _flat_row(sessions[1], "KRX:A", 300, open=300, upper_limit=1000)
+    panel = _write_panel(tmp_path / "gold", "market_panel_carry_cash", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+
+    result = run_backtest(
+        arrays=arrays,
+        events=events,
+        targets={0: {0: 1.0}},
+        config=_config(initial_cash=905, impact_k=0.0, commission="0.01", carry=True),
+        deposits={sessions[2]: 1_000},
+        rules=_rules(),
+        start=sessions[0],
+        end=sessions[-1],
+    )
+
+    buys = [e for e in result.journal if e.kind.value == "buy"]
+    assert [(e.session_idx, e.quantity_delta) for e in buys] == [(1, 2), (2, 7)]
+
+
 def test_zero_close_target_skipped(tmp_path: Path) -> None:
     sessions = _sessions(2)
     rows = [_flat_row(day, "KRX:A", 0, open=0, high=0, low=0, base_price=1) for day in sessions]
@@ -516,6 +580,145 @@ def test_invalid_target_schedules_fail_fast(tmp_path: Path) -> None:
         run_backtest(targets={0: {True: 0.5}}, **base)  # type: ignore[dict-item]
     with pytest.raises(ValueError, match="finite number"):
         run_backtest(targets={0: {0: True}}, **base)  # type: ignore[dict-item]
+
+
+def _sweep_arrays(tmp_path: Path, sessions: list[date]) -> MarketArrays:
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_sweep", rows)
+    _write_exits(panel, [])
+    return load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+
+
+def test_cash_yield_credited_and_taxed_at_year_end(tmp_path: Path) -> None:
+    import numpy as _np
+
+    from src.backtest.ledger import JournalKind as _Kind
+
+    sessions = [date(2020, 12, 30), date(2020, 12, 31), date(2021, 1, 4)]
+    arrays = _sweep_arrays(tmp_path, sessions)
+    events = build_engine_events(arrays=arrays, panel_dir=_panel_dir(tmp_path, "market_panel_sweep"), dividends=None)
+    cash = _np.zeros(len(sessions))
+    cash[1] = 0.0001
+    result = run_backtest(
+        arrays=arrays, events=events, targets={}, config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1], cash_returns=cash,
+    )
+    yields = [e for e in result.journal if e.kind is _Kind.CASH_YIELD]
+    assert [(e.session_idx, e.cash_delta) for e in yields] == [(1, 100)]
+    taxes = [e for e in result.journal if e.kind is _Kind.CASH_YIELD_TAX]
+    assert len(taxes) == 1
+    assert taxes[0].session_idx == 1
+    assert taxes[0].cash_delta == -15
+    assert result.nav[-1].cash == 1_000_000 + 100 - 15
+
+
+def test_missing_cash_return_fails_closed(tmp_path: Path) -> None:
+    import numpy as _np
+
+    from src.core.pit import PITDataError as _PIT
+
+    sessions = _sessions(3)
+    arrays = _sweep_arrays(tmp_path, sessions)
+    events = build_engine_events(arrays=arrays, panel_dir=_panel_dir(tmp_path, "market_panel_sweep"), dividends=None)
+    cash = _np.zeros(len(sessions))
+    cash[1] = _np.nan
+    with pytest.raises(_PIT, match="cash return missing"):
+        run_backtest(
+            arrays=arrays, events=events, targets={}, config=_config(impact_k=0.0, commission="0"),
+            deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1], cash_returns=cash,
+        )
+    with pytest.raises(ValueError, match="cash_returns must have shape"):
+        run_backtest(
+            arrays=arrays, events=events, targets={}, config=_config(),
+            deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+            cash_returns=_np.zeros(len(sessions) + 1),
+        )
+
+
+def test_sweep_disabled_is_noop(tmp_path: Path) -> None:
+    import numpy as _np
+
+    from src.backtest.ledger import JournalKind as _Kind
+
+    sessions = _sessions(3)
+    arrays = _sweep_arrays(tmp_path, sessions)
+    events = build_engine_events(arrays=arrays, panel_dir=_panel_dir(tmp_path, "market_panel_sweep"), dividends=None)
+    config = _config(impact_k=0.0, commission="0")
+    base = run_backtest(
+        arrays=arrays, events=events, targets={}, config=config,
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+    )
+    zeros = run_backtest(
+        arrays=arrays, events=events, targets={}, config=config,
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+        cash_returns=_np.zeros(len(sessions)),
+    )
+    assert [r.nav for r in base.nav] == [r.nav for r in zeros.nav]
+    assert not [e for e in zeros.journal if e.kind is _Kind.CASH_YIELD_TAX]
+    assert base.ledger_hash == zeros.ledger_hash
+
+
+def test_final_record_includes_year_end_tax(tmp_path: Path) -> None:
+    """The year-end assessment runs before the close mark, so the last record already carries the tax."""
+    import numpy as _np
+
+    from src.backtest.ledger import JournalKind as _Kind, LedgerAccount as _Account
+
+    sessions = [date(2020, 12, 29), date(2020, 12, 30)]
+    arrays = _sweep_arrays(tmp_path, sessions)
+    events = build_engine_events(arrays=arrays, panel_dir=_panel_dir(tmp_path, "market_panel_sweep"), dividends=None)
+    result = run_backtest(
+        arrays=arrays, events=events, targets={},
+        config=_config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+        cash_returns=_np.array([0.0, 0.01]),
+    )
+    assert [(e.session_idx, e.cash_delta) for e in result.journal if e.kind is _Kind.CASH_YIELD_TAX] == [
+        (1, -1_540)
+    ]
+    assert result.nav[-1].cash == 1_008_460
+    assert result.nav[-1].nav == 1_008_460
+    cash_deltas = sum(e.cash_delta for e in result.journal if e.account is _Account.CASH)
+    assert cash_deltas == 8_460
+    assert result.nav[-1].cash == 1_000_000 + cash_deltas
+
+
+def test_year_end_tax_beyond_cash_is_funded_by_next_session_sales(tmp_path: Path) -> None:
+    import numpy as _np
+
+    from src.backtest.ledger import JournalKind as _Kind, LedgerAccount as _Account
+
+    sessions = [date(2020, 12, 29), date(2020, 12, 30), date(2020, 12, 31), date(2021, 1, 4)]
+    rows = [_flat_row(day, "KRX:A", 100, sell_tax_rate=0.0) for day in sessions]
+    rows += [_flat_row(day, "KRX:B", 200, sell_tax_rate=0.0) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_payable", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+    result = run_backtest(
+        arrays=arrays, events=events, targets={0: {0: 1.0}, 2: {0: 0.5, 1: 0.05}},
+        config=_config(initial_cash=10_000_000, impact_k=0.0, commission="0"),
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+        cash_returns=_np.array([5.0, 0.0, 0.0, 0.0]),
+    )
+
+    assessed = result.nav[2]
+    assert (assessed.cash, assessed.tax_payable, assessed.market_value) == (0, 7_700_000, 60_000_000)
+    assert assessed.nav == 60_000_000 - 7_700_000
+    settled = result.nav[3]
+    assert (settled.tax_payable, settled.cash, settled.nav) == (0, 23_535_000, 52_300_000)
+
+    order = [(entry.kind, entry.account) for entry in result.journal if entry.session_idx == 3]
+    assert order.index((_Kind.SELL, _Account.CASH)) < order.index(
+        (_Kind.TAX_PAYMENT, _Account.CASH)
+    ) < order.index((_Kind.BUY, _Account.CASH))
+    unpaid = sum(
+        entry.cash_delta for entry in result.journal if entry.account is _Account.PAYABLE
+    )
+    assert unpaid == 0
+    assert settled.cash == 10_000_000 + sum(
+        entry.cash_delta for entry in result.journal if entry.account is _Account.CASH
+    )
 
 
 @pytest.mark.slow

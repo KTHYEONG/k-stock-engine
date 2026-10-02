@@ -15,7 +15,7 @@
 
 | 핵심 엔지니어링 지표 | 실측 성과 / 보장 기준 | 아키텍처 불변식 및 강제 장치 |
 | :--- | :---: | :--- |
-| 📈 **발견 단계 상태** | **`pending evaluation, holdout sealed`** | 단일 전략 경로(`panel → scorer → policy → simulator/ledger → criteria C1-C4`) 및 밀봉 홀드아웃 단일 시도 |
+| 📈 **챔피언 상태** | **`none`** | 단일 전략 경로(`panel → scorer → policy → account engine → report card`), 목적함수 J와 파산 가드, 밀봉 구간 없음 |
 | 🛡️ **금융 회계 무결성** | **`부동소수점 오차 0원` / `미수금 0건`** | 전 계좌 원 단위 정수 원장(`Integer KRW Ledger`) 및 매도 우선 T+2 정산 추적 |
 | ⚡ **데이터 저장소 최적화** | **`99.8% 용량 압축` (`23GB` $\to$ `39.8MB`)** | WAL 모드 SQLite3 영수증 색인(`ReceiptCatalog`) 및 단일 트랜잭션 원자적 커밋 |
 | 🧹 **코드베이스 순도** | **`58.6% 부채 제거` (`42.8k` $\to$ `17.7k LOC`)** | 레거시 격리(`legacy/`), 단일 실행 파이프라인 통폐합, 불필요 중간 레이어 제거 |
@@ -103,19 +103,20 @@ flowchart TD
 
 ---
 
-## 5. Discovery Status (발견 단계 상태)
+## 5. Champion Status (챔피언 상태)
 
-> **단일 전략 경로**: `panel → scorer → policy → sleeves/book → simulator + hedge overlay → ledger → criteria C1-C4`  
-> **평가 단위**: ML 상위 20선 + `ret21 > 0` 추세 규칙의 5-슬리브 주식북에 KOSDAQ 150 베타중립 헤지 오버레이(지수선물 정수 계약 + 인버스 ETF 잔여, 증거금·비용·파생/ETF 세율 반영)를 얹은 헤지 5-슬리브 북  
-> **실행**: `uv run python -m src.research backtest --spec config/research/strategies/ml_sleeve_hedge.toml`
+> **단일 전략 경로**: `panel → scorer → policy → sleeves/book → account engine (ledger) → report card`  
+> **평가 단위**: ML 상위 20선 + `ret21 > 0` 추세 규칙의 5-슬리브 주식북에 KOSDAQ 150 베타중립 헤지를 얹은 북을 **정수 원장 하나**(주식·KQ150 선물·인버스 ETF·현금 수익 동시 정산)로 평가한다  
+> **판정**: 목적함수 J = 5년 부트스트랩 성장률의 하위 10% 분위수(더 나은 스트레스 스트림 기준). 무결성(인과적 섭동 불일치 0)과 생존 가드(P(5y MDD ≤ −50%) ≤ 5%, P(5y g ≤ 0) ≤ 5%)만 승격을 막고, 연율·MDD·calmar·비용 그리드·손익분기 틱은 진단 보고용이다  
+> **실행**: `uv run python -m src.research evaluate --spec config/research/strategies/ml_sleeve_hedge.toml` → 최초 챔피언은 `promote --spec <PATH> --bootstrap`, 대결은 `challenge --spec <PATH> --neighbors <PATH ...>`(판정 저장, 상태 불변), 승격은 `promote --spec <PATH>`, 현재 상태는 `champion` 으로 읽는다. 기록은 `<state>/research/champion/`(`current.json` 원자 교체 + `history.jsonl` + `decisions/<digest>.json`)에 남는다
 
-| 단계 | 상태 | 비고 |
+| 항목 | 상태 | 비고 |
 | :--- | :---: | :--- |
-| Discovery (C1–C3) | `pending evaluation, holdout sealed` | 백테스트 실행 후 발견 결과 기재 |
-| Holdout (C4) | `sealed` | 최종 후보 1건, 단일 시도 |
-| Forward | `sealed` | 홀드아웃 통과 verdict 이후에만 개방 |
+| Champion | `none` | `promote --spec <PATH> --bootstrap`으로 최초 등록, 이후 승격은 저장된 판정이 있을 때만 |
+| Challenger | `unevaluated` | 같은 세션 페어드 Δg 하한 > 0 + J 비교 + 이웃 평탄부로 판정 |
+| Forward evidence | `out of scope` | 라이브 매매 시작 시 스펙 01과 함께 재개 |
 
-*발견 단계가 `backtest` 실행으로 완료되기 전까지는 성과 수치를 공표하지 않으며, 홀드아웃은 밀봉 상태를 유지합니다. 기준 미달 시 자본 보호 원칙에 따라 실거래 승격을 즉시 거부(`NO_TRADE`)합니다.*
+*밀봉 홀드아웃은 없습니다. 리서치는 반복 실행이 전제이므로 선택 편향은 챔피언/챌린저 페어드 비교, 숫자 노브의 이웃 평탄부, 비용 그리드로 통제합니다.*
 *헤지 데이터 작업: `uv run python -m src.data.cli collect-krx-hedge-series` → `uv run python -m src.data.cli build-hedge-series-silver`. 세율: 지수선물 이익 11%(연 250만원 공제, 손실 이월 없음), 인버스 ETF 이익 15.4%(손실 상계 없음). 최소 자본 근거: 총 NAV 약 100M, 하한 50M.*
 
 ---

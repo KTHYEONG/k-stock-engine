@@ -14,7 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from src.data.research_protocol import LockboxAuthorization, LockboxError
+from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.cube import ResearchCube
 
 __all__ = ["SimConfig", "SimResult", "simulate"]
@@ -45,6 +45,7 @@ class SimConfig(BaseModel):
     cash_buffer: float
     halted_exit_value: float = 1.0
     extra_slippage: float = 0.0
+    auction_slippage_ticks: float = 0.0
     execution_delay: int = 0
 
     @field_validator("capital_krw")
@@ -54,7 +55,7 @@ class SimConfig(BaseModel):
             raise ValueError(f"capital_krw must be a positive int, got {value!r}")
         return value
 
-    @field_validator("commission_rate", "impact_k", "extra_slippage")
+    @field_validator("commission_rate", "impact_k", "extra_slippage", "auction_slippage_ticks")
     @classmethod
     def _non_negative(cls, value: float) -> float:
         out = float(value)
@@ -118,6 +119,9 @@ class SimConfig(BaseModel):
             impact_k=float(_pick("impact_k")),  # type: ignore[arg-type]
             max_participation=float(_pick("max_participation")),  # type: ignore[arg-type]
             cash_buffer=float(_pick("cash_buffer")),  # type: ignore[arg-type]
+            auction_slippage_ticks=float(_pick("auction_slippage_ticks"))  # type: ignore[arg-type]
+            if "auction_slippage_ticks" in raw or any("auction_slippage_ticks" in s for s in sections)
+            else 0.0,
         )
 
     def canonical_json(self) -> str:
@@ -151,7 +155,7 @@ def simulate(
     start: date,
     end: date,
     config: SimConfig,
-    authorization: LockboxAuthorization,
+    authorization: WindowAuthorization,
 ) -> SimResult:
     """Simulate target weights on the fixed session timeline in weight space.
 
@@ -159,13 +163,13 @@ def simulate(
     shares, so it is a screening tool; promotion decisions use the ledger engine.
 
     Raises:
-        LockboxError: ``[start, end]`` is not inside ``[authorization.start, authorization.end]``.
+        WindowError: ``[start, end]`` is not inside ``[authorization.start, authorization.end]``.
         ValueError: ``start``/``end`` outside the cube sessions, a target row outside
             ``[lo - 1 - delay, hi - 1 - delay]``, a target vector of the wrong length, or negative /
             non-finite weights or a row sum above 1.
     """
     if start < authorization.start or end > authorization.end:
-        raise LockboxError(f"run window [{start}, {end}] is not inside the authorization")
+        raise WindowError(f"run window [{start}, {end}] is not inside the authorization")
     sessions = list(cube.sessions)
     index_of = {day: idx for idx, day in enumerate(sessions)}
     if start not in index_of or end not in index_of or index_of[start] > index_of[end]:
@@ -282,7 +286,7 @@ def simulate(
                     tick_val = float(tick_row[int(n)])
                     if math.isfinite(tick_val):
                         tick_frac = tick_val / float(open_row[int(n)])
-                frac = max(adv, tick_frac) + float(config.extra_slippage)
+                frac = adv + tick_frac * float(config.auction_slippage_ticks) + float(config.extra_slippage)
                 rate = float(tax_row[int(n)]) if math.isfinite(float(tax_row[int(n)])) else 0.0
                 proceeds = notion * (1.0 - frac) * (1.0 - commission - rate)
                 sell_proceeds[int(n)] = proceeds
@@ -299,7 +303,7 @@ def simulate(
                     tick_val = float(tick_row[int(n)])
                     if math.isfinite(tick_val):
                         tick_frac = tick_val / float(open_row[int(n)])
-                frac = max(adv, tick_frac) + float(config.extra_slippage)
+                frac = adv + tick_frac * float(config.auction_slippage_ticks) + float(config.extra_slippage)
                 buy_fracs[int(n)] = frac
                 buy_costs[int(n)] = notion * (1.0 + frac) * (1.0 + commission)
             total_buy_cost = float(np.sum(buy_costs))

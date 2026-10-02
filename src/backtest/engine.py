@@ -7,17 +7,31 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 
+import numpy as np
+from numpy.typing import NDArray
+
 from src.backtest.costs import CostConfig, Side, fill_cost
 from src.backtest.events import EngineEvents, ExitKind
 from src.backtest.execution import ExecutionConfig, Fill, Order, Reject, price_orders
-from src.backtest.ledger import JournalEntry, Ledger, NavRecord
+from src.backtest.ledger import JournalEntry, JournalKind, Ledger, LedgerAccount, NavRecord
 from src.backtest.market import MarketArrays
+from src.backtest.overlay import (
+    DerivativeConfig,
+    OverlayMarket,
+    OverlayPolicy,
+    OverlayState,
+    OverlayTarget,
+    ceil_amount_krw,
+    futures_expiry_rows,
+    required_reserve_krw,
+)
 from src.core.market_rules import KrxMarketRules
+from src.core.pit import PITDataError
 
 
 class DelistPolicy(StrEnum):
@@ -51,6 +65,9 @@ class BacktestResult:
     journal: tuple[JournalEntry, ...]
     dividends_integrated: bool
     ledger_hash: str
+    stock_book_returns: NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float64)
+    )
 
 
 def _target_orders(
@@ -80,62 +97,73 @@ def _target_orders(
     return orders
 
 
-def _apply_fills(
+def _spendable_cash(ledger: Ledger) -> int:
+    """Cash an order may commit; an unpaid tax liability is never spent on stocks or on the hedge."""
+    return max(ledger.cash - ledger.tax_payable, 0)
+
+
+def _apply_sell_fills(
     *, ledger: Ledger, fills: Sequence[Fill], t: int, arrays: MarketArrays, config: EngineConfig
 ) -> tuple[list[Fill], list[Reject], list[Order]]:
-    sells = [fill for fill in fills if fill.order.side is Side.SELL]
-    buys = sorted(
-        (fill for fill in fills if fill.order.side is Side.BUY),
-        key=lambda fill: fill.quantity * fill.price,
-        reverse=True,
-    )
     applied: list[Fill] = []
     rejects: list[Reject] = []
     carried: list[Order] = []
-    for fill in (*sells, *buys):
+    for fill in fills:
         order = fill.order
         n = order.instrument_idx
-        if order.side is Side.SELL:
-            rate = Decimal(str(float(arrays.float_fields["sell_tax_rate"][t, n])))
-            held = ledger.positions().get(n, 0)
-            quantity = min(fill.quantity, held)
-            shortfall = fill.quantity - quantity
-            if quantity > 0:
-                cost = fill_cost(
-                    side=Side.SELL, quantity=quantity, price=fill.price, sell_tax_rate=rate,
-                    config=config.costs,
-                )
-                ledger.sell(
-                    session_idx=t, instrument_idx=n, quantity=quantity, price=fill.price,
-                    commission=cost.commission, sell_tax=cost.sell_tax,
-                )
-                applied.append(Fill(order, quantity, fill.price) if shortfall else fill)
-            if shortfall:
-                rejects.append(Reject(order, "cash"))
-                if config.execution.carry_unfilled:
-                    carried.append(Order(n, Side.SELL, shortfall, t))
-        else:
-            quantity = min(fill.quantity, ledger.cash // fill.price)
-            commission = 0
-            while quantity > 0:
-                commission = fill_cost(
-                    side=Side.BUY, quantity=quantity, price=fill.price,
-                    sell_tax_rate=Decimal(0), config=config.costs,
-                ).commission
-                if quantity * fill.price + commission <= ledger.cash:
-                    break
-                quantity -= 1
-            shortfall = fill.quantity - quantity
-            if quantity > 0:
-                ledger.buy(
-                    session_idx=t, instrument_idx=n, quantity=quantity, price=fill.price,
-                    commission=commission,
-                )
-                applied.append(Fill(order, quantity, fill.price) if shortfall else fill)
-            if shortfall:
-                rejects.append(Reject(order, "cash"))
-                if config.execution.carry_unfilled:
-                    carried.append(Order(n, Side.BUY, shortfall, t))
+        rate = Decimal(str(float(arrays.float_fields["sell_tax_rate"][t, n])))
+        held = ledger.positions().get(n, 0)
+        quantity = min(fill.quantity, held)
+        shortfall = fill.quantity - quantity
+        if quantity > 0:
+            cost = fill_cost(
+                side=Side.SELL, quantity=quantity, price=fill.price, sell_tax_rate=rate,
+                config=config.costs,
+            )
+            ledger.sell(
+                session_idx=t, instrument_idx=n, quantity=quantity, price=fill.price,
+                commission=cost.commission, sell_tax=cost.sell_tax,
+            )
+            applied.append(Fill(order, quantity, fill.price) if shortfall else fill)
+        if shortfall:
+            rejects.append(Reject(order, "cash"))
+            if config.execution.carry_unfilled:
+                carried.append(Order(n, Side.SELL, shortfall, t))
+    return (applied, rejects, carried)
+
+
+def _apply_buy_fills(
+    *, ledger: Ledger, fills: Sequence[Fill], t: int, arrays: MarketArrays, config: EngineConfig
+) -> tuple[list[Fill], list[Reject], list[Order]]:
+    ordered = sorted(fills, key=lambda fill: fill.quantity * fill.price, reverse=True)
+    applied: list[Fill] = []
+    rejects: list[Reject] = []
+    carried: list[Order] = []
+    for fill in ordered:
+        order = fill.order
+        n = order.instrument_idx
+        spendable = _spendable_cash(ledger)
+        quantity = min(fill.quantity, spendable // fill.price) if fill.price > 0 else 0
+        commission = 0
+        while quantity > 0:
+            commission = fill_cost(
+                side=Side.BUY, quantity=quantity, price=fill.price,
+                sell_tax_rate=Decimal(0), config=config.costs,
+            ).commission
+            if quantity * fill.price + commission <= spendable:
+                break
+            quantity -= 1
+        shortfall = fill.quantity - quantity
+        if quantity > 0:
+            ledger.buy(
+                session_idx=t, instrument_idx=n, quantity=quantity, price=fill.price,
+                commission=commission,
+            )
+            applied.append(Fill(order, quantity, fill.price) if shortfall else fill)
+        if shortfall:
+            rejects.append(Reject(order, "cash"))
+            if config.execution.carry_unfilled:
+                carried.append(Order(n, Side.BUY, shortfall, t))
     return (applied, rejects, carried)
 
 
@@ -172,6 +200,154 @@ def _validate_targets(
     return cleaned
 
 
+# KRW movements booked on the cash account that finance the overlay rather than the stock book: they are
+# stripped from the stock-book return so hedge financing never registers as stock performance.
+_CASH_FLOW_KINDS = frozenset(
+    {
+        JournalKind.DEPOSIT,
+        JournalKind.MARGIN_TRANSFER,
+        JournalKind.INVERSE_BUY,
+        JournalKind.INVERSE_SELL,
+        JournalKind.INVERSE_COMMISSION,
+        JournalKind.INVERSE_TAX,
+    }
+)
+
+
+def _index_level(values: NDArray[np.float64], t: int) -> float:
+    """Index level of an already-validated window; the run rejects a missing level before it starts."""
+    return float(values[t])
+
+
+def _inverse_int(values: NDArray[np.float64], t: int) -> int | None:
+    out = float(values[t])
+    if not math.isfinite(out) or out <= 0.0:
+        return None
+    return int(out)
+
+
+def _cash_flow_krw(ledger: Ledger, since: int) -> int:
+    """Net cash-account KRW booked since journal index ``since`` that does not belong to the stock book."""
+    return sum(
+        entry.cash_delta
+        for entry in ledger.journal_since(since)
+        if entry.account is LedgerAccount.CASH and entry.kind in _CASH_FLOW_KINDS
+    )
+
+
+def _futures_commission(rate: float, *, delta: int, multiplier: int, level: float) -> int:
+    return ceil_amount_krw(rate, abs(delta), multiplier, level)
+
+
+def _maintenance_floor(contracts: int, *, level: float, config: DerivativeConfig, multiplier: int) -> int:
+    """``ceil(trigger · initial_margin_rate · contracts · multiplier · level)`` (``0`` when flat)."""
+    if contracts <= 0:
+        return 0
+    rate = Decimal(str(float(config.margin_topup_trigger_fraction))) * Decimal(
+        str(float(config.initial_margin_rate))
+    )
+    return ceil_amount_krw(rate, contracts, multiplier, float(level))
+
+
+def _sync_futures(
+    ledger: Ledger,
+    *,
+    session_idx: int,
+    target_contracts: int,
+    level: float,
+    config: DerivativeConfig,
+    multiplier: int,
+) -> None:
+    """Trade toward the pending target and hold margin at exactly ``required_reserve(k)`` — except inside the band.
+
+    Three cases (``h`` held, ``k*`` pending target, ``R`` reserve, ``M`` maintenance floor, ``available`` =
+    margin + free cash - tax_payable). (a) Hold (``k* == h`` and margin >= ``M(h)``): no futures trade and no
+    top-up; excess above ``R(h)`` is still released, but anything inside ``[M(h), R(h)]`` is left alone. (b)
+    Margin call (``k* == h`` and margin < ``M(h)``): largest ``k <= h`` with ``R(k) + commission <= available``,
+    then sync to exactly ``R(k)``. (c) Rebalance (``k* != h``): largest ``k <= k*`` funded the same way, then sync
+    to ``R(k)``. In every case unaffordable targets shrink (down to flat) instead of borrowing, and a margin the
+    cash cannot restore stays negative for a later session to repay.
+
+    Why the band: ordinary daily variation must never cost a trade — the previous always-sync rule liquidated a
+    cash-less hedge on any up day (1 contract, cash 0, +1% → margin 1.40M ≥ M 757,500 but < R 1,515,000 → closed).
+    Calls restore the full reserve, never just above the trigger.
+    """
+    held = ledger.contracts
+    if target_contracts == held and ledger.margin >= _maintenance_floor(
+        held, level=level, config=config, multiplier=multiplier
+    ):
+        reserve = required_reserve_krw(contracts=held, level=level, config=config)
+        if ledger.margin > reserve:
+            ledger.transfer_margin(session_idx=session_idx, amount=reserve - ledger.margin)
+        return
+    available = ledger.margin + _spendable_cash(ledger)
+    chosen = 0
+    for candidate in range(target_contracts, -1, -1):
+        reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
+        commission = _futures_commission(
+            float(config.futures_cost_rate),
+            delta=candidate - held,
+            multiplier=multiplier,
+            level=level,
+        )
+        if reserve + commission <= available:
+            chosen = candidate
+            break
+    if chosen != held:
+        ledger.trade_futures(
+            session_idx=session_idx,
+            contracts=chosen,
+            level=level,
+            multiplier=multiplier,
+            cost_rate=float(config.futures_cost_rate),
+        )
+    need = required_reserve_krw(contracts=ledger.contracts, level=level, config=config) - ledger.margin
+    if need > 0:
+        ledger.transfer_margin(session_idx=session_idx, amount=min(need, _spendable_cash(ledger)))
+    elif need < 0:
+        ledger.transfer_margin(session_idx=session_idx, amount=need)
+
+
+def _sync_inverse(
+    ledger: Ledger,
+    *,
+    session_idx: int,
+    target_value_krw: int,
+    price: int,
+    config: DerivativeConfig,
+) -> None:
+    """Trade the inverse ETF toward ``floor(target_value / price)`` units: sells first, buys within free cash.
+
+    Why sells first: the sale proceeds and the disposal tax are settled together, so a reduction is always
+    fundable while a purchase is capped by cash that owes no tax.
+    """
+    rate = float(config.inverse_cost_rate)
+    desired = max(int(target_value_krw) // price, 0)
+    held = ledger.inverse_units
+    if desired < held:
+        ledger.sell_inverse(
+            session_idx=session_idx,
+            units=held - desired,
+            price=price,
+            cost_rate=rate,
+            tax_rate=config.inverse_tax_rate,
+        )
+        return
+    spendable = _spendable_cash(ledger)
+    affordable = min(desired - held, spendable // price)
+    while affordable > 0 and affordable * price + ceil_amount_krw(rate, affordable, price) > spendable:
+        affordable -= 1
+    if affordable > 0:
+        ledger.buy_inverse(session_idx=session_idx, units=affordable, price=price, cost_rate=rate)
+
+
+def _policy_target(policy: OverlayPolicy, state: OverlayState) -> OverlayTarget | None:
+    target = policy.target(state)
+    if target is not None and not isinstance(target, OverlayTarget):
+        raise ValueError("overlay policy must return an OverlayTarget or None")
+    return target
+
+
 def run_backtest(
     *,
     arrays: MarketArrays,
@@ -182,18 +358,35 @@ def run_backtest(
     rules: KrxMarketRules,
     start: date,
     end: date,
+    cash_returns: NDArray[np.float64] | None = None,
+    overlay: OverlayPolicy | None = None,
+    overlay_market: OverlayMarket | None = None,
+    derivatives: DerivativeConfig | None = None,
 ) -> BacktestResult:
     """Replay pre-decided target weights on the fixed session timeline.
 
     ``targets`` maps a decision session index d to instrument-index weights (fractions of decision-session
     NAV; the remainder is cash). Orders for row d execute at session d+1 (open auction), sells before buys,
-    integer shares, no negative cash, T+2-consistent ledger. Per session order is unchanged: share factors,
-    dividend entitlements, dividend payments, exits, deposits, execution, close mark, then decision rows.
+    integer shares, no negative cash, T+2-consistent ledger. Per session order is: share factors, dividend
+    entitlements, dividend payments, exits, deposits, cash yield, sells, tax-payable payment (before any buy),
+    buys, then the close phase — variation margin, quarterly roll, overlay execution and margin maintenance,
+    inverse ETF, year-end taxes, close mark — and finally the decision rows.
     Why replay-only: decisions are produced upstream from the causal panel; the ledger's job is accounting
     truth at 10M KRW (integer shares, costs, settlement), not strategy logic.
+    ``cash_returns`` (aligned to ``arrays.sessions``; element t = cash-ETF close_t /
+    close_{t-1} - 1) credits the cash held overnight before session t's orders. ``None`` disables the sweep.
+    The cash-yield tax is assessed on the last session of each calendar year and on the run's last session,
+    before the close mark, so every ``NavRecord`` already reflects it and ``nav[-1].cash`` equals the journal sum.
 
-    Raises: ValueError for a window outside the panel, a target row outside ``[start-1, end)``, or weights that
-    are negative, non-finite or sum above 1.
+    With an overlay, ``targets`` are fractions of the **stock book**; the engine sizes stock orders against
+    ``nav - required_reserve(target contracts) - target inverse value`` so the cash the hedge needs at the close
+    is left unspent by the open-auction stock trades. The overlay target decided after session d executes in
+    session d+1: futures at the index close of d+1, the inverse ETF at its close of d+1. Overlay costs and the
+    derivative tax are paid from the margin account; a run never aborts for lack of cash - hedges shrink instead.
+
+    Raises: ValueError for a window outside the panel, a target row outside ``[start-1, end)``, weights that are
+    negative, non-finite or sum above 1, or a partial overlay configuration.
+    PITDataError: a missing index level in the window, or a missing inverse close while units are held or targeted.
     """
     sessions = list(arrays.sessions)
     session_index = {session: idx for idx, session in enumerate(sessions)}
@@ -202,6 +395,33 @@ def run_backtest(
     lo, hi = session_index[start], session_index[end]
     n_instruments = len(arrays.instrument_ids)
     schedule = _validate_targets(targets, lo=lo, hi=hi, n_instruments=n_instruments)
+    given = (overlay is not None, overlay_market is not None, derivatives is not None)
+    if any(given) and not all(given):
+        raise ValueError("overlay, overlay_market and derivatives must be given together or not at all")
+    sweep: NDArray[np.float64] | None = None
+    if cash_returns is not None:
+        sweep = np.asarray(cash_returns, dtype=np.float64)
+        if sweep.shape != (len(sessions),):
+            raise ValueError(
+                f"cash_returns must have shape ({len(sessions)},), got {sweep.shape}"
+            )
+    index_levels: NDArray[np.float64] = np.empty(0, dtype=np.float64)
+    inverse_closes: NDArray[np.float64] = np.empty(0, dtype=np.float64)
+    expiry_rows: frozenset[int] = frozenset()
+    multiplier = 0
+    if overlay is not None:
+        assert overlay_market is not None
+        assert derivatives is not None
+        index_levels = np.asarray(overlay_market.index_level, dtype=np.float64)
+        inverse_closes = np.asarray(overlay_market.inverse_close, dtype=np.float64)
+        if index_levels.shape != (len(sessions),) or inverse_closes.shape != (len(sessions),):
+            raise ValueError("overlay_market arrays must align to sessions")
+        for row in range(max(0, lo - 1), hi + 1):
+            level = float(index_levels[row])
+            if not math.isfinite(level) or level <= 0.0:
+                raise PITDataError(f"index level missing at {sessions[row].isoformat()}")
+        expiry_rows = futures_expiry_rows(sessions)
+        multiplier = int(derivatives.contract_multiplier_krw)
     deposits_by_session: dict[int, int] = {}
     for pay_date, amount in deposits.items():
         idx = session_index.get(pay_date, bisect.bisect_right(sessions, pay_date))
@@ -224,7 +444,29 @@ def run_backtest(
                 nav=config.initial_cash, buffer_scale=buffer_scale,
             )
         )
+    pending_overlay: OverlayTarget | None = None
+    if overlay is not None and lo > 0:
+        # The row before the window decides on the first session's hedge; its returns series is still empty.
+        pending_overlay = _policy_target(
+            overlay,
+            OverlayState(
+                session_idx=lo - 1,
+                nav=int(config.initial_cash),
+                stock_book_nav=int(config.initial_cash),
+                stock_book_returns=np.zeros(0, dtype=np.float64),
+                index_returns=np.zeros(0, dtype=np.float64),
+                index_level=_index_level(index_levels, lo - 1),
+                contracts=0,
+                inverse_units=0,
+            ),
+        )
+    stock_book_returns: list[float] = []
+    stock_book_history: list[float] = []
+    index_history: list[float] = []
+    stock_book_prev = int(config.initial_cash)
+
     for t in range(lo, hi + 1):
+        journal_start = ledger.journal_size
         for instrument_idx, factor, base_price in events.share_factor_by_session.get(t, ()):
             ledger.apply_share_factor(
                 session_idx=t, instrument_idx=instrument_idx, factor=factor, base_price=base_price
@@ -245,6 +487,11 @@ def run_backtest(
                 )
         if t in deposits_by_session:
             ledger.deposit(session_idx=t, amount=deposits_by_session[t])
+        if sweep is not None:
+            rate = float(sweep[t])
+            if not math.isfinite(rate):
+                raise PITDataError(f"cash return missing at {sessions[t].isoformat()}")
+            ledger.accrue_cash_yield(session_idx=t, gross_return=rate)
         executable = [order for order in pending if order.instrument_idx not in exited]
         rejects.extend(Reject(order, "delisted") for order in pending if order.instrument_idx in exited)
         order_fills, order_rejects = price_orders(
@@ -252,31 +499,136 @@ def run_backtest(
             rules=rules,
         )
         filled_orders = {fill.order for fill in order_fills}
-        applied, app_rejects, carried = _apply_fills(
-            ledger=ledger, fills=order_fills, t=t, arrays=arrays, config=config
+        sell_fills = [f for f in order_fills if f.order.side is Side.SELL]
+        buy_fills = [f for f in order_fills if f.order.side is Side.BUY]
+        applied_s, rej_s, carried_s = _apply_sell_fills(
+            ledger=ledger, fills=sell_fills, t=t, arrays=arrays, config=config
         )
-        fills.extend(applied)
+        fills.extend(applied_s)
+        rejects.extend(rej_s)
+        ledger.settle_tax_payable(session_idx=t)
+        applied_b, rej_b, carried_b = _apply_buy_fills(
+            ledger=ledger, fills=buy_fills, t=t, arrays=arrays, config=config
+        )
+        fills.extend(applied_b)
+        rejects.extend(rej_b)
         rejects.extend(order_rejects)
-        rejects.extend(app_rejects)
+        carried: list[Order] = []
+        carried.extend(carried_s)
+        carried.extend(carried_b)
         if config.execution.carry_unfilled:
-            for reject in order_rejects:
-                if reject.reason != "delisted" and reject.order not in filled_orders:
-                    carried.append(
-                        Order(
-                            reject.order.instrument_idx, reject.order.side,
-                            reject.order.quantity, t,
-                        )
-                    )
+            carried.extend(
+                Order(
+                    reject.order.instrument_idx, reject.order.side,
+                    reject.order.quantity, t,
+                )
+                for reject in order_rejects
+                if reject.reason != "delisted" and reject.order not in filled_orders
+            )
+        inverse_price: int | None = None
+        level_t = math.nan
+        if overlay is not None:
+            assert derivatives is not None
+            level_t = _index_level(index_levels, t)
+            inverse_price = _inverse_int(inverse_closes, t)
+            if ledger.contracts > 0:
+                ledger.settle_variation(
+                    session_idx=t,
+                    prev_level=_index_level(index_levels, t - 1),
+                    level=level_t,
+                    multiplier=multiplier,
+                )
+            if t in expiry_rows and ledger.contracts > 0:
+                ledger.roll_futures(
+                    session_idx=t, level=level_t, multiplier=multiplier,
+                    cost_rate=float(derivatives.futures_cost_rate),
+                )
+            _sync_futures(
+                ledger, session_idx=t,
+                target_contracts=(
+                    pending_overlay.contracts if pending_overlay is not None else ledger.contracts
+                ),
+                level=level_t, config=derivatives, multiplier=multiplier,
+            )
+            inverse_value_krw = (
+                pending_overlay.inverse_value_krw
+                if pending_overlay is not None
+                else ledger.inverse_units * (inverse_price or 0)
+            )
+            if inverse_value_krw > 0 or ledger.inverse_units > 0:
+                if inverse_price is None:
+                    raise PITDataError(f"inverse close missing at {sessions[t].isoformat()}")
+                _sync_inverse(
+                    ledger, session_idx=t, target_value_krw=inverse_value_krw,
+                    price=inverse_price, config=derivatives,
+                )
+            pending_overlay = None
+        year_end = t == hi or sessions[t].year != sessions[t + 1].year
+        if year_end:
+            if sweep is not None:
+                ledger.settle_cash_yield_tax(session_idx=t, config=config.costs)
+            if overlay is not None:
+                assert derivatives is not None
+                ledger.settle_futures_tax(session_idx=t, config=derivatives)
         record = ledger.mark(
             session_idx=t,
             close=arrays.int_fields["close"][t],
             present=arrays.bool_fields["present"][t],
+            inverse_price=inverse_price,
         )
         records.append(record)
+        flow = _cash_flow_krw(ledger, journal_start)
+        stock_book = (
+            record.cash + record.dividend_receivable + record.market_value - record.tax_payable
+        )
+        session_return = (
+            (stock_book - flow) / stock_book_prev - 1.0
+            if t > lo and stock_book_prev > 0
+            else math.nan
+        )
+        stock_book_returns.append(session_return)
+        stock_book_history.append(session_return)
+        if overlay is not None:
+            index_history.append(
+                math.nan
+                if t == lo
+                else level_t / _index_level(index_levels, t - 1) - 1.0
+            )
+        stock_book_prev = stock_book
+        sizing_nav = int(record.nav)
+        target_contracts = ledger.contracts
+        target_inverse_krw = int(record.inverse_value)
+        if overlay is not None:
+            assert derivatives is not None
+            pending_overlay = _policy_target(
+                overlay,
+                OverlayState(
+                    session_idx=t,
+                    nav=int(record.nav),
+                    stock_book_nav=(
+                        record.cash
+                        + record.dividend_receivable
+                        + record.market_value
+                        - record.tax_payable
+                    ),
+                    stock_book_returns=np.asarray(stock_book_history, dtype=np.float64),
+                    index_returns=np.asarray(index_history, dtype=np.float64),
+                    index_level=level_t,
+                    contracts=int(ledger.contracts),
+                    inverse_units=int(ledger.inverse_units),
+                ),
+            )
+            if pending_overlay is not None:
+                target_contracts = int(pending_overlay.contracts)
+                target_inverse_krw = int(pending_overlay.inverse_value_krw)
+            sizing_nav -= required_reserve_krw(
+                contracts=target_contracts, level=level_t, config=derivatives
+            ) + target_inverse_krw
+            sizing_nav = max(sizing_nav, 0)
         if t in schedule and t >= lo:
             pending = carried + _target_orders(
                 weights=schedule[t], arrays=arrays, t=t, holdings=ledger.positions(),
-                nav=record.nav, buffer_scale=buffer_scale,
+                nav=sizing_nav, buffer_scale=buffer_scale,
             )
         else:
             pending = carried
@@ -289,6 +641,7 @@ def run_backtest(
                 "instrument_idx": entry.instrument_idx,
                 "cash_delta": entry.cash_delta,
                 "quantity_delta": entry.quantity_delta,
+                "account": entry.account.value,
             }
             for entry in journal
         ],
@@ -300,6 +653,9 @@ def run_backtest(
                 "market_value": record.market_value,
                 "nav": record.nav,
                 "external_flow": record.external_flow,
+                "margin": record.margin,
+                "inverse_value": record.inverse_value,
+                "tax_payable": record.tax_payable,
             }
             for record in records
         ],
@@ -314,4 +670,5 @@ def run_backtest(
         journal=journal,
         dividends_integrated=events.dividends_integrated,
         ledger_hash=ledger_hash,
+        stock_book_returns=np.asarray(stock_book_returns, dtype=np.float64),
     )

@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from itertools import pairwise
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
@@ -15,9 +16,21 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.core.pit import PITDataError
-from src.data.research_protocol import LockboxAuthorization, LockboxError
+from src.data.research_protocol import WindowAuthorization, WindowError
 
-__all__ = ["HedgeInputs", "HedgeResult", "HedgeSpec", "hedge_inputs_from_frame", "rolling_beta", "simulate_hedged_book"]
+if TYPE_CHECKING:
+    from src.backtest.overlay import DerivativeConfig, OverlayState, OverlayTarget
+
+__all__ = [
+    "BetaNeutralOverlay",
+    "HedgeInputs",
+    "HedgeResult",
+    "HedgeSpec",
+    "derivative_config",
+    "hedge_inputs_from_frame",
+    "rolling_beta",
+    "simulate_hedged_book",
+]
 
 
 class HedgeSpec(BaseModel):
@@ -245,6 +258,129 @@ def _valid_price(value: float) -> bool:
     return math.isfinite(value) and value > 0.0
 
 
+def derivative_config(spec: HedgeSpec) -> DerivativeConfig:
+    """Map the frozen hedge identity to the engine's derivative terms (multiplier, margin, costs, taxes).
+
+    ``resize_*`` cost rates have no engine counterpart: stock resizing is priced by the engine's own
+    execution model.
+    """
+    from decimal import Decimal
+
+    from src.backtest.overlay import DerivativeConfig
+
+    return DerivativeConfig(
+        contract_multiplier_krw=int(spec.contract_multiplier_krw),
+        initial_margin_rate=float(spec.initial_margin_rate),
+        margin_buffer_rate=float(spec.margin_buffer_rate),
+        margin_topup_trigger_fraction=float(spec.margin_topup_trigger_fraction),
+        futures_cost_rate=float(spec.futures_cost_rate),
+        inverse_cost_rate=float(spec.inverse_cost_rate),
+        futures_tax_rate=Decimal(str(float(spec.futures_tax_rate))),
+        futures_annual_deduction_krw=int(spec.futures_annual_deduction_krw),
+        inverse_tax_rate=Decimal(str(float(spec.inverse_tax_rate))),
+    )
+
+
+def _ols_beta_tail(
+    stock_returns: NDArray[np.float64],
+    index_returns: NDArray[np.float64],
+    *,
+    window: int,
+    min_sessions: int,
+    cap: float,
+) -> float:
+    """OLS slope over the last ``window`` finite pairs (inclusive), clipped to [0, cap]."""
+    stock = np.asarray(stock_returns, dtype=np.float64)
+    index = np.asarray(index_returns, dtype=np.float64)
+    if stock.ndim != 1 or index.ndim != 1 or stock.shape[0] != index.shape[0]:
+        raise ValueError("stock and index returns must be equal-length 1-D arrays")
+    tail = slice(max(0, stock.shape[0] - int(window)), stock.shape[0])
+    xs = index[tail]
+    ys = stock[tail]
+    mask = np.isfinite(xs) & np.isfinite(ys)
+    if int(np.count_nonzero(mask)) < int(min_sessions):
+        return 0.0
+    dx = xs[mask] - float(xs[mask].mean())
+    var = float(np.mean(dx * dx))
+    if not var > 0.0:
+        return 0.0
+    return float(np.clip(float(np.mean(dx * ys[mask]) / var), 0.0, float(cap)))
+
+
+class BetaNeutralOverlay:
+    """``OverlayPolicy`` that shorts ``hedge_ratio · β`` of the stock book with integer futures plus an
+    inverse-ETF remainder (or inverse ETF only when ``use_futures`` is false).
+
+    β is the OLS slope of the stock-book returns on the index returns over the last
+    ``beta_window_sessions`` finite pairs available in the state (session t inclusive — the decision is made
+    after t's close), clipped to ``[0, beta_cap]``; 0.0 with fewer than ``beta_min_sessions`` pairs.
+    Rebalances on run rows ``r`` with ``r % rebalance_every_sessions == rebalance_offset`` (r counted from the
+    run's first session); returns None on other rows.
+    """
+
+    def __init__(self, spec: HedgeSpec, *, rebalance_offset: int, execution_delay: int = 0) -> None:
+        every = int(spec.rebalance_every_sessions)
+        if isinstance(rebalance_offset, bool) or not isinstance(rebalance_offset, int):
+            raise ValueError(f"rebalance_offset must be an int in [0, {every}), got {rebalance_offset!r}")
+        if not 0 <= int(rebalance_offset) < every:
+            raise ValueError(f"rebalance_offset must satisfy 0 <= value < {every}, got {rebalance_offset!r}")
+        if isinstance(execution_delay, bool) or not isinstance(execution_delay, int):
+            raise ValueError(f"execution_delay must be an int >= 0, got {execution_delay!r}")
+        if int(execution_delay) < 0:
+            raise ValueError(f"execution_delay must be >= 0, got {execution_delay!r}")
+        self._spec = spec
+        self._offset = int(rebalance_offset)
+        self._delay = int(execution_delay)
+        self._start: int | None = None
+
+    def target(self, state: OverlayState) -> OverlayTarget | None:
+        """New overlay target on rebalance rows, else None. Reads only ``state``."""
+        from src.backtest.overlay import OverlayTarget
+
+        if self._start is None:
+            self._start = int(state.session_idx)
+        run_row = int(state.session_idx) - int(self._start)
+        if run_row < 0:
+            raise ValueError(f"session_idx {state.session_idx} is before the run start {self._start}")
+        every = int(self._spec.rebalance_every_sessions)
+        if run_row % every != self._offset:
+            return None
+        if not self._spec.hedge_ratio > 0.0:
+            return OverlayTarget(contracts=0, inverse_value_krw=0)
+        stock = np.asarray(state.stock_book_returns, dtype=np.float64)
+        index = np.asarray(state.index_returns, dtype=np.float64)
+        if self._delay > 0:
+            keep = stock.shape[0] - self._delay
+            stock = stock[: max(keep, 0)]
+            index = index[: max(keep, 0)]
+        beta = _ols_beta_tail(
+            stock,
+            index,
+            window=int(self._spec.beta_window_sessions),
+            min_sessions=int(self._spec.beta_min_sessions),
+            cap=float(self._spec.beta_cap),
+        )
+        ratio = float(self._spec.hedge_ratio) * float(beta)
+        if not ratio > 0.0:
+            return OverlayTarget(contracts=0, inverse_value_krw=0)
+        level = float(state.index_level)
+        if not math.isfinite(level) or level <= 0.0:
+            raise PITDataError(f"index level missing at row {state.session_idx}")
+        nav0 = float(state.nav)
+        if not math.isfinite(nav0) or nav0 <= 0.0:
+            return OverlayTarget(contracts=0, inverse_value_krw=0)
+        contract_value = float(int(self._spec.contract_multiplier_krw)) * level
+        reserve_rate = float(self._spec.initial_margin_rate) + float(self._spec.margin_buffer_rate)
+        _, contracts, inverse_value = _frictionless_split(
+            nav0,
+            ratio,
+            contract_value,
+            reserve_rate,
+            bool(self._spec.use_futures),
+        )
+        return OverlayTarget(contracts=int(contracts), inverse_value_krw=math.floor(float(inverse_value)))
+
+
 def _frictionless_split(
     nav0: float, ratio: float, contract_value: float, reserve_rate: float, use_futures: bool
 ) -> tuple[float, int, float]:
@@ -278,7 +414,7 @@ def simulate_hedged_book(
     rebalance_offset: int = 0,
     execution_delay: int = 0,
     extra_cost_rate: float = 0.0,
-    authorization: LockboxAuthorization,
+    authorization: WindowAuthorization,
 ) -> HedgeResult:
     """Simulate NAV when the stock sleeve is overlaid with a rolling-beta short hedge.
 
@@ -288,7 +424,7 @@ def simulate_hedged_book(
     Trading costs, resizing costs and inverse-ETF tax are paid out of the stock sleeve, so NAV is conserved.
 
     Raises:
-        LockboxError: ``sessions`` is not inside ``[authorization.start, authorization.end]``.
+        WindowError: ``sessions`` is not inside ``[authorization.start, authorization.end]``.
         PITDataError: an index level or (when the inverse ETF is held) inverse close is missing or
             non-positive for a session of the run or the session before its first; ``sessions`` is not a
             subsequence of ``inputs.sessions``; costs, taxes or a margin call exceed the stock sleeve.
@@ -309,7 +445,7 @@ def simulate_hedged_book(
     if not math.isfinite(extra_cost_rate) or extra_cost_rate < 0.0:
         raise ValueError(f"extra_cost_rate must be finite and >= 0, got {extra_cost_rate!r}")
     if days[0] < authorization.start or days[-1] > authorization.end:
-        raise LockboxError(f"run window [{days[0]}, {days[-1]}] is not inside the authorization")
+        raise WindowError(f"run window [{days[0]}, {days[-1]}] is not inside the authorization")
     position = {day: pos for pos, day in enumerate(inputs.sessions)}
     run_pos = [position.get(day, -1) for day in days]
     if any(a >= b for a, b in pairwise(run_pos)) or run_pos[0] < 1:

@@ -1,4 +1,4 @@
-"""Research CLI: cube builds, ML trend-cash backtests, registration and holdout."""
+"""Research CLI: cube builds, account-engine evaluations and champion promotion."""
 
 from __future__ import annotations
 
@@ -12,10 +12,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from src.core.pit import PITDataError
-from src.data.research_protocol import LockboxError
+from src.data.research_protocol import WindowError
 
 __all__ = ["main"]
 
@@ -34,20 +32,23 @@ def _build_parser() -> argparse.ArgumentParser:
     build_cube = sub.add_parser("build-cube")
     _common_args(build_cube)
 
-    backtest = sub.add_parser("backtest")
-    _common_args(backtest)
-    backtest.add_argument("--spec", type=Path, required=True)
+    evaluate = sub.add_parser("evaluate")
+    _common_args(evaluate)
+    evaluate.add_argument("--spec", type=Path, required=True)
+    evaluate.add_argument("--capital", type=int, required=False, default=None)
 
-    register = sub.add_parser("register")
-    _common_args(register)
-    register.add_argument("--spec", type=Path, required=True)
+    champion = sub.add_parser("champion")
+    _common_args(champion)
 
-    holdout = sub.add_parser("holdout")
-    _common_args(holdout)
-    holdout.add_argument("--spec", type=Path, required=True)
+    challenge = sub.add_parser("challenge")
+    _common_args(challenge)
+    challenge.add_argument("--spec", type=Path, required=True)
+    challenge.add_argument("--neighbors", type=Path, nargs="*", default=[])
 
-    trials = sub.add_parser("trials")
-    _common_args(trials)
+    promote = sub.add_parser("promote")
+    _common_args(promote)
+    promote.add_argument("--spec", type=Path, required=True)
+    promote.add_argument("--bootstrap", action="store_true")
     return parser
 
 
@@ -60,12 +61,12 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
     from src.core.market_rules import load_krx_market_rules
     from src.core.time import KRX_TZ
     from src.data.dataset_registry import DatasetRegistry
-    from src.data.research_protocol import LockboxLedger, load_research_protocol
+    from src.data.research_protocol import WindowGuard, load_research_protocol
     from src.data.runtime import resolve_data_runtime
     from src.research.cube import CubeInputs, load_research_cube
     from src.research.ledger_bridge import run_ledger
     from src.research.pipeline import Pipeline, PipelineContext
-    from src.research.registry import TrialRegistry
+    from src.research.registry import RunRegistry
 
     runtime_config = load_runtime_config()
     runtime = resolve_data_runtime(scope_config=args.scope_config, data_root=args.data_root)
@@ -87,21 +88,25 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
         dividend_withholding_rate=Decimal("0.154"),
     )
     cube = load_research_cube(inputs, cache_root=state_root / "research" / "cube")
-    trial_registry = TrialRegistry(state_root / "research" / "trials_ml")
-    lockbox = LockboxLedger(state_root=state_root, protocol=protocol, now=lambda: datetime.now(KRX_TZ))
+    run_registry = RunRegistry(state_root / "research" / "runs")
+    guard = WindowGuard(protocol=protocol, last_session=cube.sessions[-1])
     from src.data.datasets import read_dataset
 
     dividends = read_dataset(runtime.workspace.silver_root / dividend_id).collect()
     hedge_id = registry.require("hedge_series")
     hedge_frame = read_dataset(runtime.workspace.silver_root / hedge_id).collect()
     from src.research.hedge import hedge_inputs_from_frame
+    from src.research.ledger_bridge import cash_returns_from_frame
 
     hedge_inputs = hedge_inputs_from_frame(hedge_frame, sessions=list(cube.sessions))
+    cash_id = registry.require("cash_series")
+    cash_frame = read_dataset(runtime.workspace.silver_root / cash_id).collect()
+    cash_returns = cash_returns_from_frame(cash_frame, sessions=list(cube.sessions))
     context = PipelineContext(
         protocol=protocol,
         cube=cube,
-        registry=trial_registry,
-        lockbox=lockbox,
+        registry=run_registry,
+        guard=guard,
         panel_dir=runtime.workspace.gold_root / market_id,
         dividends=dividends,
         hedge_inputs=hedge_inputs,
@@ -112,6 +117,13 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
         scores_root=state_root / "research" / "scores",
         ledger_runner=run_ledger,
         now=lambda: datetime.now(KRX_TZ),
+        dataset_ids={
+            "market_panel": market_id,
+            "dividend_events": dividend_id,
+            "hedge_series": hedge_id,
+            "cash_series": cash_id,
+        },
+        cash_returns=cash_returns,
     )
     return Pipeline(context)
 
@@ -151,83 +163,136 @@ def _run_build_cube(args: argparse.Namespace) -> Mapping[str, object]:  # pragma
     return {"cube_id": cube.cube_id, "sessions": shape[0], "instruments": shape[1], "coverage": coverage}
 
 
-def _run_backtest(args: argparse.Namespace) -> Mapping[str, object]:
+def _run_evaluate(args: argparse.Namespace) -> Mapping[str, object]:
     pipeline = _pipeline_for(args)
     spec = _load_spec(args.spec)
-    report = pipeline.evaluate_discovery(spec)
+    capital = int(args.capital) if args.capital is not None else None
+    run = pipeline.evaluate(spec, capital_krw=capital)
+    report = run.report
+    report_path = Path(pipeline._ctx.reports_root) / f"{report.spec_hash}_{report.run_id}.json"
     return {
         "spec_hash": report.spec_hash,
+        "run_id": report.run_id,
         "passed": bool(report.passed),
-        "digest": report.digest,
+        "objective_j": float(report.objective_j),
+        "g": float(report.metrics["g"]),
+        "mdd": float(report.metrics["mdd"]),
+        "report_path": str(report_path),
     }
 
 
-def _run_register(args: argparse.Namespace) -> Mapping[str, object]:
-    pipeline = _pipeline_for(args)
-    spec = _load_spec(args.spec)
-    pipeline.register_finalist(spec)
-    return {"registered": spec.spec_hash}
-
-
-def _run_holdout(args: argparse.Namespace) -> Mapping[str, object]:
-    pipeline = _pipeline_for(args)
-    spec = _load_spec(args.spec)
-    report = pipeline.holdout(spec)
-    return {"spec_hash": report.spec_hash, "passed": bool(report.passed), "digest": report.digest}
-
-
-def _run_trials(args: argparse.Namespace) -> Mapping[str, object]:
-    from src.config.runtime import load_runtime_config
-    from src.data.research_protocol import load_research_protocol
+def _champion_store(args: argparse.Namespace) -> Any:
     from src.data.runtime import resolve_data_runtime
-    from src.research.registry import TrialRegistry
-    from src.research.stats import effective_trial_count
+    from src.research.champion import ChampionStore
 
-    runtime_config = load_runtime_config()
     runtime = resolve_data_runtime(scope_config=args.scope_config, data_root=args.data_root)
-    protocol = load_research_protocol(runtime_config.research_protocol, runtime.scope)
-    registry = TrialRegistry(runtime.workspace.state_root / "research" / "trials_ml")
-    trials = registry.trials()
-    by_sessions: dict[tuple[str, ...], list[str]] = {}
-    for trial in trials:
-        try:
-            stored = registry.returns(trial.trial_id)
-        except PITDataError:
-            continue
-        key = tuple(day.isoformat() for day in stored.sessions)
-        by_sessions.setdefault(key, []).append(trial.trial_id)
-    effective = 1.0
-    if by_sessions:
-        largest = max(by_sessions.values(), key=len)
-        columns = []
-        for trial_id in largest:
-            try:
-                stored = registry.returns(trial_id)
-            except PITDataError:  # pragma: no cover - intact after the first pass
-                continue
-            columns.append(np.asarray(stored.net, dtype=float))
-        if columns:
-            if len(columns) == 1:
-                try:
-                    matrix = np.column_stack(columns)
-                    effective = float(effective_trial_count(matrix))
-                except ValueError:
-                    effective = 1.0
-            elif columns and len(columns[0]) >= 2:
-                matrix = np.column_stack(columns)
-                try:
-                    effective = float(effective_trial_count(matrix))
-                except ValueError:
-                    effective = float(len(columns))
-    prior_trials = int(protocol.criteria.prior_trials)
-    prior_effective = float(protocol.criteria.prior_effective_trials)
+    return ChampionStore(runtime.workspace.state_root / "research" / "champion")
+
+
+def _run_champion(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.research.champion import champion_record_fields
+
+    store = _champion_store(args)
+    current = store.current()
+    history = store.history()[-5:]
     return {
-        "raw_count": len(trials),
-        "effective_count": float(effective),
-        "prior_trials": prior_trials,
-        "prior_effective_trials": float(prior_effective),
-        "n_for_dsr": float(effective) + float(prior_effective),
+        "champion": None if current is None else champion_record_fields(current),
+        "history": [champion_record_fields(record) for record in history],
     }
+
+
+def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.research.champion import decide_challenge
+    from src.research.evaluation import EvaluationPolicy
+    from src.research.pipeline import strategy_spec_from_canonical_json
+
+    store = _champion_store(args)
+    current = store.current()
+    if current is None:
+        raise ValueError("no champion: run 'promote --spec PATH --bootstrap' first")
+    pipeline = _pipeline_for(args)
+    protocol = pipeline._ctx.protocol
+    policy = EvaluationPolicy.model_validate(protocol.evaluation.model_dump())
+    challenger_spec = _load_spec(args.spec)
+    champion_spec = strategy_spec_from_canonical_json(current.spec_json)
+    challenger = pipeline.evaluate(challenger_spec)
+    champion = pipeline.evaluate(champion_spec)
+    neighbors = [_load_spec(path) for path in (args.neighbors or [])]
+    neighbor_runs = tuple(pipeline.evaluate(neighbor) for neighbor in neighbors)
+    decision = decide_challenge(
+        challenger=challenger,
+        champion=champion,
+        neighbors=neighbor_runs,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+        policy=policy,
+    )
+    path = store.save_decision(decision)
+    return {
+        "promotable": decision.promotable,
+        "reasons": list(decision.reasons),
+        "delta_mean": decision.paired.mean,
+        "delta_lower": decision.paired.lower,
+        "challenger_j": decision.challenger_j,
+        "champion_j": decision.champion_j,
+        "decision_path": str(path),
+    }
+
+
+def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
+    store = _champion_store(args)
+    spec = _load_spec(args.spec)
+    pipeline = _pipeline_for(args)
+    run = pipeline.evaluate(spec)
+    now = pipeline._ctx.now()
+    if args.bootstrap:
+        record = store.bootstrap(run=run, spec=spec, spec_path=Path(args.spec), now=now)
+    else:
+        current = store.current()
+        if current is None:
+            raise ValueError("no champion to promote over: pass --bootstrap")
+        decision = _saved_decision(store, spec_hash=spec.spec_hash, run=run, champion=current)
+        record = store.promote(decision=decision, run=run, spec=spec, spec_path=Path(args.spec), now=now)
+    _LOG.info(
+        "[PORTFOLIO] champion promoted spec_hash=%s reason=%s J=%.6f",
+        record.spec_hash,
+        record.reason,
+        record.objective_j,
+    )
+    return {
+        "spec_hash": record.spec_hash,
+        "reason": record.reason,
+        "objective_j": record.objective_j,
+        "run_id": record.run_id,
+        "decision_digest": record.decision_digest,
+    }
+
+
+def _saved_decision(store: Any, *, spec_hash: str, run: Any, champion: Any) -> Any:
+    """The one saved promotable decision for this spec vs the current champion on the current window.
+
+    Re-evaluating the challenger first turns the stored ``run_id`` into a freshness check: a decision made
+    before the cube grew names a different run and is therefore refused.
+    """
+    window = (run.evidence.sessions[0], run.evidence.sessions[-1])
+    matches = [
+        decision
+        for decision in store.decisions()
+        if decision.promotable
+        and decision.challenger_hash == spec_hash
+        and decision.champion_hash == champion.spec_hash
+        and decision.window == window
+        and decision.run_ids[0] == run.report.run_id
+    ]
+    if not matches:
+        raise ValueError(
+            "no saved promotable decision for this spec against the current champion on the current window: "
+            "run 'challenge --spec PATH' first"
+        )
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} saved decisions match this spec and window; run 'challenge' again")
+    return matches[0]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -236,15 +301,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "build-cube":
             _emit(_run_build_cube(args))
-        elif args.command == "backtest":
-            _emit(_run_backtest(args))
-        elif args.command == "register":
-            _emit(_run_register(args))
-        elif args.command == "holdout":
-            _emit(_run_holdout(args))
-        elif args.command == "trials":
-            _emit(_run_trials(args))
-    except LockboxError as exc:
+        elif args.command == "evaluate":
+            _emit(_run_evaluate(args))
+        elif args.command == "champion":
+            _emit(_run_champion(args))
+        elif args.command == "challenge":
+            _emit(_run_challenge(args))
+        elif args.command == "promote":
+            _emit(_run_promote(args))
+    except WindowError as exc:
         _LOG.error("[RISK] command=%s status=failed error=%s", args.command, exc)
         _emit({"error": str(exc)})
         return 1

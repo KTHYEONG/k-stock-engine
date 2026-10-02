@@ -1,7 +1,10 @@
-"""ML trend-cash pipeline invariants."""
+"""Account-engine evaluation pipeline invariants (protocol v4)."""
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from datetime import UTC, datetime, date
 from pathlib import Path
 from typing import Any
@@ -10,7 +13,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from src.data.research_protocol import LockboxError, Segment
+from src.data.research_protocol import WindowError
 from src.research.cube import ResearchCube
 
 _NOW = datetime(2026, 9, 30, tzinfo=UTC)
@@ -23,19 +26,27 @@ def _sessions(n: int = 80) -> list[date]:
     return synthetic_sessions(n, start=date(2019, 1, 1))
 
 
-def _full_cube(sessions: list[date]) -> ResearchCube:
+def _multi_year_sessions(n: int = 1300) -> list[date]:
+    """Panel wide enough for a first test year that has a preceding test year, so the causal perturbation
+    has cut rows to work with."""
+    from tests.fixtures.synthetic_panel import synthetic_sessions
+
+    return synthetic_sessions(n, start=date(2018, 1, 1))
+
+
+def _full_cube(sessions: list[date], *, close: float = 10000.0) -> ResearchCube:
     from tests.fixtures.synthetic_panel import synthetic_cube
 
-    base = synthetic_cube(sessions, INSTRS)
+    base = synthetic_cube(sessions, INSTRS, close=close)
     arrays = dict(base.arrays)
     n_s, n_n = len(sessions), len(INSTRS)
     rng = np.random.default_rng(7)
     rets = rng.normal(loc=0.001, scale=0.004, size=(n_s, n_n))
     trend = np.cumprod(1.0 + rets, axis=0) / (1.0 + rets[0])
     arrays["adj_tr"] = np.ascontiguousarray(trend)
-    arrays["adj_px"] = np.ascontiguousarray(trend * 10000.0)
-    arrays["high"] = np.ascontiguousarray(np.full((n_s, n_n), 10100.0))
-    arrays["low"] = np.ascontiguousarray(np.full((n_s, n_n), 9900.0))
+    arrays["adj_px"] = np.ascontiguousarray(trend * close)
+    arrays["high"] = np.ascontiguousarray(np.full((n_s, n_n), close * 1.01))
+    arrays["low"] = np.ascontiguousarray(np.full((n_s, n_n), close * 0.99))
     arrays["trading_value"] = np.ascontiguousarray(
         np.asarray(arrays["volume"], dtype=float) * np.asarray(arrays["close"], dtype=float)
     )
@@ -71,7 +82,6 @@ def _full_cube(sessions: list[date]) -> ResearchCube:
             arrays[name] = np.ascontiguousarray(np.zeros((n_s, n_n)))
         else:
             arrays[name] = np.ascontiguousarray(np.full((n_s, n_n), np.nan))
-    # drift on last name so streams are positive
     drift_on = np.asarray(arrays["r_on"]).copy()
     drift_id = np.asarray(arrays["r_id"]).copy()
     drift_on[:, -1] = 0.01
@@ -88,48 +98,16 @@ def _full_cube(sessions: list[date]) -> ResearchCube:
     )
 
 
-def _protocol_for(sessions: list[date]) -> Any:
+def _protocol_for() -> Any:
     from src.data.research_protocol import load_research_protocol
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
     base = load_research_protocol(Path("config/research/protocol.toml"), scope)
-    n = len(sessions)
-    d_end = sessions[min(60, max(2, n - 20))]
-    h_start = sessions[min(61, max(3, n - 19))]
-    h_end = sessions[min(75, max(4, n - 5))]
-    f_start = sessions[min(76, max(5, n - 4))]
-    boot = base.criteria.bootstrap.model_copy(update={"draws": 20, "block_sessions": 2, "horizon_sessions": 20})
-    c1 = base.criteria.c1.model_copy(update={"max_p_cagr_le_zero": 1.0})
-    c2 = base.criteria.c2.model_copy(
-        update={
-            "min_point_calmar": -1e9,
-            "min_p_calmar": 0.0,
-            "max_p_mdd_below_limit": 1.0,
-            "max_underwater_median_sessions": 10**9,
-            "max_underwater_p95_sessions": 10**9,
-            "min_worst_phase_calmar": -1e9,
-        }
+    evaluation = base.evaluation.model_copy(
+        update={"draws": 50, "block_sessions": 5, "horizon_sessions": 30}
     )
-    c3 = base.criteria.c3.model_copy(
-        update={
-            "stress_min_point_calmar": -1e9,
-            "ledger_min_calmar": -1e9,
-            "parity_max_growth_gap": 10.0,
-        }
-    )
-    c4 = base.criteria.c4.model_copy(update={"holdout_max_p_mean_le_zero": 1.0, "holdout_min_point_calmar": -1e9})
-    criteria = base.criteria.model_copy(update={"bootstrap": boot, "c1": c1, "c2": c2, "c3": c3, "c4": c4})
-    return base.model_copy(
-        update={
-            "discovery_start": sessions[1],
-            "discovery_end": d_end,
-            "holdout_start": h_start,
-            "holdout_end": h_end,
-            "forward_start": f_start,
-            "criteria": criteria,
-        }
-    )
+    return base.model_copy(update={"evaluation": evaluation})
 
 
 def _spec(**overrides: Any) -> Any:
@@ -177,26 +155,69 @@ def _spec(**overrides: Any) -> Any:
     return StrategySpec(policy=policy, scorer=scorer, book=BookSpec(**book_kw), hedge=HedgeSpec(**hedge_kw))  # type: ignore[arg-type]
 
 
-def _context(tmp_path: Path, sessions: list[date], cube: ResearchCube | None = None) -> Any:
-    from src.core.market_rules import load_krx_market_rules
-    from src.data.research_protocol import LockboxLedger
-    from src.research.pipeline import Pipeline, PipelineContext
-    from src.research.registry import TrialRegistry
+def _panel_rows(sessions: list[date]) -> list[dict[str, Any]]:
+    """A rising panel wide enough that a shifted close is a different market, not the same one shifted."""
+    from tests.fixtures.synthetic_panel import synthetic_panel_row
 
-    protocol = _protocol_for(sessions)
+    rows: list[dict[str, Any]] = []
+    for pos, day in enumerate(sessions):
+        price = 10_000 + 20 * pos
+        rows.extend(
+            synthetic_panel_row(
+                day,
+                inst,
+                open=price,
+                high=price + 100,
+                low=price - 100,
+                close=price,
+                base_price=price,
+                upper_limit=price * 2,
+                lower_limit=price // 2,
+            )
+            for inst in INSTRS
+        )
+    return rows
+
+
+def _context(
+    tmp_path: Path,
+    sessions: list[date],
+    cube: ResearchCube | None = None,
+    *,
+    trending_index: bool = False,
+    dividends: pl.DataFrame | None = None,
+    dataset_ids: dict[str, str] | None = None,
+) -> Any:
+    from src.core.market_rules import load_krx_market_rules
+    from src.data.research_protocol import WindowGuard
+    from src.research.pipeline import Pipeline, PipelineContext
+    from src.research.registry import RunRegistry
+    from tests.fixtures.synthetic_panel import write_synthetic_panel
+
+    protocol = _protocol_for()
     cube = cube if cube is not None else _full_cube(sessions)
-    registry = TrialRegistry(tmp_path / "trials_ml")
-    lockbox = LockboxLedger(state_root=tmp_path / "state", protocol=protocol, now=lambda: _NOW)
+    registry = RunRegistry(tmp_path / "runs")
+    guard = WindowGuard(protocol=protocol, last_session=sessions[-1])
     from tests.fixtures.synthetic_panel import synthetic_hedge_inputs
 
+    hedge_inputs = (
+        _trending_hedge_inputs(sessions) if trending_index else synthetic_hedge_inputs(sessions)
+    )
+    panel = write_synthetic_panel(tmp_path / "gold", "market_panel_test", _panel_rows(sessions))
+    ids = {
+        "market_panel": "market_panel_aaaaaaaaaaaaaaa",
+        "dividend_events": "dividend_events_bbbbbbbbbbbbbbb",
+        "hedge_series": "hedge_series_cccccccccccccccc",
+        "cash_series": "cash_series_dddddddddddddddd",
+    }
     ctx = PipelineContext(
         protocol=protocol,
         cube=cube,
         registry=registry,
-        lockbox=lockbox,
-        panel_dir=tmp_path / "panel",
-        dividends=pl.DataFrame(),
-        hedge_inputs=synthetic_hedge_inputs(sessions),
+        guard=guard,
+        panel_dir=panel,
+        dividends=pl.DataFrame() if dividends is None else dividends,
+        hedge_inputs=hedge_inputs,
         rules=load_krx_market_rules(Path("config/market/krx_market_rules.toml")),
         engine_config_path=Path("config/backtest/default_engine.toml"),
         market_cache_root=tmp_path / "mcache",
@@ -204,6 +225,8 @@ def _context(tmp_path: Path, sessions: list[date], cube: ResearchCube | None = N
         scores_root=tmp_path / "scores",
         ledger_runner=_ledger_ok(sessions),
         now=lambda: _NOW,
+        dataset_ids=ids if dataset_ids is None else dataset_ids,
+        cash_returns=np.zeros(len(sessions), dtype=np.float64),
     )
     return Pipeline(ctx)
 
@@ -215,13 +238,132 @@ def _ledger_ok(sessions: list[date]) -> Any:
         start, end = kwargs["start"], kwargs["end"]
         idx = {d: i for i, d in enumerate(sessions)}
         window = tuple(sessions[idx[start] : idx[end] + 1])
+        drift = 0.0008
+        if kwargs.get("extra_slippage"):
+            drift -= 0.0002
+        if kwargs.get("auction_slippage_ticks"):
+            drift -= 0.0001 * float(kwargs["auction_slippage_ticks"])
         return LedgerOutcome(
             capital_krw=kwargs["capital_krw"],
             halted_exit_policy=kwargs["halted_exit_policy"].value,
             sessions=window,
-            log_returns=np.full(len(window), 0.0008),
+            log_returns=np.full(len(window), drift),
+            stock_book_returns=np.full(len(window), drift * 0.9),
             reject_counts={},
+            journal_totals_krw={"commission": -1000},
+            avg_stock_exposure=0.8,
+            avg_margin_share=0.1,
+            avg_inverse_share=0.05,
+            turnover_per_year=2.0,
             ledger_hash="h",
+        )
+
+    return _fake
+
+
+def _trending_hedge_inputs(sessions: list[date]) -> Any:
+    """Random-walk index level and inverse-ETF close, so the overlay actually opens a hedge position.
+
+    Aligned to the panel sessions exactly, like ``hedge_inputs_from_frame``; the engine overlay market must
+    line up row for row with the panel it prices against.
+    """
+    from src.research.hedge import HedgeInputs
+
+    rng = np.random.default_rng(11)
+    steps = rng.normal(loc=0.0004, scale=0.01, size=len(sessions))
+    level = 1500.0 * np.exp(np.cumsum(steps))
+    inverse = 8000.0 * np.exp(-np.cumsum(steps))
+    return HedgeInputs(
+        sessions=tuple(sessions),
+        index_level=np.ascontiguousarray(level),
+        inverse_close=np.ascontiguousarray(inverse),
+    )
+
+
+def _causal_account(sessions: list[date], *, leak_from_index: bool = False) -> Any:
+    """Fake account engine that actually prices the book and asks the overlay for a target every session.
+
+    A target decided at row ``r`` moves NAV from row ``r + 1`` on and the overlay only ever reads the state
+    up to its own row, so NAV and overlay decisions at rows ``<= cut`` cannot react to anything after ``cut``.
+
+    ``leak_from_index`` reproduces an engine that reads the whole index series before the run: its NAV drifts
+    once the market it was handed has been corrupted past the cut, and it hands the overlay the full series
+    instead of the prefix — the leak the perturbation test has to catch.
+    """
+    from src.backtest.overlay import OverlayState
+    from src.research.ledger_bridge import LedgerOutcome
+
+    position = {day: pos for pos, day in enumerate(sessions)}
+    multiplier = 10_000.0
+    pristine: np.ndarray | None = None
+
+    def _fake(**kwargs: Any) -> LedgerOutcome:
+        nonlocal pristine
+        window = tuple(sessions[position[kwargs["start"]] : position[kwargs["end"]] + 1])
+        targets = {int(r): np.asarray(w, dtype=np.float64) for r, w in kwargs["targets"].items()}
+        market = np.asarray(kwargs["overlay_market"].index_level, dtype=np.float64)
+        if pristine is None:
+            pristine = market.copy()
+        leak = 0.001 if leak_from_index and not np.array_equal(market, pristine) else 0.0
+        overlay = kwargs.get("overlay")
+        rows = np.asarray([position[day] for day in window], dtype=np.int64)
+        levels = np.asarray(market[rows], dtype=np.float64)
+        market_returns = np.zeros(levels.shape[0], dtype=np.float64)
+        market_returns[1:] = levels[1:] / levels[:-1] - 1.0
+        breadth = np.asarray(
+            [
+                0.0
+                if (weights := targets.get(int(rows[pos]) - 1)) is None
+                else float(np.count_nonzero(weights > 0.0))
+                for pos in range(len(window))
+            ],
+            dtype=np.float64,
+        )
+        book_full = 0.0002 + 0.6 * market_returns + 0.0001 * breadth + leak
+        stock_returns = np.zeros(len(window), dtype=np.float64)
+        index_returns = np.zeros(len(window), dtype=np.float64)
+        logs = np.empty(len(window), dtype=np.float64)
+        navs = np.empty(len(window), dtype=np.float64)
+        prev = float(kwargs["capital_krw"])
+        contracts = 0
+        for pos in range(len(window)):
+            book = float(book_full[pos])
+            pnl = -contracts * multiplier * (levels[pos] - levels[pos - 1]) if pos else 0.0
+            nav = prev * (1.0 + book) + pnl
+            stock_returns[pos] = book
+            index_returns[pos] = market_returns[pos]
+            logs[pos] = math.log(nav / prev)
+            navs[pos] = nav
+            if overlay is not None:
+                decision = overlay.target(
+                    OverlayState(
+                        session_idx=int(rows[pos]),
+                        nav=int(nav),
+                        stock_book_nav=int(nav),
+                        stock_book_returns=book_full if leak_from_index else stock_returns[: pos + 1],
+                        index_returns=market_returns if leak_from_index else index_returns[: pos + 1],
+                        index_level=float(levels[pos]),
+                        contracts=contracts,
+                        inverse_units=0,
+                    )
+                )
+                if decision is not None:
+                    contracts = int(decision.contracts)
+            prev = nav
+        return LedgerOutcome(
+            capital_krw=kwargs["capital_krw"],
+            halted_exit_policy=kwargs["halted_exit_policy"].value,
+            sessions=window,
+            log_returns=logs,
+            stock_book_returns=logs * 0.9,
+            reject_counts={},
+            journal_totals_krw={"commission": -1000},
+            avg_stock_exposure=0.8,
+            avg_margin_share=0.1,
+            avg_inverse_share=0.05,
+            turnover_per_year=2.0,
+            ledger_hash="h",
+            nav_krw=navs,
         )
 
     return _fake
@@ -274,190 +416,566 @@ def _leaky_scores(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipe, "walk_forward_scores", _fake)
 
 
-def test_discovery_records_five_base_trials_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_evaluate_runs_every_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
     spec = _spec()
-    first = pipe.evaluate_discovery(spec)
-    n1 = len(pipe._ctx.registry.trials())
-    second = pipe.evaluate_discovery(spec)
-    trials = pipe._ctx.registry.trials()
-    assert n1 == 5
-    assert len(trials) == 5
-    assert {t.trial_id for t in trials} == {t.trial_id for t in pipe._ctx.registry.trials()}
-    assert first.digest == second.digest
+    calls: list[dict[str, Any]] = []
+    runner = pipe._ctx.ledger_runner
+
+    def _spy(**kwargs: Any) -> Any:
+        calls.append(dict(kwargs))
+        return runner(**kwargs)
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    run = pipe.evaluate(spec)
+    ticks = list(pipe._ctx.protocol.scenarios.cost_grid_ticks)
+    assert len(calls) == 3 + len(ticks) + 2
+    assert all(call["cash_returns"] is not None for call in calls)
+    assert all(call["overlay"] is not None for call in calls)
+    assert any(float(call["extra_slippage"]) > 0.0 for call in calls)
+    grid_slips = sorted(
+        float(call["auction_slippage_ticks"])
+        for call in calls
+        if call["auction_slippage_ticks"] is not None
+    )
+    assert grid_slips == sorted(float(t) for t in ticks)
+    assert run.report.passed is True
+    assert run.evidence.sessions[0] == next(d for d in sessions if d.year == 2019)
 
 
-def test_stress_delay_executes_one_session_later(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.research.policy import decision_rows
-
+def test_delay_scenario_shifts_targets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
     spec = _spec()
-    protocol = pipe._ctx.protocol
-    start = next(d for d in sessions if d.year == spec.scorer.first_test_year)
-    end = [d for d in sessions if d <= protocol.discovery_end][-1]
-    lo = sessions.index(start)
-    hi = sessions.index(end)
-    rows = decision_rows(sessions, lo=lo, hi=hi + 1, every=5, phase=0)
-    panel = pipe.panel_for(hi)
-    scores = pipe.scores(spec, segment=Segment.DISCOVERY)
-    import numpy as np
+    seen: dict[str, dict[int, Any]] = {}
+    runner = pipe._ctx.ledger_runner
 
-    from src.research.policy import universe_mask
+    def _spy(**kwargs: Any) -> Any:
+        overlay = kwargs["overlay"]
+        delay = int(getattr(overlay, "_delay", 0))
+        extra = float(kwargs.get("extra_slippage") or 0.0)
+        slip = kwargs.get("auction_slippage_ticks")
+        if delay > 0:
+            seen["delay"] = dict(kwargs["targets"])
+        elif extra > 0.0 or slip is not None:
+            pass
+        else:
+            seen["base"] = dict(kwargs["targets"])
+        return runner(**kwargs)
 
-    uni = np.asarray(universe_mask(pipe._ctx.cube, spec.policy.universe), dtype=bool)[: hi + 1]
-    close = np.asarray(pipe._ctx.cube.arrays["close"], dtype=float)[: hi + 1]
-    targets = pipe._targets_for(
-        spec.policy,
-        close,
-        panel,
-        np.asarray(scores.scores, dtype=float),
-        uni,
-        list(rows),
-        protocol.primary_capital_krw,
-        0.005,
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    pipe.evaluate(spec)
+    delay_n = int(pipe._ctx.protocol.scenarios.stress_delay_sessions)
+    bound = max(seen["base"])
+    assert set(seen["delay"]) == {r + delay_n for r in seen["base"] if r + delay_n <= bound}
+    assert any(r not in seen["delay"] for r in seen["base"])
+
+
+def test_placebo_is_seeded_and_model_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    spec = _spec()
+    per_run: list[list[dict[int, Any]]] = []
+    runner = pipe._ctx.ledger_runner
+
+    def _spy(**kwargs: Any) -> Any:
+        per_run[-1].append(dict(kwargs["targets"]))
+        return runner(**kwargs)
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    per_run.append([])
+    pipe.evaluate(spec)
+    per_run.append([])
+    pipe.evaluate(spec)
+    assert counter.calls == 2
+    assert len(per_run[0]) == len(per_run[1])
+    first_placebo, second_placebo = per_run[0][-1], per_run[1][-1]
+    assert set(first_placebo) == set(second_placebo)
+    for row in first_placebo:
+        assert np.array_equal(np.asarray(first_placebo[row]), np.asarray(second_placebo[row]))
+
+
+def _score_counter(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import src.research.pipeline as pipe_mod
+
+    real = pipe_mod.Pipeline.scores
+
+    class _Counter:
+        calls = 0
+
+    def _spy(self: Any, spec: Any, *, panel: Any = None) -> Any:
+        _Counter.calls += 1
+        return real(self, spec, panel=panel)
+
+    monkeypatch.setattr(pipe_mod.Pipeline, "scores", _spy)
+    _clean_scores(monkeypatch)
+    return _Counter
+
+
+def test_registry_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    run = pipe.evaluate(spec)
+    records = pipe._ctx.registry.runs(run_id=run.report.run_id)
+    ticks = list(pipe._ctx.protocol.scenarios.cost_grid_ticks)
+    assert len(records) == 3 + len(ticks) + 2
+    assert {r.scenario for r in records} == (
+        {"base", "stress_slippage", "stress_delay", "unhedged", "placebo"}
+        | {f"cost_{t}" for t in ticks}
     )
-    base_cfg = pipe._base_sim_config()
-    delay = int(protocol.criteria.c1.stress_execution_delay)
-    assert delay >= 1
-    from src.research.simulator import simulate
+    assert all(r.report_digest == run.report.digest for r in records)
+    assert all(r.protocol_hash == pipe._ctx.protocol.content_hash for r in records)
+    lines_before = len((tmp_path / "runs" / "index.jsonl").read_text(encoding="utf-8").strip().splitlines())
+    rerun = pipe.evaluate(spec)
+    assert rerun.report.run_id == run.report.run_id
+    assert rerun.report.digest == run.report.digest
+    lines_after = len((tmp_path / "runs" / "index.jsonl").read_text(encoding="utf-8").strip().splitlines())
+    assert lines_after == lines_before
 
-    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
-    exec_base = {r: w for r, w in targets.items() if lo - 1 <= r <= hi - 1}
-    exec_delay = {r: w for r, w in targets.items() if lo - 1 - delay <= r <= hi - 1 - delay}
-    assert set(exec_base) == set(targets) - ({max(targets)} if max(targets) == hi else set())
-    assert set(exec_delay) != set(exec_base)
-    rb = simulate(pipe._ctx.cube, exec_base, start=start, end=end, config=base_cfg, authorization=auth)
-    rd = simulate(
-        pipe._ctx.cube,
-        exec_delay,
-        start=start,
-        end=end,
-        config=base_cfg.model_copy(update={"execution_delay": delay}),
-        authorization=auth,
-    )
-    assert not np.array_equal(np.asarray(rb.log_returns), np.asarray(rd.log_returns))
+
+def test_report_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec()
+    run = pipe.evaluate(spec)
+    path = tmp_path / "reports" / f"{spec.spec_hash}_{run.report.run_id}.json"
+    assert path.is_file()
+    assert json.loads(path.read_text(encoding="utf-8"))["digest"] == run.report.digest
 
 
 def test_leaky_scorer_is_caught(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
+    sessions = _multi_year_sessions()
     pipe = _context(tmp_path, sessions)
     _leaky_scores(monkeypatch)
+    run = pipe.evaluate(_spec())
+    by = {c.name: c for c in run.report.integrity}
+    assert by["perturbation_mismatches"].passed is False
+    assert run.report.passed is False
+
+
+def test_perturbation_detects_an_account_leak(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions, leak_from_index=True))
+    run = pipe.evaluate(_spec())
+    assert run.evidence.perturbation_mismatches > 0
+    by = {c.name: c for c in run.report.integrity}
+    assert by["perturbation_mismatches"].passed is False
+    assert run.report.passed is False
+
+
+def test_causal_account_passes_the_perturbation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.pipeline as pipe_mod
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+    clean = pipe_mod.walk_forward_scores
+    rescores: list[int] = []
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        if len(kwargs["test_years"]) == 1:
+            rescores.append(kwargs["test_years"][0])
+        return clean(*args, **kwargs)
+
+    monkeypatch.setattr(pipe_mod, "walk_forward_scores", _counting)
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
+    run = pipe.evaluate(_spec())
+    assert rescores
+    assert len(rescores) == int(pipe._ctx.protocol.scenarios.perturbation_cuts)
+    assert run.evidence.perturbation_mismatches == 0
+    assert {c.name: c for c in run.report.integrity}["perturbation_mismatches"].passed is True
+
+
+def test_perturbation_never_passes_vacuously(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.pipeline as pipe_mod
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    clean = pipe_mod.walk_forward_scores
+
+    def _rescore_fails(*args: Any, **kwargs: Any) -> Any:
+        if len(kwargs["test_years"]) == 1:
+            raise RuntimeError("rescore failed")
+        return clean(*args, **kwargs)
+
+    monkeypatch.setattr(pipe_mod, "walk_forward_scores", _rescore_fails)
+    with pytest.raises(RuntimeError, match="rescore failed"):
+        pipe.evaluate(_spec())
+    assert counter.calls == 1
+    assert not list((tmp_path / "reports").glob("*.json"))
+
+
+def test_capital_is_part_of_the_run_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
     spec = _spec()
-    report = pipe.evaluate_discovery(spec)
-    by = {c.name: c for c in report.checks}
-    assert by["C1.perturbation"].passed is False
-    assert report.checks[0].value > 0
+    small = pipe.evaluate(spec, capital_krw=10_000_000)
+    large = pipe.evaluate(spec, capital_krw=100_000_000)
+    assert small.report.run_id != large.report.run_id
+    records = pipe._ctx.registry.runs()
+    assert {record.run_id for record in records} == {small.report.run_id, large.report.run_id}
+    assert {record.capital_krw for record in records} == {10_000_000, 100_000_000}
+    ticks = list(pipe._ctx.protocol.scenarios.cost_grid_ticks)
+    per_run = 3 + len(ticks) + 2
+    assert len(pipe._ctx.registry.runs(run_id=small.report.run_id)) == per_run
+    assert len(pipe._ctx.registry.runs(run_id=large.report.run_id)) == per_run
+    written = sorted(path.name for path in (tmp_path / "reports").glob("*.json"))
+    assert written == [
+        f"{spec.spec_hash}_{large.report.run_id}.json",
+        f"{spec.spec_hash}_{small.report.run_id}.json",
+    ]
 
 
-def test_discovery_window_stays_inside_authorization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_non_primary_capital_keeps_integrity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # close * min_units_per_slot > sleeve slot at 10M, so the affordability filter really binds there.
+    sessions = _multi_year_sessions()
+    pipe = _context(
+        tmp_path, sessions, _full_cube(sessions, close=400_000.0), trending_index=True
+    )
+    _clean_scores(monkeypatch)
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
+    run = pipe.evaluate(_spec(policy={"min_units_per_slot": 3}), capital_krw=10_000_000)
+    assert run.evidence.perturbation_mismatches == 0
+    assert pipe._sim_config(10_000_000).capital_krw == 10_000_000
+    assert {r.capital_krw for r in pipe._ctx.registry.runs(run_id=run.report.run_id)} == {10_000_000}
+
+
+def test_dataset_rebuild_is_a_new_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    spec = _spec()
+    _clean_scores(monkeypatch)
+    first = _context(tmp_path / "a", sessions)
+    original = first.evaluate(spec)
+    second = _context(
+        tmp_path / "b",
+        sessions,
+        dataset_ids=dict(first._ctx.dataset_ids, cash_series="cash_series_eeeeeeeeeeeeeeee"),
+    )
+    refreshed = second.evaluate(spec)
+
+    assert original.report.run_id != refreshed.report.run_id
+    assert original.report.objective_j == refreshed.report.objective_j
+    assert {r.run_id for r in first._ctx.registry.runs()} == {original.report.run_id}
+    assert {r.run_id for r in second._ctx.registry.runs()} == {refreshed.report.run_id}
+    assert sorted(path.name for path in (tmp_path / "a" / "reports").glob("*.json")) == [
+        f"{spec.spec_hash}_{original.report.run_id}.json"
+    ]
+
+
+def test_run_identity_requires_every_dataset_id() -> None:
+    from src.research.pipeline import _evaluation_run_id
+
+    with pytest.raises(ValueError, match="dataset_ids are missing"):
+        _evaluation_run_id(
+            spec=_spec(),
+            capital_krw=100_000_000,
+            protocol_hash="p",
+            cube_id="c",
+            dataset_ids={"market_panel": "market_panel_0"},
+            start=date(2020, 1, 2),
+            end=date(2020, 2, 2),
+            engine_config_bytes=b"engine",
+        )
+
+
+def test_perturbation_reaches_the_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An account that values row ``t`` with the engine close of row ``t+1`` must fail the integrity check.
+
+    The bug is injected as a ledger runner that hands the real ``run_ledger`` a patched ``MarketArrays``, so the
+    detection runs through the production account engine rather than a stand-in, and the corrupted rows the
+    pipeline replays are the ones the engine actually reads.
+    """
+    from src.backtest.market import MarketArrays
+    from src.research.ledger_bridge import run_ledger
+
+    sessions = _multi_year_sessions(800)
+    pipe = _context(tmp_path, sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+
+    def _tomorrows_close(**kwargs: Any) -> Any:
+        arrays = kwargs.pop("market_arrays")
+        close = np.asarray(arrays.int_fields["close"], dtype=np.int64)
+        shifted = close.copy()
+        shifted[:-1] = close[1:]
+        return run_ledger(
+            **kwargs,
+            market_arrays=MarketArrays(
+                dataset_id=arrays.dataset_id,
+                sessions=arrays.sessions,
+                instrument_ids=arrays.instrument_ids,
+                int_fields={**arrays.int_fields, "close": np.ascontiguousarray(shifted)},
+                float_fields=arrays.float_fields,
+                bool_fields=arrays.bool_fields,
+                market=arrays.market,
+            ),
+        )
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _tomorrows_close)
+    run = pipe.evaluate(_spec())
+    assert run.evidence.perturbation_mismatches > 0
+    assert run.report.passed is False
+
+
+def test_engine_input_corruption_respects_the_cut() -> None:
+    from src.backtest.market import MarketArrays
+    from src.research.pipeline import _corrupt_dividends, _corrupt_market_arrays
+
+    sessions = _sessions(6)
+    shape = (len(sessions), 3)
+    ints = {
+        "close": np.full(shape, 10_000, dtype=np.int64),
+        "volume": np.zeros(shape, dtype=np.int64),
+    }
+    floats = {"adtv20": np.full(shape, 1.0e12, dtype=np.float64)}
+    present = np.zeros(shape, dtype=bool)
+    present[4:] = True
+    arrays = MarketArrays(
+        dataset_id="market_panel_0",
+        sessions=tuple(sessions),
+        instrument_ids=("a", "b", "c"),
+        int_fields=ints,
+        float_fields=floats,
+        bool_fields={"present": present, "entry_blocked": np.zeros(shape, dtype=bool)},
+        market=np.ones(shape, dtype=np.int8),
+    )
+    corrupted = _corrupt_market_arrays(arrays, 2, np.random.default_rng(3))
+    assert np.array_equal(corrupted.int_fields["close"][:3], ints["close"][:3])
+    assert np.array_equal(corrupted.int_fields["volume"][:3], ints["volume"][:3])
+    assert np.array_equal(corrupted.float_fields["adtv20"][:3], floats["adtv20"][:3])
+    assert not np.array_equal(corrupted.int_fields["close"][3:], ints["close"][3:])
+    assert np.all(corrupted.int_fields["close"][3:] > 0)
+    assert np.array_equal(corrupted.int_fields["volume"][3:], ints["volume"][3:])
+    assert np.array_equal(corrupted.bool_fields["present"][:3], present[:3])
+    assert corrupted.bool_fields["present"][3:].all()
+    assert not np.array_equal(
+        corrupted.bool_fields["entry_blocked"][3:], arrays.bool_fields["entry_blocked"][3:]
+    )
+
+    dividends = pl.DataFrame(
+        {
+            "instrument_id": ["a", "a", "a"],
+            "ex_session": [sessions[0], sessions[2], sessions[4]],
+            "pay_session": [sessions[1], sessions[3], sessions[5]],
+            "dps_krw": [10, 20, 30],
+        }
+    )
+    scaled = _corrupt_dividends(dividends, sessions[2], np.random.default_rng(4))
+    assert scaled["dps_krw"].to_list()[0] == 10
+    assert scaled["dps_krw"].to_list()[1] == 20
+    assert scaled["dps_krw"].to_list()[2] > 30
+    assert _corrupt_dividends(pl.DataFrame(), sessions[0], np.random.default_rng(5)).height == 0
+
+
+def test_data_end_follows_the_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    cash = np.zeros(len(sessions), dtype=np.float64)
+    cash[-3:] = np.nan
+    object.__setattr__(pipe._ctx, "cash_returns", cash)
+    run = pipe.evaluate(_spec())
+    assert run.report.end == sessions[-4]
+    assert run.evidence.sessions[-1] == sessions[-4]
+
+
+def test_internal_gap_fails_before_scoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core.pit import PITDataError
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    cash = np.zeros(len(sessions), dtype=np.float64)
+    cash[30] = np.nan
+    object.__setattr__(pipe._ctx, "cash_returns", cash)
+    with pytest.raises(PITDataError, match=sessions[30].isoformat()):
+        pipe.evaluate(_spec())
+    assert counter.calls == 0
+    assert not list((tmp_path / "reports").glob("*.json"))
+
+
+def test_index_level_gap_fails_before_scoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An index-level hole inside the window names its session, together with any inverse-close gap."""
+    from src.core.pit import PITDataError
+    from src.research.hedge import HedgeInputs
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions, trending_index=True)
+    counter = _score_counter(monkeypatch)
+    inputs = pipe._ctx.hedge_inputs
+    levels = np.asarray(inputs.index_level, dtype=np.float64).copy()
+    inverse = np.asarray(inputs.inverse_close, dtype=np.float64).copy()
+    levels[30] = np.nan
+    inverse[45] = np.nan
+    object.__setattr__(
+        pipe._ctx,
+        "hedge_inputs",
+        HedgeInputs(
+            sessions=inputs.sessions,
+            index_level=np.ascontiguousarray(levels),
+            inverse_close=np.ascontiguousarray(inverse),
+        ),
+    )
+    with pytest.raises(PITDataError) as excinfo:
+        pipe.evaluate(_spec())
+    message = str(excinfo.value)
+    assert sessions[30].isoformat() in message
+    assert f"inverse close is also missing at {sessions[45].isoformat()}" in message
+    assert counter.calls == 0
+    assert not list((tmp_path / "reports").glob("*.json"))
+
+
+def test_unusable_inputs_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core.pit import PITDataError
+    from src.research.hedge import HedgeInputs
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    inputs = pipe._ctx.hedge_inputs
+
+    object.__setattr__(
+        pipe._ctx,
+        "hedge_inputs",
+        HedgeInputs(
+            sessions=inputs.sessions,
+            index_level=np.ascontiguousarray(np.asarray(inputs.index_level)[:-1]),
+            inverse_close=np.ascontiguousarray(np.asarray(inputs.inverse_close)),
+        ),
+    )
+    with pytest.raises(PITDataError, match="differs from its sessions"):
+        pipe.evaluate(_spec())
+
+    object.__setattr__(pipe._ctx, "hedge_inputs", inputs)
+    object.__setattr__(pipe._ctx, "cash_returns", np.zeros(len(sessions) - 1, dtype=np.float64))
+    with pytest.raises(PITDataError, match="not aligned"):
+        pipe.evaluate(_spec())
+
+    object.__setattr__(pipe._ctx, "cash_returns", np.full(len(sessions), np.nan, dtype=np.float64))
+    with pytest.raises(PITDataError, match="no session in"):
+        pipe.evaluate(_spec())
+
+    object.__setattr__(pipe._ctx, "cash_returns", None)
+    with pytest.raises(PITDataError, match="cash return series"):
+        pipe.evaluate(_spec())
+
+
+def test_window_guard_rejects_out_of_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
     spec = _spec(scorer={"first_test_year": 2030})
     with pytest.raises(ValueError, match="first_test_year"):
-        pipe.evaluate_discovery(spec)
-    # start after discovery end (same year span, late first_test_year)
-    from datetime import timedelta
-
-    long_sessions = [date(2019, 1, 1) + timedelta(days=i) for i in range(400)]
-    long_pipe = _context(tmp_path, long_sessions)
-    _clean_scores(monkeypatch)
-    late = _spec(scorer={"first_test_year": 2020})
-    with pytest.raises(ValueError, match="after the discovery end"):
-        long_pipe.evaluate_discovery(late)
+        pipe.evaluate(spec)
+    with pytest.raises(ValueError, match="first_test_year"):
+        pipe.scores(spec)
+    with pytest.raises(ValueError, match="capital_krw must be positive"):
+        pipe.evaluate(_spec(), capital_krw=0)
+    with pytest.raises(WindowError):
+        pipe._ctx.guard.authorize(start=date(2017, 1, 1), end=sessions[-1])
 
 
-def test_register_requires_passed_intact_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import json
-
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    with pytest.raises(ValueError, match="missing"):
-        pipe.register_finalist(spec)
-    pipe.evaluate_discovery(spec)
-    path = pipe._ctx.reports_root / f"{spec.spec_hash}_discovery.json"
-    raw = json.loads(path.read_text())
-    raw["checks"][0]["passed"] = False
-    # keep old digest to simulate failure? recompute: write failing report with correct digest
-    from src.research.pipeline import _rebuild_report
-
-    body = {k: v for k, v in raw.items() if k != "digest"}
-    rebuilt = _rebuild_report(body)
-    raw["digest"] = rebuilt.digest
-    path.write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n")
-    with pytest.raises(ValueError, match="did not pass"):
-        pipe.register_finalist(spec)
-    # tamper
-    pipe.evaluate_discovery(spec)
-    raw = json.loads(path.read_text())
-    raw["checks"][0]["value"] = 999.0
-    path.write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n")
-    with pytest.raises(ValueError, match="digest mismatch"):
-        pipe.register_finalist(spec)
-
-
-def test_holdout_sealed_without_finalist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    with pytest.raises(LockboxError):
-        pipe.holdout(spec)
-
-
-def test_holdout_uses_production_phase_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    pipe.evaluate_discovery(spec)
-    pipe.register_finalist(spec)
-    report = pipe.holdout(spec)
-    trials = pipe._ctx.registry.trials(segment=Segment.HOLDOUT)
-    assert len(trials) == 1
-    assert report.segment is Segment.HOLDOUT
-    # forward stays sealed
-    with pytest.raises(ValueError, match="sealed"):
-        pipe.scores(spec, segment=Segment.FORWARD)
-
-
-def test_annualized_turnover_and_cost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    pipe.evaluate_discovery(spec)
-    for trial in pipe._ctx.registry.trials(segment=Segment.DISCOVERY):
-        assert trial.metrics["turnover"] >= 0.0
-        assert trial.metrics["cost"] >= 0.0
-        assert trial.metrics["turnover"] == pytest.approx(trial.metrics["turnover"])
-    # per-year multiples: turnover equals session mean scaled by sessions_per_year
-    trial = pipe._ctx.registry.trials(segment=Segment.DISCOVERY)[0]
-    assert np.isfinite(trial.metrics["turnover"])
-    assert np.isfinite(trial.metrics["cost"])
-
-
-def test_halted_policy_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.research.simulator import simulate
+def test_index_benchmark_fails_closed_on_missing_hedge_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.core.pit import PITDataError
+    from src.research.hedge import HedgeInputs
 
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
-    protocol = pipe._ctx.protocol
-    start = next(d for d in sessions if d.year == _spec().scorer.first_test_year)
-    end = [d for d in sessions if d <= protocol.discovery_end][-1]
-    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
-    cfg0 = pipe._base_sim_config().model_copy(update={"halted_exit_value": 0.0})
-    cfg1 = pipe._base_sim_config().model_copy(update={"halted_exit_value": 1.0})
-    r0 = simulate(pipe._ctx.cube, {}, start=start, end=end, config=cfg0, authorization=auth)
-    r1 = simulate(pipe._ctx.cube, {}, start=start, end=end, config=cfg1, authorization=auth)
-    assert r0.sessions == r1.sessions
+    window = tuple(sessions)
+    inputs = pipe._ctx.hedge_inputs
+
+    def _with(new_inputs: object) -> None:
+        object.__setattr__(pipe._ctx, "hedge_inputs", new_inputs)
+
+    levels = np.asarray(inputs.index_level)
+    inverse = np.asarray(inputs.inverse_close)
+
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions),
+        index_level=np.ascontiguousarray(levels),
+        inverse_close=np.ascontiguousarray(inverse),
+    ))
+    assert np.allclose(pipe._index_log_returns(window), 0.0)
+
+    dropped_day = np.concatenate([levels[:4], levels[5:]])
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions[:4]) + tuple(inputs.sessions)[5:],
+        index_level=np.ascontiguousarray(dropped_day),
+        inverse_close=np.ascontiguousarray(inverse),
+    ))
+    with pytest.raises(PITDataError, match="missing"):
+        pipe._index_log_returns(window)
+
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions),
+        index_level=np.ascontiguousarray(levels[:-2]),
+        inverse_close=np.ascontiguousarray(inverse),
+    ))
+    with pytest.raises(PITDataError, match="differs from its sessions"):
+        pipe._index_log_returns(window)
+
+    broken = levels.copy()
+    broken[6] = np.nan
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions),
+        index_level=np.ascontiguousarray(broken),
+        inverse_close=np.ascontiguousarray(inverse),
+    ))
+    with pytest.raises(PITDataError, match="non-positive"):
+        pipe._index_log_returns(window)
+
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions)[1:],
+        index_level=np.ascontiguousarray(levels[1:]),
+        inverse_close=np.ascontiguousarray(inverse[1:]),
+    ))
+    assert pipe._index_log_returns(window)[0] == 0.0
+
+    _with(HedgeInputs(
+        sessions=tuple(inputs.sessions),
+        index_level=np.ascontiguousarray(levels),
+        inverse_close=np.ascontiguousarray(inverse),
+    ))
+    run = pipe.evaluate(_spec())
+    assert np.isfinite(run.report.controls["index_g"])
+
+
+def test_universe_benchmark_edges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec(policy={"universe": {"min_adtv20_krw": 10**15, "min_price_krw": 0}})
+    run = pipe.evaluate(spec)
+    assert np.isfinite(run.report.controls["universe_ew_g"])
+    assert len(run.evidence.universe_ew_log_returns) == len(run.evidence.sessions)
+
+    n_rows = len(sessions)
+    uni = np.ones((n_rows, len(INSTRS)), dtype=bool)
+    flat = np.full((n_rows, len(INSTRS)), 10_000.0)
+    assert np.all(pipe._universe_ew_log_returns(0, 1, uni, flat) == 0.0)
+
+    one = np.zeros((n_rows, len(INSTRS)), dtype=bool)
+    one[:, 0] = True
+    nan_close = flat.copy()
+    nan_close[4, 0] = np.nan
+    assert np.all(pipe._universe_ew_log_returns(4, 5, one, nan_close) == 0.0)
+
+    rising = flat * (1.001 ** np.arange(n_rows, dtype=float)[:, None])
+    assert pipe._universe_ew_log_returns(1, 3, one, rising)[0] == pytest.approx(math.log(1.001))
+    assert np.all(pipe._universe_ew_log_returns(1, 3, np.zeros_like(one), flat) == 0.0)
 
 
 def test_scores_cache_validity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -465,8 +983,7 @@ def test_scores_cache_validity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
     spec = _spec()
-    first = pipe.scores(spec, segment=Segment.DISCOVERY)
-    # tamper cache file
+    first = pipe.scores(spec)
     cache_files = list((tmp_path / "scores").glob("*.npz"))
     assert cache_files
     with np.load(str(cache_files[0])) as store:
@@ -480,19 +997,32 @@ def test_scores_cache_validity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         last_row=np.asarray(0),
         scores=bad_scores,
     )
-    second = pipe.scores(spec, segment=Segment.DISCOVERY)
+    second = pipe.scores(spec)
     assert np.array_equal(np.asarray(first.scores), np.asarray(second.scores), equal_nan=True)
 
 
-def test_price_cap_effect_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scores_cache_corrupt_file_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
-    spec = _spec(policy={"min_units_per_slot": 3})
-    report = pipe.evaluate_discovery(spec)
-    by = {c.name: c for c in report.checks}
-    assert "C3.price_cap_effect" in by
-    assert np.isfinite(by["C3.price_cap_effect"].value)
+    spec = _spec()
+    first = pipe.scores(spec)
+    cache_files = list((tmp_path / "scores").glob("*.npz"))
+    assert cache_files
+    cache_files[0].write_bytes(b"not a npz")
+    second = pipe.scores(spec)
+    assert np.array_equal(np.asarray(first.scores), np.asarray(second.scores), equal_nan=True)
+
+
+def test_panel_and_window_guards(tmp_path: Path) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    with pytest.raises(ValueError, match="last_row"):
+        pipe.panel_for(-1)
+    with pytest.raises(ValueError, match="last_row"):
+        pipe.panel_for(len(sessions))
+    with pytest.raises(ValueError, match="capital_krw must be positive"):
+        pipe._sim_config(0)
 
 
 def test_spec_identity(tmp_path: Path) -> None:
@@ -523,352 +1053,348 @@ def test_spec_identity(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert load_strategy_spec(good).spec_hash != load_strategy_spec(other).spec_hash
-    changed_book = tmp_path / "bb.toml"
-    changed_book.write_text(
-        good.read_text(encoding="utf-8").replace("stock_capital_fraction=0.75", "stock_capital_fraction=0.5"),
-        encoding="utf-8",
-    )
-    assert load_strategy_spec(good).spec_hash != load_strategy_spec(changed_book).spec_hash
-    changed_hedge = tmp_path / "bh.toml"
-    changed_hedge.write_text(
-        good.read_text(encoding="utf-8").replace("hedge_ratio=1.0", "hedge_ratio=0.5"), encoding="utf-8"
-    )
-    assert load_strategy_spec(good).spec_hash != load_strategy_spec(changed_hedge).spec_hash
-    mismatched = tmp_path / "mm.toml"
-    mismatched.write_text(
-        good.read_text(encoding="utf-8").replace("sleeves=5", "sleeves=3"), encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="sleeves"):
-        load_strategy_spec(mismatched)
-    bad = tmp_path / "c.toml"
-    bad.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nn=20\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[nope]\nx=1\n[scorer]\n[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n',
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="unknown"):
-        load_strategy_spec(bad)
-    with pytest.raises(OSError, match="missing"):
-        load_strategy_spec(tmp_path / "missing.toml")
-    malformed = tmp_path / "mal.toml"
-    malformed.write_text("[policy\nbroken", encoding="utf-8")
-    with pytest.raises(ValueError, match="invalid strategy TOML"):
-        load_strategy_spec(malformed)
-    missing_table = tmp_path / "mt.toml"
-    missing_table.write_text('[policy]\nfamily="ml_trend_cash"\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="must declare"):
-        load_strategy_spec(missing_table)
-    bad_policy = tmp_path / "bp.toml"
-    bad_policy.write_text(
-        '[policy]\nfamily=""\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="invalid \\[policy\\]"):
-        load_strategy_spec(bad_policy)
-    bad_scorer = tmp_path / "bs.toml"
-    bad_scorer.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\nhorizons=[]\n'
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=1.0\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="invalid \\[scorer\\]"):
-        load_strategy_spec(bad_scorer)
-    bad_book = tmp_path / "bb2.toml"
-    bad_book.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
-        "[book]\nsleeves=0\n[hedge]\nhedge_ratio=1.0\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="invalid \\[book\\]"):
-        load_strategy_spec(bad_book)
-    bad_hedge = tmp_path / "bh2.toml"
-    bad_hedge.write_text(
-        '[policy]\nfamily="ml_trend_cash"\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n[scorer]\n'
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n[hedge]\nhedge_ratio=-1.0\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="invalid \\[hedge\\]"):
-        load_strategy_spec(bad_hedge)
 
 
-def test_trial_metrics_without_capital_reports_raw_hedge_totals() -> None:
-    from src.research.pipeline import _trial_metrics
+def test_strategy_spec_from_canonical_json_round_trip() -> None:
+    from src.research.pipeline import StrategySpec, strategy_spec_from_canonical_json
 
-    metrics = _trial_metrics(np.full(10, 0.001), np.zeros(10), np.zeros(10), 252)
-    assert metrics["hedge_cost"] == 0.0
-    assert metrics["tax"] == 0.0
-    assert np.isfinite(metrics["cagr"])
+    spec = _spec(policy={"n": 7})
+    restored = strategy_spec_from_canonical_json(spec.canonical_json())
+    assert isinstance(restored, StrategySpec)
+    assert restored == spec
+    assert restored.spec_hash == spec.spec_hash
+    for bad in ("{}", '{"policy": {}}', "not json"):
+        with pytest.raises(ValueError, match="invalid strategy canonical JSON"):
+            strategy_spec_from_canonical_json(bad)
+    mismatched = json.loads(spec.canonical_json())
+    mismatched["book"] = {"sleeves": 3, "stock_capital_fraction": 0.75}
+    with pytest.raises(ValueError, match="invalid strategy canonical JSON"):
+        strategy_spec_from_canonical_json(json.dumps(mismatched))
 
 
-def test_hedge_perturbation_counts_stale_leg_mismatches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def _count_build_panel(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import src.research.pipeline as pipe_mod
+
+    real = pipe_mod.build_panel
+    calls = {"n": 0}
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipe_mod, "build_panel", _counting)
+    return calls
+
+
+def test_panel_built_once_per_evaluate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    calls = _count_build_panel(monkeypatch)
+    spec = _spec()
+    pipe.evaluate(spec)
+    assert calls["n"] == 1
+    pipe.evaluate(spec)
+    assert calls["n"] == 2
+
+
+def test_scores_reject_a_foreign_panel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions = _sessions()
     pipe = _context(tmp_path, sessions)
     _clean_scores(monkeypatch)
     spec = _spec()
-    protocol = pipe._ctx.protocol
-    start = next(d for d in sessions if d.year == spec.scorer.first_test_year)
-    end = [d for d in sessions if d <= protocol.discovery_end][-1]
-    from src.research.pipeline import _window_indices
+    _, hi, _ = pipe._window_rows(spec)
+    with pytest.raises(ValueError, match="data-end row"):
+        pipe.scores(spec, panel=pipe.panel_for(hi - 1))
+    assert pipe.scores(spec, panel=pipe.panel_for(hi)).last_row == hi
 
-    lo, hi = _window_indices(sessions, start, end)
-    window = tuple(sessions[lo : hi + 1])
-    width = hi - lo + 1
-    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
-    zeros = np.zeros(width)
-    zeros_int = np.zeros(width, dtype=np.int64)
-    rng = np.random.default_rng(3)
-    mismatches = pipe._hedge_perturbation_mismatches(
-        spec, np.zeros(width), window, lo, lo, zeros, zeros_int, zeros,
-        int(protocol.primary_capital_krw), auth, rng,
+
+def _causal_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str) -> Any:
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path / tag, sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
+    return pipe, pipe.evaluate(_spec())
+
+
+def test_perturbation_result_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipe, run = _causal_run(tmp_path, monkeypatch, "a")
+    assert run.evidence.perturbation_mismatches == 0
+    assert run.report.digest == "8c732e8664c9fcb5657b260c0b7b022d5c43a1e6bd4888ad8e58fc1138d0e541"
+    assert len(pipe._ctx.registry.runs(run_id=run.report.run_id)) == 9
+
+
+def test_cuts_do_not_overlap_in_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import gc
+    import weakref
+
+    import src.research.pipeline as pipe_mod
+
+    real = pipe_mod.Pipeline._corrupt_cube
+    seen: list[Any] = []
+
+    def _spy(cube: Any, cut: int, seed: int) -> Any:
+        # ResearchCube is a frozen slotted dataclass without weakref support; the copy-on-write
+        # mapping it hands out is owned solely by the cube, so its lifetime is the cube's
+        # lifetime for this check.
+        gc.collect()
+        if seen:
+            assert seen[-1]() is None, "previous cut's corrupted cube is still alive"
+        out = real(cube, cut, seed)
+        seen.append(weakref.ref(out.arrays["close"]))
+        return out
+
+    monkeypatch.setattr(pipe_mod.Pipeline, "_corrupt_cube", staticmethod(_spy))
+    pipe, run = _causal_run(tmp_path, monkeypatch, "b")
+    assert len(seen) == int(pipe._ctx.protocol.scenarios.perturbation_cuts)
+    assert run.evidence.perturbation_mismatches == 0
+    gc.collect()
+    assert all(ref() is None for ref in seen)
+
+
+def test_memory_telemetry_emitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    import src.research.pipeline as pipe_mod
+
+    caplog.set_level(logging.INFO, logger=pipe_mod.__name__)
+    _, run = _causal_run(tmp_path, monkeypatch, "c")
+    assert run.evidence.perturbation_mismatches == 0
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "[SYS] evaluate memory phase=" in record.getMessage()
+    ]
+    n_cuts = 3
+    expected = ["inputs", "panel", "scores", "targets", "scenarios"] + [f"cut{i}" for i in range(n_cuts)] + ["done"]
+    assert [line.split("phase=")[1].split(" ")[0] for line in lines] == expected
+
+
+def _memmapped_cube(root: Path, arrays: dict[str, np.ndarray]) -> ResearchCube:
+    """A cube whose arrays are read-only memory maps, exactly what a cache hit hands the pipeline."""
+    root.mkdir(parents=True, exist_ok=True)
+    mapped: dict[str, Any] = {}
+    for name, arr in arrays.items():
+        np.save(root / f"arr_{name}.npy", np.ascontiguousarray(arr), allow_pickle=False)
+        mapped[name] = np.load(root / f"arr_{name}.npy", mmap_mode="r")
+    n_s = next(iter(arrays.values())).shape[0]
+    return ResearchCube(
+        cube_id="research_cube_0123456789abcdef",
+        sessions=tuple(_sessions(n_s)),
+        instrument_ids=tuple(INSTRS),
+        arrays=mapped,
+        exit_at=np.full(len(INSTRS), -1, dtype=np.int64),
+        exit_halted=np.zeros(len(INSTRS), dtype=bool),
     )
-    assert mismatches == 0
-    stale = pipe._hedge_perturbation_mismatches(
-        spec, np.zeros(width), window, lo, lo, np.ones(width), np.ones(width, dtype=np.int64), np.ones(width),
-        int(protocol.primary_capital_krw), auth, rng,
+
+
+def _corrupt_cube(cube: ResearchCube, cut: int, seed: int) -> ResearchCube:
+    from src.research.pipeline import Pipeline
+
+    return Pipeline._corrupt_cube(cube, cut, seed)
+
+
+def _probe_arrays(n_s: int) -> dict[str, np.ndarray]:
+    n_n = len(INSTRS)
+    return {
+        "alpha": np.ascontiguousarray(np.arange(n_s * n_n, dtype=np.float64).reshape(n_s, n_n) + 1.0),
+        "beta": np.ascontiguousarray(np.full((n_s, n_n), 7.0) + np.arange(n_s * n_n).reshape(n_s, n_n) % 3),
+        "gamma": np.ascontiguousarray(np.arange(n_s * n_n).reshape(n_s, n_n) % 2 == 0),
+        "delta": np.ascontiguousarray(np.arange(n_s * n_n, dtype=np.int64).reshape(n_s, n_n) % 11),
+    }
+
+
+def test_lazy_corruption_materialises_only_read_arrays(tmp_path: Path) -> None:
+    """A consumer that reads one array pays for one array; the others stay untouched and match an eager read."""
+    from collections.abc import Mapping
+
+    cube = _memmapped_cube(tmp_path / "cube", _probe_arrays(12))
+    lazy = _corrupt_cube(cube, 5, 3)
+    eager = _corrupt_cube(cube, 5, 3)
+    assert isinstance(lazy.arrays, Mapping)
+    assert tuple(lazy.arrays) == tuple(cube.arrays)
+    assert len(lazy.arrays) == len(cube.arrays)
+    with pytest.raises(TypeError):
+        lazy.arrays["delta"] = np.zeros((12, len(INSTRS)))  # type: ignore[index]
+    assert lazy.arrays.materialised() == ()
+    assert not lazy.arrays["alpha"].flags.writeable
+    assert lazy.arrays.materialised() == ("alpha",)
+    assert not lazy.arrays["beta"].flags.writeable
+    for name in cube.arrays:
+        assert np.array_equal(lazy.arrays[name], eager.arrays[name], equal_nan=True)
+    assert lazy.cube_id == cube.cube_id
+    assert lazy.sessions == cube.sessions
+    assert lazy.instrument_ids == cube.instrument_ids
+    assert np.array_equal(lazy.exit_at, cube.exit_at)
+    assert np.array_equal(lazy.exit_halted, cube.exit_halted)
+
+
+def test_corrupted_cube_keeps_the_prefix_and_changes_the_tail(tmp_path: Path) -> None:
+    """Rows up to the cut are byte-identical to the source; the tail is corrupted per dtype."""
+    cube = _memmapped_cube(tmp_path / "cube", _probe_arrays(12))
+    out = _corrupt_cube(cube, 5, 11)
+    for name in ("alpha", "beta"):
+        corrupted = out.arrays[name]
+        assert corrupted.flags.c_contiguous
+        assert corrupted[:6].tobytes() == cube.arrays[name][:6].tobytes()
+        assert corrupted[6:].tobytes() != cube.arrays[name][6:].tobytes()
+    flags = out.arrays["gamma"]
+    assert flags[:6].tobytes() == cube.arrays["gamma"][:6].tobytes()
+    flipped = int(np.count_nonzero(flags[6:] != cube.arrays["gamma"][6:]))
+    assert 0.2 < flipped / flags[6:].size < 0.8
+    ints = out.arrays["delta"]
+    assert ints[:6].tobytes() == cube.arrays["delta"][:6].tobytes()
+    steps = ints[6:].astype(np.int64) - cube.arrays["delta"][6:].astype(np.int64)
+    assert bool(np.any(steps != 0))
+    assert int(np.abs(steps).max()) <= 2
+
+
+def test_corruption_is_independent_of_access_order(tmp_path: Path) -> None:
+    """Two cubes built with the same seed agree byte for byte however their arrays are read."""
+    names = ("alpha", "beta", "gamma", "delta")
+    cube = _memmapped_cube(tmp_path / "cube", _probe_arrays(12))
+    forward = _corrupt_cube(cube, 4, 17)
+    backward = _corrupt_cube(cube, 4, 17)
+    for name in names:
+        _ = forward.arrays[name]
+    for name in reversed(names):
+        _ = backward.arrays[name]
+    for name in names:
+        assert forward.arrays[name].tobytes() == backward.arrays[name].tobytes()
+    assert forward.arrays.materialised() == names
+    assert backward.arrays.materialised() == tuple(reversed(names))
+
+
+def test_corruption_never_mutates_the_source(tmp_path: Path) -> None:
+    """Reading every corrupted array leaves the memory-mapped source byte-identical and read-only."""
+    import hashlib
+
+    cube = _memmapped_cube(tmp_path / "cube", _probe_arrays(12))
+
+    def _digest() -> str:
+        return hashlib.sha256(
+            b"".join(np.ascontiguousarray(cube.arrays[name]).tobytes() for name in sorted(cube.arrays))
+        ).hexdigest()
+
+    before = _digest()
+    out = _corrupt_cube(cube, 5, 2)
+    for name in sorted(out.arrays):
+        _ = out.arrays[name]
+    assert out.arrays.materialised() == tuple(sorted(out.arrays))
+    assert _digest() == before
+    assert all(not cube.arrays[name].flags.writeable for name in cube.arrays)
+
+
+_SMAPS_HEADER = re.compile(r"^[0-9a-f]+-[0-9a-f]+\s")
+
+
+def _private_dirty_kb(needle: str) -> int:
+    """Sum of ``Private_Dirty`` over the VMAs backed by ``needle``: pages this process has written."""
+    total = 0
+    current = False
+    with open("/proc/self/smaps", encoding="utf-8") as handle:
+        for line in handle:
+            if _SMAPS_HEADER.match(line):
+                current = needle in line
+            elif current and line.startswith("Private_Dirty:"):
+                total += int(line.split()[1])
+    return total
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps").is_file(), reason="needs Linux procfs")
+def test_copy_on_write_charges_only_the_corrupted_tail(tmp_path: Path) -> None:
+    """Corrupting a mapped array dirties its tail, not the whole file: a full copy would cost 10x more."""
+    n_s, n_n = 2_000, 500
+    cube = _memmapped_cube(tmp_path / "cube", {"wide": np.ones((n_s, n_n), dtype=np.float64)})
+    name = str((tmp_path / "cube" / "arr_wide.npy").resolve())
+    before = _private_dirty_kb(name)
+    corrupted = _corrupt_cube(cube, 1_800, 3).arrays["wide"]
+    assert np.array_equal(corrupted[:1_801], cube.arrays["wide"][:1_801])
+    tail_kb = (n_s - 1_801) * n_n * 8 / 1024
+    full_kb = n_s * n_n * 8 / 1024
+    assert _private_dirty_kb(name) - before <= 2 * tail_kb + 1024
+    assert tail_kb < full_kb / 4
+
+
+def test_corrupt_cube_rejects_a_cut_outside_the_panel(tmp_path: Path) -> None:
+    """A cut that leaves no rows to corrupt, or points past the panel, is a caller error."""
+    cube = _memmapped_cube(tmp_path / "cube", _probe_arrays(12))
+    for cut in (-1, 11, 40):
+        with pytest.raises(ValueError, match="perturbation cut"):
+            _corrupt_cube(cube, cut, 1)
+    assert _corrupt_cube(cube, 0, 1).arrays.materialised() == ()
+
+
+def test_in_memory_source_is_copied_not_aliased() -> None:
+    """A synthetic in-memory cube is copied per array, so a consumer can never write into the fixture."""
+    sessions = _sessions(12)
+    arrays = _probe_arrays(12)
+    cube = ResearchCube.from_arrays(
+        cube_id="research_cube_0123456789abcdef",
+        sessions=sessions,
+        instrument_ids=INSTRS,
+        arrays=arrays,
+        exit_at=np.full(len(INSTRS), -1, dtype=np.int64),
+        exit_halted=np.zeros(len(INSTRS), dtype=bool),
     )
-    assert stale == 3
+    out = _corrupt_cube(cube, 5, 9)
+    assert not isinstance(out.arrays["alpha"], np.memmap)
+    assert out.arrays["alpha"][6:].tobytes() != arrays["alpha"][6:].tobytes()
+    assert arrays["alpha"][6:].tobytes() == cube.arrays["alpha"][6:].tobytes()
 
 
-def test_window_helpers_and_panel_guards(tmp_path: Path) -> None:
-    from src.research.pipeline import (
-        _first_at_or_after,
-        _last_at_or_before,
-        _window_indices,
-    )
-
-    sessions = _sessions()
-    with pytest.raises(ValueError, match="within the cube"):
-        _window_indices(sessions, sessions[5], sessions[2])
-    with pytest.raises(ValueError, match="after the last"):
-        _first_at_or_after(sessions, date(2030, 1, 1))
-    with pytest.raises(ValueError, match="before the first"):
-        _last_at_or_before(sessions, date(1990, 1, 1))
-    pipe = _context(tmp_path, sessions)
-    with pytest.raises(ValueError, match="last_row"):
-        pipe.panel_for(-1)
-    with pytest.raises(ValueError, match="last_row"):
-        pipe.panel_for(len(sessions))
-
-
-def test_effective_and_rebuild_edge_cases() -> None:
-    from src.research.pipeline import _effective_from_columns, _rebuild_report
-
-    assert _effective_from_columns([]) == 1.0
-    flat = [np.zeros(10), np.zeros(10)]
-    assert _effective_from_columns(flat) == float(len(flat))
-    single = [np.random.default_rng(0).normal(size=10)]
-    assert _effective_from_columns(single) >= 1.0
-    assert _effective_from_columns([np.zeros(10)]) == 1.0
-    with pytest.raises(ValueError, match="invalid criteria report"):
-        _rebuild_report({"checks": ["bad"]})  # type: ignore[dict-item]
-
-
-def test_scores_cache_corrupt_file_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    first = pipe.scores(spec, segment=Segment.DISCOVERY)
-    cache_files = list((tmp_path / "scores").glob("*.npz"))
-    assert cache_files
-    cache_files[0].write_bytes(b"not a npz")
-    second = pipe.scores(spec, segment=Segment.DISCOVERY)
-    assert np.array_equal(np.asarray(first.scores), np.asarray(second.scores), equal_nan=True)
-
-
-def test_register_second_spec_refused_and_malformed_reports(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import json
-
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    pipe.evaluate_discovery(spec)
-    pipe.register_finalist(spec)
-    other = _spec(policy={"n": 3})
-    pipe.evaluate_discovery(other)
-    with pytest.raises(LockboxError, match="only one finalist"):
-        pipe.register_finalist(other)
-    # malformed JSON
-    path = pipe._ctx.reports_root / f"{spec.spec_hash}_discovery.json"
-    path.write_text("not json", encoding="utf-8")
-    with pytest.raises(ValueError, match="invalid discovery report"):
-        pipe.register_finalist(spec)
-    # missing digest
-    pipe.evaluate_discovery(spec)
-    raw = json.loads(path.read_text())
-    del raw["digest"]
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="digest mismatch"):
-        pipe.register_finalist(spec)
-    # spec mismatch
-    pipe.evaluate_discovery(spec)
-    raw = json.loads(path.read_text())
-    raw["spec_hash"] = "0" * 64
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="spec mismatch"):
-        pipe.register_finalist(spec)
-
-
-def test_window_for_spec_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from datetime import timedelta
-
-    sessions = [date(2019, 1, 1) + timedelta(days=i) for i in range(400)]
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec(scorer={"first_test_year": 2030})
-    with pytest.raises(ValueError, match="no sessions"):
-        pipe._window_for_spec(spec, Segment.DISCOVERY)
-    with pytest.raises(ValueError, match="no sessions"):
-        pipe.scores(spec, segment=Segment.DISCOVERY)
-    late = _spec(scorer={"first_test_year": 2020})
-    with pytest.raises(ValueError, match="after the discovery end"):
-        pipe._window_for_spec(late, Segment.DISCOVERY)
-
-
-def test_holdout_scores_refuse_outsider_after_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    pipe.evaluate_discovery(spec)
-    pipe.register_finalist(spec)
-    pipe.holdout(spec)
-    outsider = _spec(policy={"n": 3})
-    with pytest.raises(LockboxError, match=r"sealed|not authorized"):
-        pipe.scores(outsider, segment=Segment.HOLDOUT)
-
-
-def test_scores_identity_depends_on_universe_and_scorer() -> None:
-    from src.research.pipeline import _scores_identity
-
-    base = _spec()
-    wider = _spec(policy={"universe": {"min_adtv20_krw": 1, "min_price_krw": 0}})
-    retuned = _spec(scorer={"num_boost_round": 7})
-    assert _scores_identity(base) == _scores_identity(_spec())
-    assert _scores_identity(base) != _scores_identity(wider)
-    assert _scores_identity(base) != _scores_identity(retuned)
-
-
-def test_hedged_stream_equals_overlay_on_sleeve_mean(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from src.research.book import build_sleeve_targets, mean_sleeve_returns
-    from src.research.hedge import simulate_hedged_book
+def test_lazy_corruption_still_catches_a_panel_leak(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A panel built from row t+1 of ``close`` is caught: the lazy copy still corrupts ``close`` on access."""
+    import src.research.pipeline as pipe_mod
     from src.research.model import ScoreMatrix
-    from src.research.policy import universe_mask
-    from types import SimpleNamespace
+    from src.research.panel import FeaturePanel
 
-    sessions = _sessions()
+    sessions = _multi_year_sessions()
     pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    protocol = pipe._ctx.protocol
-    start = next(d for d in sessions if d.year == spec.scorer.first_test_year)
-    end = [d for d in sessions if d <= protocol.discovery_end][-1]
-    lo = sessions.index(start)
-    hi = sessions.index(end)
-    panel = pipe.panel_for(hi)
-    scores = pipe.scores(spec, segment=Segment.DISCOVERY)
-    base_scores = np.asarray(scores.scores, dtype=float)
-    uni = np.asarray(universe_mask(pipe._ctx.cube, spec.policy.universe), dtype=bool)[: hi + 1]
-    close = np.asarray(pipe._ctx.cube.arrays["close"], dtype=float)[: hi + 1]
-    from src.research.book import sleeve_capital_krw as _sleeve_cap
+    real_panel = pipe_mod.build_panel
 
-    sleeve_cap = _sleeve_cap(int(protocol.primary_capital_krw), spec.book)
-    proxy = SimpleNamespace(arrays={"close": close})
-    fake = ScoreMatrix(
-        scores=np.ascontiguousarray(base_scores, dtype=np.float32),
-        test_years=(0,),
-        config_hash="pipeline",
-        last_row=panel.last_row,
-    )
-    sleeves = build_sleeve_targets(
-        spec.policy, proxy, panel, fake, uni, sessions=sessions, sleeves=5,  # type: ignore[arg-type]
-        lo=lo, hi=hi + 1, sleeve_capital_krw=sleeve_cap, cash_buffer=0.005,
-    )
-    auth = pipe._ctx.lockbox.authorize(start=start, end=end, spec_hash=None)
-    logs = []
-    for sleeve_map in sleeves:
-        from src.research.simulator import simulate
+    def _leaky_panel(cube: Any, *, last_row: int) -> Any:
+        panel = real_panel(cube, last_row=last_row)
+        n_rows, n_inst = panel.features["dev_ma20"].shape
+        dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
+        close = np.asarray(cube.arrays["close"], dtype=np.float64)
 
-        cfg = pipe._base_sim_config().model_copy(update={"capital_krw": sleeve_cap})
-        executable = {r: w for r, w in sleeve_map.items() if lo - 1 <= r <= hi - 1}
-        logs.append(np.asarray(simulate(pipe._ctx.cube, executable, start=start, end=end, config=cfg, authorization=auth).log_returns))
-    expected = simulate_hedged_book(
-        mean_sleeve_returns(logs), tuple(sessions[lo : hi + 1]), pipe._ctx.hedge_inputs, spec.hedge,
-        capital_krw=int(protocol.primary_capital_krw), rebalance_offset=0, authorization=auth,
-    )
-    report = pipe.evaluate_discovery(spec)
-    stored = pipe._ctx.registry.returns(report.trial_id)
-    assert np.allclose(np.asarray(stored.net), np.asarray(expected.log_returns), atol=1e-12)
+        def _shifted(block: Any) -> Any:
+            padded = np.full((n_rows, n_inst), np.nan)
+            padded[:-1] = block[1:n_rows]
+            return padded
 
+        today = np.full((n_rows, n_inst), np.nan)
+        today[:-1] = close[: n_rows - 1]
+        # A deliberate leak: today's feature is next day's feature rescaled by tomorrow's close. The clean
+        # panel is unchanged, so only a ``close`` corrupted past the cut can move a score at or before it.
+        features = dict(panel.features)
+        features["dev_ma20"] = np.ascontiguousarray(
+            _shifted(dev) * (_shifted(close) / today), dtype=np.float32
+        )
+        features["dev_ma20"].flags.writeable = False
+        return FeaturePanel(features=features, labels=dict(panel.labels), last_row=panel.last_row)
 
-def test_ledger_replay_uses_combined_stock_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    calls: list[dict[str, object]] = []
-    ledger = pipe._ctx.ledger_runner
+    def _scores_from_feature(
+        panel: Any, universe: Any, panel_sessions: Any, config: Any, *, test_years: Any, authorization: Any
+    ) -> Any:
+        n_rows, n_inst = panel.features["dev_ma20"].shape
+        uni = np.asarray(universe, dtype=bool)
+        dev = np.asarray(panel.features["dev_ma20"], dtype=float)
+        out = np.full((n_rows, n_inst), np.nan)
+        for row, day in enumerate(list(panel_sessions)[:n_rows]):
+            if day.year in set(test_years) and bool(uni[row].any()):
+                out[row] = dev[row]
+        arr = np.ascontiguousarray(out, dtype=np.float32)
+        arr.flags.writeable = False
+        return ScoreMatrix(
+            scores=arr, test_years=tuple(test_years), config_hash=config.config_hash, last_row=panel.last_row
+        )
 
-    def _spy(**kwargs: object) -> object:
-        calls.append(dict(kwargs))
-        return ledger(**kwargs)  # type: ignore[arg-type]
-
-    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
-    pipe.evaluate_discovery(spec)
-    capitals = {int(call["capital_krw"]) for call in calls}  # type: ignore[arg-type]
-    assert capitals == {int(c) for c in pipe._ctx.protocol.criteria.c3.ledger_capitals}
-    assert len(calls) == 2 * len(capitals)
-    first_targets = calls[0]["targets"]
-    assert isinstance(first_targets, dict)
-    assert len(first_targets) > 0
-
-
-def test_missing_hedge_data_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import math
-
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    levels = np.asarray(pipe._ctx.hedge_inputs.index_level).copy()
-    levels[5] = math.nan
-    from src.research.hedge import HedgeInputs
-
-    object.__setattr__(
-        pipe._ctx,
-        "hedge_inputs",
-        HedgeInputs(
-            sessions=tuple(pipe._ctx.hedge_inputs.sessions),
-            index_level=np.ascontiguousarray(levels),
-            inverse_close=np.ascontiguousarray(np.asarray(pipe._ctx.hedge_inputs.inverse_close)),
-        ),
-    )
-    with pytest.raises(Exception, match=r"missing|non-positive|subsequence"):
-        pipe.evaluate_discovery(spec)
-    assert list((tmp_path / "reports").glob("*_discovery.json")) == []
-
-
-def test_holdout_records_single_hedged_trial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import json as _json
-
-    sessions = _sessions()
-    pipe = _context(tmp_path, sessions)
-    _clean_scores(monkeypatch)
-    spec = _spec()
-    pipe.evaluate_discovery(spec)
-    pipe.register_finalist(spec)
-    report = pipe.holdout(spec)
-    trials = pipe._ctx.registry.trials(segment=Segment.HOLDOUT)
-    assert len(trials) == 1
-    assert trials[0].trial_id == report.trial_id
-    payload = _json.loads(trials[0].sim_config_json)
-    assert payload["offset"] == 0
-    assert trials[0].metrics["hedge_cost"] >= 0.0
-    assert trials[0].metrics["tax"] >= 0.0
+    monkeypatch.setattr(pipe_mod, "build_panel", _leaky_panel)
+    monkeypatch.setattr(pipe_mod, "walk_forward_scores", _scores_from_feature)
+    run = pipe.evaluate(_spec())
+    assert run.evidence.perturbation_mismatches > 0
+    assert {c.name: c for c in run.report.integrity}["perturbation_mismatches"].passed is False
+    assert run.report.passed is False
