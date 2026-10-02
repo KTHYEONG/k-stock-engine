@@ -4,47 +4,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy.stats import norm
 
 import pytest
-
-
-def test_effective_n_bounds() -> None:
-    from src.research.stats import effective_trial_count
-
-    rng = np.random.default_rng(7)
-    identical = np.repeat(rng.normal(size=(5000, 1)), 5, axis=1)
-    assert effective_trial_count(identical) == pytest.approx(1.0, abs=1e-9)
-    noise = rng.normal(size=(5000, 5))
-    assert 4.5 <= effective_trial_count(noise) <= 5.0
-
-
-def test_dsr_decreases_with_trial_count() -> None:
-    from src.research.stats import deflated_sharpe_ratio
-
-    rng = np.random.default_rng(11)
-    candidate = rng.normal(loc=0.001, scale=0.01, size=750)
-    trials = rng.normal(loc=0.4, scale=0.3, size=200)
-    values = [deflated_sharpe_ratio(candidate, trial_sharpes=trials, n_trials=n) for n in (2, 50, 500)]
-    assert all(0.0 < value < 1.0 for value in values)
-    assert values[0] > values[1] > values[2]
-
-
-def test_dsr_degenerate_n() -> None:
-    from src.research.stats import deflated_sharpe_ratio
-
-    rng = np.random.default_rng(13)
-    candidate = rng.normal(loc=0.001, scale=0.01, size=500)
-    trials = np.array([0.5])
-    value = deflated_sharpe_ratio(candidate, trial_sharpes=trials, n_trials=1)
-    mean, std = float(np.mean(candidate)), float(np.std(candidate, ddof=1))
-    sharpe = mean / std
-    centered = candidate - mean
-    moment2 = float(np.mean(centered**2))
-    skew = float(np.mean(centered**3) / moment2**1.5)
-    kurt = float(np.mean(centered**4) / moment2**2)
-    denom = math.sqrt(1.0 - skew * sharpe + (kurt - 1.0) / 4.0 * sharpe**2)
-    assert value == pytest.approx(float(norm.cdf(sharpe * math.sqrt(len(candidate) - 1) / denom)))
 
 
 def test_bootstrap_reproducible() -> None:
@@ -100,34 +61,6 @@ def test_bootstrap_validation() -> None:
     assert out.shape == (4,)
 
 
-def test_effective_n_validation() -> None:
-    from src.research.stats import effective_trial_count
-
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        effective_trial_count(np.ones(10))
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        effective_trial_count(np.ones((1, 3)))
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        effective_trial_count(np.column_stack([np.ones(10), np.arange(10, dtype=float)]))
-    single = np.arange(10, dtype=float).reshape(10, 1)
-    assert effective_trial_count(single) == pytest.approx(1.0)
-
-
-def test_dsr_validation() -> None:
-    from src.research.stats import deflated_sharpe_ratio
-
-    good = np.array([0.01, -0.005, 0.02, -0.01, 0.015])
-    trials = np.array([0.3, 0.5, 0.4])
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        deflated_sharpe_ratio(np.array([0.1]), trial_sharpes=trials, n_trials=5)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        deflated_sharpe_ratio(good, trial_sharpes=np.array([]), n_trials=5)
-    with pytest.raises(ValueError, match=r"invalid|empty|positive|length|1-D|2-D|column|horizon|draws|block|session|trial|variance|must|non|at least"):
-        deflated_sharpe_ratio(good, trial_sharpes=trials, n_trials=0)
-    with pytest.raises(ValueError, match=r"candidate must have positive variance"):
-        deflated_sharpe_ratio(np.full(10, 0.5), trial_sharpes=trials, n_trials=5)
-
-
 def test_point_metrics_on_known_path() -> None:
     from src.research.stats import point_metrics
 
@@ -153,66 +86,126 @@ def test_zero_drawdown_calmar_is_infinite() -> None:
     assert metrics.underwater_sessions == 0
 
 
-def test_bootstrap_profile_determinism() -> None:
-    from src.research.stats import bootstrap_profile
+def test_growth_profile_deterministic_and_reuses_draws() -> None:
+    from src.research.stats import growth_profile
 
-    rng = np.random.default_rng(31)
-    x = rng.normal(loc=0.0005, scale=0.01, size=252)
-    kwargs = {"block": 21, "draws": 30, "seed": 7, "horizon": 60, "mdd_limit": -0.5, "sessions_per_year": 252}
-    first = bootstrap_profile(x, **kwargs)
-    second = bootstrap_profile(x, **kwargs)
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=300)
+    kwargs = {"block": 21, "draws": 50, "seed": 7, "horizon": 126, "sessions_per_year": 252}
+    first = growth_profile(x, **kwargs, quantile=0.1, mdd_limits=(-0.3, -0.5))
+    second = growth_profile(x, **kwargs, quantile=0.1, mdd_limits=(-0.3, -0.5))
     assert first == second
-    with pytest.raises(ValueError, match="non-empty"):
-        bootstrap_profile(np.array([]), **kwargs)
-    with pytest.raises(ValueError, match="bootstrap requires"):
-        bootstrap_profile(x, **{**kwargs, "block": 500})
-    with pytest.raises(ValueError, match="bootstrap requires"):
-        bootstrap_profile(x, **{**kwargs, "draws": 0})
+    other_q = growth_profile(x, **kwargs, quantile=0.5, mdd_limits=(-0.3, -0.5))
+    assert other_q.g_median == first.g_median
+    assert other_q.g_point == first.g_point
+    assert other_q.p_growth_le_zero == first.p_growth_le_zero
 
 
-def test_bootstrap_extremes() -> None:
-    from src.research.stats import bootstrap_profile
+def test_growth_profile_quantile_below_median() -> None:
+    from src.research.stats import growth_profile
 
-    rng = np.random.default_rng(37)
-    rising = rng.normal(loc=0.005, scale=0.001, size=500)
-    kwargs = {"block": 21, "draws": 50, "seed": 3, "horizon": 126, "mdd_limit": -0.5, "sessions_per_year": 252}
-    up = bootstrap_profile(rising, **kwargs)
-    assert up.p_cagr_ge_abs_mdd > 0.9
-    assert up.p_cagr_le_zero < 0.1
-    down = bootstrap_profile(-rising, **kwargs)
-    assert down.p_cagr_ge_abs_mdd < 0.1
-    assert down.p_cagr_le_zero > 0.9
+    rng = np.random.default_rng(1)
+    x = rng.normal(loc=0.001, scale=0.02, size=1500)
+    profile = growth_profile(
+        x, block=63, draws=300, seed=3, horizon=1260,
+        sessions_per_year=252, quantile=0.1, mdd_limits=(-0.5,),
+    )
+    assert profile.g_quantile < profile.g_median
 
 
-def test_underwater_quantiles_reflect_long_drawdown() -> None:
-    from src.research.stats import bootstrap_profile, point_metrics
+def test_growth_profile_validation() -> None:
+    from src.research.stats import growth_profile
 
-    x = np.concatenate([np.full(50, 0.01), np.full(100, -0.005), np.full(50, 0.02)])
-    assert point_metrics(x, sessions_per_year=252).underwater_sessions == 125
-    profile = bootstrap_profile(x, block=10, draws=40, seed=5, horizon=200, mdd_limit=-0.5, sessions_per_year=252)
-    assert profile.underwater_median_sessions >= 50
-    assert profile.underwater_p95_sessions >= 100
-    assert profile.underwater_p95_sessions >= profile.underwater_median_sessions
+    x = np.ones(10)
+    base = {"block": 3, "draws": 4, "seed": 1, "horizon": 5,
+            "sessions_per_year": 252, "quantile": 0.1, "mdd_limits": (-0.5,)}
+    with pytest.raises(ValueError, match=r"non-empty|1-D"):
+        growth_profile(np.array([]), **base)
+    with pytest.raises(ValueError, match=r"non-empty|1-D"):
+        growth_profile(np.zeros((2, 2)), **base)
+    with pytest.raises(ValueError, match="block"):
+        growth_profile(x, **{**base, "block": 0})
+    with pytest.raises(ValueError, match="block"):
+        growth_profile(x, **{**base, "block": 11})
+    with pytest.raises(ValueError, match="draws"):
+        growth_profile(x, **{**base, "draws": 0})
+    with pytest.raises(ValueError, match="horizon"):
+        growth_profile(x, **{**base, "horizon": 0})
+    with pytest.raises(ValueError, match="sessions_per_year"):
+        growth_profile(x, **{**base, "sessions_per_year": 0})
+    with pytest.raises(ValueError, match="quantile"):
+        growth_profile(x, **{**base, "quantile": 0.0})
+    with pytest.raises(ValueError, match="quantile"):
+        growth_profile(x, **{**base, "quantile": 1.0})
+    with pytest.raises(ValueError, match="mdd limit"):
+        growth_profile(x, **{**base, "mdd_limits": (-1.5,)})
+    with pytest.raises(ValueError, match="mdd limit"):
+        growth_profile(x, **{**base, "mdd_limits": (0.0,)})
 
 
-def test_dsr_from_dispersion_monotonic_and_guards() -> None:
-    from src.research.stats import deflated_sharpe_ratio_from_dispersion
+def test_paired_delta_cancels_shared_noise() -> None:
+    from src.research.stats import paired_growth_delta
 
-    rng = np.random.default_rng(41)
-    candidate = rng.normal(loc=0.001, scale=0.01, size=750)
-    values = [
-        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.3, n_trials=n)
-        for n in (1, 2, 50, 500)
-    ]
-    assert all(0.0 < value < 1.0 for value in values)
-    assert values[0] > values[1] > values[2] > values[3]
-    with pytest.raises(ValueError, match="n_trials"):
-        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.3, n_trials=0)
-    with pytest.raises(ValueError, match="dispersion"):
-        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=0.0, n_trials=50)
-    with pytest.raises(ValueError, match="dispersion"):
-        deflated_sharpe_ratio_from_dispersion(candidate, sharpe_std_per_period=float("nan"), n_trials=50)
-    with pytest.raises(ValueError, match="positive variance"):
-        deflated_sharpe_ratio_from_dispersion(np.full(10, 0.5), sharpe_std_per_period=0.3, n_trials=50)
-    with pytest.raises(ValueError, match="at least 2 sessions"):
-        deflated_sharpe_ratio_from_dispersion(np.array([0.1]), sharpe_std_per_period=0.3, n_trials=50)
+    rng = np.random.default_rng(2)
+    b = rng.normal(size=1500)
+    a = b + 0.0004
+    delta = paired_growth_delta(
+        a, b, block=21, draws=300, seed=5, horizon=1260, sessions_per_year=252, alpha=0.05,
+    )
+    assert delta.lower == pytest.approx(0.0004 * 252, abs=1e-9)
+    assert delta.p_positive == 1.0
+    assert delta.sessions == 1500
+
+
+def test_paired_delta_identity() -> None:
+    from src.research.stats import paired_growth_delta
+
+    rng = np.random.default_rng(3)
+    b = rng.normal(size=200)
+    delta = paired_growth_delta(
+        b, b, block=10, draws=20, seed=5, horizon=50, sessions_per_year=252, alpha=0.05,
+    )
+    assert delta.mean == 0.0
+    assert delta.lower == 0.0
+    assert delta.upper == 0.0
+
+
+def test_paired_delta_validation() -> None:
+    from src.research.stats import paired_growth_delta
+
+    a = np.ones(10)
+    b = np.ones(9)
+    base = {"block": 3, "draws": 4, "seed": 1, "horizon": 5, "sessions_per_year": 252, "alpha": 0.05}
+    with pytest.raises(ValueError, match=r"non-empty|1-D"):
+        paired_growth_delta(np.array([]), a, **base)
+    with pytest.raises(ValueError, match=r"share length"):
+        paired_growth_delta(a, b, **base)
+    with pytest.raises(ValueError, match="alpha"):
+        paired_growth_delta(a, a, **{**base, "alpha": 0.0})
+    with pytest.raises(ValueError, match="alpha"):
+        paired_growth_delta(a, a, **{**base, "alpha": 0.5})
+    with pytest.raises(ValueError, match="block"):
+        paired_growth_delta(a, a, **{**base, "block": 11})
+    with pytest.raises(ValueError, match="draws"):
+        paired_growth_delta(a, a, **{**base, "draws": 0})
+    with pytest.raises(ValueError, match="horizon"):
+        paired_growth_delta(a, a, **{**base, "horizon": 0})
+    with pytest.raises(ValueError, match="sessions_per_year"):
+        paired_growth_delta(a, a, **{**base, "sessions_per_year": 0})
+
+
+def test_breakeven_interpolation_and_edges() -> None:
+    from src.research.stats import breakeven_slippage_ticks
+
+    assert breakeven_slippage_ticks({0: 0.20, 0.5: 0.10, 1.0: -0.02}) == pytest.approx(
+        0.5 + 0.5 * (0.10 / 0.12)
+    )
+    assert breakeven_slippage_ticks({0.0: 0.2, 1.0: 0.1}) == math.inf
+    assert breakeven_slippage_ticks({0.0: -0.1, 1.0: 0.2}) == 0.0
+    assert breakeven_slippage_ticks({0.0: 0.0, 1.0: -0.1}) == 0.0
+    with pytest.raises(ValueError, match="at least two"):
+        breakeven_slippage_ticks({0.0: 0.1})
+    with pytest.raises(ValueError, match="finite"):
+        breakeven_slippage_ticks({0.0: 0.1, 1.0: math.inf})
+    with pytest.raises(ValueError, match="finite"):
+        breakeven_slippage_ticks({0.0: 0.1, math.nan: 0.2})

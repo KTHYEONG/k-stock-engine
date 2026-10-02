@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 
 import numpy as np
@@ -9,7 +10,8 @@ import pytest
 
 from src.backtest.costs import CostConfig
 from src.backtest.events import DividendEvent
-from src.backtest.ledger import JournalKind, Ledger
+from src.backtest.ledger import JournalKind, Ledger, LedgerAccount
+from src.backtest.overlay import DerivativeConfig
 from src.core.pit import PITDataError
 
 
@@ -28,7 +30,9 @@ def _entitlement(instrument_idx: int, ex: int, pay: int, dps: int) -> DividendEv
 
 
 def _cash(ledger: Ledger, initial_cash: int) -> int:
-    return initial_cash + sum(entry.cash_delta for entry in ledger.journal)
+    return initial_cash + sum(
+        entry.cash_delta for entry in ledger.journal if entry.account is LedgerAccount.CASH
+    )
 
 
 def _quantity_sums(ledger: Ledger) -> dict[int, int]:
@@ -223,3 +227,381 @@ def test_close_exit_at_zero_records_total_loss() -> None:
     ledger.close_exit(session_idx=1, instrument_idx=0, price=0)
     assert ledger.positions() == {}
     assert _cash(ledger, 100_000) == 50_000
+
+
+def _yield_costs(rate: str = "0.154") -> CostConfig:
+    return CostConfig(
+        commission_rate=Decimal("0.00015"), impact_k=0.0, dividend_withholding_rate=Decimal("0"),
+        cash_yield_tax_rate=Decimal(rate),
+    )
+
+
+def test_cash_yield_credited_on_overnight_cash() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    assert ledger.accrue_cash_yield(session_idx=1, gross_return=0.0001) == 100
+    assert ledger.cash == 1_000_100
+    kinds = [entry.kind for entry in ledger.journal]
+    assert kinds == [JournalKind.CASH_YIELD]
+    assert _cash(ledger, 1_000_000) == ledger.cash
+
+
+def test_cash_yield_zero_cash_or_dust_is_noop() -> None:
+    empty = Ledger(initial_cash=0)
+    assert empty.accrue_cash_yield(session_idx=0, gross_return=0.01) == 0
+    assert empty.journal == ()
+    dust = Ledger(initial_cash=100)
+    assert dust.accrue_cash_yield(session_idx=0, gross_return=0.000001) == 0
+    assert dust.journal == ()
+    assert dust.cash == 100
+
+
+def test_negative_yield_floors_toward_minus_inf() -> None:
+    ledger = Ledger(initial_cash=1_000_001)
+    assert ledger.accrue_cash_yield(session_idx=1, gross_return=-0.0001) == -101
+    assert ledger.cash == 1_000_001 - 101
+    assert _cash(ledger, 1_000_001) == ledger.cash
+
+
+def test_cash_yield_invalid_return_rejected() -> None:
+    ledger = Ledger(initial_cash=1_000)
+    for bad in (float("nan"), float("inf"), -1.0, -2.0, True, "0.01"):
+        with pytest.raises(ValueError, match="gross_return"):
+            ledger.accrue_cash_yield(session_idx=0, gross_return=bad)  # type: ignore[arg-type]
+
+
+def test_year_end_tax_nets_the_year() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.accrue_cash_yield(session_idx=0, gross_return=0.0005)
+    ledger.accrue_cash_yield(session_idx=1, gross_return=-0.0001)
+    assert ledger.settle_cash_yield_tax(session_idx=2, config=_yield_costs()) == 61
+    assert ledger.cash == 1_000_000 + 500 - 101 - 61
+    tax_entries = [e for e in ledger.journal if e.kind is JournalKind.CASH_YIELD_TAX]
+    assert [(e.cash_delta, e.session_idx) for e in tax_entries] == [(-61, 2)]
+    assert ledger.settle_cash_yield_tax(session_idx=3, config=_yield_costs()) == 0
+    assert _cash(ledger, 1_000_000) == ledger.cash
+
+
+def test_negative_year_pays_no_tax() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.accrue_cash_yield(session_idx=0, gross_return=-0.0003)
+    assert ledger.settle_cash_yield_tax(session_idx=1, config=_yield_costs()) == 0
+    assert not [e for e in ledger.journal if e.kind is JournalKind.CASH_YIELD_TAX]
+
+
+def test_dust_yield_tax_rounds_to_zero() -> None:
+    ledger = Ledger(initial_cash=10_000)
+    assert ledger.accrue_cash_yield(session_idx=0, gross_return=0.0001) == 1
+    assert ledger.settle_cash_yield_tax(session_idx=1, config=_yield_costs()) == 0
+    assert not [e for e in ledger.journal if e.kind is JournalKind.CASH_YIELD_TAX]
+    assert _cash(ledger, 10_000) == ledger.cash
+
+
+def _payable_sum(ledger: Ledger) -> int:
+    return sum(e.cash_delta for e in ledger.journal if e.account is LedgerAccount.PAYABLE)
+
+
+def _invested_book(*, cash_left: int) -> Ledger:
+    """A fully invested book: 100 accruals bank a ytd sweep yield of 10,000, then buys leave ``cash_left``."""
+    ledger = Ledger(initial_cash=10_000_000)
+    for session_idx in range(100):
+        ledger.accrue_cash_yield(session_idx=session_idx, gross_return=0.00001)
+    ledger.buy(session_idx=100, instrument_idx=0, quantity=10_010_000 - cash_left, price=1, commission=0)
+    assert ledger.cash == cash_left
+    return ledger
+
+
+def test_tax_beyond_cash_becomes_a_payable() -> None:
+    """A fully invested book owes more than it holds: the account records the liability, cash stays >= 0."""
+    ledger = _invested_book(cash_left=99)
+
+    before = ledger.mark(session_idx=101, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool))
+    assert ledger.settle_cash_yield_tax(session_idx=101, config=_yield_costs()) == 1_540
+    after = ledger.mark(session_idx=101, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool))
+
+    assert ledger.cash == 0
+    assert ledger.tax_payable == 1_441
+    assert after.nav == before.nav - 1_540
+    entries = [e for e in ledger.journal if e.kind is JournalKind.CASH_YIELD_TAX]
+    assert [(e.account, e.cash_delta) for e in entries] == [
+        (LedgerAccount.CASH, -99),
+        (LedgerAccount.PAYABLE, -1_441),
+    ]
+    assert _cash(ledger, 10_000_000) == ledger.cash
+    assert _payable_sum(ledger) == -ledger.tax_payable
+
+
+def test_next_session_sales_fund_the_tax_payable() -> None:
+    ledger = _invested_book(cash_left=99)
+    ledger.settle_cash_yield_tax(session_idx=101, config=_yield_costs())
+
+    ledger.sell(
+        session_idx=102, instrument_idx=0, quantity=1, price=2_000_000, commission=0, sell_tax=0
+    )
+    assert ledger.settle_tax_payable(session_idx=102) == 1_441
+    assert ledger.tax_payable == 0
+    assert ledger.cash == 2_000_000 - 1_441
+    payments = [e for e in ledger.journal if e.kind is JournalKind.TAX_PAYMENT]
+    assert [(e.account, e.cash_delta) for e in payments] == [
+        (LedgerAccount.CASH, -1_441),
+        (LedgerAccount.PAYABLE, 1_441),
+    ]
+    assert _payable_sum(ledger) == -ledger.tax_payable
+    assert _cash(ledger, 10_000_000) == ledger.cash
+
+
+def test_tax_payment_capped_by_available_cash() -> None:
+    ledger = _invested_book(cash_left=499)
+    ledger.settle_cash_yield_tax(session_idx=101, config=_yield_costs())
+    assert (ledger.cash, ledger.tax_payable) == (0, 1_041)
+
+    ledger.deposit(session_idx=102, amount=600)
+    assert ledger.settle_tax_payable(session_idx=102) == 600
+    assert (ledger.cash, ledger.tax_payable) == (0, 441)
+    assert ledger.settle_tax_payable(session_idx=103) == 0
+    ledger.deposit(session_idx=104, amount=500)
+    assert ledger.settle_tax_payable(session_idx=104) == 441
+    assert (ledger.cash, ledger.tax_payable) == (59, 0)
+    assert _payable_sum(ledger) == 0
+    assert _cash(ledger, 10_000_000) == ledger.cash
+
+
+def test_settle_tax_payable_without_liability_is_noop() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    assert ledger.settle_tax_payable(session_idx=0) == 0
+    assert ledger.journal == ()
+    assert ledger.tax_payable == 0
+
+
+def _derivatives(**over: object) -> DerivativeConfig:
+    base: dict[str, object] = {
+        "contract_multiplier_krw": 10_000,
+        "initial_margin_rate": 0.1,
+        "margin_buffer_rate": 0.05,
+        "margin_topup_trigger_fraction": 1.0,
+        "futures_cost_rate": 0.0,
+        "inverse_cost_rate": 0.0,
+        "futures_tax_rate": Decimal("0.11"),
+        "futures_annual_deduction_krw": 2_500_000,
+        "inverse_tax_rate": Decimal("0.154"),
+    }
+    base.update(over)
+    return DerivativeConfig(**base)  # type: ignore[arg-type]
+
+
+def test_variation_settles_floored_marks_exactly() -> None:
+    """Two short contracts settle to the floored mark: the sum of daily deltas equals the mark difference."""
+    ledger = Ledger(initial_cash=10_000_000)
+    ledger.transfer_margin(session_idx=0, amount=1_000_000)
+    ledger.trade_futures(session_idx=0, contracts=2, level=1000.00, multiplier=10, cost_rate=0.0)
+
+    first = ledger.settle_variation(
+        session_idx=1, prev_level=1000.00, level=1001.37, multiplier=10
+    )
+    second = ledger.settle_variation(
+        session_idx=2, prev_level=1001.37, level=999.99, multiplier=10
+    )
+
+    mark_start = math.floor(-2 * 10 * 1000.00)
+    mark_up = math.floor(-2 * 10 * 1001.37)
+    mark_end = math.floor(-2 * 10 * 999.99)
+    assert (first, second) == (mark_up - mark_start, mark_end - mark_up)
+    assert first + second == mark_end - mark_start
+    assert ledger.margin == 1_000_000 + first + second
+    assert all(
+        entry.account is LedgerAccount.MARGIN
+        for entry in ledger.journal
+        if entry.kind is JournalKind.VARIATION_MARGIN
+    )
+    assert _cash(ledger, 10_000_000) == ledger.cash
+
+
+def test_short_gains_when_the_index_falls() -> None:
+    """A 10-point fall on one 10,000-KRW contract settles exactly +100,000 and feeds the year-to-date P&L."""
+    ledger = Ledger(initial_cash=10_000_000)
+    ledger.transfer_margin(session_idx=0, amount=1_000_000)
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+
+    assert ledger.settle_variation(
+        session_idx=1, prev_level=1000.0, level=990.0, multiplier=10_000
+    ) == 100_000
+    assert ledger.margin == 1_100_000
+
+    config = _derivatives(futures_annual_deduction_krw=0)
+    assert ledger.settle_futures_tax(session_idx=2, config=config) == math.floor(100_000 * 0.11)
+    assert ledger.margin == 1_100_000 - math.floor(100_000 * 0.11)
+
+
+def test_transfers_conserve_both_accounts() -> None:
+    """A transfer moves KRW between the two accounts only; the cash side is the sole guard rail."""
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.transfer_margin(session_idx=0, amount=50_000)
+    ledger.transfer_margin(session_idx=1, amount=-50_000)
+
+    cash_entries = [e for e in ledger.journal if e.account is LedgerAccount.CASH]
+    margin_entries = [e for e in ledger.journal if e.account is LedgerAccount.MARGIN]
+    assert ledger.cash == 1_000_000 + sum(e.cash_delta for e in cash_entries)
+    assert ledger.margin == sum(e.cash_delta for e in margin_entries) == 0
+    assert [e.cash_delta for e in cash_entries] == [-50_000, 50_000]
+
+    ledger.transfer_margin(session_idx=2, amount=1_000_000)
+    assert (ledger.cash, ledger.margin) == (0, 1_000_000)
+    with pytest.raises(ValueError, match="exceeds"):
+        ledger.transfer_margin(session_idx=3, amount=1)
+    assert (ledger.cash, ledger.margin) == (0, 1_000_000)
+
+
+def test_inverse_tax_charged_only_on_gains_per_sale() -> None:
+    """Disposal tax with no loss offset: the winning half pays, the losing half pays nothing."""
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.buy_inverse(session_idx=0, units=10, price=10_000, cost_rate=0.0)
+
+    assert ledger.sell_inverse(
+        session_idx=1, units=5, price=11_000, cost_rate=0.0, tax_rate=Decimal("0.154")
+    ) == math.floor(5_000 * 0.154)
+    assert ledger.sell_inverse(
+        session_idx=2, units=5, price=9_000, cost_rate=0.0, tax_rate=Decimal("0.154")
+    ) == 0
+    assert ledger.inverse_units == 0
+    assert ledger.cash == 1_000_000 - 100_000 + 55_000 + 45_000 - math.floor(5_000 * 0.154)
+    assert _cash(ledger, 1_000_000) == ledger.cash
+
+
+def test_futures_tax_deduction_without_carry_forward() -> None:
+    """The annual deduction applies per year: year 1's loss neither taxes nor reduces year 2's base."""
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=4, level=1000.0, multiplier=1_000, cost_rate=0.0)
+    assert ledger.settle_variation(
+        session_idx=1, prev_level=1000.0, level=1750.0, multiplier=1_000
+    ) == -3_000_000
+    assert ledger.margin == -3_000_000
+
+    config = _derivatives()
+    assert ledger.settle_futures_tax(session_idx=2, config=config) == 0
+    assert ledger.settle_variation(
+        session_idx=3, prev_level=1750.0, level=750.0, multiplier=1_000
+    ) == 4_000_000
+
+    assert ledger.settle_futures_tax(session_idx=4, config=config) == 165_000
+    assert ledger.margin == 1_000_000 - 165_000
+    taxes = [e for e in ledger.journal if e.kind is JournalKind.FUTURES_TAX]
+    assert [(e.account, e.cash_delta) for e in taxes] == [(LedgerAccount.MARGIN, -165_000)]
+    assert _cash(ledger, 0) == ledger.cash == 0
+    assert ledger.settle_futures_tax(session_idx=5, config=config) == 0
+
+
+def test_futures_no_ops_and_argument_validation() -> None:
+    """Flat positions and a zero transfer are silent no-ops; bad arguments are rejected at the boundary."""
+    ledger = Ledger(initial_cash=1_000_000)
+
+    assert ledger.settle_variation(
+        session_idx=0, prev_level=1000.0, level=900.0, multiplier=10_000
+    ) == 0
+    assert ledger.journal == ()
+
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    ledger.trade_futures(session_idx=1, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    assert [e.kind for e in ledger.journal] == [JournalKind.FUTURES_TRADE]
+    assert ledger.margin == 0
+
+    ledger.roll_futures(session_idx=2, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    assert [e.kind for e in ledger.journal] == [JournalKind.FUTURES_TRADE]
+    ledger.roll_futures(session_idx=3, level=1000.0, multiplier=10_000, cost_rate=0.001)
+    assert ledger.journal[-1].kind is JournalKind.FUTURES_ROLL
+    assert ledger.journal[-1].cash_delta == -math.ceil(2 * 0.001 * 10_000 * 1000.0)
+
+    flat = Ledger(initial_cash=1_000_000)
+    flat.roll_futures(session_idx=0, level=1000.0, multiplier=10_000, cost_rate=0.001)
+    assert flat.journal == ()
+
+    before = ledger.journal
+    ledger.transfer_margin(session_idx=4, amount=0)
+    assert ledger.journal == before
+    with pytest.raises(ValueError, match="cost_rate must be"):
+        ledger.roll_futures(session_idx=4, level=1000.0, multiplier=10_000, cost_rate=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="amount must be an integer"):
+        ledger.transfer_margin(session_idx=4, amount=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="contracts must be"):
+        ledger.trade_futures(
+            session_idx=4, contracts=-1, level=1000.0, multiplier=10_000, cost_rate=0.0
+        )
+    with pytest.raises(ValueError, match="cost_rate must be"):
+        ledger.trade_futures(
+            session_idx=4, contracts=1, level=1000.0, multiplier=10_000, cost_rate=1.0
+        )
+    for bad in (True, float("nan"), -1.0):
+        with pytest.raises(PITDataError, match="level must be finite"):
+            ledger.trade_futures(
+                session_idx=4, contracts=2, level=bad, multiplier=10_000, cost_rate=0.0  # type: ignore[arg-type]
+            )
+    with pytest.raises(PITDataError, match="prev_level must be finite"):
+        ledger.settle_variation(
+            session_idx=4, prev_level="x", level=1000.0, multiplier=10_000  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="cost_rate must be"):
+        ledger.roll_futures(session_idx=4, level=1000.0, multiplier=10_000, cost_rate=2.0)
+    with pytest.raises(PITDataError, match="level must be finite"):
+        ledger.roll_futures(session_idx=4, level=None, multiplier=10_000, cost_rate=0.0)  # type: ignore[arg-type]
+    assert ledger.margin == -math.ceil(2 * 0.001 * 10_000 * 1000.0)
+
+
+def test_inverse_order_validation_rejects_bad_arguments() -> None:
+    """Units, price and the disposal tax rate are validated at the ledger boundary."""
+    ledger = Ledger(initial_cash=1_000_000)
+    with pytest.raises(ValueError, match="units must be"):
+        ledger.buy_inverse(session_idx=0, units=0, price=10_000, cost_rate=0.0)
+    with pytest.raises(ValueError, match="units must be"):
+        ledger.buy_inverse(session_idx=0, units=1.5, price=10_000, cost_rate=0.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="inverse buy costs"):
+        ledger.buy_inverse(session_idx=0, units=200, price=10_000, cost_rate=0.0)
+
+    ledger.buy_inverse(session_idx=0, units=1, price=10_000, cost_rate=0.0)
+    with pytest.raises(ValueError, match="exceeds inverse holding"):
+        ledger.sell_inverse(
+            session_idx=1, units=2, price=10_000, cost_rate=0.0, tax_rate=Decimal("0.154")
+        )
+    for bad in (0.154, True):
+        with pytest.raises(ValueError, match="tax_rate must be"):
+            ledger.sell_inverse(
+                session_idx=1, units=1, price=10_000, cost_rate=0.0, tax_rate=bad  # type: ignore[arg-type]
+            )
+    with pytest.raises(ValueError, match="tax_rate must be in"):
+        ledger.sell_inverse(
+            session_idx=1, units=1, price=10_000, cost_rate=0.0, tax_rate=Decimal("1.0")
+        )
+    assert ledger.inverse_units == 1
+    assert _cash(ledger, 1_000_000) == ledger.cash
+
+
+def test_mark_requires_a_price_for_an_inverse_holding() -> None:
+    ledger = Ledger(initial_cash=1_000_000)
+    ledger.buy_inverse(session_idx=0, units=1, price=10_000, cost_rate=0.0)
+
+    with pytest.raises(PITDataError, match="without a price"):
+        ledger.mark(
+            session_idx=1, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool)
+        )
+    with pytest.raises(PITDataError, match="invalid inverse price"):
+        ledger.mark(
+            session_idx=1, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool),
+            inverse_price=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(PITDataError, match="invalid inverse price"):
+        ledger.mark(
+            session_idx=1, close=np.zeros(1, dtype=np.int64), present=np.ones(1, dtype=bool),
+            inverse_price=-1,
+        )
+
+
+def test_futures_tax_below_one_won_is_not_journaled() -> None:
+    """A positive but sub-won tax rounds away, leaving the year-to-date account reset and margin untouched."""
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    ledger.settle_variation(session_idx=1, prev_level=1000.0, level=990.0, multiplier=10_000)
+
+    assert ledger.settle_futures_tax(
+        session_idx=2,
+        config=_derivatives(futures_annual_deduction_krw=0, futures_tax_rate=Decimal("0.000005")),
+    ) == 0
+    assert ledger.margin == 100_000
+    assert ledger.settle_futures_tax(session_idx=3, config=_derivatives()) == 0

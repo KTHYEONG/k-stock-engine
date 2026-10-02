@@ -64,7 +64,7 @@ def test_open_auction_fills_at_open_with_adverse_tick_rounding(tmp_path: Path) -
         orders=(buy, sell), arrays=arrays, t=1, config=_open_config(), costs=_costs(), rules=rules
     )
     assert rejects == ()
-    assert [(fill.quantity, fill.price) for fill in fills] == [(100, 10_100), (100, 10_000)]
+    assert [(fill.quantity, fill.price) for fill in fills] == [(100, 10_081), (100, 10_019)]
 
 
 def test_halted_session_rejects(tmp_path: Path) -> None:
@@ -290,7 +290,7 @@ def test_close_auction_fills_at_close(tmp_path: Path) -> None:
         rules=_rules(),
     )
     assert rejects == ()
-    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 9_820), (10, 9_810)]
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 9_813), (10, 9_813)]
 
 
 def test_vwap_proxy_adds_half_tick_adverse(tmp_path: Path) -> None:
@@ -315,7 +315,7 @@ def test_vwap_proxy_adds_half_tick_adverse(tmp_path: Path) -> None:
         rules=_rules(),
     )
     assert rejects == ()
-    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 10_100), (10, 10_000)]
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 10_092), (10, 10_041)]
 
 
 def test_close_locked_ranges_reject(tmp_path: Path) -> None:
@@ -427,3 +427,122 @@ def test_sell_on_blocked_name_fills(tmp_path: Path) -> None:
     )
     assert rejects == ()
     assert [(fill.quantity, fill.price) for fill in fills] == [(10, 10_000)]
+
+
+def _slip_costs(slippage_ticks: float = 0.0, extra: float = 0.0) -> CostConfig:
+    return CostConfig(
+        commission_rate=Decimal("0.00015"), impact_k=0.0, dividend_withholding_rate=Decimal("0"),
+        auction_slippage_ticks=slippage_ticks, extra_slippage=extra,
+    )
+
+
+def test_zero_slippage_fills_at_base(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_zero_slip",
+        [
+            _mrow(DAY0, "KRX:A", close=10_000, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=10_000, upper_limit=13_000, lower_limit=7_000),
+        ],
+    )
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    sell = Order(instrument_idx=0, side=Side.SELL, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(buy, sell), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 10_000), (10, 10_000)]
+
+
+def test_fractional_tick_slippage_is_exact(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_frac_slip",
+        [
+            _mrow(DAY0, "KRX:A", close=2_350, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=2_350, upper_limit=3_000, lower_limit=1_500),
+        ],
+    )
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    sell = Order(instrument_idx=0, side=Side.SELL, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(buy, sell), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(0.5),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 2_353), (10, 2_347)]
+
+
+def test_one_tick_reproduces_legacy_level(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_one_tick",
+        [
+            _mrow(DAY0, "KRX:A", close=2_350, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=2_350, upper_limit=3_000, lower_limit=1_500),
+        ],
+    )
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    sell = Order(instrument_idx=0, side=Side.SELL, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(buy, sell), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(1.0),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 2_355), (10, 2_345)]
+
+
+def test_stress_slippage_additive(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_stress",
+        [
+            _mrow(DAY0, "KRX:A", close=10_000, adtv20=1e9, ret_vol60=0.02),
+            _mrow(DAY1, "KRX:A", open=10_000, upper_limit=13_000, lower_limit=7_000),
+        ],
+    )
+    import math as _math
+
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(buy,), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(0.0, 0.001),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, _math.ceil(10_000 * 1.001))]
+
+
+def test_slippage_limits_still_clip(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_slip_clip",
+        [
+            _mrow(DAY0, "KRX:A", close=12_900, adtv20=1e12, ret_vol60=0.0),
+            _mrow(DAY1, "KRX:A", open=13_000, upper_limit=13_000, lower_limit=10_000),
+        ],
+    )
+    buy = Order(instrument_idx=0, side=Side.BUY, quantity=10, decision_session_idx=0)
+    fills, _ = price_orders(
+        orders=(buy,), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(1.0),
+        rules=_rules(),
+    )
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 13_000)]
+
+
+def test_sell_floored_at_one_krw(tmp_path: Path) -> None:
+    arrays = _arrays(
+        tmp_path,
+        "market_panel_floor_one",
+        [
+            _mrow(DAY0, "KRX:A", close=2, adtv20=1e12, ret_vol60=0.0),
+            _mrow(DAY1, "KRX:A", open=2, upper_limit=100, lower_limit=0),
+        ],
+    )
+    sell = Order(instrument_idx=0, side=Side.SELL, quantity=10, decision_session_idx=0)
+    fills, rejects = price_orders(
+        orders=(sell,), arrays=arrays, t=1, config=_open_config(), costs=_slip_costs(10.0),
+        rules=_rules(),
+    )
+    assert rejects == ()
+    assert [(fill.quantity, fill.price) for fill in fills] == [(10, 1)]

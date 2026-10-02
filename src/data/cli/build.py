@@ -475,11 +475,31 @@ def _run_hedge_series_silver(args: argparse.Namespace) -> Mapping[str, object]:
     )
 
 
+def _run_cash_series_silver(args: argparse.Namespace) -> Mapping[str, object]:
+    from dataclasses import asdict
+
+    from src.config import load_runtime_config
+    from src.data.cash_series_silver import load_cash_series_config, materialize_cash_series_silver
+    from src.data.dataset_registry import DatasetRegistry
+
+    runtime = scoped_runtime(args)
+    registry = DatasetRegistry(runtime.workspace.state_root)
+    universe_id = resolve_input_id(runtime, registry, "ordinary_universe", args.universe_dataset_id)
+    cash = load_cash_series_config(load_runtime_config().cash_series)
+    result = materialize_cash_series_silver(
+        catalog=scoped_catalog(runtime), universe_root=runtime.workspace.silver_root,
+        silver_root=runtime.workspace.silver_root, config=cash, universe_dataset_id=universe_id,
+    )
+    register_dataset(runtime, "cash_series", result.dataset_id)
+    return asdict(result) | {"dataset_path": str(result.dataset_path)}
+
+
 BUILD_COMMANDS: tuple[Command, ...] = (
     Command("normalize-dart-facts", "Incremental DART fact refresh", _add_normalize, _run_normalize),
     Command("build-investor-flow-silver", "Build Silver LS investor-flow dataset from raw rows", _add_flow_silver, _run_flow_silver),
     Command("build-daily-market-silver", "Build Silver daily-market dataset with KRX base prices", _add_daily_silver, _run_daily_silver),
     Command("build-hedge-series-silver", "Build Silver hedge-series dataset", _add_daily_silver, _run_hedge_series_silver),
+    Command("build-cash-series-silver", "Build Silver cash-series dataset", _add_daily_silver, _run_cash_series_silver),
     Command("build-ordinary-universe", "Build the point-in-time ordinary-share universe", _add_ordinary, _run_ordinary),
     Command("build-market-panel", "Build decision-safe Gold market panel", _add_panel, _run_panel),
     Command("build-reference-benchmarks", "Build frictionless Gold reference benchmarks", _add_benchmarks, _run_benchmarks),
