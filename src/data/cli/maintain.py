@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Mapping
+from pathlib import Path
 from typing import cast
 
 from src.data.cli.common import (
@@ -38,6 +39,34 @@ def _add_index(parser: argparse.ArgumentParser) -> None:
     add_scoped_args(parser)
     parser.add_argument("--dry-run", action="store_true", help="Classify without publishing anything")
     parser.add_argument("--batch-size", type=int, default=1000, help="Blobs per catalog revision")
+
+
+def _add_migrate_snapshot(parser: argparse.ArgumentParser) -> None:
+    add_scoped_args(parser)
+    parser.add_argument("--snapshot-root", type=Path, required=True, help="Legacy data/bronze/stocks directory")
+    parser.add_argument(
+        "--kinds", nargs="+", choices=("daily_market", "security_master"),
+        default=["daily_market", "security_master"],
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Validate without persisting anything")
+
+
+def _run_migrate_snapshot(args: argparse.Namespace) -> Mapping[str, object]:
+    from dataclasses import asdict
+
+    from src.core.pit import EvidenceKind
+    from src.data.snapshot_migration import migrate_snapshot_krx
+
+    runtime = scoped_runtime(args)
+    runtime.workspace.initialize()
+    reports = migrate_snapshot_krx(
+        runtime,
+        snapshot_root=Path(args.snapshot_root),
+        kinds=tuple(EvidenceKind(kind) for kind in args.kinds),
+        dry_run=bool(args.dry_run),
+        emit=lambda payload: emit(dict(payload)),
+    )
+    return {"type": "summary", "reports": [asdict(report) for report in reports]}
 
 
 def _run_audit(args: argparse.Namespace) -> Mapping[str, object]:
@@ -133,6 +162,10 @@ MAINTAIN_COMMANDS: tuple[Command, ...] = (
     Command("scope-info", "Show resolved scope and workspace roots", _add_audit, _run_scope_info),
     Command("init-workspace", "Create scope-namespaced workspace directories", _add_audit, _run_init_workspace),
     Command("index-bronze", "Register and classify every stored Bronze payload in the catalog", _add_index, _run_index),
+    Command(
+        "migrate-snapshot-krx", "Re-wrap legacy snapshot KRX session pages as scoped receipts",
+        _add_migrate_snapshot, _run_migrate_snapshot,
+    ),
     Command("verify-datasets", "Verify current or all scoped datasets", _add_verify, _run_verify),
     Command("prune-datasets", "Plan or apply removal of unreferenced datasets", _add_prune, _run_prune),
 )
