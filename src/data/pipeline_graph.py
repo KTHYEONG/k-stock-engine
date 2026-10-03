@@ -1061,6 +1061,7 @@ def _run_dart_collection_step(
             provider=provider,
             quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
             key_env=provider.default_key_env,
+            host_pacer_path=ctx.runtime.workspace.state_root / "quota" / "dart_host_pacer.json",
         )
     job_ctx = build_job_context(
         runtime=ctx.runtime, provider=provider, key_env=provider.default_key_env, collector=collector
