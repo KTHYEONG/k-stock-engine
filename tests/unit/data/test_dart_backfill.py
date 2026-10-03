@@ -43,6 +43,7 @@ def _capped_provider(*, daily_budget, daily_reserve, batch_identities):  # type:
             circuit_threshold=3,
             requests_per_identity=3,
             batch_identities=batch_identities,
+            host_min_interval_seconds=0.1,
             shared_ip_avoid_windows_kst=[],
             keys={
                 "TEST_DART_KEY": DartKeyPolicy(

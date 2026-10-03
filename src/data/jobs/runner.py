@@ -6,12 +6,15 @@ continue. One process runs a job name at a time, enforced by a lock file.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 from src.config.providers import ProviderPolicy, RunnerPolicy
@@ -30,6 +33,7 @@ __all__ = [
     "JobSpec",
     "JobUnit",
     "ScopedPayload",
+    "Shard",
     "build_job_context",
     "run_job",
     "seconds_until_window_end",
@@ -57,6 +61,47 @@ class JobUnit:
             raise ValueError("job unit requires a source and a natural key")
         if isinstance(self.max_requests, bool) or int(self.max_requests) < 1:
             raise ValueError(f"invalid max_requests {self.max_requests!r}: must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class Shard:
+    """Deterministic partition ``index`` of ``count`` over job units.
+
+    Why: several DART keys can split one job only if every process plans the same pending list and claims a
+    disjoint, stable subset of it; hashing the catalog natural key gives that without coordination.
+
+    Raises:
+        ValueError: ``count < 1`` or ``index`` outside ``[0, count)``.
+    """
+
+    index: int
+    count: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.count, bool) or isinstance(self.index, bool):
+            raise ValueError(f"invalid shard {self.index!r}/{self.count!r}: integers required")
+        if int(self.count) < 1 or int(self.index) < 0 or int(self.index) >= int(self.count):
+            raise ValueError(
+                f"invalid shard {self.index!r}/{self.count!r}: expected 0 <= index < count with count >= 1"
+            )
+
+    def owns(self, unit: JobUnit) -> bool:
+        """True when SHA-256 of ``unit.source + "\\x1f" + unit.natural_key`` modulo ``count`` equals ``index``."""
+        digest = hashlib.sha256(f"{unit.source}\x1f{unit.natural_key}".encode()).hexdigest()
+        return int(digest, 16) % int(self.count) == int(self.index)
+
+    @classmethod
+    def parse(cls, text: str) -> Shard:
+        """Parse ``"i/n"`` (0-based ``i``). Raises ValueError on any other form."""
+        parts = str(text).split("/")
+        if len(parts) != 2:
+            raise ValueError(f"invalid shard {text!r}: expected 'i/n'")
+        try:
+            index = int(parts[0])
+            count = int(parts[1])
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid shard {text!r}: expected 'i/n'") from None
+        return cls(index=index, count=count)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +211,27 @@ def build_job_context(
     )
 
 
+def _busy() -> JobReport:
+    return JobReport(status="busy", done=0, pending_left=0, requests_used=0)
+
+
+def _try_lock(path: Path, kind: int) -> Any | None:
+    """Open ``path`` and take a non-blocking ``kind`` lock, or return None when held."""
+    handle = path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), kind | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _unlock(handle: Any) -> None:
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
 def run_job(
     spec: JobSpec,
     ctx: JobContext,
@@ -174,6 +240,7 @@ def run_job(
     max_chunks: int | None,
     dry_run: bool,
     emit: Callable[[Mapping[str, object]], None],
+    shard: Shard | None = None,
 ) -> JobReport:
     """Run a job in quota-bounded chunks until done, out of budget, or unsafe to continue.
 
@@ -188,26 +255,43 @@ def run_job(
     aborts the whole run on the first transport failure instead. Every chunk
     emits one progress line carrying ``done``, ``pending``, ``requests_used``,
     ``elapsed_s`` and ``eta_s`` (mean seconds per completed unit).
+
+    A ``shard`` restricts the run to the pending units it owns; shards of one
+    job take a shared job lock plus an exclusive per-shard lock, so shards run
+    together while the same shard never runs twice and an unsharded run never
+    overlaps a sharded one.
     """
     if isinstance(chunk_size, bool) or int(chunk_size) < 1:
         raise ValueError(f"invalid chunk_size {chunk_size!r}: must be a positive integer")
     if max_chunks is not None and (isinstance(max_chunks, bool) or int(max_chunks) < 1):
         raise ValueError(f"invalid max_chunks {max_chunks!r}: must be a positive integer")
-    lock_path = ctx.runtime.workspace.state_root / "jobs" / f"{spec.name}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("w")
+    jobs_dir = ctx.runtime.workspace.state_root / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_handle = _try_lock(
+        jobs_dir / f"{spec.name}.lock", fcntl.LOCK_SH if shard is not None else fcntl.LOCK_EX
+    )
+    if job_handle is None:
+        return _busy()
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        return JobReport(status="busy", done=0, pending_left=0, requests_used=0)
-    try:
-        return _run_locked(
-            spec, ctx, chunk_size=int(chunk_size), max_chunks=max_chunks, dry_run=dry_run, emit=emit
+        if shard is None:
+            return _run_locked(
+                spec, ctx, chunk_size=int(chunk_size), max_chunks=max_chunks,
+                dry_run=dry_run, emit=emit,
+            )
+        shard_handle = _try_lock(
+            jobs_dir / f"{spec.name}.shard-{shard.index}-of-{shard.count}.lock", fcntl.LOCK_EX
         )
+        if shard_handle is None:
+            return _busy()
+        try:
+            return _run_locked(
+                spec, ctx, chunk_size=int(chunk_size), max_chunks=max_chunks,
+                dry_run=dry_run, emit=emit, shard=shard,
+            )
+        finally:
+            _unlock(shard_handle)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        _unlock(job_handle)
 
 
 def _ledger_remaining(ctx: JobContext) -> int:
@@ -254,8 +338,11 @@ def _run_locked(
     max_chunks: int | None,
     dry_run: bool,
     emit: Callable[[Mapping[str, object]], None],
+    shard: Shard | None = None,
 ) -> JobReport:
     pending = list(spec.pending(ctx))
+    if shard is not None:
+        pending = [unit for unit in pending if shard.owns(unit)]
     headroom = ctx.headroom()
     worst_case = sum(unit.max_requests for unit in pending)
     emit(

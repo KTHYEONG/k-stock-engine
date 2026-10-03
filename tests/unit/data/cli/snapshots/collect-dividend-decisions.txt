@@ -2,6 +2,7 @@ usage: cli.py collect-dividend-decisions [-h] [--scope-config SCOPE_CONFIG]
                                          [--data-root DATA_ROOT]
                                          [--key-env KEY_ENV] [--dry-run]
                                          [--max-chunks MAX_CHUNKS]
+                                         [--shard SHARD]
 
 options:
   -h, --help            show this help message and exit
@@ -10,3 +11,4 @@ options:
   --key-env KEY_ENV
   --dry-run
   --max-chunks MAX_CHUNKS
+  --shard SHARD         Shard 'I/N' (0-based I)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import json
 import os
 import threading
 import time
@@ -51,6 +53,84 @@ class QuotaGate(Protocol):
         ...
 
 
+class HostPacer:
+    """Cross-process minimum spacing between attempts that share one host-level rate limit.
+
+    Why: in-process pacing cannot see sibling processes; the next-allowed wall-clock instant is kept in a
+    lock-protected state file so every process sharing ``state_path`` observes the same spacing.
+
+    Args:
+        state_path: File holding the next allowed attempt time (file and parent created on demand).
+        min_interval_seconds: Minimum spacing between consecutive attempts across all holders.
+        clock: Wall-clock seconds (``time.time``); monotonic clocks are not comparable across processes.
+        sleep: Sleep function.
+
+    Raises:
+        ValueError: ``min_interval_seconds`` <= 0.
+    """
+
+    def __init__(
+        self,
+        state_path: Path,
+        *,
+        min_interval_seconds: float,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if isinstance(min_interval_seconds, bool) or float(min_interval_seconds) <= 0:
+            raise ValueError(
+                f"invalid min_interval_seconds {min_interval_seconds!r}: must be positive"
+            )
+        self._state_path = Path(state_path)
+        self._min_interval = float(min_interval_seconds)
+        self._clock = clock
+        self._sleep = sleep
+
+    @property
+    def _lock_path(self) -> Path:
+        return self._state_path.with_name(self._state_path.name + ".lock")
+
+    def _read_next_allowed(self) -> float | None:
+        try:
+            raw = self._state_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            document = json.loads(raw)
+        except ValueError:
+            return None
+        moment = document.get("next_allowed") if isinstance(document, dict) else None
+        if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+            return None
+        return float(moment)
+
+    def _write_next_allowed(self, moment: float) -> None:
+        tmp_path = self._state_path.with_name(
+            f".{self._state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"next_allowed": moment}))
+        os.replace(tmp_path, self._state_path)
+
+    def wait_turn(self) -> None:
+        """Block until this caller holds the next slot, then reserve it."""
+        lock_path = self._lock_path
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                now = self._clock()
+                slot = now
+                stored = self._read_next_allowed()
+                if stored is not None and stored > slot:
+                    slot = stored
+                self._write_next_allowed(slot + self._min_interval)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        delay = slot - self._clock()
+        if delay > 0:
+            self._sleep(delay)
+
 def parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
     """Parse a ``Retry-After`` header value into seconds."""
     if value is None:
@@ -97,6 +177,7 @@ class HttpTransport:
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        host_pacer: HostPacer | None = None,
     ) -> None:
         self._provider = provider
         self._base_url = base_url.rstrip("/")
@@ -107,6 +188,7 @@ class HttpTransport:
         self._session = session if session is not None else requests.Session()
         self._sleep = sleep
         self._monotonic = monotonic
+        self._host_pacer = host_pacer
         self._pace_lock = threading.Lock()
         self._last_attempt: float | None = None
 
@@ -115,6 +197,12 @@ class HttpTransport:
         return self._provider
 
     def _pace(self) -> None:
+        self._pace_local()
+        # Host slot last, so the reserved slot is the moment closest to the send.
+        if self._host_pacer is not None:
+            self._host_pacer.wait_turn()
+
+    def _pace_local(self) -> None:
         if self._min_interval <= 0:
             with self._pace_lock:
                 self._last_attempt = self._monotonic()
