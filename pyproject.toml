@@ -1,7 +1,7 @@
 [project]
 name = "k-stock-engine"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 
 dependencies = [
     "numpy>=2.0.0",
@@ -85,7 +85,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "E402", "N802", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841"]
-"tools/agent_skills/lean_check.py" = ["T20", "S607", "S603"]
 "src/execution/*" = ["T20", "ASYNC230", "ASYNC240", "S110", "SIM108", "B006"]
 "legacy/*" = ["ALL"]
 
@@ -145,7 +144,7 @@ python_files = ["test_*.py"]
 addopts = "-ra -q --import-mode=importlib -m \"not slow\" -n 4"
 pythonpath = ["."]
 markers = [
-    "slow: tests that read real data/ parquet files (skipped by default; run with -m slow or lean_check --run-slow)",
+    "slow: tests that read real data/ parquet files (skipped by default; run with -m slow)",
 ]
 filterwarnings = [
     "ignore::RuntimeWarning:numpy.*",
