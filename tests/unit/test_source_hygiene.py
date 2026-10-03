@@ -8,8 +8,8 @@ REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "src"
 TOOLS = REPO / "tools"
 SECRETS_MODULE = SRC / "config" / "secrets.py"
-# Reference-only until the parser spec deletes the tool; never executed.
-EXCLUDED = {REPO / "tools" / "agent_skills"}
+# Local quality gate (never imported by src/); it forwards os.environ to its subprocesses by design.
+EXCLUDED = {REPO / "tools" / "verify.py"}
 
 _PATH_PREFIXES = ("config/", "data/", "/home/")
 
