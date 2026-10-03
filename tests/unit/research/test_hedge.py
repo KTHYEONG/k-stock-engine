@@ -570,3 +570,52 @@ def test_beta_neutral_overlay_guards() -> None:
     assert config.contract_multiplier_krw == 10_000
     assert str(config.futures_tax_rate) == "0.11"
     assert str(config.inverse_tax_rate) == "0.154"
+
+
+def test_regime_filter_flattens_hedge_in_uptrend_and_fails_safe() -> None:
+    from src.research.hedge import BetaNeutralOverlay
+
+    rng = np.random.default_rng(3)
+    noise = rng.normal(0, 0.002, 80)
+    up = 0.004 + noise
+    down = -0.004 + noise
+    spec = _spec(beta_window_sessions=60, beta_min_sessions=20, regime_ma_sessions=50, rebalance_every_sessions=100)
+
+    def last_target(index: np.ndarray, s: HedgeSpec) -> Any:
+        overlay = BetaNeutralOverlay(s, rebalance_offset=79)
+        out = None
+        for i in range(80):
+            out = overlay.target(_overlay_state(i, 0.5 * index, index))
+        return out
+
+    assert last_target(up, spec).contracts == 0
+    assert last_target(down, spec).contracts > 0
+    assert last_target(up, _spec(beta_window_sessions=60, beta_min_sessions=20, rebalance_every_sessions=100)).contracts > 0
+    short = _spec(beta_window_sessions=60, beta_min_sessions=20, regime_ma_sessions=200, rebalance_every_sessions=100)
+    assert last_target(up, short).contracts > 0
+    gap = up.copy()
+    gap[-3] = np.nan
+    assert last_target(gap, spec).contracts > 0
+
+
+def test_regime_filter_in_simulator_is_causal_and_validated() -> None:
+    days, stock, inputs, idx_ret = _world()
+    base = simulate_hedged_book(stock, days[1:], inputs, _spec(), capital_krw=CAPITAL, authorization=_auth(days))
+    gated = simulate_hedged_book(
+        stock, days[1:], inputs, _spec(regime_ma_sessions=50), capital_krw=CAPITAL, authorization=_auth(days)
+    )
+    assert not np.array_equal(base.beta, gated.beta)
+    assert bool(np.all((gated.beta == 0.0) | (gated.beta == base.beta)))
+    cut = 250
+    future = inputs.index_level.copy()
+    future[cut + 2 :] *= 1.5
+    moved = HedgeInputs(sessions=inputs.sessions, index_level=future, inverse_close=inputs.inverse_close)
+    perturbed = simulate_hedged_book(
+        stock, days[1:], moved, _spec(regime_ma_sessions=50), capital_krw=CAPITAL, authorization=_auth(days)
+    )
+    assert np.array_equal(perturbed.beta[:cut], gated.beta[:cut])
+    for bad in (1, 0, True, 2.5):
+        with pytest.raises(ValueError, match="regime_ma_sessions"):
+            _spec(regime_ma_sessions=bad)
+    assert _spec().canonical_json() != _spec(regime_ma_sessions=100).canonical_json()
+    assert _spec(regime_ma_sessions=None).regime_ma_sessions is None
