@@ -1,0 +1,14 @@
+usage: cli.py migrate-snapshot-krx [-h] [--scope-config SCOPE_CONFIG]
+                                   [--data-root DATA_ROOT] --snapshot-root
+                                   SNAPSHOT_ROOT
+                                   [--kinds {daily_market,security_master} [{daily_market,security_master} ...]]
+                                   [--dry-run]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --snapshot-root SNAPSHOT_ROOT
+                        Legacy data/bronze/stocks directory
+  --kinds {daily_market,security_master} [{daily_market,security_master} ...]
+  --dry-run             Validate without persisting anything
