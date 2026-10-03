@@ -396,3 +396,36 @@ def test_row_uses_only_its_own_inputs() -> None:
         policy, _cube(), other_panel, _scores(other_mat), uni, rows=[5], capital_krw=CAP, cash_buffer=0.0
     )
     assert np.array_equal(np.asarray(first[5]), np.asarray(second[5]))
+
+
+def test_trend_fail_fraction_keeps_partial_slot() -> None:
+    mat = _full_scores()
+    mat[5] = [0.9, 0.8, 0.7, 0.1, 0.1, 0.1]
+    panel = _panel()
+    panel.features["ret_21"][5, 1] = np.float32(-0.02)
+    panel.features["ret_21"][5, 2] = np.float32(np.nan)
+    uni = np.ones((S, N), dtype=bool)
+    kwargs: dict[str, object] = {"rows": [5], "capital_krw": CAP, "cash_buffer": 0.0}
+    cash = build_targets(_policy(n=3), _cube(), panel, _scores(mat), uni, **kwargs)
+    soft = build_targets(_policy(n=3, trend_fail_weight_fraction=0.5), _cube(), panel, _scores(mat), uni, **kwargs)
+    zero = build_targets(_policy(n=3, trend_fail_weight_fraction=0.0), _cube(), panel, _scores(mat), uni, **kwargs)
+    assert np.asarray(cash[5]) == pytest.approx([1 / 3, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert np.asarray(soft[5]) == pytest.approx([1 / 3, 1 / 6, 1 / 6, 0.0, 0.0, 0.0])
+    assert np.array_equal(np.asarray(zero[5]), np.asarray(cash[5]))
+    assert float(np.asarray(soft[5]).sum()) <= 1.0
+
+
+def test_trend_fail_fraction_is_inert_when_all_pass_and_validated() -> None:
+    cube, panel, scores, uni = _wide_row(20, 20)
+    kwargs: dict[str, object] = {"rows": [5], "capital_krw": CAP, "cash_buffer": 0.0}
+    plain = build_targets(_policy(n=20), cube, panel, scores, uni, **kwargs)
+    soft = build_targets(_policy(n=20, trend_fail_weight_fraction=0.4), cube, panel, scores, uni, **kwargs)
+    assert np.array_equal(np.asarray(plain[5]), np.asarray(soft[5]))
+    for bad in (-0.1, 1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="trend_fail_weight_fraction"):
+            TrendCashPolicy(trend_fail_weight_fraction=bad)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TrendCashPolicy(trend_fail_weight_fraction=0.5, redistribute_cap_multiple=2.0)
+    assert _policy().spec_hash != _policy(trend_fail_weight_fraction=0.5).spec_hash
+    assert json.loads(_policy().canonical_json())["trend_fail_weight_fraction"] is None
+    assert _policy(trend_fail_weight_fraction=None).trend_fail_weight_fraction is None

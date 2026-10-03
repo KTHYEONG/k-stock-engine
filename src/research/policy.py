@@ -10,7 +10,7 @@ from datetime import date
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.research.cube import ResearchCube
 from src.research.model import ScoreMatrix
@@ -63,6 +63,10 @@ class TrendCashPolicy(BaseModel):
     Why: drawdowns are market-driven; picks whose own 1-month trend has failed are the earliest,
     bottom-up signal of a risk-off state, and holding cash for them cut the probe drawdown from -47% to -15%
     without any index timing. The rule only works on ML picks (random picks + the same rule lost money).
+    ``trend_fail_weight_fraction`` (None = off, same as 0.0): a selected name that fails the trend rule keeps
+    this fraction of its 1/n slot instead of going fully to cash. Why: the full cash rule leaves the book about
+    half invested; partial de-risking keeps most of the drawdown protection at far less growth drag.
+    Mutually exclusive with ``redistribute_cap_multiple`` (both reallocate the same failed slots).
 
     ``redistribute_cap_multiple`` (None = off): names that pass the trend rule share the weight of failed slots
     equally, each capped at ``redistribute_cap_multiple / n``; any remainder stays cash. Why a cap: without it
@@ -78,6 +82,7 @@ class TrendCashPolicy(BaseModel):
     trend_min_dev_ma20: float | None = None
     trend_min_ret21: float | None = None
     redistribute_cap_multiple: float | None = None
+    trend_fail_weight_fraction: float | None = None
     min_units_per_slot: int = 3
 
     @field_validator("family")
@@ -135,6 +140,22 @@ class TrendCashPolicy(BaseModel):
         if not math.isfinite(cap) or cap < 1.0:
             raise ValueError(f"redistribute_cap_multiple must be finite and >= 1.0, got {value!r}")
         return cap
+
+    @field_validator("trend_fail_weight_fraction")
+    @classmethod
+    def _fail_fraction(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        fraction = float(value)  # type: ignore[arg-type]
+        if not math.isfinite(fraction) or not 0.0 <= fraction < 1.0:
+            raise ValueError(f"trend_fail_weight_fraction must satisfy 0 <= value < 1, got {value!r}")
+        return fraction
+
+    @model_validator(mode="after")
+    def _exclusive_fail_handling(self) -> TrendCashPolicy:
+        if self.trend_fail_weight_fraction is not None and self.redistribute_cap_multiple is not None:
+            raise ValueError("trend_fail_weight_fraction and redistribute_cap_multiple are mutually exclusive")
+        return self
 
     def canonical_json(self) -> str:
         """Canonical JSON of the policy with sorted keys and compact separators."""
@@ -199,7 +220,8 @@ def build_targets(
 
     With ``redistribute_cap_multiple`` set, the m passing names instead split the failed slots equally:
     each receives ``min(1/m, cap / n)``; failed names stay 0 and the uncapped remainder stays cash
-    (m = 0 leaves the row all-zero). The selection, incumbency and trend tests are unaffected.
+    (m = 0 leaves the row all-zero). With ``trend_fail_weight_fraction`` = f set, failed names receive f/n
+    instead of 0. The selection, incumbency and trend tests are unaffected.
 
     Raises: ValueError if a row has no score row in ``scores`` or ``capital_krw``/``cash_buffer`` invalid.
     """
@@ -286,9 +308,9 @@ def build_targets(
             n_pass = int(np.count_nonzero(passing))
             cap = policy.redistribute_cap_multiple
             unit = min(1.0 / float(n_pass), float(cap) / float(policy.n)) if cap is not None and n_pass > 0 else weight
+            fail_unit = weight * float(policy.trend_fail_weight_fraction or 0.0)
             for pos_k, k in enumerate(kept):
-                if bool(passing[pos_k]):
-                    weights[int(k)] = unit
+                weights[int(k)] = unit if bool(passing[pos_k]) else fail_unit
             incumbents = set(kept)
         else:
             incumbents = set()

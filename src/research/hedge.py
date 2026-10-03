@@ -55,6 +55,7 @@ class HedgeSpec(BaseModel):
     futures_tax_rate: float
     futures_annual_deduction_krw: int
     inverse_tax_rate: float
+    regime_ma_sessions: int | None = None
 
     @field_validator("hedge_ratio")
     @classmethod
@@ -145,6 +146,15 @@ class HedgeSpec(BaseModel):
     def _deduction(cls, value: object) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"futures_annual_deduction_krw must be an int >= 0, got {value!r}")
+        return int(value)
+
+    @field_validator("regime_ma_sessions")
+    @classmethod
+    def _regime_window(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+            raise ValueError(f"regime_ma_sessions must be an int >= 2, got {value!r}")
         return int(value)
 
     @model_validator(mode="after")
@@ -281,6 +291,28 @@ def derivative_config(spec: HedgeSpec) -> DerivativeConfig:
     )
 
 
+def _hedge_regime_on(levels: NDArray[np.float64], window: int | None) -> bool:
+    """True when the hedge should be held: no regime filter, the last level is below the mean of the last
+    ``window`` levels, or fewer than ``window`` finite positive levels exist.
+
+    Why fail-safe to hedged: an unknown regime keeps the always-on hedge behaviour rather than dropping protection.
+    """
+    if window is None:
+        return True
+    tail = np.asarray(levels, dtype=np.float64)[-int(window) :]
+    if tail.shape[0] < int(window) or not bool(np.all(np.isfinite(tail) & (tail > 0.0))):
+        return True
+    return bool(tail[-1] < float(tail.mean()))
+
+
+def _levels_from_returns(index_returns: NDArray[np.float64], window: int | None) -> NDArray[np.float64]:
+    """Relative index levels over the last ``window`` returns (NaN propagates so the regime fails safe)."""
+    if window is None:
+        return np.zeros(0, dtype=np.float64)
+    tail = np.asarray(index_returns, dtype=np.float64)[-int(window) :]
+    return np.asarray(np.cumprod(1.0 + tail), dtype=np.float64)
+
+
 def _ols_beta_tail(
     stock_returns: NDArray[np.float64],
     index_returns: NDArray[np.float64],
@@ -314,6 +346,8 @@ class BetaNeutralOverlay:
     β is the OLS slope of the stock-book returns on the index returns over the last
     ``beta_window_sessions`` finite pairs available in the state (session t inclusive — the decision is made
     after t's close), clipped to ``[0, beta_cap]``; 0.0 with fewer than ``beta_min_sessions`` pairs.
+    With ``regime_ma_sessions`` set, the hedge is held only while the index (rebuilt from the run's index
+    returns) closes below its ``regime_ma_sessions`` moving average; otherwise the target is flat.
     Rebalances on run rows ``r`` with ``r % rebalance_every_sessions == rebalance_offset`` (r counted from the
     run's first session); returns None on other rows.
     """
@@ -353,6 +387,9 @@ class BetaNeutralOverlay:
             keep = stock.shape[0] - self._delay
             stock = stock[: max(keep, 0)]
             index = index[: max(keep, 0)]
+        window = self._spec.regime_ma_sessions
+        if not _hedge_regime_on(_levels_from_returns(index, window), window):
+            return OverlayTarget(contracts=0, inverse_value_krw=0)
         beta = _ols_beta_tail(
             stock,
             index,
@@ -422,6 +459,8 @@ def simulate_hedged_book(
     ``rebalance_offset`` shifts the decision grid; ``execution_delay`` makes every beta estimate stale by that
     many sessions; ``extra_cost_rate`` (stress) is added to the futures and inverse per-side cost rates.
     Trading costs, resizing costs and inverse-ETF tax are paid out of the stock sleeve, so NAV is conserved.
+    With ``regime_ma_sessions`` set, a rebalance hedges only while the run's index level (as seen with the same
+    ``execution_delay``) is below its moving average; otherwise the hedge is closed.
 
     Raises:
         WindowError: ``sessions`` is not inside ``[authorization.start, authorization.end]``.
@@ -499,7 +538,10 @@ def simulate_hedged_book(
             cost_total += need * spec.resize_sell_cost_rate
             topups += 1
         if i >= 1 and i % every == rebalance_offset:
-            beta_live = float(beta_full[max(i - execution_delay, 0)])
+            seen = max(i - execution_delay, 0)
+            window = spec.regime_ma_sessions
+            regime_on = _hedge_regime_on(levels[: seen + 1], window)
+            beta_live = float(beta_full[seen]) if regime_on else 0.0
             nav0 = stock + margin + inv_value
             new_stock, k_new, v_new = _frictionless_split(
                 nav0, spec.hedge_ratio * beta_live, multiplier * level, reserve_rate, spec.use_futures
