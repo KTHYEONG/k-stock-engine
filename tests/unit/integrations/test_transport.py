@@ -421,3 +421,123 @@ def test_token_cache_load_branches(tmp_path) -> None:
     cache.path.write_text("{}", encoding="utf-8")
     cache.path.chmod(0o644)
     assert cache.load() is None
+
+
+def _host_pacer(state_path, *, interval=0.1, clock=None, sleeps=None):  # type: ignore[no-untyped-def]
+    from src.integrations.transport import HostPacer
+
+    params: dict = {"min_interval_seconds": interval}
+    if clock is not None:
+        params["clock"] = clock
+    if sleeps is not None:
+        params["sleep"] = sleeps.append
+    else:
+        params["sleep"] = lambda _s: None
+    return HostPacer(state_path, **params)
+
+
+def test_host_pacer_spaces_attempts_across_holders(tmp_path) -> None:
+    import json
+
+    import pytest
+
+    state = tmp_path / "quota" / "dart_host_pacer.json"
+    state.parent.mkdir(parents=True)
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+    first = _host_pacer(state, clock=lambda: clock["t"], sleeps=sleeps)
+    second = _host_pacer(state, clock=lambda: clock["t"], sleeps=sleeps)
+
+    slots: list[float] = []
+    for turn in range(5):
+        (first if turn % 2 == 0 else second).wait_turn()
+        slots.append(json.loads(state.read_text(encoding="utf-8"))["next_allowed"] - 0.1)
+
+    assert len(slots) == 5
+    assert len(set(slots)) == 5
+    assert slots == sorted(slots)
+    from itertools import pairwise
+
+    for before, after in pairwise(slots):
+        assert after - before >= 0.1 - 1e-9
+    for slot, slept in zip(slots[1:], sleeps, strict=True):
+        assert slept == pytest.approx(slot - 1000.0)
+
+
+def test_host_pacer_recovers_corrupt_state_file(tmp_path) -> None:
+    import json
+
+    state = tmp_path / "quota" / "dart_host_pacer.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("garbage{{{", encoding="utf-8")
+    _host_pacer(state, clock=lambda: 500.0).wait_turn()
+    assert json.loads(state.read_text(encoding="utf-8"))["next_allowed"] == 500.1
+
+    state.write_text(json.dumps({"next_allowed": "soon"}), encoding="utf-8")
+    _host_pacer(state, clock=lambda: 500.0).wait_turn()
+    assert json.loads(state.read_text(encoding="utf-8"))["next_allowed"] == 500.1
+
+
+def test_transport_without_pacer_is_unchanged() -> None:
+    from types import SimpleNamespace
+
+    clock = {"t": 2000.0}
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        calls["n"] += 1
+        return _ok_response()
+
+    transport = _transport(
+        session=SimpleNamespace(get=fake_get),
+        min_interval_seconds=1.0,
+        sleep=sleeps.append,
+        monotonic=lambda: clock["t"],
+        host_pacer=None,
+    )
+
+    assert transport.get("ep", {}).status_code == 200
+    assert transport.get("ep", {}).status_code == 200
+    assert calls["n"] == 2
+    assert sleeps == [1.0]
+
+
+def test_retries_also_wait_for_the_host_slot(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    state = tmp_path / "quota" / "dart_host_pacer.json"
+    state.parent.mkdir(parents=True)
+    turns = {"n": 0}
+    inner = _host_pacer(state, clock=lambda: 300.0)
+    real_wait = inner.wait_turn
+
+    def _counted() -> None:
+        turns["n"] += 1
+        real_wait()
+
+    inner.wait_turn = _counted  # type: ignore[method-assign]
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(status_code=503, headers={}, json=lambda: {})
+        return _ok_response()
+
+    transport = _transport(session=SimpleNamespace(get=fake_get), sleep=lambda _s: None, host_pacer=inner)
+
+    assert transport.get("ep", {}).status_code == 200
+    assert calls["n"] == 2
+    assert turns["n"] == 2
+
+
+def test_host_pacer_rejects_non_positive_interval(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.transport import HostPacer
+
+    with pytest.raises(ValueError, match="min_interval_seconds"):
+        HostPacer(tmp_path / "pacer.json", min_interval_seconds=0)
+    with pytest.raises(ValueError, match="min_interval_seconds"):
+        HostPacer(tmp_path / "pacer.json", min_interval_seconds=-0.5)

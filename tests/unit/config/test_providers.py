@@ -76,6 +76,33 @@ def test_undeclared_key_is_rejected() -> None:
         _policy().dart_key("OPENDART_API_KEY_9")
 
 
+def test_four_keys_declared_with_one_default() -> None:
+    provider = _policy()
+
+    assert set(provider.dart.keys) == {
+        "OPENDART_API_KEY", "OPENDART_API_KEY_2", "OPENDART_API_KEY_3", "OPENDART_API_KEY_4",
+    }
+    for key_env in ("OPENDART_API_KEY_3", "OPENDART_API_KEY_4"):
+        key = provider.dart_key(key_env)
+        assert (key.daily_limit, key.daily_budget, key.daily_reserve) == (20000, 19500, 500)
+        assert (key.min_interval_seconds, key.max_workers) == (0.2, 2)
+        assert key.default is False
+    assert provider.default_key_env == "OPENDART_API_KEY_2"
+    assert provider.dart.host_min_interval_seconds == 0.1
+
+
+def test_host_interval_floor_enforced() -> None:
+    import pydantic
+
+    from src.config.providers import DartPolicy
+
+    provider = _policy()
+    with pytest.raises(pydantic.ValidationError):
+        DartPolicy(**{**_dart_kwargs(provider), "host_min_interval_seconds": 0.01})
+    with pytest.raises(pydantic.ValidationError):
+        DartPolicy(**{**_dart_kwargs(provider), "host_min_interval_seconds": 0.0})
+
+
 def test_unsafe_interval_is_rejected() -> None:
     import pydantic
 
@@ -143,6 +170,7 @@ def test_default_key_falls_back_to_primary_without_marker() -> None:
             circuit_threshold=3,
             requests_per_identity=3,
             batch_identities=500,
+            host_min_interval_seconds=0.1,
             shared_ip_avoid_windows_kst=[],
             disclosure_types=["  "],
             keys=dict(provider.dart.keys),
@@ -154,6 +182,7 @@ def _dart_kwargs(provider):  # type: ignore[no-untyped-def]
         "circuit_threshold": 3,
         "requests_per_identity": 3,
         "batch_identities": 500,
+        "host_min_interval_seconds": provider.dart.host_min_interval_seconds,
         "shared_ip_avoid_windows_kst": [],
         "keys": dict(provider.dart.keys),
     }

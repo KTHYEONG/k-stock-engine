@@ -8,6 +8,7 @@ import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from src.config.errors import ConfigError
 from src.config.providers import ProviderPolicy
@@ -20,6 +21,7 @@ from src.data.scoped_ingestion import FACT_SOURCE, dart_fact_natural_key
 from src.integrations.dart.client import dart_ledger_for_key
 from src.integrations.dart.xbrl import DartXbrlCollector
 from src.integrations.quota import ProviderQuotaStateStore
+from src.integrations.transport import HostPacer
 
 __all__ = [
     "DartFactBatchPlan",
@@ -95,6 +97,7 @@ def build_scoped_dart_collector(
     provider: ProviderPolicy,
     quota_store: ProviderQuotaStateStore,
     key_env: str | None = None,
+    host_pacer_path: Path | None = None,
 ) -> DartXbrlCollector:
     """Sole DART collector for one declared key from its provider policy.
 
@@ -108,6 +111,11 @@ def build_scoped_dart_collector(
         api_key = read_secret(resolved)
     except ConfigError as exc:
         raise ValueError(f"{resolved} is not set") from exc
+    host_pacer = (
+        HostPacer(host_pacer_path, min_interval_seconds=provider.dart.host_min_interval_seconds)
+        if host_pacer_path is not None
+        else None
+    )
     return DartXbrlCollector(
         api_key=api_key,
         quota_store=quota_store,
@@ -115,6 +123,7 @@ def build_scoped_dart_collector(
         max_workers=policy.max_workers,
         min_interval=policy.min_interval_seconds,
         daily_request_limit=policy.daily_budget,
+        host_pacer=host_pacer,
     )
 
 

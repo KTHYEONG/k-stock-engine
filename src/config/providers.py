@@ -179,11 +179,26 @@ class DartPolicy(BaseModel):
     circuit_threshold: PositiveInt
     requests_per_identity: PositiveInt
     batch_identities: PositiveInt
+    host_min_interval_seconds: PositiveFloat
+    """Minimum spacing between any two DART HTTP attempts from this host, across all keys and processes.
+
+    Why: OpenDART blocks by IP, so per-key pacing alone multiplies the host rate by the number of key
+    processes. Must be >= ``MIN_DART_INTERVAL_SECONDS`` (the measured per-key floor).
+    """
     shared_ip_avoid_windows_kst: list[tuple[str, str]] = []
     disclosure_types: tuple[str, ...] = ("A", "I001")
     corp_codes_max_age_days: PositiveInt = 30
     document_parser: DocumentParserPolicy = DocumentParserPolicy()
     keys: dict[str, DartKeyPolicy]
+    @field_validator("host_min_interval_seconds")
+    @classmethod
+    def _check_host_interval(cls, value: float) -> float:
+        if float(value) < MIN_DART_INTERVAL_SECONDS:
+            raise ValueError(
+                f"host_min_interval_seconds below {MIN_DART_INTERVAL_SECONDS} exceeds the measured safe rate"
+            )
+        return float(value)
+
     @field_validator("keys")
     @classmethod
     def _check_keys(cls, value: dict[str, DartKeyPolicy]) -> dict[str, DartKeyPolicy]:

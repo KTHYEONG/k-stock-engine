@@ -20,7 +20,7 @@ from src.integrations.errors import (
     ProviderTerminalError,
 )
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
-from src.integrations.transport import HttpTransport, RetryPolicy
+from src.integrations.transport import HostPacer, HttpTransport, RetryPolicy
 
 if TYPE_CHECKING:
     from src.config.providers import DisclosureFilter
@@ -174,6 +174,7 @@ class DartApiClient:
         quota_provider: str | None = None,
         now: Callable[[], datetime] | None = None,
         daily_request_limit: int | None = None,
+        host_pacer: HostPacer | None = None,
     ) -> None:
         self.api_key = api_key
         if not self.api_key and request_json is None and raw_request_json is None and request_bytes is None:
@@ -211,6 +212,7 @@ class DartApiClient:
             session=self._session,
             sleep=lambda seconds: time.sleep(seconds),
             monotonic=lambda: time.monotonic(),
+            host_pacer=host_pacer,
         )
 
     def _sync_session(self) -> None:

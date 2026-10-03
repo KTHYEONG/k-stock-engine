@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from src.config.providers import DisclosureFilter
     from src.integrations.dart.client import DartCorpCodeRecord, DisclosureListing
     from src.integrations.quota import ProviderQuotaStateStore
+    from src.integrations.transport import HostPacer
 
 _REQUIRED_FACTS: tuple[str, ...] = (
     "sales",
@@ -69,6 +70,7 @@ class DartXbrlCollector:
         quota_provider: str | None = None,
         now: Callable[[], datetime] | None = None,
         daily_request_limit: int | None = None,
+        host_pacer: HostPacer | None = None,
     ) -> None:
         key = api_key
         if not key and request_json is None and request_bytes is None and client is None:
@@ -84,6 +86,7 @@ class DartXbrlCollector:
         self._quota_provider = quota_provider
         self._now = now
         self._min_interval = min_interval
+        self._host_pacer = host_pacer
         if request_json is None and request_bytes is None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
 
@@ -94,6 +97,7 @@ class DartXbrlCollector:
                 now=now,
                 min_interval=min_interval,
                 daily_request_limit=daily_request_limit,
+                host_pacer=host_pacer,
             )
         if request_bytes is not None and key is not None and self._client is None:
             from src.integrations.dart.client import DartApiClient
@@ -106,6 +110,7 @@ class DartXbrlCollector:
                 now=now,
                 min_interval=min_interval,
                 daily_request_limit=daily_request_limit,
+                host_pacer=host_pacer,
             )
 
     def fetch_corp_code_records(self) -> tuple[DartCorpCodeRecord, ...]:

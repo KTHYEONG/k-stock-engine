@@ -175,6 +175,17 @@ class ScopedBronzeWriter:
             validate_envelope(contract, payload.payload, status=status)
         return contract
 
+    def validate(self, payload: ScopedRawPayload) -> SourceContract:
+        """Check one keyed payload against the scope and its source contract without storing anything.
+
+        Raises:
+            PITDataError: the payload violates the scope window or its source contract.
+        """
+        self._validate(payload)
+        contract = self._contract_for(payload.source, CoverageShape.KEYED, kind=payload.kind)
+        validate_envelope(contract, payload.payload, status=payload.status)
+        return contract
+
     def persist_many(
         self, payloads: Sequence[ScopedRawPayload | ScopedRangePayload]
     ) -> tuple[ScopedReceipt, ...]:
@@ -218,9 +229,7 @@ class ScopedBronzeWriter:
                     for item in payload.ranges
                 )
                 continue
-            self._validate(payload)
-            contract = self._contract_for(payload.source, CoverageShape.KEYED, kind=payload.kind)
-            validate_envelope(contract, payload.payload, status=payload.status)
+            contract = self.validate(payload)
             receipt = self._store(
                 self._canonical_payload(contract, payload.payload),
                 kind=contract.kind,
