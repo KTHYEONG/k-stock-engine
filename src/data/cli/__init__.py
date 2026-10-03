@@ -38,6 +38,7 @@ def _ensure_registered() -> None:
         "scope-info",
         "init-workspace",
         "index-bronze",
+        "migrate-snapshot-krx",
         "collect-scoped",
         "collect-krx-daily-market",
         "collect-krx-security-master",
