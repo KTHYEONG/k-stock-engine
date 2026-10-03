@@ -4,6 +4,8 @@
 circuit_threshold = 3
 requests_per_identity = 3
 batch_identities = 500
+# Aggregate pacing across every DART key process on this host (IP-level blocking is shared).
+host_min_interval_seconds = 0.1
 shared_ip_avoid_windows_kst = [["21:25", "21:50"]]
 # Market-wide disclosure list types the DART jobs consume: periodic reports (A),
 # profit-structure changes (I001), fair disclosures carrying preliminary results
@@ -35,6 +37,20 @@ daily_reserve = 500
 min_interval_seconds = 0.2
 max_workers = 2
 default = true
+
+[dart.keys.OPENDART_API_KEY_3]
+daily_limit = 20000
+daily_budget = 19500
+daily_reserve = 500
+min_interval_seconds = 0.2
+max_workers = 2
+
+[dart.keys.OPENDART_API_KEY_4]
+daily_limit = 20000
+daily_budget = 19500
+daily_reserve = 500
+min_interval_seconds = 0.2
+max_workers = 2
 
 [kis]
 app_key_env = "KIS_APP_KEY"

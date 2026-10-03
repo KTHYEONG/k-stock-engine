@@ -23,6 +23,7 @@ def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  
             circuit_threshold=threshold,
             requests_per_identity=3,
             batch_identities=batch,
+            host_min_interval_seconds=0.1,
             shared_ip_avoid_windows_kst=[tuple(window) for window in windows],
             keys={
                 "TEST_DART_KEY": DartKeyPolicy(

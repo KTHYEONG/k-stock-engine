@@ -83,7 +83,10 @@ def _run_dart_job(args: argparse.Namespace, *, job_name: str) -> dict[str, objec
     key_env = getattr(args, "key_env", None) or provider.default_key_env
     quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
     dry_run = bool(getattr(args, "dry_run", False))
-    collector = None if dry_run else build_scoped_dart_collector(provider=provider, quota_store=quota_store, key_env=key_env)
+    collector = None if dry_run else build_scoped_dart_collector(
+        provider=provider, quota_store=quota_store, key_env=key_env,
+        host_pacer_path=runtime.workspace.state_root / "quota" / "dart_host_pacer.json",
+    )
     ctx = build_job_context(runtime=runtime, provider=provider, key_env=key_env, collector=collector)
 
     def _emit(payload: Mapping[str, object]) -> None:
@@ -92,14 +95,16 @@ def _run_dart_job(args: argparse.Namespace, *, job_name: str) -> dict[str, objec
     report = run_job(
         resolve_dart_job(job_name), ctx,
         chunk_size=provider.dart.batch_identities, max_chunks=getattr(args, "max_chunks", None),
-        dry_run=dry_run, emit=_emit,
+        dry_run=dry_run, emit=_emit, shard=getattr(args, "shard", None),
     )
     _LOG.info(
         "[DATA] command=%s status=%s done=%d pending_left=%d requests_used=%d",
         job_name, report.status, report.done, report.pending_left, report.requests_used,
     )
+    shard = getattr(args, "shard", None)
     return {"job": job_name, "status": report.status, "done": report.done,
-            "pending_left": report.pending_left, "requests_used": report.requests_used}
+            "pending_left": report.pending_left, "requests_used": report.requests_used,
+            "shard": None if shard is None else f"{shard.index}/{shard.count}"}
 
 
 def _run_krx_job(args: argparse.Namespace, *, job_name: str) -> dict[str, object]:
@@ -266,6 +271,21 @@ def _add_dart_job(parser: argparse.ArgumentParser) -> None:
     _add_dry_run_max_chunks(parser)
 
 
+def _parse_shard(text: str):  # type: ignore[no-untyped-def]
+    from src.data.jobs.runner import Shard
+
+    return Shard.parse(text)
+
+
+def _add_shard(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--shard", type=_parse_shard, required=False, default=None, help="Shard 'I/N' (0-based I)")
+
+
+def _add_sharded_dart_job(parser: argparse.ArgumentParser) -> None:
+    _add_dart_job(parser)
+    _add_shard(parser)
+
+
 def _add_classification(parser: argparse.ArgumentParser) -> None:
     from src.data.cli.common import _KIS_CLASSIFICATION_PACE_SECONDS
 
@@ -331,7 +351,10 @@ def _run_document_job(args: argparse.Namespace, *, job_name: str) -> dict[str, o
         spec = DartDocumentFetchJob()
     collector = None
     if job_name in {"dart_document_fetch", "dart_benchmark_documents"} and not dry_run:  # pragma: no cover - live provider path
-        collector = build_scoped_dart_collector(provider=provider, quota_store=quota_store, key_env=key_env)
+        collector = build_scoped_dart_collector(
+            provider=provider, quota_store=quota_store, key_env=key_env,
+            host_pacer_path=runtime.workspace.state_root / "quota" / "dart_host_pacer.json",
+        )
     ctx = build_job_context(runtime=runtime, provider=provider, key_env=key_env, collector=collector)
 
     def _emit(payload: Mapping[str, object]) -> None:
@@ -340,20 +363,27 @@ def _run_document_job(args: argparse.Namespace, *, job_name: str) -> dict[str, o
     report = run_job(
         spec, ctx,
         chunk_size=provider.dart.batch_identities, max_chunks=getattr(args, "max_chunks", None),
-        dry_run=dry_run, emit=_emit,
+        dry_run=dry_run, emit=_emit, shard=getattr(args, "shard", None),
     )
     _LOG.info(
         "[DATA] command=%s status=%s done=%d pending_left=%d requests_used=%d",
         job_name, report.status, report.done, report.pending_left, report.requests_used,
     )
+    shard = getattr(args, "shard", None)
     return {"job": job_name, "status": report.status, "done": report.done,
-            "pending_left": report.pending_left, "requests_used": report.requests_used}
+            "pending_left": report.pending_left, "requests_used": report.requests_used,
+            "shard": None if shard is None else f"{shard.index}/{shard.count}"}
 
 
 def _add_document_fetch_job(parser: argparse.ArgumentParser) -> None:
     add_scoped_args(parser)
     parser.add_argument("--key-env", type=str, required=False, default=None)
     _add_dry_run_max_chunks(parser)
+
+
+def _add_sharded_document_fetch_job(parser: argparse.ArgumentParser) -> None:
+    _add_document_fetch_job(parser)
+    _add_shard(parser)
 
 
 def _add_document_reparse_job(parser: argparse.ArgumentParser) -> None:
@@ -404,15 +434,15 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_dart_job(args, job_name="dart_disclosures")),
     Command("collect-dart-corp-codes", "Refresh the DART corp-code bridge when the universe needs it", _add_dart_job,
             lambda args: _run_dart_job(args, job_name="dart_corp_codes")),
-    Command("collect-dart-facts", "Collect DART periodic-report facts for eligible filings", _add_dart_job,
+    Command("collect-dart-facts", "Collect DART periodic-report facts for eligible filings", _add_sharded_dart_job,
             lambda args: _run_dart_job(args, job_name="dart_facts")),
-    Command("collect-dividend-decisions", "Collect DART cash-dividend decision archives", _add_dart_job,
+    Command("collect-dividend-decisions", "Collect DART cash-dividend decision archives", _add_sharded_dart_job,
             lambda args: _run_dart_job(args, job_name="dividend_decisions")),
-    Command("collect-earnings-releases", "Collect DART preliminary-result and profit-change archives", _add_dart_job,
+    Command("collect-earnings-releases", "Collect DART preliminary-result and profit-change archives", _add_sharded_dart_job,
             lambda args: _run_dart_job(args, job_name="earnings_releases")),
     Command("reparse-dart-documents", "Re-derive document fact pages from stored archives", _add_document_reparse_job,
             lambda args: _run_document_job(args, job_name="dart_document_reparse")),
-    Command("collect-dart-documents", "Fetch document archives for relevant document-path identities", _add_document_fetch_job,
+    Command("collect-dart-documents", "Fetch document archives for relevant document-path identities", _add_sharded_document_fetch_job,
             lambda args: _run_document_job(args, job_name="dart_document_fetch")),
     Command("collect-dart-benchmark-documents", "Fetch document archives for benchmark filings", _add_document_fetch_job,
             lambda args: _run_document_job(args, job_name="dart_benchmark_documents")),
