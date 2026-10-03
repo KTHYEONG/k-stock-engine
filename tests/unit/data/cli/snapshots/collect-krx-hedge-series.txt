@@ -1,0 +1,10 @@
+usage: cli.py collect-krx-hedge-series [-h] [--scope-config SCOPE_CONFIG]
+                                       [--data-root DATA_ROOT] [--dry-run]
+                                       [--max-chunks MAX_CHUNKS]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --dry-run
+  --max-chunks MAX_CHUNKS
