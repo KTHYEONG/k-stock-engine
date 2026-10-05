@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 
 import numpy as np
@@ -249,6 +249,67 @@ def _maintenance_floor(contracts: int, *, level: float, config: DerivativeConfig
     return ceil_amount_krw(rate, contracts, multiplier, float(level))
 
 
+def _largest_fundable_contracts(
+    *,
+    target_contracts: int,
+    held: int,
+    available: int,
+    level: float,
+    config: DerivativeConfig,
+    multiplier: int,
+) -> int:
+    """Largest ``k`` in ``[0, target_contracts]`` with ``required_reserve(k) + commission(k - held) <= available``,
+    or ``0`` when none qualifies.
+
+    Why: choosing the funded contract count must not scale with the contract count. When the account is far larger
+    than the hedge target's notional (or a corrupted replay inflates it), a linear scan from the target costs
+    seconds per call; the reserve is non-decreasing in ``k`` and the commission is never negative, so no ``k``
+    whose reserve alone exceeds ``available`` can qualify and the search can start at the reserve bound.
+
+    Args:
+        target_contracts: Pending overlay target (>= 0).
+        held: Contracts currently held (>= 0); only the commission term depends on it.
+        available: Margin plus spendable cash in whole KRW (may be <= 0).
+        level: Positive finite futures-underlying level.
+        config: Derivative terms (margin and buffer rates, cost rate).
+        multiplier: KRW per index point per contract.
+
+    Returns:
+        The chosen contract count; identical to the first qualifying candidate of a descending scan from
+        ``target_contracts``.
+
+    Raises:
+        PITDataError / ValueError: propagated unchanged from ``required_reserve_krw`` for a non-positive or
+            non-finite ``level`` or a negative contract count.
+    """
+    if target_contracts <= 0:
+        return 0
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        required_reserve_krw(contracts=target_contracts, level=level, config=config)
+    level_f = float(level)
+    if not math.isfinite(level_f) or level_f <= 0.0:
+        required_reserve_krw(contracts=target_contracts, level=level, config=config)
+    if available < 0:
+        return 0
+    rate = Decimal(str(float(config.initial_margin_rate))) + Decimal(
+        str(float(config.margin_buffer_rate))
+    )
+    capacity = rate * Decimal(int(multiplier)) * Decimal(str(level_f))
+    bound = int(
+        (Decimal(int(available)) / capacity).to_integral_value(rounding=ROUND_FLOOR)
+    )
+    start = min(int(target_contracts), bound)
+    cost_rate = float(config.futures_cost_rate)
+    for candidate in range(start, -1, -1):
+        reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
+        commission = _futures_commission(
+            cost_rate, delta=candidate - int(held), multiplier=int(multiplier), level=level,
+        )
+        if reserve + commission <= available:
+            return candidate
+    return 0
+
+
 def _sync_futures(
     ledger: Ledger,
     *,
@@ -281,18 +342,10 @@ def _sync_futures(
             ledger.transfer_margin(session_idx=session_idx, amount=reserve - ledger.margin)
         return
     available = ledger.margin + _spendable_cash(ledger)
-    chosen = 0
-    for candidate in range(target_contracts, -1, -1):
-        reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
-        commission = _futures_commission(
-            float(config.futures_cost_rate),
-            delta=candidate - held,
-            multiplier=multiplier,
-            level=level,
-        )
-        if reserve + commission <= available:
-            chosen = candidate
-            break
+    chosen = _largest_fundable_contracts(
+        target_contracts=target_contracts, held=held, available=available,
+        level=level, config=config, multiplier=multiplier,
+    )
     if chosen != held:
         ledger.trade_futures(
             session_idx=session_idx,
