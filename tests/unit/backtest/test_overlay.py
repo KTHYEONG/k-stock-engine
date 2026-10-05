@@ -12,7 +12,13 @@ from typing import Any
 import numpy as np
 import pytest
 
-from src.backtest.engine import BacktestResult, EngineConfig, _sync_futures, run_backtest
+from src.backtest.engine import (
+    BacktestResult,
+    EngineConfig,
+    _largest_fundable_contracts,
+    _sync_futures,
+    run_backtest,
+)
 from src.backtest.costs import CostConfig
 from src.backtest.events import EngineEvents, build_engine_events
 from src.backtest.ledger import JournalKind, Ledger, LedgerAccount
@@ -1036,3 +1042,189 @@ def test_rebalance_syncs_to_the_reserve(tmp_path: Path) -> None:
     ]
     assert (result.nav[2].margin, result.nav[2].cash) == (3_030_000, 370_000)
     _assert_reconciles(result, config.initial_cash)
+
+
+def _reference_scan(
+    *, target: int, held: int, available: int, level: float,
+    config: DerivativeConfig, multiplier: int,
+) -> int:
+    from src.backtest.engine import _futures_commission
+
+    chosen = 0
+    for candidate in range(target, -1, -1):
+        reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
+        commission = _futures_commission(
+            float(config.futures_cost_rate), delta=candidate - held,
+            multiplier=multiplier, level=level,
+        )
+        if reserve + commission <= available:
+            chosen = candidate
+            break
+    return chosen
+
+
+def _counting_engine(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    import src.backtest.engine as engine_mod
+
+    original = engine_mod.required_reserve_krw
+    counter = {"n": 0}
+
+    def wrapped(*, contracts: int, level: float, config: DerivativeConfig) -> int:
+        counter["n"] += 1
+        return original(contracts=contracts, level=level, config=config)
+
+    monkeypatch.setattr(engine_mod, "required_reserve_krw", wrapped)
+    return counter
+
+
+def test_fundable_count_matches_descending_scan() -> None:
+    config = _derivatives(futures_cost_rate=0.0005)
+    multiplier = 10_000
+    levels = (500.0, 1000.0, 1080.0, 1500.0, 2000.0)
+    cases = 0
+    for idx in range(2_000):
+        target = (idx * 13 + 7) % 31
+        held = (idx * 7 + 3) % 11
+        level = levels[idx % len(levels)]
+        per = required_reserve_krw(contracts=1, level=level, config=config)
+        if idx % 4 == 0:
+            available = (idx * 1_234_567) % (30 * per + 1)
+        else:
+            k = (idx * 11 + 5) % 31
+            base = required_reserve_krw(contracts=k, level=level, config=config)
+            available = max(base + ((-1) if idx % 3 == 0 else (1 if idx % 3 == 1 else 0)), 0)
+        expected = _reference_scan(
+            target=target, held=held, available=available, level=level,
+            config=config, multiplier=multiplier,
+        )
+        got = _largest_fundable_contracts(
+            target_contracts=target, held=held, available=available, level=level,
+            config=config, multiplier=multiplier,
+        )
+        assert got == expected
+        cases += 1
+    for target, available in (
+        (1_000_000, 10**18),
+        (5_000_000, 10**18),
+        (100, 0),
+        (30, required_reserve_krw(contracts=30, level=1000.0, config=config)),
+    ):
+        expected = _reference_scan(
+            target=target, held=3, available=available, level=1000.0,
+            config=config, multiplier=multiplier,
+        )
+        got = _largest_fundable_contracts(
+            target_contracts=target, held=3, available=available, level=1000.0,
+            config=config, multiplier=multiplier,
+        )
+        assert got == expected
+        cases += 1
+    assert cases >= 2_000
+
+
+def test_large_target_with_ample_cash_returns_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    counter = _counting_engine(monkeypatch)
+    config = _derivatives(futures_cost_rate=0.0005)
+
+    got = _largest_fundable_contracts(
+        target_contracts=5_000_000, held=3, available=10**18, level=1000.0,
+        config=config, multiplier=10_000,
+    )
+
+    assert got == 5_000_000
+    assert counter["n"] <= 10
+
+
+def test_large_target_with_scarce_cash_does_not_scale(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _derivatives()
+    level = 1000.0
+    available = 10_000_000
+    counts: list[int] = []
+    results: list[int] = []
+    counter = _counting_engine(monkeypatch)
+    for target in (1_000, 100_000, 10_000_000):
+        counter["n"] = 0
+        results.append(
+            _largest_fundable_contracts(
+                target_contracts=target, held=2, available=available, level=level,
+                config=config, multiplier=10_000,
+            )
+        )
+        counts.append(counter["n"])
+    assert results[0] == results[1] == results[2]
+    assert counts[0] == counts[1] == counts[2]
+    assert counts[0] <= 30
+
+
+def test_commission_can_disqualify_the_reserve_bound() -> None:
+    config = _derivatives(futures_cost_rate=0.001)
+    level = 1000.0
+    available = required_reserve_krw(contracts=5, level=level, config=config)
+
+    got = _largest_fundable_contracts(
+        target_contracts=5, held=20, available=available, level=level,
+        config=config, multiplier=10_000,
+    )
+    expected = _reference_scan(
+        target=5, held=20, available=available, level=level,
+        config=config, multiplier=10_000,
+    )
+
+    assert got == expected < 5
+
+
+def test_nothing_fundable_falls_back_to_flat() -> None:
+    for available in (0, -100):
+        for config in (_derivatives(), _derivatives(futures_cost_rate=0.001)):
+            assert _largest_fundable_contracts(
+                target_contracts=5, held=5, available=available, level=1000.0,
+                config=config, multiplier=10_000,
+            ) == 0
+
+
+def test_zero_target_returns_zero() -> None:
+    config = _derivatives()
+    for available in (-5, 0, 10_000_000):
+        for level in (1000.0, 0.0, -1.0, float("nan")):
+            assert _largest_fundable_contracts(
+                target_contracts=0, held=3, available=available, level=level,  # type: ignore[arg-type]
+                config=config, multiplier=10_000,
+            ) == 0
+
+
+def test_invalid_level_fails_closed() -> None:
+    config = _derivatives()
+    for bad in (float("nan"), float("inf"), float("-inf"), 0.0, -5.0, None):
+        try:
+            required_reserve_krw(contracts=5, level=bad, config=config)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            expected_type = type(exc)
+        else:
+            raise AssertionError(f"reserve must reject level {bad!r}")
+        with pytest.raises(expected_type):
+            _largest_fundable_contracts(
+                target_contracts=5, held=0, available=10_000_000, level=bad,  # type: ignore[arg-type]
+                config=config, multiplier=10_000,
+            )
+
+
+def test_perturbation_cut_no_longer_blows_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    counter = _counting_engine(monkeypatch)
+    config = _derivatives(futures_cost_rate=0.0005)
+    level = 1000.0
+    ledger = Ledger(initial_cash=10_000_000)
+    target = 5_000_000
+    available = ledger.margin + max(ledger.cash - ledger.tax_payable, 0)
+    assert required_reserve_krw(contracts=1001, level=level, config=config) > available
+    expected = _reference_scan(
+        target=1000, held=0, available=available, level=level,
+        config=config, multiplier=10_000,
+    )
+
+    _sync_futures(
+        ledger, session_idx=0, target_contracts=target, level=level,
+        config=config, multiplier=10_000,
+    )
+
+    assert ledger.contracts == expected
+    assert counter["n"] <= 60
