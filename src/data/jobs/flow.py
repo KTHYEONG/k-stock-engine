@@ -297,6 +297,9 @@ class KisInvestorFlowJob:
                         if session is not None
                     ]
                     earliest = min(row_sessions) if row_sessions else anchor
+                    # A KIS page reaches back a fixed row count, so early anchors return pre-scope rows;
+                    # the answered range may only claim sessions inside the scope.
+                    earliest = max(earliest, ctx.runtime.scope.evidence_start)
                     envelope = raw_rows_envelope(
                         contract, query=dict(response.query), rows=[dict(row) for row in response.rows]
                     )
