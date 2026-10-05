@@ -616,3 +616,26 @@ def test_ls_valued_cells_with_empty_partitions_fail_closed(tmp_path: Path) -> No
 
     with pytest.raises(PITDataError, match="invalid investor_flow_ls dataset"):
         KisInvestorFlowJob().pending(ctx)
+
+
+def test_kis_page_reaching_before_scope_start_claims_only_in_scope_range(tmp_path: Path) -> None:
+    from src.data.evidence_sources import KIS_FLOW_SOURCE
+    from src.data.jobs.flow import KisInvestorFlowJob
+    from src.data.receipt_catalog import EvidenceStatus
+
+    runtime = _runtime(tmp_path)
+    start = runtime.scope.evidence_start
+    sessions = _sessions(3, start=start)
+    pre_scope = _sessions(3, start=start - timedelta(days=3))[:3]
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub([*pre_scope, *sessions]))
+    _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
+
+    report, _ = _run(KisInvestorFlowJob(), ctx)
+
+    assert report.status == "complete"
+    ranges = list(ctx.catalog.ranges(source=KIS_FLOW_SOURCE))
+    assert [(item.start, item.end, item.status) for item in ranges] == [
+        (start, sessions[-1], EvidenceStatus.SUCCESS)
+    ]
