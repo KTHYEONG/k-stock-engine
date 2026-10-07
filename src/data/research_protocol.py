@@ -1,4 +1,4 @@
-"""Research data-window guard, report-card policy and scenario bindings (protocol v5)."""
+"""Research data-window guard, report-card policy and scenario bindings (protocol v6)."""
 from __future__ import annotations
 
 import hashlib
@@ -97,11 +97,17 @@ class ChampionPolicy(BaseModel):
 
 
 class ResearchProtocol(BaseModel):
-    """Data window, report-card policy and scenarios of the research program (v5).
+    """Data window, report-card policy and scenarios of the research program (v6).
 
     There is no sealed segment: any window between ``evaluation_start`` and the last certified session may
     be evaluated any number of times. Selection bias is handled by champion/challenger paired comparison
     plus neighbor plateaus and the cost grid, not by withholding history.
+
+    Protocol v6 supports two promotion paths:
+    1. Superiority: paired growth lower bound > 0.
+    2. Non-inferiority: paired growth lower bound > -δ (where δ is noninferiority_margin) and paired monthly-block
+       CVaR (expected tail loss) lower bound > 0, ensuring statistically verified tail-risk reduction within tolerated
+       annual log-growth loss δ.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

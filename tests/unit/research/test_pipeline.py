@@ -1937,3 +1937,83 @@ def test_load_strategy_spec_invalid_regime_hedge_table(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="invalid \\[regime_hedge\\] table"):
         load_strategy_spec(p)
 
+
+_STAGED_REGIME_SPECS = (
+    "ml_regime_s1_kqhedge.toml",
+    "ml_regime_s1_kqhedge_tv05.toml",
+    "ml_regime_s1_kqhedge_tv15.toml",
+    "ml_regime_s2_volcap.toml",
+    "ml_regime_s2_volcap20.toml",
+    "ml_regime_s2_volcap30.toml",
+    "ml_regime_s3_tsmom.toml",
+)
+
+
+def test_staged_strategy_tomls_load_and_differ_only_in_targeted_knobs() -> None:
+    """Invariant: every new staged strategy file loads cleanly, and neighbor variants differ
+    from their challenger in only the targeted knob."""
+    from src.research.champion import knob_changes
+    from src.research.pipeline import load_strategy_spec
+
+    strat_dir = Path("config/research/strategies")
+    specs = {fname: load_strategy_spec(strat_dir / fname) for fname in _STAGED_REGIME_SPECS}
+
+    # Stage 1: neighbors differ from challenger only in regime_hedge.target_vol
+    s1_challenger = specs["ml_regime_s1_kqhedge.toml"]
+    assert s1_challenger.regime_hedge is not None
+    assert s1_challenger.regime_hedge.target_vol == pytest.approx(0.10)
+    for neighbor_name, expected_tv in [
+        ("ml_regime_s1_kqhedge_tv05.toml", 0.05),
+        ("ml_regime_s1_kqhedge_tv15.toml", 0.15),
+    ]:
+        neighbor_spec = specs[neighbor_name]
+        assert neighbor_spec.regime_hedge is not None
+        assert neighbor_spec.regime_hedge.target_vol == pytest.approx(expected_tv)
+        diff = knob_changes(neighbor_spec, s1_challenger)
+        assert diff == ("regime_hedge.target_vol",)
+
+    # Stage 2: neighbors differ from challenger only in trend_overlay.vol_cap
+    s2_challenger = specs["ml_regime_s2_volcap.toml"]
+    assert s2_challenger.trend_overlay is not None
+    assert s2_challenger.trend_overlay.vol_cap == pytest.approx(0.25)
+    for neighbor_name, expected_vc in [
+        ("ml_regime_s2_volcap20.toml", 0.20),
+        ("ml_regime_s2_volcap30.toml", 0.30),
+    ]:
+        neighbor_spec = specs[neighbor_name]
+        assert neighbor_spec.trend_overlay is not None
+        assert neighbor_spec.trend_overlay.vol_cap == pytest.approx(expected_vc)
+        diff = knob_changes(neighbor_spec, s2_challenger)
+        assert diff == ("trend_overlay.vol_cap",)
+
+    # Stage 3: challenger replaces ma with tsmom
+    s3_challenger = specs["ml_regime_s3_tsmom.toml"]
+    assert s3_challenger.trend_overlay is not None
+    assert s3_challenger.trend_overlay.signal == "tsmom"
+    assert s3_challenger.trend_overlay.tsmom_horizons == (21, 63, 126, 252)
+    assert s3_challenger.trend_overlay.ma_sessions is None
+    assert knob_changes(s3_challenger, s2_challenger) == ("trend_overlay.ma_sessions",)
+    assert knob_changes(s2_challenger, s1_challenger) == (
+        "trend_overlay.vol_cap",
+        "trend_overlay.vol_window_sessions",
+    )
+    champion = load_strategy_spec(strat_dir / "ml_growth_t85_b50_k200.toml")
+    assert set(knob_changes(s1_challenger, champion)) == {
+        f"regime_hedge.{name}"
+        for name in json.loads(s1_challenger.regime_hedge.canonical_json())
+        if name != "tsmom_horizons"
+    }
+
+
+def test_staged_strategy_leg_tax_terms_match() -> None:
+    """Invariant: in every staged file, the [regime_hedge] tax terms equal the [trend_overlay] tax terms."""
+    from src.research.pipeline import load_strategy_spec
+
+    strat_dir = Path("config/research/strategies")
+    for fname in _STAGED_REGIME_SPECS:
+        spec = load_strategy_spec(strat_dir / fname)
+        assert spec.trend_overlay is not None
+        assert spec.regime_hedge is not None
+        assert spec.regime_hedge.futures_tax_rate == pytest.approx(spec.trend_overlay.futures_tax_rate)
+        assert spec.regime_hedge.futures_annual_deduction_krw == spec.trend_overlay.futures_annual_deduction_krw
+        assert spec.regime_hedge.futures_cost_rate == pytest.approx(spec.trend_overlay.futures_cost_rate)

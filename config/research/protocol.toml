@@ -1,5 +1,5 @@
-# Research protocol v5: data-window guard, report-card policy and scenario definitions.
-version = "research-protocol-v5"
+# Research protocol v6: data-window guard, report-card policy and scenario definitions.
+version = "research-protocol-v6"
 # Earliest session a run window may start (first month with trailing-four-quarter fundamentals for most
 # issuers). Model training may still read earlier PIT cube rows; this bounds run windows only.
 evaluation_start = "2017-04-01"
@@ -32,3 +32,7 @@ alpha = 0.05
 require_neighbors = true
 paired_horizon = "full"
 multiplicity = "bonferroni_decisions"
+# declared tolerance (user, 2026-10-07): at most 3%p/yr log-growth loss for a statistically shown tail-risk cut; never re-tuned after results
+noninferiority_margin = 0.03
+tail_quantile = 0.05
+tail_block_sessions = 21

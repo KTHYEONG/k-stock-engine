@@ -20,9 +20,9 @@ def _protocol():  # type: ignore[no-untyped-def]
     return load_research_protocol(Path("config/research/protocol.toml"), scope), scope
 
 
-def test_protocol_v5_loads() -> None:
+def test_protocol_v6_loads() -> None:
     protocol, _ = _protocol()
-    assert protocol.version == "research-protocol-v5"
+    assert protocol.version == "research-protocol-v6"
     assert protocol.evaluation_start == date(2017, 4, 1)
     assert protocol.sessions_per_year == 252
     assert protocol.primary_capital_krw == 100_000_000
@@ -47,6 +47,9 @@ def test_protocol_v5_loads() -> None:
     assert protocol.champion.require_neighbors is True
     assert protocol.champion.paired_horizon == "full"
     assert protocol.champion.multiplicity == "bonferroni_decisions"
+    assert protocol.champion.noninferiority_margin == pytest.approx(0.03)
+    assert protocol.champion.tail_quantile == pytest.approx(0.05)
+    assert protocol.champion.tail_block_sessions == 21
 
 
 def test_content_hash_stable() -> None:
@@ -198,23 +201,35 @@ def test_v4_file_keeps_v4_semantics(tmp_path: Path) -> None:
     assert protocol.champion.multiplicity == "none"
 
 
-def test_v5_keys_round_trip_and_change_the_hash(tmp_path: Path) -> None:
+def _without_lines(path: Path, tmp_path: Path, name: str, keys: tuple[str, ...]) -> Path:
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith(keys)
+    ]
+    out = tmp_path / name
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
+def test_champion_keys_round_trip_and_change_the_hash(tmp_path: Path) -> None:
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
-    v5_path = Path("config/research/protocol.toml")
-    v5_protocol = load_research_protocol(v5_path, scope)
-    assert v5_protocol.champion.paired_horizon == "full"
-    assert v5_protocol.champion.multiplicity == "bonferroni_decisions"
-    lines = [
-        line
-        for line in v5_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() not in ('paired_horizon = "full"', 'multiplicity = "bonferroni_decisions"')
-    ]
-    stripped_path = tmp_path / "protocol-stripped.toml"
-    stripped_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    stripped = load_research_protocol(stripped_path, scope)
-    assert stripped.content_hash != v5_protocol.content_hash
+    path = Path("config/research/protocol.toml")
+    protocol = load_research_protocol(path, scope)
+    assert protocol.champion.paired_horizon == "full"
+    assert protocol.champion.multiplicity == "bonferroni_decisions"
+    assert protocol.champion.noninferiority_margin == pytest.approx(0.03)
+    for name, keys in (
+        ("v4-keys.toml", ("paired_horizon", "multiplicity")),
+        ("v5-keys.toml", ("noninferiority_margin",)),
+    ):
+        stripped = load_research_protocol(_without_lines(path, tmp_path, name, keys), scope)
+        assert stripped.content_hash != protocol.content_hash
+    assert load_research_protocol(
+        _without_lines(path, tmp_path, "no-margin.toml", ("noninferiority_margin",)), scope
+    ).champion.noninferiority_margin is None
 
 
 def test_unknown_champion_key_rejected(tmp_path: Path) -> None:
@@ -233,10 +248,20 @@ def test_v5_file_disables_noninferiority_path(tmp_path: Path) -> None:
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
-    protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+    lines = [
+        line
+        for line in base.splitlines()
+        if not line.strip().startswith("noninferiority_margin")
+    ]
+    v5_path = tmp_path / "protocol-v5.toml"
+    v5_path.write_text("\n".join(lines).replace('version = "research-protocol-v6"', 'version = "research-protocol-v5"') + "\n", encoding="utf-8")
+    protocol = load_research_protocol(v5_path, scope)
     assert protocol.champion.noninferiority_margin is None
     assert protocol.champion.tail_quantile == 0.05
     assert protocol.champion.tail_block_sessions == 21
+    v6_protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
+    assert protocol.content_hash != v6_protocol.content_hash
 
 
 def test_out_of_range_margin_rejected(tmp_path: Path) -> None:
