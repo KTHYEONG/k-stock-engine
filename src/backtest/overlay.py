@@ -5,11 +5,11 @@ from __future__ import annotations
 import bisect
 import math
 import numbers
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_CEILING, Decimal
-from typing import Protocol
+from typing import Final, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -96,21 +96,59 @@ class DerivativeConfig:
             )
 
 
+PRIMARY_LEG: Final = "primary"
+
+
+def _check_leg_name(name: object) -> None:
+    if not isinstance(name, str) or not name or name == PRIMARY_LEG:
+        raise ValueError(f"invalid leg name: {name!r}")
+
+
+def _check_leg_pairs(pairs: object, *, what: str) -> None:
+    """Secondary-leg ``(name, contracts)`` pairs: valid unique names in strictly ascending order, integer counts."""
+    if not isinstance(pairs, tuple):
+        raise ValueError(f"{what} must be a tuple of (name, contracts) pairs, got {pairs!r}")
+    prev_name: str | None = None
+    for item in pairs:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError(f"leg pair must be a 2-tuple (name, contracts), got {item!r}")
+        name, count = item
+        _check_leg_name(name)
+        if name == prev_name:
+            raise ValueError(f"duplicate leg name in {what}: {name!r}")
+        if prev_name is not None and name < prev_name:
+            raise ValueError(f"{what} must be sorted by name: {pairs!r}")
+        prev_name = name
+        if _reject_bool(count) or not isinstance(count, numbers.Integral):
+            raise ValueError(f"leg {name!r} contracts must be an integer, got {count!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class OverlayMarket:
-    """Closes aligned to the engine sessions: futures underlying level and inverse-ETF close (NaN before listing)."""
+    """Closes aligned to the engine sessions: futures underlying level, inverse-ETF close (NaN before listing),
+    and the underlying level of each secondary futures leg by name."""
 
     index_level: NDArray[np.float64]
     inverse_close: NDArray[np.float64]
+    legs: Mapping[str, NDArray[np.float64]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.legs, Mapping):
+            raise ValueError(f"legs must be a Mapping, got {self.legs!r}")
+        for name, arr in self.legs.items():
+            _check_leg_name(name)
+            if not isinstance(arr, np.ndarray):
+                raise ValueError(f"leg {name!r} must be an ndarray, got {arr!r}")
 
 
 @dataclass(frozen=True, slots=True)
 class OverlayTarget:
-    """Net short futures contracts (signed: negative = net long) and inverse-ETF value in KRW (>= 0) to hold
-    after the next session."""
+    """Net short futures contracts (signed: negative = net long), inverse-ETF value in KRW (>= 0), and signed
+    net-short contracts of each secondary leg as ``(name, contracts)`` pairs sorted by name."""
 
     contracts: int
     inverse_value_krw: int
+    legs: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         contracts = self.contracts
@@ -121,6 +159,7 @@ class OverlayTarget:
             raise ValueError(f"inverse_value_krw must be an integer >= 0, got {inverse!r}")
         if int(inverse) < 0:
             raise ValueError(f"inverse_value_krw must be >= 0, got {inverse!r}")
+        _check_leg_pairs(self.legs, what="legs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +181,10 @@ class OverlayState:
     index_level: float
     contracts: int
     inverse_units: int
+    leg_contracts: tuple[tuple[str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        _check_leg_pairs(self.leg_contracts, what="leg_contracts")
 
 
 class OverlayPolicy(Protocol):

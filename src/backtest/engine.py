@@ -21,6 +21,7 @@ from src.backtest.execution import ExecutionConfig, Fill, Order, Reject, price_o
 from src.backtest.ledger import JournalEntry, JournalKind, Ledger, LedgerAccount, NavRecord
 from src.backtest.market import MarketArrays
 from src.backtest.overlay import (
+    PRIMARY_LEG,
     DerivativeConfig,
     OverlayMarket,
     OverlayPolicy,
@@ -334,43 +335,71 @@ def _sync_futures(
     level: float,
     config: DerivativeConfig,
     multiplier: int,
+    leg_targets: Mapping[str, int] | None = None,
+    leg_markets: Mapping[str, tuple[DerivativeConfig, float]] | None = None,
 ) -> None:
-    """Trade toward the pending target and hold margin at exactly ``required_reserve(k)`` — except inside the band.
+    """Trade every leg toward its pending target and hold the pooled margin at exactly the summed
+    ``required_reserve(k)`` — except inside the band.
 
-    Three cases (``h`` held, ``k*`` pending target, ``R`` reserve, ``M`` maintenance floor, ``available`` =
-    margin + free cash - tax_payable). (a) Hold (``k* == h`` and margin >= ``M(h)``): no futures trade and no
-    top-up; excess above ``R(h)`` is still released, but anything inside ``[M(h), R(h)]`` is left alone. (b)
-    Margin call (``k* == h`` and margin < ``M(h)``): largest same-side ``|k| <= |h|`` with ``R(k) + commission <= available``,
-    then sync to exactly ``R(k)``. (c) Rebalance (``k* != h``): largest same-side ``|k| <= |k*|`` funded the same way, then sync
-    to ``R(k)``. In every case unaffordable targets shrink (down to flat) instead of borrowing, and a margin the
-    cash cannot restore stays negative for a later session to repay.
+    Legs are the primary plus each secondary leg that is targeted or held (``leg_markets`` maps a secondary name to
+    its terms and current level). ``h`` held, ``k*`` pending target, ``R`` reserve, ``M`` maintenance floor, all
+    summed over legs; ``available`` = margin + free cash - tax_payable. (a) Hold (``k* == h`` on every leg and
+    margin >= ``M``): no futures trade and no top-up; excess above ``R`` is still released, but anything inside
+    ``[M, R]`` is left alone. (b) Otherwise legs are funded in order (primary, then secondary names ascending): each
+    takes the largest same-side ``|k| <= |k*|`` with ``R(k) + commission <= `` what earlier legs left of
+    ``available``, then margin syncs to the summed ``R``. While margin >= ``M``, a leg already at its target keeps
+    its position. Unaffordable targets shrink (down to flat) instead of borrowing, and a margin the cash cannot
+    restore stays negative for a later session to repay.
 
     Why the band: ordinary daily variation must never cost a trade — the previous always-sync rule liquidated a
     cash-less hedge on any up day (1 contract, cash 0, +1% → margin 1.40M ≥ M 757,500 but < R 1,515,000 → closed).
-    Calls restore the full reserve, never just above the trigger.
+    For the same reason, opening a secondary leg must never liquidate a primary leg that sits inside the band.
     """
-    held = ledger.contracts
-    if target_contracts == held and ledger.margin >= _maintenance_floor(
-        held, level=level, config=config, multiplier=multiplier
-    ):
-        reserve = required_reserve_krw(contracts=held, level=level, config=config)
+    markets = leg_markets or {}
+    targets = dict(leg_targets or {})
+    names = sorted(set(targets) | {name for name, _ in ledger.legs})
+    legs: list[tuple[str, DerivativeConfig, float, int, int]] = [
+        (PRIMARY_LEG, config, level, int(multiplier), target_contracts)
+    ]
+    for name in names:
+        leg_config, leg_level = markets[name]
+        legs.append((name, leg_config, leg_level, int(leg_config.contract_multiplier_krw), targets.get(name, 0)))
+    held = {name: ledger.leg_contracts(name) for name, *_ in legs}
+    floor = sum(
+        _maintenance_floor(held[name], level=lvl, config=cfg, multiplier=mult) for name, cfg, lvl, mult, _ in legs
+    )
+    in_band = ledger.margin >= floor
+    if in_band and all(target == held[name] for name, *_, target in legs):
+        reserve = sum(required_reserve_krw(contracts=held[name], level=lvl, config=cfg) for name, cfg, lvl, *_ in legs)
         if ledger.margin > reserve:
             ledger.transfer_margin(session_idx=session_idx, amount=reserve - ledger.margin)
         return
-    available = ledger.margin + _spendable_cash(ledger)
-    chosen = _largest_fundable_contracts(
-        target_contracts=target_contracts, held=held, available=available,
-        level=level, config=config, multiplier=multiplier,
-    )
-    if chosen != held:
-        ledger.trade_futures(
-            session_idx=session_idx,
-            contracts=chosen,
-            level=level,
-            multiplier=multiplier,
-            cost_rate=float(config.futures_cost_rate),
+    remaining = ledger.margin + _spendable_cash(ledger)
+    for name, cfg, lvl, mult, target in legs:
+        prior = held[name]
+        if in_band and target == prior:
+            chosen = prior
+        else:
+            chosen = _largest_fundable_contracts(
+                target_contracts=target, held=prior, available=remaining,
+                level=lvl, config=cfg, multiplier=mult,
+            )
+        if chosen != prior:
+            ledger.trade_futures(
+                session_idx=session_idx,
+                contracts=chosen,
+                level=lvl,
+                multiplier=mult,
+                cost_rate=float(cfg.futures_cost_rate),
+                leg=name,
+            )
+        remaining -= required_reserve_krw(contracts=chosen, level=lvl, config=cfg) + _futures_commission(
+            float(cfg.futures_cost_rate), delta=chosen - prior, multiplier=mult, level=lvl,
         )
-    need = required_reserve_krw(contracts=ledger.contracts, level=level, config=config) - ledger.margin
+    need = (
+        sum(required_reserve_krw(contracts=ledger.leg_contracts(name), level=lvl, config=cfg) for name, cfg, lvl, *_ in legs)
+        - ledger.margin
+    )
     if need > 0:
         ledger.transfer_margin(session_idx=session_idx, amount=min(need, _spendable_cash(ledger)))
     elif need < 0:
@@ -417,6 +446,34 @@ def _policy_target(policy: OverlayPolicy, state: OverlayState) -> OverlayTarget 
     return target
 
 
+def _check_target_legs(
+    target: OverlayTarget | None,
+    *,
+    leg_levels: Mapping[str, NDArray[np.float64]],
+    leg_configs: Mapping[str, DerivativeConfig],
+    checked: set[str],
+    rows: range,
+    sessions: Sequence[date],
+) -> None:
+    """Reject a target leg without terms; verify each targeted leg's levels over the run once (added to ``checked``).
+
+    Why at first targeting rather than up front: a configured leg the policy never trades must not demand history.
+    """
+    if target is None:
+        return
+    for leg_name, _ in target.legs:
+        if leg_name in checked:
+            continue
+        if leg_name not in leg_configs:
+            raise ValueError(f"unknown target leg {leg_name!r}: no leg_derivatives entry")
+        levels = leg_levels[leg_name]
+        for row in rows:
+            level = float(levels[row])
+            if not math.isfinite(level) or level <= 0.0:
+                raise PITDataError(f"leg {leg_name!r} level missing at {sessions[row].isoformat()}")
+        checked.add(leg_name)
+
+
 def run_backtest(
     *,
     arrays: MarketArrays,
@@ -431,6 +488,7 @@ def run_backtest(
     overlay: OverlayPolicy | None = None,
     overlay_market: OverlayMarket | None = None,
     derivatives: DerivativeConfig | None = None,
+    leg_derivatives: Mapping[str, DerivativeConfig] | None = None,
     rebalance_band: float = 0.0,
 ) -> BacktestResult:
     """Replay pre-decided target weights on the fixed session timeline.
@@ -471,6 +529,8 @@ def run_backtest(
     given = (overlay is not None, overlay_market is not None, derivatives is not None)
     if any(given) and not all(given):
         raise ValueError("overlay, overlay_market and derivatives must be given together or not at all")
+    if leg_derivatives and overlay is None:
+        raise ValueError("leg_derivatives requires an overlay")
     sweep: NDArray[np.float64] | None = None
     if cash_returns is not None:
         sweep = np.asarray(cash_returns, dtype=np.float64)
@@ -482,6 +542,9 @@ def run_backtest(
     inverse_closes: NDArray[np.float64] = np.empty(0, dtype=np.float64)
     expiry_rows: frozenset[int] = frozenset()
     multiplier = 0
+    leg_configs: dict[str, DerivativeConfig] = {}
+    leg_levels: dict[str, NDArray[np.float64]] = {}
+    checked_legs: set[str] = set()
     if overlay is not None:
         assert overlay_market is not None
         assert derivatives is not None
@@ -495,6 +558,24 @@ def run_backtest(
                 raise PITDataError(f"index level missing at {sessions[row].isoformat()}")
         expiry_rows = futures_expiry_rows(sessions)
         multiplier = int(derivatives.contract_multiplier_krw)
+
+        for leg_name, leg_config in (leg_derivatives or {}).items():
+            if leg_name not in overlay_market.legs:
+                raise ValueError(f"leg {leg_name!r} in leg_derivatives is absent from overlay_market.legs")
+            if (
+                leg_config.futures_tax_rate != derivatives.futures_tax_rate
+                or leg_config.futures_annual_deduction_krw != derivatives.futures_annual_deduction_krw
+            ):
+                raise ValueError(
+                    f"leg {leg_name!r} futures_tax_rate / futures_annual_deduction_krw differ from the primary's; "
+                    "derivative tax is assessed on one aggregate"
+                )
+            leg_level = np.asarray(overlay_market.legs[leg_name], dtype=np.float64)
+            if leg_level.shape != (len(sessions),):
+                raise ValueError(f"leg {leg_name!r} levels must align to sessions")
+            leg_configs[leg_name] = leg_config
+            leg_levels[leg_name] = leg_level
+
     deposits_by_session: dict[int, int] = {}
     for pay_date, amount in deposits.items():
         idx = session_index.get(pay_date, bisect.bisect_right(sessions, pay_date))
@@ -531,7 +612,12 @@ def run_backtest(
                 index_level=_index_level(index_levels, lo - 1),
                 contracts=0,
                 inverse_units=0,
+                leg_contracts=(),
             ),
+        )
+        _check_target_legs(
+            pending_overlay, leg_levels=leg_levels, leg_configs=leg_configs, checked=checked_legs,
+            rows=range(max(0, lo - 1), hi + 1), sessions=sessions,
         )
     stock_book_returns: list[float] = []
     stock_book_history: list[float] = []
@@ -604,6 +690,7 @@ def run_backtest(
             assert derivatives is not None
             level_t = _index_level(index_levels, t)
             inverse_price = _inverse_int(inverse_closes, t)
+
             if ledger.contracts != 0:
                 ledger.settle_variation(
                     session_idx=t,
@@ -611,17 +698,39 @@ def run_backtest(
                     level=level_t,
                     multiplier=multiplier,
                 )
-            if t in expiry_rows and ledger.contracts != 0:
-                ledger.roll_futures(
-                    session_idx=t, level=level_t, multiplier=multiplier,
-                    cost_rate=float(derivatives.futures_cost_rate),
+            for leg_name, _ in ledger.legs:
+                ledger.settle_variation(
+                    session_idx=t,
+                    prev_level=_index_level(leg_levels[leg_name], t - 1),
+                    level=_index_level(leg_levels[leg_name], t),
+                    multiplier=int(leg_configs[leg_name].contract_multiplier_krw),
+                    leg=leg_name,
                 )
+            if t in expiry_rows:
+                if ledger.contracts != 0:
+                    ledger.roll_futures(
+                        session_idx=t, level=level_t, multiplier=multiplier,
+                        cost_rate=float(derivatives.futures_cost_rate),
+                    )
+                for leg_name, _ in ledger.legs:
+                    ledger.roll_futures(
+                        session_idx=t,
+                        level=_index_level(leg_levels[leg_name], t),
+                        multiplier=int(leg_configs[leg_name].contract_multiplier_krw),
+                        cost_rate=float(leg_configs[leg_name].futures_cost_rate),
+                        leg=leg_name,
+                    )
             _sync_futures(
                 ledger, session_idx=t,
                 target_contracts=(
                     pending_overlay.contracts if pending_overlay is not None else ledger.contracts
                 ),
                 level=level_t, config=derivatives, multiplier=multiplier,
+                leg_targets=dict(pending_overlay.legs if pending_overlay is not None else ledger.legs),
+                leg_markets={
+                    leg_name: (leg_configs[leg_name], _index_level(leg_levels[leg_name], t))
+                    for leg_name in leg_configs
+                },
             )
             inverse_value_krw = (
                 pending_overlay.inverse_value_krw
@@ -671,6 +780,7 @@ def run_backtest(
         sizing_nav = int(record.nav)
         target_contracts = ledger.contracts
         target_inverse_krw = int(record.inverse_value)
+        target_legs = ledger.legs
         if overlay is not None:
             assert derivatives is not None
             pending_overlay = _policy_target(
@@ -689,14 +799,24 @@ def run_backtest(
                     index_level=level_t,
                     contracts=int(ledger.contracts),
                     inverse_units=int(ledger.inverse_units),
+                    leg_contracts=ledger.legs,
                 ),
             )
             if pending_overlay is not None:
                 target_contracts = int(pending_overlay.contracts)
                 target_inverse_krw = int(pending_overlay.inverse_value_krw)
-            sizing_nav -= required_reserve_krw(
-                contracts=target_contracts, level=level_t, config=derivatives
-            ) + target_inverse_krw
+                target_legs = pending_overlay.legs
+            _check_target_legs(
+                pending_overlay, leg_levels=leg_levels, leg_configs=leg_configs, checked=checked_legs,
+                rows=range(max(0, lo - 1), hi + 1), sessions=sessions,
+            )
+            reserve = required_reserve_krw(contracts=target_contracts, level=level_t, config=derivatives) + sum(
+                required_reserve_krw(
+                    contracts=count, level=_index_level(leg_levels[leg_name], t), config=leg_configs[leg_name]
+                )
+                for leg_name, count in target_legs
+            )
+            sizing_nav -= reserve + target_inverse_krw
             sizing_nav = max(sizing_nav, 0)
         if t in schedule and t >= lo:
             pending = carried + _target_orders(
@@ -715,6 +835,7 @@ def run_backtest(
                 "cash_delta": entry.cash_delta,
                 "quantity_delta": entry.quantity_delta,
                 "account": entry.account.value,
+                **({"leg": entry.leg} if entry.leg is not None else {}),
             }
             for entry in journal
         ],

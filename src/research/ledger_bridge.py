@@ -31,6 +31,7 @@ __all__ = [
     "LedgerOutcome",
     "cash_returns_from_frame",
     "overlay_market_from_inputs",
+    "overlay_market_with_legs",
     "run_ledger",
 ]
 
@@ -74,6 +75,20 @@ def overlay_market_from_inputs(inputs: HedgeInputs) -> OverlayMarket:
     return OverlayMarket(
         index_level=np.ascontiguousarray(np.asarray(inputs.index_level, dtype=np.float64)),
         inverse_close=np.ascontiguousarray(np.asarray(inputs.inverse_close, dtype=np.float64)),
+    )
+
+
+def overlay_market_with_legs(
+    primary: HedgeInputs, legs: Mapping[str, HedgeInputs]
+) -> OverlayMarket:
+    """Engine overlay closes from primary hedge inputs and secondary leg inputs by name."""
+    return OverlayMarket(
+        index_level=np.ascontiguousarray(np.asarray(primary.index_level, dtype=np.float64)),
+        inverse_close=np.ascontiguousarray(np.asarray(primary.inverse_close, dtype=np.float64)),
+        legs={
+            name: np.ascontiguousarray(np.asarray(inp.index_level, dtype=np.float64))
+            for name, inp in legs.items()
+        },
     )
 
 
@@ -208,6 +223,7 @@ def run_ledger(
     overlay: OverlayPolicy | None = None,
     overlay_market: OverlayMarket | None = None,
     derivatives: DerivativeConfig | None = None,
+    leg_derivatives: Mapping[str, DerivativeConfig] | None = None,
     extra_slippage: float = 0.0,
     auction_slippage_ticks: float | None = None,
     sessions_per_year: int = 252,
@@ -277,6 +293,7 @@ def run_ledger(
         overlay=overlay,
         overlay_market=overlay_market,
         derivatives=derivatives,
+        leg_derivatives=leg_derivatives,
         rebalance_band=rebalance_band,
     )
     sessions = tuple(arrays.sessions[record.session_idx] for record in result.nav)
