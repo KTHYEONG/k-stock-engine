@@ -20,6 +20,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
     assert config.market_rules == repo / "config" / "market" / "krx_market_rules.toml"
     assert config.reference_benchmarks == repo / "config" / "data" / "reference_benchmarks.toml"
     assert config.hedge_series == repo / "config" / "data" / "hedge_series.toml"
+    assert config.trend_series == repo / "config" / "data" / "trend_series.toml"
     assert config.cash_series == repo / "config" / "data" / "cash_series.toml"
     assert config.engine == repo / "config" / "backtest" / "default_engine.toml"
     assert config.strategies_root == repo / "config" / "research" / "strategies"
@@ -30,6 +31,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
         config.market_rules,
         config.reference_benchmarks,
         config.hedge_series,
+        config.trend_series,
         config.cash_series,
         config.engine,
         config.research_protocol,
@@ -46,6 +48,8 @@ def test_research_protocol_path_resolved_and_exists() -> None:
     assert config.research_protocol.is_file()
     assert config.hedge_series.is_absolute()
     assert config.hedge_series.is_file()
+    assert config.trend_series.is_absolute()
+    assert config.trend_series.is_file()
     assert config.cash_series.is_absolute()
     assert config.cash_series.is_file()
 
@@ -74,6 +78,7 @@ def test_missing_referenced_file_fails_closed_with_key_name(tmp_path: Path) -> N
         ("logs_root", "logs"),
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("hedge_series", "config/data/hedge_series.toml"),
+        ("trend_series", "config/data/trend_series.toml"),
         ("cash_series", "config/data/cash_series.toml"),
         ("engine", "config/backtest/default_engine.toml"),
         ("research_protocol", "config/research/protocol.toml"),
@@ -117,6 +122,7 @@ def test_missing_strategies_dir_fails_closed(tmp_path: Path) -> None:
         ("logs_root", "logs"),
         ("reference_benchmarks", "config/data/reference_benchmarks.toml"),
         ("hedge_series", "config/data/hedge_series.toml"),
+        ("trend_series", "config/data/trend_series.toml"),
         ("cash_series", "config/data/cash_series.toml"),
         ("engine", "config/backtest/default_engine.toml"),
         ("research_protocol", "config/research/protocol.toml"),

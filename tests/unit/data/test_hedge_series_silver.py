@@ -483,3 +483,156 @@ def test_never_listed_etf_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(PITDataError):
         _materialize(catalog_root, silver_root)
     assert list(Path(silver_root).glob("hedge_series_*")) == []
+
+
+def _trend_config(**overrides: object) -> HedgeSeriesConfig:
+    values: dict[str, object] = {
+        "collection_start": DAY1,
+        "index_name": "코스피 200",
+        "index_class": "KOSPI",
+        "inverse_ticker": "114800",
+        "available_time": time(18, 0),
+        "source": "krx_trend_series",
+    }
+    values.update(overrides)
+    return HedgeSeriesConfig.model_validate(values)
+
+
+def _publish_as(
+    catalog_root: Path, payload_dir: Path, session: date, records: object, *, source: str
+) -> None:
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps({"session": session.isoformat(), "records": records}, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    payload_path = payload_dir / f"{source}-{session.isoformat()}.json"
+    payload_path.write_bytes(raw)
+    seed_receipts(
+        ReceiptCatalog(catalog_root),
+        [
+            ReceiptIndexEntry(
+                source=source,
+                natural_key=session.isoformat(),
+                as_of=session,
+                fiscal_period=None,
+                status=EvidenceStatus.SUCCESS,
+                content_hash=digest,
+                retrieved_at=datetime(2026, 3, 7, tzinfo=UTC),
+                payload_path=payload_path,
+            )
+        ],
+    )
+
+
+def test_kosdaq_identity_is_byte_stable(tmp_path: Path) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_id_for, load_manifest
+
+    catalog_root, silver_root = _setup(tmp_path, (DAY1, DAY2, DAY3))
+    pages = _pages(tmp_path)
+    _publish(catalog_root, pages, DAY1, [_index_record(DAY1)])
+    _publish(catalog_root, pages, DAY2, [_index_record(DAY2)])
+    _publish(catalog_root, pages, DAY3, [_index_record(DAY3), _etf_record(DAY3)])
+    result = materialize_hedge_series_silver(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver_root,
+        silver_root=silver_root,
+        config=_config(),
+    )
+    manifest = load_manifest(result.dataset_path)
+    assert manifest.kind == "hedge_series"
+    assert "index_class" not in manifest.params
+    assert "source" not in manifest.params
+    assert set(manifest.params) == {"collection_start", "index_name", "inverse_ticker", "available_time"}
+    legacy_identity = DatasetIdentity(
+        kind="hedge_series", layer=DatasetLayer.SILVER, policy_version=POLICY_VERSION,
+        inputs=manifest.inputs,
+        params={
+            "collection_start": DAY1.isoformat(), "index_name": "코스닥 150",
+            "inverse_ticker": "251340", "available_time": "18:00:00",
+        },
+    )
+    assert result.dataset_id == dataset_id_for(legacy_identity)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kind"),
+    [("krx_trend_series", "trend_series"), ("custom_index_series", "hedge_series")],
+)
+def test_trend_series_reads_own_receipts(tmp_path: Path, source: str, expected_kind: str) -> None:
+    from src.data.hedge_series_silver import materialize_hedge_series_silver as _materialize_series
+
+    catalog_root, silver_root = _setup(tmp_path, (DAY1, DAY2, DAY3))
+    pages = _pages(tmp_path)
+    for day in (DAY1, DAY2, DAY3):
+        index = dict(_index_record(day))
+        index.update({"IDX_CLSS": "KOSPI", "IDX_NM": "코스피 200"})
+        etf = dict(_etf_record(day))
+        etf.update({"ISU_CD": "114800", "ISU_SRT_CD": "114800"})
+        records = [index] if day != DAY3 else [index, etf]
+        _publish_as(catalog_root, pages, day, records, source=source)
+    result = _materialize_series(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver_root,
+        silver_root=silver_root,
+        config=_trend_config(source=source),
+    )
+    assert result.sessions == 3
+    assert result.inverse_listing_session == DAY3
+    assert result.dataset_id.startswith(f"{expected_kind}_")
+    with pytest.raises(PITDataError):
+        _materialize_series(
+            catalog=ReceiptCatalog(catalog_root),
+            universe_root=silver_root,
+            silver_root=silver_root,
+            config=_trend_config(source="krx_hedge_series"),
+        )
+
+
+def test_distinct_series_have_distinct_ids(tmp_path: Path) -> None:
+    catalog_root, silver_root = _setup(tmp_path, (DAY1, DAY2, DAY3))
+    pages = _pages(tmp_path)
+    _publish(catalog_root, pages, DAY1, [_index_record(DAY1)])
+    _publish(catalog_root, pages, DAY2, [_index_record(DAY2)])
+    _publish(catalog_root, pages, DAY3, [_index_record(DAY3), _etf_record(DAY3)])
+    for day in (DAY1, DAY2, DAY3):
+        index = dict(_index_record(day))
+        index.update({"IDX_CLSS": "KOSPI", "IDX_NM": "코스피 200"})
+        etf = dict(_etf_record(day))
+        etf.update({"ISU_CD": "114800", "ISU_SRT_CD": "114800"})
+        records = [index] if day != DAY3 else [index, etf]
+        _publish_as(catalog_root, pages, day, records, source="krx_trend_series")
+    kosdaq = materialize_hedge_series_silver(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver_root,
+        silver_root=silver_root,
+        config=_config(),
+    )
+    trend = materialize_hedge_series_silver(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver_root,
+        silver_root=silver_root,
+        config=_trend_config(),
+    )
+    assert kosdaq.dataset_id != trend.dataset_id
+
+
+def test_trend_config_roundtrip_and_source_validation(tmp_path: Path) -> None:
+    good = tmp_path / "trend.toml"
+    good.write_text(
+        'collection_start = 2017-01-02\nindex_class = "KOSPI"\nindex_name = "코스피 200"\n'
+        'inverse_ticker = "114800"\navailable_time = "18:00:00"\nsource = "krx_trend_series"\n',
+        encoding="utf-8",
+    )
+    parsed = load_hedge_series_config(good)
+    assert parsed.index_class == "KOSPI"
+    assert parsed.source == "krx_trend_series"
+    assert load_hedge_series_config(Path("config/data/trend_series.toml")).index_class == "KOSPI"
+    with pytest.raises(ValueError, match="non-empty string"):
+        HedgeSeriesConfig.model_validate(
+            {
+                "collection_start": DAY1,
+                "index_name": "코스피 200",
+                "inverse_ticker": "114800",
+                "available_time": time(18, 0),
+                "source": "  ",
+            }
+        )

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import polars as pl
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -26,7 +26,7 @@ from src.data.datasets import (
     resolve_bronze_digest,
     universe_sessions,
 )
-from src.data.evidence_sources import KRX_HEDGE_SERIES_SOURCE
+from src.data.evidence_sources import KRX_HEDGE_SERIES_SOURCE, KRX_TREND_SERIES_SOURCE
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
 POLICY_VERSION: Final = "krx-hedge-series-v1"
@@ -44,14 +44,20 @@ _SCHEMA: dict[str, Any] = {
 
 
 class HedgeSeriesConfig(BaseModel):
-    """Collection and Silver policy for the KRX hedge series."""
+    """Collection and Silver policy for one KRX index-plus-inverse-ETF series.
+
+    ``source`` is the receipt-catalog source of the series' Bronze pages. Why per series: two series fetched for the
+    same session must never overwrite each other's receipt, and the catalog keys receipts by (source, session).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     collection_start: date
     index_name: str
+    index_class: Literal["KOSDAQ", "KOSPI"] = "KOSDAQ"
     inverse_ticker: str
     available_time: time
+    source: str = KRX_HEDGE_SERIES_SOURCE
 
     @field_validator("index_name")
     @classmethod
@@ -65,6 +71,13 @@ class HedgeSeriesConfig(BaseModel):
     def _six_digit_ticker(cls, value: str) -> str:
         if not isinstance(value, str) or len(value) != 6 or not value.isdigit():
             raise ValueError("inverse_ticker must be a 6-digit string")
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def _non_empty_source(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("source must be a non-empty string")
         return value
 
 
@@ -162,7 +175,8 @@ def materialize_hedge_series_silver(
     universe_dataset_id: str | None = None,
 ) -> HedgeSeriesResult:
     """Normalize one hash-verified KRX hedge page per certified session ≥ ``config.collection_start``
-    and publish Silver kind ``hedge_series``.
+    and publish Silver kind ``hedge_series`` (``trend_series`` for ``krx_trend_series``,
+    so each series owns its registry pointer).
 
     Why: the hedge overlay needs the futures underlying (index level) and the real inverse-ETF price path;
     both are exchange-certified daily values, stored without any adjustment or fill.
@@ -182,7 +196,7 @@ def materialize_hedge_series_silver(
     if not sessions:
         raise PITDataError("KRX hedge series has no certified sessions at or after collection_start")
     entries = catalog.latest(
-        source=KRX_HEDGE_SERIES_SOURCE,
+        source=config.source,
         natural_keys={session.isoformat() for session in sessions},
     )
     for session in sessions:
@@ -193,8 +207,19 @@ def materialize_hedge_series_silver(
             raise PITDataError(f"KRX hedge series catalog date conflicts for {session}")
 
     source_hashes = [entries[session.isoformat()].content_hash for session in sessions]
+    params: dict[str, str] = {
+        "collection_start": config.collection_start.isoformat(),
+        "index_name": config.index_name,
+        "inverse_ticker": config.inverse_ticker,
+        "available_time": config.available_time.isoformat(),
+    }
+    if config.index_class != "KOSDAQ":
+        params["index_class"] = config.index_class
+    if config.source != KRX_HEDGE_SERIES_SOURCE:
+        params["source"] = config.source
+    dataset_kind = "trend_series" if config.source == KRX_TREND_SERIES_SOURCE else "hedge_series"
     identity = DatasetIdentity(
-        kind="hedge_series",
+        kind=dataset_kind,
         layer=DatasetLayer.SILVER,
         policy_version=POLICY_VERSION,
         inputs={
@@ -203,12 +228,7 @@ def materialize_hedge_series_silver(
                 None, source_hashes, label="hedge-series Bronze source"
             ),
         },
-        params={
-            "collection_start": config.collection_start.isoformat(),
-            "index_name": config.index_name,
-            "inverse_ticker": config.inverse_ticker,
-            "available_time": config.available_time.isoformat(),
-        },
+        params=params,
     )
     partitions: dict[str, pl.DataFrame] = {}
     partition_details: list[dict[str, object]] = []

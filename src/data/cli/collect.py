@@ -422,6 +422,8 @@ COLLECT_COMMANDS: tuple[Command, ...] = (
             lambda args: _run_krx_job(args, job_name="krx_security_master")),
     Command("collect-krx-hedge-series", "Collect KRX hedge-series pages (KOSDAQ150 index, inverse ETF) for completed sessions", _add_krx_job,
             lambda args: _run_krx_job(args, job_name="krx_hedge_series")),
+    Command("collect-krx-trend-series", "Collect KRX trend-series pages (KOSPI 200 index, inverse ETF) for completed sessions", _add_krx_job,
+            lambda args: _run_krx_job(args, job_name="krx_trend_series")),
     Command("collect-krx-cash-series", "Collect KRX cash-series pages (cash-equivalent ETF) for completed sessions", _add_krx_job,
             lambda args: _run_krx_job(args, job_name="krx_cash_series")),
     Command("collect-kind-notices", "Collect KIND exchange-notice search windows", _add_krx_job,

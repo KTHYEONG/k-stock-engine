@@ -1,11 +1,11 @@
 usage: cli.py [-h]
-              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,migrate-snapshot-krx,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-krx-hedge-series,collect-krx-cash-series,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-hedge-series-silver,build-cash-series-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+              {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,migrate-snapshot-krx,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-krx-hedge-series,collect-krx-trend-series,collect-krx-cash-series,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-hedge-series-silver,build-trend-series-silver,build-cash-series-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
               ...
 
 PIT dataset foundation CLI
 
 positional arguments:
-  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,migrate-snapshot-krx,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-krx-hedge-series,collect-krx-cash-series,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-hedge-series-silver,build-cash-series-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
+  {normalize-dart-facts,audit-ordinary-universe-prices,scope-info,init-workspace,index-bronze,migrate-snapshot-krx,collect-scoped,collect-krx-daily-market,collect-krx-security-master,collect-krx-hedge-series,collect-krx-trend-series,collect-krx-cash-series,collect-kind-notices,collect-kind-documents,collect-ls-investor-flow,collect-kis-investor-flow,collect-dart-disclosures,collect-dart-corp-codes,collect-dart-facts,collect-dividend-decisions,collect-earnings-releases,reparse-dart-documents,collect-dart-documents,collect-dart-benchmark-documents,benchmark-dart-documents,build-investor-flow-silver,build-daily-market-silver,build-hedge-series-silver,build-trend-series-silver,build-cash-series-silver,build-ordinary-universe,build-market-panel,build-reference-benchmarks,verify-datasets,prune-datasets,refresh-scope,build-investor-flow-kis-supplement,build-investor-flow-union,build-financial-quality,build-dividend-events,build-earnings-releases,benchmark-earnings-releases,build-market-actions,collect-industry-classification,collect-stock-classification,build-industry-classification-silver}
     normalize-dart-facts
                         Incremental DART fact refresh
     audit-ordinary-universe-prices
@@ -26,6 +26,9 @@ positional arguments:
                         sessions
     collect-krx-hedge-series
                         Collect KRX hedge-series pages (KOSDAQ150 index,
+                        inverse ETF) for completed sessions
+    collect-krx-trend-series
+                        Collect KRX trend-series pages (KOSPI 200 index,
                         inverse ETF) for completed sessions
     collect-krx-cash-series
                         Collect KRX cash-series pages (cash-equivalent ETF)
@@ -66,6 +69,8 @@ positional arguments:
                         Build Silver daily-market dataset with KRX base prices
     build-hedge-series-silver
                         Build Silver hedge-series dataset
+    build-trend-series-silver
+                        Build Silver KOSPI 200 trend-series dataset
     build-cash-series-silver
                         Build Silver cash-series dataset
     build-ordinary-universe
