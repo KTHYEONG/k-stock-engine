@@ -150,7 +150,14 @@ def _spec(**overrides: Any) -> Any:
     hedge_kw.update(overrides.pop("hedge", {}))
     policy = TrendCashPolicy(**policy_kw)  # type: ignore[arg-type]
     scorer = ScorerConfig(**scorer_kw)  # type: ignore[arg-type]
-    return StrategySpec(policy=policy, scorer=scorer, book=BookSpec(**book_kw), hedge=HedgeSpec(**hedge_kw))  # type: ignore[arg-type]
+    return StrategySpec(
+        policy=policy,
+        scorer=scorer,
+        book=BookSpec(**book_kw),
+        hedge=HedgeSpec(**hedge_kw),
+        trend_overlay=overrides.get("trend_overlay"),
+        regime_hedge=overrides.get("regime_hedge"),
+    )  # type: ignore[arg-type]
 
 
 def _panel_rows(sessions: list[date]) -> list[dict[str, Any]]:
@@ -1750,3 +1757,183 @@ def test_run_id_includes_trend_dataset_only_for_trend_specs(tmp_path: Path, monk
     object.__setattr__(other._ctx, "dataset_ids", other_ids)
     assert other.evaluate(plain).report.run_id == champion_run.report.run_id
     assert other.evaluate(trend_spec).report.run_id != trend_run.report.run_id
+
+
+def _regime_spec(**overrides: Any) -> Any:
+    from src.research.regime_hedge import RegimeHedgeSpec
+
+    regime_kw: dict[str, Any] = {
+        "tsmom_horizons": (5, 10, 15, 20),
+        "target_vol": 0.10,
+        "max_fraction": 1.5,
+        "vol_window_sessions": 20,
+        "rebalance_every_sessions": 5,
+        "contract_multiplier_krw": 10000,
+        "initial_margin_rate": 0.2,
+        "margin_buffer_rate": 0.1,
+        "margin_topup_trigger_fraction": 0.75,
+        "futures_cost_rate": 0.0003,
+        "futures_tax_rate": 0.11,
+        "futures_annual_deduction_krw": 2500000,
+    }
+    regime_kw.update(overrides.pop("regime_hedge", {}))
+    base = _trend_spec(**overrides)
+    return base.model_copy(update={"regime_hedge": RegimeHedgeSpec(**regime_kw)})
+
+
+def test_champion_identity_unchanged_with_regime_hedge_support() -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    champion_path = Path("config/research/strategies/ml_growth_t85_b50_k200.toml")
+    spec = load_strategy_spec(champion_path)
+    assert spec.spec_hash == "8c2aad2c8c3c5a133e7a3c6cef3134f43b89749dd87fa3d2f57c223118e4676c"
+    assert spec.regime_hedge is None
+
+
+def test_regime_hedge_without_trend_overlay_rejected() -> None:
+    from src.research.pipeline import StrategySpec
+    from src.research.regime_hedge import RegimeHedgeSpec
+
+    regime = RegimeHedgeSpec(
+        tsmom_horizons=(5, 10),
+        target_vol=0.10,
+        max_fraction=1.5,
+        vol_window_sessions=20,
+        rebalance_every_sessions=5,
+        contract_multiplier_krw=10000,
+        initial_margin_rate=0.2,
+        margin_buffer_rate=0.1,
+        margin_topup_trigger_fraction=0.75,
+        futures_cost_rate=0.0003,
+        futures_tax_rate=0.11,
+        futures_annual_deduction_krw=2500000,
+    )
+    with pytest.raises(ValueError, match="regime_hedge requires trend_overlay is not None"):
+        _spec(regime_hedge=regime)
+
+    base = _trend_spec()
+    with pytest.raises(ValueError, match=r"hedge\.hedge_ratio == 0"):
+        StrategySpec(
+            policy=base.policy,
+            scorer=base.scorer,
+            book=base.book,
+            hedge=base.hedge.model_copy(update={"hedge_ratio": 0.5}),
+            trend_overlay=base.trend_overlay,
+            regime_hedge=regime,
+        )
+
+
+def test_both_legs_reach_every_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.backtest.overlay import OverlayState
+    from src.research.regime_hedge import CompositeOverlay, RegimeHedgeLeg
+    from src.research.trend_overlay import TrendOverlay
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    _with_trend_inputs(pipe, sessions)
+    spec = _regime_spec()
+
+    seen: list[dict[str, Any]] = []
+    runner = pipe._ctx.ledger_runner
+
+    def _spy(**kwargs: Any) -> Any:
+        seen.append(dict(kwargs))
+        return runner(**kwargs)
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    pipe.evaluate(spec)
+
+    delay_n = int(pipe._ctx.protocol.scenarios.stress_delay_sessions)
+    extra = float(pipe._ctx.protocol.scenarios.stress_hedge_extra_cost)
+    names = ["base", "stress_slippage", "stress_delay"] + [
+        f"cost_{tick}" for tick in pipe._ctx.protocol.scenarios.cost_grid_ticks
+    ] + ["unhedged", "placebo"]
+    assert len(seen) == len(names)
+
+    for name, call in zip(names, seen, strict=True):
+        assert "leg_derivatives" in call
+        leg_derivs = call["leg_derivatives"]
+        assert leg_derivs is not None
+        assert "kq150" in leg_derivs
+
+        overlay = call["overlay"]
+        inner = overlay._inner if hasattr(overlay, "_inner") else overlay
+        assert isinstance(inner, CompositeOverlay)
+        primary = inner._primary
+        secondary = inner._legs["kq150"]
+        assert isinstance(primary, TrendOverlay)
+        assert isinstance(secondary, RegimeHedgeLeg)
+
+        expected_delay = delay_n if name == "stress_delay" else 0
+        assert primary._delay == expected_delay
+        assert secondary._delay == expected_delay
+
+        expected_cost = 0.0003 + (extra if name == "stress_slippage" else 0.0)
+        assert call["derivatives"].futures_cost_rate == pytest.approx(expected_cost)
+        assert leg_derivs["kq150"].futures_cost_rate == pytest.approx(expected_cost)
+
+        if name == "unhedged":
+            assert primary._spec.long_fraction == 0.0
+            assert primary._spec.short_fraction == 0.0
+            assert secondary._spec.max_fraction == 0.0
+            dummy_state = OverlayState(
+                session_idx=0,
+                nav=100_000_000,
+                stock_book_nav=100_000_000,
+                stock_book_returns=np.zeros(1),
+                index_returns=np.zeros(1),
+                index_level=1000.0,
+                contracts=0,
+                inverse_units=0,
+                leg_contracts=(),
+            )
+            target = inner.target(dummy_state)
+            assert target is not None
+            assert target.contracts == 0
+            assert target.legs == (("kq150", 0),)
+
+
+def test_perturbation_detects_a_leaking_regime_hedge_leg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.pipeline as pipe_mod
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path / "clean", sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+    _with_trend_inputs(pipe, sessions)
+    spec = _regime_spec()
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
+
+    run_clean = pipe.evaluate(spec)
+    assert run_clean.evidence.perturbation_mismatches == 0
+
+    other = _context(tmp_path / "leaky", sessions, trending_index=True)
+    _with_trend_inputs(other, sessions)
+    object.__setattr__(other._ctx, "ledger_runner", _causal_account(sessions))
+
+    class _LeakyRegimeHedgeLeg:
+        def __init__(self, spec: Any, *, index_level: Any, rebalance_offset: int = 0, execution_delay: int = 0) -> None:
+            self._levels = np.asarray(index_level, dtype=np.float64)
+            self._start: int | None = None
+
+        def target_contracts(self, state: Any) -> int | None:
+            idx = int(state.session_idx) + 1
+            if idx >= len(self._levels):
+                return 0
+            return int(float(self._levels[idx]) * 1e6) % 5 + 1
+
+    monkeypatch.setattr(pipe_mod, "RegimeHedgeLeg", _LeakyRegimeHedgeLeg)
+    leaky_run = other.evaluate(spec)
+    assert leaky_run.evidence.perturbation_mismatches > 0
+
+
+def test_load_strategy_spec_invalid_regime_hedge_table(tmp_path: Path) -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    base_toml = Path("config/research/strategies/ml_growth_t85_b50_k200.toml").read_text(encoding="utf-8")
+    content = base_toml + "\n[regime_hedge]\ntarget_vol = 'invalid_not_a_float'\n"
+    p = tmp_path / "bad.toml"
+    p.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid \\[regime_hedge\\] table"):
+        load_strategy_spec(p)
+

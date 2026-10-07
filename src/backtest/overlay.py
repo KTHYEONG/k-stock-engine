@@ -99,7 +99,7 @@ class DerivativeConfig:
 PRIMARY_LEG: Final = "primary"
 
 
-def _check_leg_name(name: object) -> None:
+def check_leg_name(name: object) -> None:
     if not isinstance(name, str) or not name or name == PRIMARY_LEG:
         raise ValueError(f"invalid leg name: {name!r}")
 
@@ -113,7 +113,7 @@ def _check_leg_pairs(pairs: object, *, what: str) -> None:
         if not isinstance(item, tuple) or len(item) != 2:
             raise ValueError(f"leg pair must be a 2-tuple (name, contracts), got {item!r}")
         name, count = item
-        _check_leg_name(name)
+        check_leg_name(name)
         if name == prev_name:
             raise ValueError(f"duplicate leg name in {what}: {name!r}")
         if prev_name is not None and name < prev_name:
@@ -136,7 +136,7 @@ class OverlayMarket:
         if not isinstance(self.legs, Mapping):
             raise ValueError(f"legs must be a Mapping, got {self.legs!r}")
         for name, arr in self.legs.items():
-            _check_leg_name(name)
+            check_leg_name(name)
             if not isinstance(arr, np.ndarray):
                 raise ValueError(f"leg {name!r} must be an ndarray, got {arr!r}")
 

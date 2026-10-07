@@ -55,6 +55,19 @@ TREND_CONTRACT_KNOBS = frozenset({
     "trend_overlay.futures_cost_rate",
     "trend_overlay.futures_tax_rate",
     "trend_overlay.futures_annual_deduction_krw",
+    "trend_overlay.vol_window_sessions",
+})
+REGIME_HEDGE_EXEMPT_KNOBS = frozenset({
+    "regime_hedge.contract_multiplier_krw",
+    "regime_hedge.initial_margin_rate",
+    "regime_hedge.margin_buffer_rate",
+    "regime_hedge.margin_topup_trigger_fraction",
+    "regime_hedge.futures_cost_rate",
+    "regime_hedge.futures_tax_rate",
+    "regime_hedge.futures_annual_deduction_krw",
+    "regime_hedge.vol_window_sessions",
+    "regime_hedge.rebalance_every_sessions",
+    "regime_hedge.max_fraction",
 })
 
 
@@ -217,11 +230,19 @@ def decide_challenge(
     if protocol.champion.require_neighbors and changes:
         covered = _knob_coverage(challenger_spec, neighbor_runs)
         exempt = set(TREND_CONTRACT_KNOBS)
+        exempt.update(REGIME_HEDGE_EXEMPT_KNOBS)
         if (challenger_spec.trend_overlay is None) != (champion_spec.trend_overlay is None):
             # One-overlay accounting forbids a hedge-ratio neighbor while the trend overlay is active.
             exempt.update({"hedge.hedge_ratio", "trend_overlay.rebalance_every_sessions"})
         if challenger_spec.trend_overlay is None:
             exempt.update(knob for knob in changes if knob.startswith("trend_overlay."))
+        elif (
+            champion_spec.trend_overlay is not None
+            and challenger_spec.trend_overlay.signal != champion_spec.trend_overlay.signal
+        ):
+            exempt.add("trend_overlay.ma_sessions")
+        if challenger_spec.regime_hedge is None:
+            exempt.update(knob for knob in changes if knob.startswith("regime_hedge."))
         for knob in changes:
             if knob.startswith("scorer.") or knob in covered or knob in exempt:
                 continue
@@ -555,6 +576,8 @@ def _numeric_leaves_of(spec: StrategySpec) -> dict[str, float]:
     }
     if spec.trend_overlay is not None:
         sections["trend_overlay"] = json.loads(spec.trend_overlay.canonical_json())
+    if spec.regime_hedge is not None:
+        sections["regime_hedge"] = json.loads(spec.regime_hedge.canonical_json())
     out: dict[str, float] = {}
     for name in sorted(sections):
         out.update(_numeric_leaves(sections[name], name))
