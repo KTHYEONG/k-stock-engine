@@ -721,6 +721,133 @@ def test_year_end_tax_beyond_cash_is_funded_by_next_session_sales(tmp_path: Path
     )
 
 
+def test_long_target_executes_and_conserves_krw(tmp_path: Path) -> None:
+    from src.backtest.ledger import JournalKind as _Kind, LedgerAccount
+    from src.backtest.overlay import DerivativeConfig, OverlayMarket, OverlayState, OverlayTarget
+
+    sessions = _sessions(4)
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_long", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+
+    class _Long:
+        def target(self, state: OverlayState) -> OverlayTarget:
+            return OverlayTarget(contracts=-1, inverse_value_krw=0)
+
+    derivatives = DerivativeConfig(
+        contract_multiplier_krw=10_000, initial_margin_rate=0.1, margin_buffer_rate=0.05,
+        margin_topup_trigger_fraction=1.0, futures_cost_rate=0.0, inverse_cost_rate=0.0,
+        futures_tax_rate=Decimal("0.11"), futures_annual_deduction_krw=2_500_000,
+        inverse_tax_rate=Decimal("0.154"),
+    )
+    market = OverlayMarket(
+        index_level=np.asarray([1000.0, 1000.0, 1030.0, 1060.0], dtype=np.float64),
+        inverse_close=np.asarray([10_000.0] * 4, dtype=np.float64),
+    )
+    result = run_backtest(
+        arrays=arrays, events=events, targets={0: {0: 0.5}}, config=_config(initial_cash=10_000_000, commission="0", impact_k=0.0),
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+        overlay=_Long(), overlay_market=market, derivatives=derivatives,
+    )
+    for record in result.nav:
+        journal = [e for e in result.journal if e.session_idx <= record.session_idx]
+        assert record.cash == 10_000_000 + sum(e.cash_delta for e in journal if e.account is LedgerAccount.CASH)
+        assert record.margin == sum(e.cash_delta for e in journal if e.account is LedgerAccount.MARGIN)
+        assert record.nav == (
+            record.cash + record.dividend_receivable + record.market_value
+            + record.margin + record.inverse_value - record.tax_payable
+        )
+    variations = [e.cash_delta for e in result.journal if e.kind is _Kind.VARIATION_MARGIN]
+    assert sum(variations) == 600_000
+    assert result.nav[0].margin == 0
+    assert result.nav[1].market_value == 4_250_000
+    assert [(e.session_idx, e.quantity_delta) for e in result.journal if e.kind is _Kind.FUTURES_TRADE] == [(1, -1)]
+
+
+def test_unaffordable_long_shrinks_never_flips(tmp_path: Path) -> None:
+    from src.backtest.ledger import JournalKind as _Kind
+    from src.backtest.overlay import DerivativeConfig, OverlayMarket, OverlayState, OverlayTarget
+
+    sessions = _sessions(4)
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_long_thin", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+
+    class _BigLong:
+        def target(self, state: OverlayState) -> OverlayTarget:
+            return OverlayTarget(contracts=-5, inverse_value_krw=0)
+
+    derivatives = DerivativeConfig(
+        contract_multiplier_krw=10_000, initial_margin_rate=0.1, margin_buffer_rate=0.05,
+        margin_topup_trigger_fraction=1.0, futures_cost_rate=0.0, inverse_cost_rate=0.0,
+        futures_tax_rate=Decimal("0.11"), futures_annual_deduction_krw=2_500_000,
+        inverse_tax_rate=Decimal("0.154"),
+    )
+    market = OverlayMarket(
+        index_level=np.asarray([1000.0] * 4, dtype=np.float64),
+        inverse_close=np.asarray([10_000.0] * 4, dtype=np.float64),
+    )
+    result = run_backtest(
+        arrays=arrays, events=events, targets={}, config=_config(initial_cash=2_000_000),
+        deposits={}, rules=_rules(), start=sessions[0], end=sessions[-1],
+        overlay=_BigLong(), overlay_market=market, derivatives=derivatives,
+    )
+    held = 0
+    for entry in result.journal:
+        if entry.kind is _Kind.FUTURES_TRADE:
+            held += entry.quantity_delta
+            assert held <= 0
+    assert held == -1
+
+
+def test_bounded_fundable_search_negative() -> None:
+    import time
+
+    from src.backtest.engine import _largest_fundable_contracts
+    from src.backtest.overlay import DerivativeConfig, required_reserve_krw
+    from src.backtest.engine import _futures_commission
+
+    config = DerivativeConfig(
+        contract_multiplier_krw=10_000, initial_margin_rate=0.1, margin_buffer_rate=0.05,
+        margin_topup_trigger_fraction=1.0, futures_cost_rate=0.0005, inverse_cost_rate=0.0,
+        futures_tax_rate=Decimal("0.11"), futures_annual_deduction_krw=2_500_000,
+        inverse_tax_rate=Decimal("0.154"),
+    )
+    level, mult = 1000.0, 10_000
+
+    def _reference(target: int, held: int, available: int) -> int:
+        candidate = target
+        while candidate <= 0:
+            reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
+            commission = _futures_commission(
+                float(config.futures_cost_rate), delta=candidate - held,
+                multiplier=mult, level=level,
+            )
+            if reserve + commission <= available:
+                return candidate
+            candidate += 1
+        return 0
+
+    for target, held, available in [(-5, 0, 10_000_000), (-5, -2, 10_000_000), (-7, 1, 3_000_000)]:
+        assert _largest_fundable_contracts(
+            target_contracts=target, held=held, available=available, level=level,
+            config=config, multiplier=mult,
+        ) == _reference(target, held, available)
+
+    started = time.perf_counter()
+    got = _largest_fundable_contracts(
+        target_contracts=-(10**8), held=0, available=10_000_000, level=level,
+        config=config, multiplier=mult,
+    )
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.05
+    assert got == _reference(-10, 0, 10_000_000) == -6
+
+
 @pytest.mark.slow
 def test_reference_benchmark_parity() -> None:
     """Test-only frictionless close-fill model reproduces eligible_ew_pr."""

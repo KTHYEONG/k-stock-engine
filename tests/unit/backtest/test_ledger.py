@@ -523,7 +523,7 @@ def test_futures_no_ops_and_argument_validation() -> None:
         ledger.transfer_margin(session_idx=4, amount=1.5)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="contracts must be"):
         ledger.trade_futures(
-            session_idx=4, contracts=-1, level=1000.0, multiplier=10_000, cost_rate=0.0
+            session_idx=4, contracts=True, level=1000.0, multiplier=10_000, cost_rate=0.0  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="cost_rate must be"):
         ledger.trade_futures(
@@ -605,3 +605,97 @@ def test_futures_tax_below_one_won_is_not_journaled() -> None:
     ) == 0
     assert ledger.margin == 100_000
     assert ledger.settle_futures_tax(session_idx=3, config=_derivatives()) == 0
+
+
+def test_long_position_gains_on_a_rising_index() -> None:
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=-2, level=300.0, multiplier=50_000, cost_rate=0.0)
+    delta = ledger.settle_variation(
+        session_idx=1, prev_level=300.0, level=303.0, multiplier=50_000
+    )
+    assert delta == 2 * 50_000 * 3
+    assert ledger.margin == 2 * 50_000 * 3
+    assert ledger.settle_futures_tax(
+        session_idx=2, config=_derivatives(futures_annual_deduction_krw=0)
+    ) == 33_000
+
+
+def test_long_and_short_marks_are_mirror_images() -> None:
+    levels = [300.0, 303.0, 301.5]
+    deltas: dict[int, list[int]] = {}
+    for contracts in (2, -2):
+        ledger = Ledger(initial_cash=0)
+        ledger.trade_futures(
+            session_idx=0, contracts=contracts, level=levels[0], multiplier=50_000, cost_rate=0.0
+        )
+        seq = [
+            ledger.settle_variation(
+                session_idx=i + 1, prev_level=levels[i], level=levels[i + 1], multiplier=50_000
+            )
+            for i in range(len(levels) - 1)
+        ]
+        deltas[contracts] = seq
+    assert deltas[2] == [-d for d in deltas[-2]]
+    for contracts in (2, -2):
+        mark = math.floor(-contracts * 50_000 * levels[-1]) - math.floor(
+            -contracts * 50_000 * levels[0]
+        )
+        assert sum(deltas[contracts]) == mark
+
+
+def test_flip_commission_uses_the_gross_change() -> None:
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    rate, level, mult = 0.0005, 1000.0, 10_000
+    ledger.trade_futures(
+        session_idx=1, contracts=-2, level=level, multiplier=mult, cost_rate=rate
+    )
+    trades = [e for e in ledger.journal if e.kind is JournalKind.FUTURES_TRADE]
+    assert trades[-1].quantity_delta == -3
+    commissions = [e for e in ledger.journal if e.kind is JournalKind.FUTURES_COMMISSION]
+    assert commissions[-1].cash_delta == -math.ceil(rate * 3 * mult * level)
+
+
+def test_roll_cost_is_size_symmetric() -> None:
+    debits = []
+    for contracts in (-3, 3):
+        ledger = Ledger(initial_cash=0)
+        ledger.trade_futures(
+            session_idx=0, contracts=contracts, level=1000.0, multiplier=10_000, cost_rate=0.0
+        )
+        ledger.roll_futures(session_idx=1, level=1000.0, multiplier=10_000, cost_rate=0.001)
+        rolls = [e for e in ledger.journal if e.kind is JournalKind.FUTURES_ROLL]
+        debits.append(rolls[-1].cash_delta)
+    assert debits[0] == debits[1]
+
+
+@pytest.mark.parametrize("contracts", [-3, 3])
+def test_signed_fractional_marks_conserve_whole_krw(contracts: int) -> None:
+    from decimal import ROUND_FLOOR
+
+    levels = [300.01, 303.137, 299.999, 301.123]
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(
+        session_idx=0, contracts=contracts, level=levels[0], multiplier=7, cost_rate=0.0
+    )
+    settled = 0
+    for idx, level in enumerate(levels[1:], start=1):
+        settled += ledger.settle_variation(
+            session_idx=idx, prev_level=levels[idx - 1], level=level, multiplier=7
+        )
+        marks = [
+            int((Decimal(-contracts * 7) * Decimal(str(value))).to_integral_value(rounding=ROUND_FLOOR))
+            for value in (levels[0], level)
+        ]
+        assert settled == ledger.margin == marks[1] - marks[0]
+
+
+def test_short_only_replay_is_unchanged() -> None:
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=2, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    assert ledger.settle_variation(
+        session_idx=1, prev_level=1000.0, level=990.0, multiplier=10_000
+    ) == 200_000
+    ledger.roll_futures(session_idx=2, level=990.0, multiplier=10_000, cost_rate=0.001)
+    assert ledger.margin == 200_000 - math.ceil(2 * 0.001 * 2 * 10_000 * 990.0)
+    assert [e.quantity_delta for e in ledger.journal if e.kind is JournalKind.FUTURES_TRADE] == [2]
