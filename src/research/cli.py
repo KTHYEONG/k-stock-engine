@@ -102,6 +102,20 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
     cash_id = registry.require("cash_series")
     cash_frame = read_dataset(runtime.workspace.silver_root / cash_id).collect()
     cash_returns = cash_returns_from_frame(cash_frame, sessions=list(cube.sessions))
+    trend_id = registry.current("trend_series")
+    if trend_id is not None:
+        trend_frame = read_dataset(runtime.workspace.silver_root / trend_id).collect()
+        trend_inputs = hedge_inputs_from_frame(trend_frame, sessions=list(cube.sessions))
+    else:
+        trend_inputs = None
+    dataset_ids = {
+        "market_panel": market_id,
+        "dividend_events": dividend_id,
+        "hedge_series": hedge_id,
+        "cash_series": cash_id,
+    }
+    if trend_id is not None:
+        dataset_ids["trend_series"] = trend_id
     context = PipelineContext(
         protocol=protocol,
         cube=cube,
@@ -117,13 +131,9 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
         scores_root=state_root / "research" / "scores",
         ledger_runner=run_ledger,
         now=lambda: datetime.now(KRX_TZ),
-        dataset_ids={
-            "market_panel": market_id,
-            "dividend_events": dividend_id,
-            "hedge_series": hedge_id,
-            "cash_series": cash_id,
-        },
+        dataset_ids=dataset_ids,
         cash_returns=cash_returns,
+        trend_inputs=trend_inputs,
     )
     return Pipeline(context)
 

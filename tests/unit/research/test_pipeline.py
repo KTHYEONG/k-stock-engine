@@ -104,9 +104,7 @@ def _protocol_for() -> Any:
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
     base = load_research_protocol(Path("config/research/protocol.toml"), scope)
-    evaluation = base.evaluation.model_copy(
-        update={"draws": 50, "block_sessions": 5, "horizon_sessions": 30}
-    )
+    evaluation = base.evaluation.model_copy(update={"draws": 50, "block_sessions": 5, "horizon_sessions": 30})
     return base.model_copy(update={"evaluation": evaluation})
 
 
@@ -200,9 +198,7 @@ def _context(
     guard = WindowGuard(protocol=protocol, last_session=sessions[-1])
     from tests.fixtures.synthetic_panel import synthetic_hedge_inputs
 
-    hedge_inputs = (
-        _trending_hedge_inputs(sessions) if trending_index else synthetic_hedge_inputs(sessions)
-    )
+    hedge_inputs = _trending_hedge_inputs(sessions) if trending_index else synthetic_hedge_inputs(sessions)
     panel = write_synthetic_panel(tmp_path / "gold", "market_panel_test", _panel_rows(sessions))
     ids = {
         "market_panel": "market_panel_aaaaaaaaaaaaaaa",
@@ -312,9 +308,7 @@ def _causal_account(sessions: list[date], *, leak_from_index: bool = False) -> A
         market_returns[1:] = levels[1:] / levels[:-1] - 1.0
         breadth = np.asarray(
             [
-                0.0
-                if (weights := targets.get(int(rows[pos]) - 1)) is None
-                else float(np.count_nonzero(weights > 0.0))
+                0.0 if (weights := targets.get(int(rows[pos]) - 1)) is None else float(np.count_nonzero(weights > 0.0))
                 for pos in range(len(window))
             ],
             dtype=np.float64,
@@ -436,9 +430,7 @@ def test_evaluate_runs_every_scenario(tmp_path: Path, monkeypatch: pytest.Monkey
     assert all(call["overlay"] is not None for call in calls)
     assert any(float(call["extra_slippage"]) > 0.0 for call in calls)
     grid_slips = sorted(
-        float(call["auction_slippage_ticks"])
-        for call in calls
-        if call["auction_slippage_ticks"] is not None
+        float(call["auction_slippage_ticks"]) for call in calls if call["auction_slippage_ticks"] is not None
     )
     assert grid_slips == sorted(float(t) for t in ticks)
     assert run.report.passed is True
@@ -526,8 +518,7 @@ def test_registry_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     ticks = list(pipe._ctx.protocol.scenarios.cost_grid_ticks)
     assert len(records) == 3 + len(ticks) + 2
     assert {r.scenario for r in records} == (
-        {"base", "stress_slippage", "stress_delay", "unhedged", "placebo"}
-        | {f"cost_{t}" for t in ticks}
+        {"base", "stress_slippage", "stress_delay", "unhedged", "placebo"} | {f"cost_{t}" for t in ticks}
     )
     assert all(r.report_digest == run.report.digest for r in records)
     assert all(r.protocol_hash == pipe._ctx.protocol.content_hash for r in records)
@@ -631,18 +622,18 @@ def test_capital_is_part_of_the_run_identity(tmp_path: Path, monkeypatch: pytest
     assert len(pipe._ctx.registry.runs(run_id=small.report.run_id)) == per_run
     assert len(pipe._ctx.registry.runs(run_id=large.report.run_id)) == per_run
     written = sorted(path.name for path in (tmp_path / "reports").glob("*.json"))
-    assert written == sorted([
-        f"{spec.spec_hash}_{large.report.run_id}.json",
-        f"{spec.spec_hash}_{small.report.run_id}.json",
-    ])
+    assert written == sorted(
+        [
+            f"{spec.spec_hash}_{large.report.run_id}.json",
+            f"{spec.spec_hash}_{small.report.run_id}.json",
+        ]
+    )
 
 
 def test_non_primary_capital_keeps_integrity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # close * min_units_per_slot > sleeve slot at 10M, so the affordability filter really binds there.
     sessions = _multi_year_sessions()
-    pipe = _context(
-        tmp_path, sessions, _full_cube(sessions, close=400_000.0), trending_index=True
-    )
+    pipe = _context(tmp_path, sessions, _full_cube(sessions, close=400_000.0), trending_index=True)
     _clean_scores(monkeypatch)
     object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
     run = pipe.evaluate(_spec(policy={"min_units_per_slot": 3}), capital_krw=10_000_000)
@@ -758,9 +749,7 @@ def test_engine_input_corruption_respects_the_cut() -> None:
     assert np.array_equal(corrupted.int_fields["volume"][3:], ints["volume"][3:])
     assert np.array_equal(corrupted.bool_fields["present"][:3], present[:3])
     assert corrupted.bool_fields["present"][3:].all()
-    assert not np.array_equal(
-        corrupted.bool_fields["entry_blocked"][3:], arrays.bool_fields["entry_blocked"][3:]
-    )
+    assert not np.array_equal(corrupted.bool_fields["entry_blocked"][3:], arrays.bool_fields["entry_blocked"][3:])
 
     dividends = pl.DataFrame(
         {
@@ -885,9 +874,7 @@ def test_window_guard_rejects_out_of_range(tmp_path: Path, monkeypatch: pytest.M
         pipe._ctx.guard.authorize(start=date(2017, 1, 1), end=sessions[-1])
 
 
-def test_index_benchmark_fails_closed_on_missing_hedge_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_index_benchmark_fails_closed_on_missing_hedge_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.core.pit import PITDataError
     from src.research.hedge import HedgeInputs
 
@@ -903,52 +890,64 @@ def test_index_benchmark_fails_closed_on_missing_hedge_data(
     levels = np.asarray(inputs.index_level)
     inverse = np.asarray(inputs.inverse_close)
 
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions),
-        index_level=np.ascontiguousarray(levels),
-        inverse_close=np.ascontiguousarray(inverse),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions),
+            index_level=np.ascontiguousarray(levels),
+            inverse_close=np.ascontiguousarray(inverse),
+        )
+    )
     assert np.allclose(pipe._index_log_returns(window), 0.0)
 
     dropped_day = np.concatenate([levels[:4], levels[5:]])
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions[:4]) + tuple(inputs.sessions)[5:],
-        index_level=np.ascontiguousarray(dropped_day),
-        inverse_close=np.ascontiguousarray(inverse),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions[:4]) + tuple(inputs.sessions)[5:],
+            index_level=np.ascontiguousarray(dropped_day),
+            inverse_close=np.ascontiguousarray(inverse),
+        )
+    )
     with pytest.raises(PITDataError, match="missing"):
         pipe._index_log_returns(window)
 
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions),
-        index_level=np.ascontiguousarray(levels[:-2]),
-        inverse_close=np.ascontiguousarray(inverse),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions),
+            index_level=np.ascontiguousarray(levels[:-2]),
+            inverse_close=np.ascontiguousarray(inverse),
+        )
+    )
     with pytest.raises(PITDataError, match="differs from its sessions"):
         pipe._index_log_returns(window)
 
     broken = levels.copy()
     broken[6] = np.nan
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions),
-        index_level=np.ascontiguousarray(broken),
-        inverse_close=np.ascontiguousarray(inverse),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions),
+            index_level=np.ascontiguousarray(broken),
+            inverse_close=np.ascontiguousarray(inverse),
+        )
+    )
     with pytest.raises(PITDataError, match="non-positive"):
         pipe._index_log_returns(window)
 
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions)[1:],
-        index_level=np.ascontiguousarray(levels[1:]),
-        inverse_close=np.ascontiguousarray(inverse[1:]),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions)[1:],
+            index_level=np.ascontiguousarray(levels[1:]),
+            inverse_close=np.ascontiguousarray(inverse[1:]),
+        )
+    )
     assert pipe._index_log_returns(window)[0] == 0.0
 
-    _with(HedgeInputs(
-        sessions=tuple(inputs.sessions),
-        index_level=np.ascontiguousarray(levels),
-        inverse_close=np.ascontiguousarray(inverse),
-    ))
+    _with(
+        HedgeInputs(
+            sessions=tuple(inputs.sessions),
+            index_level=np.ascontiguousarray(levels),
+            inverse_close=np.ascontiguousarray(inverse),
+        )
+    )
     run = pipe.evaluate(_spec())
     assert np.isfinite(run.report.controls["index_g"])
 
@@ -1072,7 +1071,6 @@ def test_strategy_spec_from_canonical_json_round_trip() -> None:
         strategy_spec_from_canonical_json(json.dumps(mismatched))
 
 
-
 def _count_build_panel(monkeypatch: pytest.MonkeyPatch) -> Any:
     import src.research.pipeline as pipe_mod
 
@@ -1156,7 +1154,9 @@ def test_cuts_do_not_overlap_in_memory(tmp_path: Path, monkeypatch: pytest.Monke
     assert all(ref() is None for ref in seen)
 
 
-def test_memory_telemetry_emitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+def test_memory_telemetry_emitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     import logging
 
     import src.research.pipeline as pipe_mod
@@ -1373,9 +1373,7 @@ def test_lazy_corruption_still_catches_a_panel_leak(tmp_path: Path, monkeypatch:
         # A deliberate leak: today's feature is next day's feature rescaled by tomorrow's close. The clean
         # panel is unchanged, so only a ``close`` corrupted past the cut can move a score at or before it.
         features = dict(panel.features)
-        features["dev_ma20"] = np.ascontiguousarray(
-            _shifted(dev) * (_shifted(close) / today), dtype=np.float32
-        )
+        features["dev_ma20"] = np.ascontiguousarray(_shifted(dev) * (_shifted(close) / today), dtype=np.float32)
         features["dev_ma20"].flags.writeable = False
         return FeaturePanel(features=features, labels=dict(panel.labels), last_row=panel.last_row)
 
@@ -1442,3 +1440,313 @@ def test_band_reaches_every_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert calls
     assert all(float(call.get("rebalance_band", -1.0)) == 0.5 for call in calls)
     assert sim_bands == [0.5]
+
+
+def _trend_spec(**overrides: Any) -> Any:
+    from src.research.trend_overlay import TrendOverlaySpec
+
+    trend_kw: dict[str, Any] = {
+        "ma_sessions": 20,
+        "long_fraction": 1.0,
+        "short_fraction": 0.5,
+        "rebalance_every_sessions": 5,
+        "contract_multiplier_krw": 10000,
+        "initial_margin_rate": 0.2,
+        "margin_buffer_rate": 0.1,
+        "margin_topup_trigger_fraction": 0.75,
+        "futures_cost_rate": 0.0003,
+        "futures_tax_rate": 0.11,
+        "futures_annual_deduction_krw": 2500000,
+    }
+    trend_kw.update(overrides.pop("trend_overlay", {}))
+    base = _spec(hedge={"hedge_ratio": 0.0}, **overrides)
+    return base.model_copy(update={"trend_overlay": TrendOverlaySpec(**trend_kw)})
+
+
+def _with_trend_inputs(pipe: Any, sessions: list[date]) -> Any:
+    from src.research.hedge import HedgeInputs
+
+    rng = np.random.default_rng(11)
+    steps = rng.normal(loc=0.0004, scale=0.01, size=len(sessions))
+    level = 1500.0 * np.exp(np.cumsum(steps))
+    inverse = 8000.0 * np.exp(-np.cumsum(steps))
+    inputs = HedgeInputs(
+        sessions=tuple(sessions),
+        index_level=np.ascontiguousarray(level),
+        inverse_close=np.ascontiguousarray(inverse),
+    )
+    object.__setattr__(pipe._ctx, "trend_inputs", inputs)
+    object.__setattr__(
+        pipe._ctx,
+        "dataset_ids",
+        dict(pipe._ctx.dataset_ids, trend_series="trend_series_eeeeeeeeeeeeeeee"),
+    )
+    return inputs
+
+
+def test_pre_overlay_spec_identity_unchanged() -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    spec = load_strategy_spec(__import__("pathlib").Path("config/research/strategies/ml_sleeve_hedge.toml"))
+    assert spec.spec_hash == "4ec4b1c58d8c722954a20cb7507dc9f7943bbd8d769fc040676696484f1c1dc9"
+
+
+def test_one_overlay_per_account(tmp_path: Path) -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    path = tmp_path / "trend.toml"
+    path.write_text(
+        '[policy]\nfamily="ml_trend_cash"\nn=20\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
+        "[scorer]\nfirst_test_year=2019\n"
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
+        "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
+        "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
+        "resize_sell_cost_rate=0.0025\nresize_buy_cost_rate=0.0005\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\ninverse_tax_rate=0.154\n"
+        "[trend_overlay]\nma_sessions=50\nlong_fraction=1.0\nshort_fraction=0.5\nrebalance_every_sessions=5\n"
+        "contract_multiplier_krw=10000\ninitial_margin_rate=0.2\nmargin_buffer_rate=0.1\n"
+        "margin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="one overlay per account"):
+        load_strategy_spec(path)
+    path.write_text(path.read_text(encoding="utf-8").replace("hedge_ratio=1.0", "hedge_ratio=0.0"), encoding="utf-8")
+    from src.research.pipeline import strategy_spec_from_canonical_json
+
+    spec = load_strategy_spec(path)
+    assert spec.trend_overlay is not None
+    assert strategy_spec_from_canonical_json(spec.canonical_json()) == spec
+
+
+def test_invalid_trend_overlay_table_rejected(tmp_path: Path) -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    path = tmp_path / "bad_trend.toml"
+    path.write_text(
+        '[policy]\nfamily="ml_trend_cash"\nn=20\nrebalance_every_sessions=5\n[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n'
+        "[scorer]\nfirst_test_year=2019\n"
+        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[hedge]\nhedge_ratio=0.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
+        "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
+        "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
+        "resize_sell_cost_rate=0.0025\nresize_buy_cost_rate=0.0005\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\ninverse_tax_rate=0.154\n"
+        "[trend_overlay]\nma_sessions=1\nlong_fraction=1.0\nshort_fraction=0.5\nrebalance_every_sessions=5\n"
+        "contract_multiplier_krw=10000\ninitial_margin_rate=0.2\nmargin_buffer_rate=0.1\n"
+        "margin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\nfutures_tax_rate=0.11\n"
+        "futures_annual_deduction_krw=2500000\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="trend_overlay"):
+        load_strategy_spec(path)
+
+
+def test_trend_run_id_requires_trend_dataset_id() -> None:
+    from datetime import date
+
+    from src.research.pipeline import _evaluation_run_id
+
+    spec = _trend_spec()
+    with pytest.raises(ValueError, match="trend_series"):
+        _evaluation_run_id(
+            spec=spec,
+            capital_krw=100_000_000,
+            protocol_hash="p",
+            cube_id="c",
+            dataset_ids={
+                "market_panel": "a",
+                "dividend_events": "b",
+                "hedge_series": "c",
+                "cash_series": "d",
+            },
+            start=date(2020, 1, 2),
+            end=date(2020, 2, 2),
+            engine_config_bytes=b"engine",
+        )
+
+
+def test_trend_level_gap_fails_before_scoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core.pit import PITDataError
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    _with_trend_inputs(pipe, sessions)
+    inputs = pipe._ctx.trend_inputs
+    assert inputs is not None
+    levels = np.asarray(inputs.index_level, dtype=np.float64).copy()
+    levels[30] = np.nan
+    from src.research.hedge import HedgeInputs
+
+    object.__setattr__(
+        pipe._ctx,
+        "trend_inputs",
+        HedgeInputs(
+            sessions=inputs.sessions,
+            index_level=np.ascontiguousarray(levels),
+            inverse_close=np.ascontiguousarray(np.asarray(inputs.inverse_close)),
+        ),
+    )
+    with pytest.raises(PITDataError, match="trend index level is missing"):
+        pipe.evaluate(_trend_spec())
+    assert counter.calls == 0
+
+
+def test_trend_scenario_overlay_requires_inputs(tmp_path: Path) -> None:
+    from src.core.pit import PITDataError
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    with pytest.raises(PITDataError, match="trend return series"):
+        pipe._trend_scenario_overlay(_trend_spec(), "base", delay_n=0, extra_cost=0.0)
+
+
+def test_trend_spec_routes_every_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.research.trend_overlay import TrendOverlay
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    trend_inputs = _with_trend_inputs(pipe, sessions)
+    spec = _trend_spec()
+    spec = spec.model_copy(update={"hedge": spec.hedge.model_copy(update={"inverse_cost_rate": 0.9999})})
+    seen: list[dict[str, Any]] = []
+    runner = pipe._ctx.ledger_runner
+
+    def _spy(**kwargs: Any) -> Any:
+        seen.append(dict(kwargs))
+        return runner(**kwargs)
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    run = pipe.evaluate(spec)
+    delay_n = int(pipe._ctx.protocol.scenarios.stress_delay_sessions)
+    extra = float(pipe._ctx.protocol.scenarios.stress_hedge_extra_cost)
+    names = ["base", "stress_slippage", "stress_delay"] + [
+        f"cost_{tick}" for tick in pipe._ctx.protocol.scenarios.cost_grid_ticks
+    ] + ["unhedged", "placebo"]
+    assert len(seen) == len(names)
+    for name, call in zip(names, seen, strict=True):
+        overlay = call["overlay"]
+        inner = overlay._inner if hasattr(overlay, "_inner") else overlay
+        assert isinstance(inner, TrendOverlay)
+        assert inner._delay == (delay_n if name == "stress_delay" else 0)
+        assert inner._spec.long_fraction == (0.0 if name == "unhedged" else 1.0)
+        assert inner._spec.short_fraction == (0.0 if name == "unhedged" else 0.5)
+        assert call["derivatives"].futures_cost_rate == pytest.approx(0.0003 + (extra if name == "stress_slippage" else 0.0))
+        assert call["derivatives"].inverse_cost_rate == 0.0
+        np.testing.assert_array_equal(call["overlay_market"].index_level, trend_inputs.index_level)
+        np.testing.assert_array_equal(inner._levels, trend_inputs.index_level)
+    np.testing.assert_array_equal(run.evidence.index_log_returns, pipe._index_log_returns(tuple(sessions)))
+
+
+def test_misaligned_trend_inputs_fail_before_scoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from src.core.pit import PITDataError
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    inputs = _with_trend_inputs(pipe, sessions)
+    object.__setattr__(pipe._ctx, "trend_inputs", replace(inputs, sessions=tuple(reversed(sessions))))
+    with pytest.raises(PITDataError, match="not aligned"):
+        pipe.evaluate(_trend_spec())
+    assert counter.calls == 0
+
+
+def test_trend_overlay_replays_signed_positions_on_account_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.research.hedge import HedgeInputs
+    from src.research.ledger_bridge import run_ledger
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    inputs = _with_trend_inputs(pipe, sessions)
+    levels = np.concatenate([np.linspace(1000.0, 1100.0, 40), np.linspace(1100.0, 1000.0, 40)])
+    object.__setattr__(
+        pipe._ctx, "trend_inputs", HedgeInputs(inputs.sessions, levels, np.full(len(sessions), np.nan))
+    )
+    base_decisions: list[Any] = []
+
+    def _runner(**kwargs: Any) -> Any:
+        outcome = run_ledger(**kwargs)
+        if hasattr(kwargs["overlay"], "decisions"):
+            base_decisions.extend(kwargs["overlay"].decisions)
+        return outcome
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _runner)
+    run = pipe.evaluate(_trend_spec(trend_overlay={"ma_sessions": 5, "rebalance_every_sessions": 1}))
+    assert any(decision.contracts < 0 for decision in base_decisions)
+    assert any(decision.contracts > 0 for decision in base_decisions)
+    assert run.evidence.base.avg_margin_share > 0.0
+    assert run.evidence.base.avg_inverse_share == 0.0
+    assert np.all(np.isfinite(run.evidence.base.log_returns))
+    assert run.evidence.unhedged.avg_margin_share == 0.0
+    assert run.evidence.unhedged.avg_inverse_share == 0.0
+
+
+def test_trend_spec_without_trend_inputs_fails_before_scoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core.pit import PITDataError
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    counter = _score_counter(monkeypatch)
+    spec = _trend_spec()
+    with pytest.raises(PITDataError):
+        pipe.evaluate(spec)
+    assert counter.calls == 0
+
+
+def test_perturbation_corrupts_trend_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.pipeline as pipe_mod
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions, trending_index=True)
+    _clean_scores(monkeypatch)
+    _with_trend_inputs(pipe, sessions)
+    spec = _trend_spec()
+    object.__setattr__(pipe._ctx, "ledger_runner", _causal_account(sessions))
+    run = pipe.evaluate(spec)
+    assert run.evidence.perturbation_mismatches == 0
+
+    other = _context(tmp_path / "leaky", sessions, trending_index=True)
+    _with_trend_inputs(other, sessions)
+    object.__setattr__(other._ctx, "ledger_runner", _causal_account(sessions))
+
+    class _Leaky:
+        def __init__(self, spec: Any, *, index_level: Any, rebalance_offset: int = 0, execution_delay: int = 0) -> None:
+            self._levels = np.asarray(index_level, dtype=np.float64)
+            self._start: int | None = None
+
+        def target(self, state: Any) -> Any:
+            from src.backtest.overlay import OverlayTarget
+
+            if self._start is None:
+                self._start = int(state.session_idx)
+            idx = int(state.session_idx) + 1
+            if idx >= len(self._levels):
+                return OverlayTarget(contracts=0, inverse_value_krw=0)
+            return OverlayTarget(contracts=int(float(self._levels[idx]) * 1e6) % 7 - 3, inverse_value_krw=0)
+
+    monkeypatch.setattr(pipe_mod, "TrendOverlay", _Leaky)
+    leaky = other.evaluate(spec)
+    assert leaky.evidence.perturbation_mismatches > 0
+
+
+def test_run_id_includes_trend_dataset_only_for_trend_specs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _sessions()
+    _clean_scores(monkeypatch)
+    champion = _context(tmp_path / "a", sessions)
+    trend_spec = _trend_spec()
+    _with_trend_inputs(champion, sessions)
+    plain = _spec()
+    champion_run = champion.evaluate(plain)
+    trend_run = champion.evaluate(trend_spec)
+    other_ids = dict(champion._ctx.dataset_ids, trend_series="trend_series_ffffffffffffffff")
+    other = _context(tmp_path / "b", sessions)
+    _with_trend_inputs(other, sessions)
+    object.__setattr__(other._ctx, "dataset_ids", other_ids)
+    assert other.evaluate(plain).report.run_id == champion_run.report.run_id
+    assert other.evaluate(trend_spec).report.run_id != trend_run.report.run_id
