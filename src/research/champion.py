@@ -403,9 +403,7 @@ def decision_from_canonical_json(payload: str) -> ChallengeDecision:
             paired=_delta_from_fields(raw["paired"]),
             challenger_j=_num(raw["challenger_j"]),
             champion_j=_num(raw["champion_j"]),
-            neighbors=tuple(
-                (str(item[0]), _delta_from_fields(item[1])) for item in raw["neighbors"]
-            ),
+            neighbors=tuple((str(item[0]), _delta_from_fields(item[1])) for item in raw["neighbors"]),
             knob_changes=tuple(str(item) for item in raw["knob_changes"]),
             reasons=tuple(str(item) for item in raw["reasons"]),
         )
@@ -420,6 +418,8 @@ def _numeric_leaves_of(spec: StrategySpec) -> dict[str, float]:
         "policy": json.loads(spec.policy.canonical_json()),
         "scorer": json.loads(spec.scorer.canonical_json()),
     }
+    if spec.trend_overlay is not None:
+        sections["trend_overlay"] = json.loads(spec.trend_overlay.canonical_json())
     out: dict[str, float] = {}
     for name in sorted(sections):
         out.update(_numeric_leaves(sections[name], name))
