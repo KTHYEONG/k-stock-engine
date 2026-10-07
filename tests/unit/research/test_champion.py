@@ -35,9 +35,7 @@ def _protocol(*, require_neighbors: bool = True) -> ResearchProtocol:
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
     base = load_research_protocol(Path("config/research/protocol.toml"), scope)
-    evaluation = base.evaluation.model_copy(
-        update={"draws": 200, "block_sessions": 5, "horizon_sessions": 30}
-    )
+    evaluation = base.evaluation.model_copy(update={"draws": 200, "block_sessions": 5, "horizon_sessions": 30})
     champion = base.champion.model_copy(update={"require_neighbors": require_neighbors})
     return base.model_copy(update={"evaluation": evaluation, "champion": champion})
 
@@ -157,9 +155,7 @@ def _card(
         end=sessions[-1],
         objective_j=float(objective_j),
         objective_stream=stream,
-        integrity=(
-            CheckResult(name="perturbation_mismatches", value=0.0, threshold=0.0, passed=True),
-        ),
+        integrity=(CheckResult(name="perturbation_mismatches", value=0.0, threshold=0.0, passed=True),),
         guards=(CheckResult(name="p_growth_le_zero", value=0.0, threshold=0.05, passed=passed),),
         metrics={"g": float(objective_j), "mdd": -0.1},
         yearly_growth={2019: float(objective_j)},
@@ -378,9 +374,7 @@ def test_bool_and_string_leaves_are_not_knobs() -> None:
     assert knob_changes(base, _spec(hedge={"use_futures": False})) == ()
     assert knob_changes(base, _spec(policy={"family": "other"})) == ()
     assert knob_changes(base, _spec(policy={"n": 21})) == ("policy.n",)
-    assert knob_changes(base, _spec(book={"stock_capital_fraction": 0.5})) == (
-        "book.stock_capital_fraction",
-    )
+    assert knob_changes(base, _spec(book={"stock_capital_fraction": 0.5})) == ("book.stock_capital_fraction",)
     assert knob_changes(base, _spec(policy={"universe": {"min_adtv20_krw": 1_000, "min_price_krw": 1_000}})) == (
         "policy.universe.min_adtv20_krw",
     )
@@ -550,10 +544,14 @@ def test_bootstrap_refuses_a_failed_report(tmp_path: Path) -> None:
     store = ChampionStore(tmp_path / "champion")
     spec = _spec()
     with pytest.raises(ValueError, match="did not pass"):
-        store.bootstrap(run=_run(spec, sessions, drift=0.001, passed=False), spec=spec, spec_path=Path("s.toml"), now=_NOW)
+        store.bootstrap(
+            run=_run(spec, sessions, drift=0.001, passed=False), spec=spec, spec_path=Path("s.toml"), now=_NOW
+        )
     assert store.current() is None
     with pytest.raises(ValueError, match="not produced by this spec"):
-        store.bootstrap(run=_run(spec, sessions, drift=0.001), spec=_spec(policy={"n": 21}), spec_path=Path("s.toml"), now=_NOW)
+        store.bootstrap(
+            run=_run(spec, sessions, drift=0.001), spec=_spec(policy={"n": 21}), spec_path=Path("s.toml"), now=_NOW
+        )
     assert store.current() is None
 
 
@@ -681,9 +679,7 @@ def test_promote_replaces_current_and_appends_history(tmp_path: Path) -> None:
     orphan = ChampionStore(tmp_path / "empty")
     orphan.save_decision(decision)
     with pytest.raises(ValueError, match="no champion to promote over"):
-        orphan.promote(
-            decision=decision, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW
-        )
+        orphan.promote(decision=decision, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW)
     assert orphan.current() is None
     assert orphan.history() == ()
 
@@ -839,3 +835,41 @@ def test_store_reads_corrupt_state_as_a_pit_error(tmp_path: Path) -> None:
     (root / "decisions" / "broken.json").write_text("{", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid challenge decision"):
         store.decisions()
+
+
+def _trend_spec(**overrides: Any) -> StrategySpec:
+    from src.research.trend_overlay import TrendOverlaySpec
+
+    trend_kw: dict[str, Any] = {
+        "ma_sessions": 50,
+        "long_fraction": 1.0,
+        "short_fraction": 0.5,
+        "rebalance_every_sessions": 5,
+        "contract_multiplier_krw": 10000,
+        "initial_margin_rate": 0.2,
+        "margin_buffer_rate": 0.1,
+        "margin_topup_trigger_fraction": 0.75,
+        "futures_cost_rate": 0.0003,
+        "futures_tax_rate": 0.11,
+        "futures_annual_deduction_krw": 2500000,
+    }
+    trend_kw.update(overrides.pop("trend_overlay", {}))
+    base = _spec(hedge={"hedge_ratio": 0.0}, **overrides)
+    return base.model_copy(update={"trend_overlay": TrendOverlaySpec(**trend_kw)})
+
+
+def test_trend_knobs_need_neighbors() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec()
+    challenger_spec = _trend_spec(trend_overlay={"ma_sessions": 60})
+    decision = decide_challenge(
+        challenger=_run(challenger_spec, sessions, drift=0.001),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=_protocol(),
+        policy=_policy(_protocol()),
+    )
+    assert decision.knob_changes == ("trend_overlay.ma_sessions",)
+    assert decision.reasons == ("neighbors_missing:trend_overlay.ma_sessions",)
