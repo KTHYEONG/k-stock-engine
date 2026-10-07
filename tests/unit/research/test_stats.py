@@ -209,3 +209,86 @@ def test_breakeven_interpolation_and_edges() -> None:
         breakeven_slippage_ticks({0.0: 0.1, 1.0: math.inf})
     with pytest.raises(ValueError, match="finite"):
         breakeven_slippage_ticks({0.0: 0.1, math.nan: 0.2})
+
+
+def test_paired_growth_tail_delta_growth_matches_legacy() -> None:
+    from src.research.stats import paired_growth_delta, paired_growth_tail_delta
+
+    rng = np.random.default_rng(42)
+    b = rng.normal(size=500)
+    a = b + 0.0003
+    kwargs = {
+        "block": 21,
+        "draws": 100,
+        "seed": 999,
+        "horizon": 252,
+        "sessions_per_year": 252,
+        "alpha": 0.05,
+    }
+    legacy = paired_growth_delta(a, b, **kwargs)
+    combined = paired_growth_tail_delta(a, b, **kwargs, tail_block_sessions=21, tail_quantile=0.05)
+    assert combined.growth == legacy
+
+
+def test_paired_growth_tail_delta_tail_improves_when_crashes_shrink() -> None:
+    from src.research.stats import paired_growth_tail_delta
+
+    rng = np.random.default_rng(123)
+    b = rng.normal(loc=0.0005, scale=0.002, size=2520)
+    # create severe crash months in b
+    m = b.size // 21
+    sums = [b[i * 21 : (i + 1) * 21].sum() for i in range(m)]
+    worst_indices = np.argsort(sums)[: max(1, round(0.05 * m))]
+    for idx in worst_indices:
+        b[idx * 21 : (idx + 1) * 21] -= 0.006
+
+    # halve the worst monthly blocks in a
+    a = b.copy()
+    for idx in worst_indices:
+        a[idx * 21 : (idx + 1) * 21] = b[idx * 21 : (idx + 1) * 21] * 0.5
+
+    # redistribute difference across other sessions to keep |growth.mean| < 1%p
+    diff_total = float((a - b).sum())
+    other_indices = [i for i in range(b.size) if i // 21 not in worst_indices]
+    for i in other_indices:
+        a[i] -= diff_total / len(other_indices)
+
+    result = paired_growth_tail_delta(
+        a, b,
+        block=21, draws=500, seed=77, horizon=2520, sessions_per_year=252,
+        alpha=0.05, tail_block_sessions=21, tail_quantile=0.05,
+    )
+    assert result.tail.lower > 0.0
+    assert abs(result.growth.mean) < 0.01
+
+
+def test_paired_growth_tail_delta_argument_validation() -> None:
+    from src.research.stats import paired_growth_tail_delta
+
+    a = np.ones(50)
+    b = np.ones(50)
+    base = {
+        "block": 10,
+        "draws": 20,
+        "seed": 1,
+        "horizon": 30,
+        "sessions_per_year": 252,
+        "alpha": 0.05,
+    }
+    with pytest.raises(ValueError, match="tail_quantile"):
+        paired_growth_tail_delta(a, b, **base, tail_block_sessions=10, tail_quantile=0.0)
+    with pytest.raises(ValueError, match="tail_quantile"):
+        paired_growth_tail_delta(a, b, **base, tail_block_sessions=10, tail_quantile=0.6)
+    with pytest.raises(ValueError, match="tail_block_sessions"):
+        paired_growth_tail_delta(a, b, **base, tail_block_sessions=0, tail_quantile=0.05)
+    with pytest.raises(ValueError, match="tail_block_sessions"):
+        paired_growth_tail_delta(a, b, **base, tail_block_sessions=35, tail_quantile=0.05)
+    with pytest.raises(ValueError, match=r"non-empty|1-D"):
+        paired_growth_tail_delta(np.array([]), a, **base, tail_block_sessions=10, tail_quantile=0.05)
+    with pytest.raises(ValueError, match=r"share length"):
+        paired_growth_tail_delta(a, np.ones(40), **base, tail_block_sessions=10, tail_quantile=0.05)
+    with pytest.raises(ValueError, match="alpha"):
+        paired_growth_tail_delta(a, b, **{**base, "alpha": 0.0}, tail_block_sessions=10, tail_quantile=0.05)
+    with pytest.raises(ValueError, match="alpha"):
+        paired_growth_tail_delta(a, b, **{**base, "alpha": 0.5}, tail_block_sessions=10, tail_quantile=0.05)
+

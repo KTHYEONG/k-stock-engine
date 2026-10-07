@@ -272,7 +272,7 @@ def test_indistinguishable_is_not_promoted() -> None:
         champion_spec=champion_spec,
     )
     assert decision.promotable is False
-    assert decision.reasons == ("paired_lower_bound",)
+    assert decision.reasons == ("superiority:paired_lower_bound",)
     assert decision.knob_changes == ("scorer.num_leaves",)
 
 
@@ -350,7 +350,7 @@ def test_knife_edge_and_tied_neighbors_block() -> None:
         challenger_spec=challenger_spec,
         champion_spec=champion_spec,
     )
-    assert decision.reasons == (f"neighbor_not_better:{worse.spec_hash}", f"neighbor_not_better:{tie.spec_hash}")
+    assert decision.reasons == (f"superiority:neighbor_not_better:{worse.spec_hash}", f"superiority:neighbor_not_better:{tie.spec_hash}")
 
 
 def test_scorer_only_change_skips_the_neighbor_rule() -> None:
@@ -479,7 +479,7 @@ def test_objective_stream_of_the_challenger_decides_the_paired_test() -> None:
         challenger_spec=challenger_spec,
         champion_spec=champion_spec,
     )
-    assert early.reasons == ("paired_lower_bound",)
+    assert early.reasons == ("superiority:paired_lower_bound",)
 
 
 def test_decision_canonical_json_round_trip() -> None:
@@ -515,7 +515,7 @@ def test_non_finite_objectives_survive_canonical_json() -> None:
         champion_spec=champion_spec,
     )
     assert "objective_j" in decision.reasons
-    assert f"neighbor_not_better:{_spec(policy={'n': 30}).spec_hash}" in decision.reasons
+    assert f"superiority:neighbor_not_better:{_spec(policy={'n': 30}).spec_hash}" in decision.reasons
     assert np.isnan(decision.neighbors[0][1].mean)
     restored = decision_from_canonical_json(decision.canonical_json())
     assert np.isnan(restored.challenger_j)
@@ -602,7 +602,7 @@ def test_promote_requires_the_saved_decision(tmp_path: Path) -> None:
     assert store.decisions() == (decision,)
     assert store.decision_path(decision.digest).is_file()
 
-    blocked = replace(decision, reasons=("paired_lower_bound",))
+    blocked = replace(decision, reasons=("superiority:paired_lower_bound",), path="none")
     store.save_decision(blocked)
     with pytest.raises(ValueError, match="not promotable"):
         store.promote(decision=blocked, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW)
@@ -1070,3 +1070,306 @@ def test_overlay_removal_does_not_require_impossible_neighbors() -> None:
         challenger_spec=challenger_spec, champion_spec=champion_spec,
     )
     assert decision.promotable
+
+
+def test_noninferiority_promotes_equal_growth_safer_challenger() -> None:
+    sessions = _sessions(2520)
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    # Create streams where challenger has same mean as champion but halved worst months
+    rng = np.random.default_rng(123)
+    base_logs = rng.normal(loc=0.0005, scale=0.002, size=len(sessions))
+    m = len(sessions) // 21
+    sums = [base_logs[i * 21 : (i + 1) * 21].sum() for i in range(m)]
+    worst_indices = np.argsort(sums)[: max(1, round(0.05 * m))]
+    for idx in worst_indices:
+        base_logs[idx * 21 : (idx + 1) * 21] -= 0.006
+
+    challenger_logs = base_logs.copy()
+    for idx in worst_indices:
+        challenger_logs[idx * 21 : (idx + 1) * 21] = base_logs[idx * 21 : (idx + 1) * 21] * 0.5
+
+    diff_total = float((challenger_logs - base_logs).sum())
+    other_indices = [i for i in range(len(sessions)) if i // 21 not in worst_indices]
+    for i in other_indices:
+        challenger_logs[i] -= diff_total / len(other_indices)
+
+    champion = _run(champion_spec, sessions, drift=0.0005)
+    champion = replace(
+        champion,
+        evidence=replace(
+            champion.evidence,
+            stress_slippage=_outcome(sessions, base_logs),
+        ),
+    )
+    challenger = _run(challenger_spec, sessions, drift=0.0005)
+    challenger = replace(
+        challenger,
+        evidence=replace(
+            challenger.evidence,
+            stress_slippage=_outcome(sessions, challenger_logs),
+        ),
+    )
+
+    protocol = _protocol(paired_horizon="full")
+    protocol = protocol.model_copy(
+        update={
+            "evaluation": protocol.evaluation.model_copy(update={"block_sessions": 21, "draws": 500}),
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.03, "tail_quantile": 0.05, "tail_block_sessions": 21, "paired_horizon": "full"}
+            ),
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "noninferiority"
+    assert decision.promotable is True
+    assert decision.noninferiority_margin == 0.03
+    assert decision.tail is not None
+    assert decision.tail.lower > 0.0
+
+
+def test_margin_breach_blocks_noninferiority_path() -> None:
+    sessions = _sessions(252 * 5)
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    # Challenger has 5%p/yr lower growth
+    rng = np.random.default_rng(101)
+    base_logs = rng.normal(loc=0.0008, scale=0.02, size=len(sessions))
+    challenger_logs = base_logs.copy() - (0.05 / 252)
+    m = len(sessions) // 21
+    k = max(1, round(0.05 * m))
+    sums = [base_logs[i * 21 : (i + 1) * 21].sum() for i in range(m)]
+    for idx in np.argsort(sums)[:k]:
+        challenger_logs[idx * 21 : (idx + 1) * 21] *= 0.2
+
+    champion = replace(
+        _run(champion_spec, sessions, drift=0.0008),
+        evidence=replace(_evidence(sessions, drift=0.0008), stress_slippage=_outcome(sessions, base_logs)),
+    )
+    challenger = replace(
+        _run(challenger_spec, sessions, drift=0.0006),
+        evidence=replace(_evidence(sessions, drift=0.0006), stress_slippage=_outcome(sessions, challenger_logs)),
+    )
+
+    protocol = _protocol()
+    protocol = protocol.model_copy(
+        update={
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.03}
+            )
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "none"
+    assert not decision.promotable
+    assert "noninferiority:growth_margin" in decision.reasons
+
+
+def test_tail_not_shown_blocks_noninferiority_path() -> None:
+    sessions = _sessions()
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    champion = _run(champion_spec, sessions, drift=0.0008)
+    challenger = _run(challenger_spec, sessions, drift=0.0008)
+
+    protocol = _protocol()
+    protocol = protocol.model_copy(
+        update={
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.03}
+            )
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "none"
+    assert not decision.promotable
+    assert "noninferiority:tail_lower_bound" in decision.reasons
+
+
+def test_superiority_wins_ties() -> None:
+    sessions = _sessions()
+    champion_spec = _spec(policy={"n": 20})
+    challenger_spec = _spec(policy={"n": 25})
+    champion = _run(champion_spec, sessions, drift=0.0008)
+    challenger = _run(challenger_spec, sessions, drift=0.0020)
+    neighbors = (_run(_spec(policy={"n": 30}), sessions, drift=0.0018),)
+
+    protocol = _protocol()
+    protocol = protocol.model_copy(
+        update={
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.03}
+            )
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        neighbors=neighbors,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "superiority"
+    assert decision.promotable is True
+    assert decision.tail is not None
+    assert decision.paired.lower > -0.03
+
+
+def test_disabled_path_is_v5_behaviour() -> None:
+    sessions = _sessions()
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    champion = _run(champion_spec, sessions, drift=0.0008)
+    challenger = _run(challenger_spec, sessions, drift=0.0012)
+
+    v5_protocol = _protocol()  # noninferiority_margin is None
+    assert v5_protocol.champion.noninferiority_margin is None
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=v5_protocol,
+    )
+    assert decision.path == "superiority"
+    assert decision.promotable is True
+    assert decision.tail is None
+    assert decision.noninferiority_margin is None
+
+
+def test_objective_j_still_required_for_noninferiority() -> None:
+    sessions = _sessions(252 * 5)
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    rng = np.random.default_rng(102)
+    base_logs = rng.normal(loc=0.0005, scale=0.02, size=len(sessions))
+    challenger_logs = base_logs.copy()
+    m = len(sessions) // 21
+    k = max(1, round(0.05 * m))
+    sums = [base_logs[i * 21 : (i + 1) * 21].sum() for i in range(m)]
+    for idx in np.argsort(sums)[:k]:
+        challenger_logs[idx * 21 : (idx + 1) * 21] *= 0.5
+
+    champion = replace(
+        _run(champion_spec, sessions, drift=0.0005, objective_j=0.20),
+        evidence=replace(_evidence(sessions, drift=0.0005), stress_slippage=_outcome(sessions, base_logs)),
+    )
+    challenger = replace(
+        _run(challenger_spec, sessions, drift=0.0005, objective_j=0.10),
+        evidence=replace(_evidence(sessions, drift=0.0005), stress_slippage=_outcome(sessions, challenger_logs)),
+    )
+
+    protocol = _protocol()
+    protocol = protocol.model_copy(
+        update={
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.03}
+            )
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "none"
+    assert not decision.promotable
+    assert "objective_j" in decision.reasons
+
+
+def test_noninferiority_neighbor_failures_reported() -> None:
+    sessions = _sessions()
+    champion_spec = _spec(policy={"n": 20})
+    challenger_spec = _spec(policy={"n": 25})
+    champion = _run(champion_spec, sessions, drift=0.0008)
+    challenger = _run(challenger_spec, sessions, drift=0.0008)
+
+    # neighbor with worse growth (< -δ) and worse tail
+    worse_neighbor = _spec(policy={"n": 30})
+    neighbor_run = _run(worse_neighbor, sessions, drift=0.0001)
+
+    protocol = _protocol()
+    protocol = protocol.model_copy(
+        update={
+            "champion": protocol.champion.model_copy(
+                update={"noninferiority_margin": 0.01}
+            )
+        }
+    )
+
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        neighbors=(neighbor_run,),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.path == "none"
+    assert not decision.promotable
+    assert any(r.startswith("noninferiority:neighbor_growth_margin:") for r in decision.reasons)
+    assert any(r.startswith("noninferiority:neighbor_tail_not_better:") for r in decision.reasons)
+
+
+def test_legacy_decision_file_loads_with_derived_path() -> None:
+    sessions = _sessions()
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    for drift, expected in ((0.0012, "superiority"), (0.0008, "none")):
+        decision = _decide(
+            challenger=_run(challenger_spec, sessions, drift=drift),
+            champion=_run(champion_spec, sessions, drift=0.0008),
+            challenger_spec=challenger_spec,
+            champion_spec=champion_spec,
+        )
+        legacy = json.loads(decision.canonical_json())
+        for key in ("path", "tail", "noninferiority_margin"):
+            del legacy[key]
+        restored = decision_from_canonical_json(json.dumps(legacy))
+        assert restored.path == expected
+        assert restored.tail is None
+        assert restored.noninferiority_margin is None
+        assert restored.promotable is (expected != "none")
+
+
+def test_unknown_decision_path_rejected() -> None:
+    sessions = _sessions()
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    payload = json.loads(decision.canonical_json())
+    payload["path"] = "maybe"
+    with pytest.raises(ValueError, match="unknown promotion path"):
+        decision_from_canonical_json(json.dumps(payload))

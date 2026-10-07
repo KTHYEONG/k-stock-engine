@@ -243,9 +243,13 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
     path = store.save_decision(decision)
     return {
         "promotable": decision.promotable,
+        "path": decision.path,
         "reasons": list(decision.reasons),
         "delta_mean": decision.paired.mean,
         "delta_lower": decision.paired.lower,
+        "tail_mean": decision.tail.mean if decision.tail is not None else None,
+        "tail_lower": decision.tail.lower if decision.tail is not None else None,
+        "noninferiority_margin": decision.noninferiority_margin,
         "challenger_j": decision.challenger_j,
         "champion_j": decision.champion_j,
         "alpha_effective": decision.alpha_effective,

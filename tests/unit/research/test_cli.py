@@ -279,9 +279,13 @@ def test_champion_lifecycle(
     assert challenged["reasons"] == []
     assert set(challenged) == {
         "promotable",
+        "path",
         "reasons",
         "delta_mean",
         "delta_lower",
+        "tail_mean",
+        "tail_lower",
+        "noninferiority_margin",
         "challenger_j",
         "champion_j",
         "alpha_effective",
