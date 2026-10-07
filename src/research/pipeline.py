@@ -51,6 +51,7 @@ from src.research.policy import TrendCashPolicy, universe_mask
 from src.research.registry import RunRegistry, RunReturns
 from src.research.simulator import SimConfig, simulate
 from src.research.stats import annualized_log_growth
+from src.research.trend_overlay import TrendOverlay, TrendOverlaySpec, trend_derivative_config
 
 __all__ = [
     "EvaluationRun",
@@ -86,11 +87,14 @@ class StrategySpec(BaseModel):
     scorer: ScorerConfig
     book: BookSpec
     hedge: HedgeSpec
+    trend_overlay: TrendOverlaySpec | None = None
 
     @model_validator(mode="after")
     def _check_sleeves(self) -> StrategySpec:
         if int(self.book.sleeves) != int(self.policy.rebalance_every_sessions):
             raise ValueError("book.sleeves must equal policy.rebalance_every_sessions")
+        if self.trend_overlay is not None and float(self.hedge.hedge_ratio) != 0.0:
+            raise ValueError("one overlay per account")
         return self
 
     def canonical_json(self) -> str:
@@ -102,6 +106,8 @@ class StrategySpec(BaseModel):
             "policy": json.loads(self.policy.canonical_json()),
             "scorer": json.loads(self.scorer.canonical_json()),
         }
+        if self.trend_overlay is not None:
+            payload["trend_overlay"] = json.loads(self.trend_overlay.canonical_json())
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property
@@ -122,7 +128,7 @@ def load_strategy_spec(path: Path) -> StrategySpec:
         raise ValueError(f"invalid strategy TOML: {path}: {exc}") from exc
     if not isinstance(raw, dict):  # pragma: no cover - tomllib always returns a dict
         raise ValueError(f"invalid strategy TOML: {path}")
-    allowed = {"policy", "scorer", "book", "hedge"}
+    allowed = {"policy", "scorer", "book", "hedge", "trend_overlay"}
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
@@ -145,7 +151,11 @@ def load_strategy_spec(path: Path) -> StrategySpec:
     except Exception as exc:
         raise ValueError(f"invalid [hedge] table: {exc}") from exc
     try:
-        return StrategySpec(policy=policy, scorer=scorer, book=book, hedge=hedge)
+        trend = TrendOverlaySpec.model_validate(raw["trend_overlay"]) if "trend_overlay" in raw else None
+    except Exception as exc:
+        raise ValueError(f"invalid [trend_overlay] table: {exc}") from exc
+    try:
+        return StrategySpec(policy=policy, scorer=scorer, book=book, hedge=hedge, trend_overlay=trend)
     except Exception as exc:
         raise ValueError(f"invalid strategy spec: {exc}") from exc
 
@@ -162,6 +172,7 @@ def strategy_spec_from_canonical_json(payload: str) -> StrategySpec:
             scorer=ScorerConfig.model_validate(raw["scorer"]),
             book=BookSpec.model_validate(raw["book"]),
             hedge=HedgeSpec.model_validate(raw["hedge"]),
+            trend_overlay=(TrendOverlaySpec.model_validate(raw["trend_overlay"]) if "trend_overlay" in raw else None),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid strategy canonical JSON: {exc}") from exc
@@ -185,6 +196,7 @@ class PipelineContext:
     now: Callable[[], datetime]
     dataset_ids: Mapping[str, str]
     cash_returns: NDArray[np.float64] | None = None
+    trend_inputs: HedgeInputs | None = None
 
 
 #: Datasets the account engine reads beside the cube. The account goes straight to them, so rebuilding any of
@@ -221,13 +233,18 @@ def _evaluation_run_id(
     inputs directly instead of through the cube, so a rebuilt input is a different run even when the cube id
     survived the rebuild.
     """
-    missing = [name for name in _RUN_INPUT_DATASETS if not dataset_ids.get(name)]
+    names = list(_RUN_INPUT_DATASETS)
+    if spec.trend_overlay is not None:
+        if not dataset_ids.get("trend_series"):
+            raise ValueError('pipeline dataset_ids are missing: ["trend_series"]')
+        names = [*names, "trend_series"]
+    missing = [name for name in names if not dataset_ids.get(name)]
     if missing:
         raise ValueError(f"pipeline dataset_ids are missing: {missing}")
     payload = {
         "capital_krw": int(capital_krw),
         "cube_id": cube_id,
-        "dataset_ids": {name: str(dataset_ids[name]) for name in _RUN_INPUT_DATASETS},
+        "dataset_ids": {name: str(dataset_ids[name]) for name in names},
         "end": end.isoformat(),
         "engine_config_sha256": hashlib.sha256(engine_config_bytes).hexdigest(),
         "protocol_hash": protocol_hash,
@@ -304,9 +321,7 @@ def _log_memory_phase(phase: str) -> None:
     )
 
 
-def _corrupt_hedge_inputs(
-    inputs: HedgeInputs, cut: int, *, sessions: Sequence[date], rng: Any
-) -> HedgeInputs:
+def _corrupt_hedge_inputs(inputs: HedgeInputs, cut: int, *, sessions: Sequence[date], rng: Any) -> HedgeInputs:
     """Scale the index level and inverse close of every session after the cube row ``cut`` (NaN stays NaN).
 
     Sessions are matched by date rather than by position: the hedge series may carry a lead session the cube
@@ -336,9 +351,7 @@ def _corrupt_cash_returns(values: NDArray[np.float64], cut: int, rng: Any) -> ND
     return np.ascontiguousarray(out, dtype=np.float64)
 
 
-def _decision_mismatches(
-    clean: Sequence[_OverlayDecision], perturbed: Sequence[_OverlayDecision], cut: int
-) -> int:
+def _decision_mismatches(clean: Sequence[_OverlayDecision], perturbed: Sequence[_OverlayDecision], cut: int) -> int:
     """Overlay decisions taken at rows ``<= cut`` that differ."""
     mismatches = 0
     for before, after in zip(clean, perturbed, strict=False):
@@ -393,8 +406,7 @@ def _corrupt_market_arrays(arrays: MarketArrays, cut: int, rng: Any) -> MarketAr
         int_fields={name: _ints(block) for name, block in arrays.int_fields.items()},
         float_fields={name: _floats(block) for name, block in arrays.float_fields.items()},
         bool_fields={
-            name: _presence(block) if name == "present" else _bools(block)
-            for name, block in arrays.bool_fields.items()
+            name: _presence(block) if name == "present" else _bools(block) for name, block in arrays.bool_fields.items()
         },
         market=arrays.market,
     )
@@ -508,11 +520,10 @@ class Pipeline:
             self._sim_configs[capital] = config
         return config
 
-    def _hedge_series_by_row(
-        self, values: NDArray[np.float64], sessions: Sequence[date]
+    def _series_by_row(
+        self, inputs: HedgeInputs, values: NDArray[np.float64], sessions: Sequence[date]
     ) -> NDArray[np.float64]:
         """One hedge series re-posed onto the cube timeline (NaN where the session is absent)."""
-        inputs = self._ctx.hedge_inputs
         series = np.asarray(values, dtype=np.float64)
         if series.size != len(inputs.sessions):
             raise PITDataError("hedge series length differs from its sessions")
@@ -529,7 +540,20 @@ class Pipeline:
             out[cube_rows] = series[hedge_rows]
         return out
 
-    def _data_end_row(self, *, lo: int, hi: int, sessions: Sequence[date]) -> int:
+    def _hedge_series_by_row(self, values: NDArray[np.float64], sessions: Sequence[date]) -> NDArray[np.float64]:
+        """One hedge series re-posed onto the cube timeline (NaN where the session is absent)."""
+        return self._series_by_row(self._ctx.hedge_inputs, values, sessions)
+
+    def _trend_series_by_row(self, sessions: Sequence[date]) -> NDArray[np.float64]:
+        """Trend index level re-posed onto the cube timeline (NaN where the session is absent)."""
+        inputs = self._ctx.trend_inputs
+        if inputs is None:
+            raise PITDataError("evaluate requires the trend return series")
+        if inputs.sessions != tuple(sessions):
+            raise PITDataError("trend inputs are not aligned to cube sessions")
+        return self._series_by_row(inputs, np.asarray(inputs.index_level, dtype=np.float64), sessions)
+
+    def _data_end_row(self, *, lo: int, hi: int, sessions: Sequence[date], spec: StrategySpec | None = None) -> int:
         """Last cube row whose cash return and futures-underlying level are both usable.
 
         The cash and hedge series may lag the cube by a few sessions, so the window ends where every input
@@ -545,9 +569,7 @@ class Pipeline:
             raise PITDataError("evaluate requires the cash return series")
         cash = np.asarray(self._ctx.cash_returns, dtype=np.float64)
         if cash.shape != (len(sessions),):
-            raise PITDataError(
-                f"cash returns {cash.shape} are not aligned to the {len(sessions)} cube sessions"
-            )
+            raise PITDataError(f"cash returns {cash.shape} are not aligned to the {len(sessions)} cube sessions")
         levels = self._hedge_series_by_row(self._ctx.hedge_inputs.index_level, sessions)
         inverse = self._hedge_series_by_row(self._ctx.hedge_inputs.inverse_close, sessions)
         usable = np.isfinite(cash) & np.isfinite(levels) & (levels > 0.0)
@@ -561,14 +583,17 @@ class Pipeline:
         note = f"; the inverse close is also missing at {sessions[inverse_gaps[0]].isoformat()}" if inverse_gaps else ""
         for row in range(max(lo - 1, 0), data_end + 1):
             if not (math.isfinite(float(levels[row])) and float(levels[row]) > 0.0):
-                raise PITDataError(
-                    f"index level is missing at {sessions[row].isoformat()} inside the run window{note}"
-                )
+                raise PITDataError(f"index level is missing at {sessions[row].isoformat()} inside the run window{note}")
         for row in range(lo, data_end + 1):
             if not math.isfinite(float(cash[row])):
-                raise PITDataError(
-                    f"cash return is missing at {sessions[row].isoformat()} inside the run window{note}"
-                )
+                raise PITDataError(f"cash return is missing at {sessions[row].isoformat()} inside the run window{note}")
+        if spec is not None and spec.trend_overlay is not None:
+            trend = self._trend_series_by_row(sessions)
+            for row in range(max(lo - 1, 0), data_end + 1):
+                if not (math.isfinite(float(trend[row])) and float(trend[row]) > 0.0):
+                    raise PITDataError(
+                        f"trend index level is missing at {sessions[row].isoformat()} inside the run window"
+                    )
         return data_end
 
     def _window_rows(self, spec: StrategySpec) -> tuple[int, int, WindowAuthorization]:
@@ -585,9 +610,40 @@ class Pipeline:
         if not firsts:
             raise ValueError(f"first_test_year {fty} has no sessions in the cube")
         lo = sessions.index(firsts[0])
-        hi = self._data_end_row(lo=lo, hi=len(sessions) - 1, sessions=sessions)
+        hi = self._data_end_row(lo=lo, hi=len(sessions) - 1, sessions=sessions, spec=spec)
         auth = ctx.guard.authorize(start=sessions[lo], end=sessions[hi])
         return lo, hi, auth
+
+    def _trend_scenario_overlay(
+        self, spec: StrategySpec, name: str, *, delay_n: int, extra_cost: float
+    ) -> tuple[Any, Any, Any]:
+        """Triple ``(overlay, overlay_market, derivatives)`` for a trend-overlay scenario."""
+        from src.research.ledger_bridge import overlay_market_from_inputs
+
+        inputs = self._ctx.trend_inputs
+        if inputs is None:
+            raise PITDataError("evaluate requires the trend return series")
+        base = spec.trend_overlay
+        assert base is not None
+        delay = 0
+        effective = base
+        if name == "stress_delay":
+            delay = int(delay_n)
+        elif name == "stress_slippage":
+            effective = base.model_copy(update={"futures_cost_rate": float(base.futures_cost_rate) + float(extra_cost)})
+        elif name == "unhedged":
+            effective = base.model_copy(update={"long_fraction": 0.0, "short_fraction": 0.0})
+        overlay = TrendOverlay(
+            effective,
+            index_level=np.ascontiguousarray(np.asarray(inputs.index_level, dtype=np.float64)),
+            rebalance_offset=0,
+            execution_delay=delay,
+        )
+        return (
+            overlay,
+            overlay_market_from_inputs(inputs),
+            trend_derivative_config(effective),
+        )
 
     def panel_for(self, last_row: int) -> FeaturePanel:
         n = len(self._ctx.cube.sessions)
@@ -719,9 +775,7 @@ class Pipeline:
             engine_config_bytes=engine_bytes,
         )
         policy = EvaluationPolicy.model_validate(protocol.evaluation.model_dump())
-        market_arrays = load_market_arrays(
-            panel_dir=Path(ctx.panel_dir), cache_root=Path(ctx.market_cache_root)
-        )
+        market_arrays = load_market_arrays(panel_dir=Path(ctx.panel_dir), cache_root=Path(ctx.market_cache_root))
         _log_memory_phase("inputs")
 
         panel = self.panel_for(hi)
@@ -765,19 +819,23 @@ class Pipeline:
         del panel
         _log_memory_phase("targets")
 
-        overlay_market = overlay_market_from_inputs(ctx.hedge_inputs)
-        derivatives = derivative_config(spec.hedge)
-        stressed_derivatives = derivative_config(
-            spec.hedge.model_copy(
-                update={
-                    "futures_cost_rate": float(spec.hedge.futures_cost_rate)
-                    + float(scenarios.stress_hedge_extra_cost),
-                    "inverse_cost_rate": float(spec.hedge.inverse_cost_rate)
-                    + float(scenarios.stress_hedge_extra_cost),
-                }
+        use_trend = spec.trend_overlay is not None
+        if use_trend:
+            assert ctx.trend_inputs is not None  # guaranteed by _data_end_row
+            overlay_market = overlay_market_from_inputs(ctx.trend_inputs)
+            derivatives = trend_derivative_config(spec.trend_overlay)  # type: ignore[arg-type]
+        else:
+            overlay_market = overlay_market_from_inputs(ctx.hedge_inputs)
+            derivatives = derivative_config(spec.hedge)
+            stressed_derivatives = derivative_config(
+                spec.hedge.model_copy(
+                    update={
+                        "futures_cost_rate": float(spec.hedge.futures_cost_rate) + float(scenarios.stress_hedge_extra_cost),
+                        "inverse_cost_rate": float(spec.hedge.inverse_cost_rate) + float(scenarios.stress_hedge_extra_cost),
+                    }
+                )
             )
-        )
-        unhedged_derivatives = derivative_config(spec.hedge.model_copy(update={"hedge_ratio": 0.0}))
+            unhedged_derivatives = derivative_config(spec.hedge.model_copy(update={"hedge_ratio": 0.0}))
 
         scenario_names = (
             ["base", "stress_slippage", "stress_delay"]
@@ -791,7 +849,62 @@ class Pipeline:
             _LOG.info("[ALGO] evaluate scenario=%s %d/%d", name, pos + 1, n_runs)
             overlay: Any
             slip_ticks: float | None
-            if name == "stress_delay":
+            scenario_market = overlay_market
+            if use_trend:
+                if name == "stress_delay":
+                    targets = delayed
+                    extra = 0.0
+                    slip_ticks = None
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec, name, delay_n=delay_n, extra_cost=0.0
+                    )
+                    overlay = inner
+                elif name == "stress_slippage":
+                    targets = executable
+                    extra = float(scenarios.stress_extra_slippage)
+                    slip_ticks = None
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec,
+                        name,
+                        delay_n=delay_n,
+                        extra_cost=float(scenarios.stress_hedge_extra_cost),
+                    )
+                    overlay = inner
+                elif name.startswith("cost_"):
+                    targets = executable
+                    extra = 0.0
+                    slip_ticks = float(name[len("cost_") :])
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec, "base", delay_n=delay_n, extra_cost=0.0
+                    )
+                    overlay = inner
+                elif name == "unhedged":
+                    targets = executable
+                    extra = 0.0
+                    slip_ticks = None
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec, name, delay_n=delay_n, extra_cost=0.0
+                    )
+                    overlay = inner
+                elif name == "placebo":
+                    targets = placebo_executable
+                    extra = 0.0
+                    slip_ticks = None
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec, "base", delay_n=delay_n, extra_cost=0.0
+                    )
+                    overlay = inner
+                else:
+                    targets = executable
+                    extra = 0.0
+                    slip_ticks = None
+                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                        spec, "base", delay_n=delay_n, extra_cost=0.0
+                    )
+                    outcome_derivatives = derivatives
+                    base_recorder = _RecordingOverlay(inner)
+                    overlay = base_recorder
+            elif name == "stress_delay":
                 targets = delayed
                 overlay = BetaNeutralOverlay(spec.hedge, rebalance_offset=0, execution_delay=delay_n)
                 outcome_derivatives = derivatives
@@ -811,9 +924,7 @@ class Pipeline:
                 slip_ticks = float(name[len("cost_") :])
             elif name == "unhedged":
                 targets = executable
-                overlay = BetaNeutralOverlay(
-                    spec.hedge.model_copy(update={"hedge_ratio": 0.0}), rebalance_offset=0
-                )
+                overlay = BetaNeutralOverlay(spec.hedge.model_copy(update={"hedge_ratio": 0.0}), rebalance_offset=0)
                 outcome_derivatives = unhedged_derivatives
                 extra = 0.0
                 slip_ticks = None
@@ -845,7 +956,7 @@ class Pipeline:
                 authorization=auth,
                 cash_returns=ctx.cash_returns,
                 overlay=overlay,
-                overlay_market=overlay_market,
+                overlay_market=scenario_market if use_trend else overlay_market,
                 derivatives=outcome_derivatives,
                 extra_slippage=extra,
                 auction_slippage_ticks=slip_ticks,
@@ -858,12 +969,15 @@ class Pipeline:
         index_log_returns = self._index_log_returns(window_sessions)
         universe_ew = self._universe_ew_log_returns(lo, hi, uni_full, close_full)
         float_result = simulate(
-            ctx.cube, executable, start=start, end=end, config=self._sim_config(capital), authorization=auth,
+            ctx.cube,
+            executable,
+            start=start,
+            end=end,
+            config=self._sim_config(capital),
+            authorization=auth,
             rebalance_band=float(spec.book.rebalance_band),
         )
-        fast_sim_growth = float(
-            annualized_log_growth(np.asarray(float_result.log_returns), sessions_per_year=spy)
-        )
+        fast_sim_growth = float(annualized_log_growth(np.asarray(float_result.log_returns), sessions_per_year=spy))
         mismatches = self._perturbation_mismatches(
             spec,
             base_scores=base_scores,
@@ -884,9 +998,7 @@ class Pipeline:
             base=outcomes["base"],
             stress_slippage=outcomes["stress_slippage"],
             stress_delay=outcomes["stress_delay"],
-            cost_grid={
-                float(tick): outcomes[f"cost_{tick}"] for tick in scenarios.cost_grid_ticks
-            },
+            cost_grid={float(tick): outcomes[f"cost_{tick}"] for tick in scenarios.cost_grid_ticks},
             unhedged=outcomes["unhedged"],
             placebo=outcomes["placebo"],
             index_log_returns=index_log_returns,
@@ -906,9 +1018,7 @@ class Pipeline:
                 run_id=run_id,
                 scenario=name,
                 capital_krw=capital,
-                sim_config_json=json.dumps(
-                    {"scenario": name, "engine_config_hash": engine_hash}, sort_keys=True
-                ),
+                sim_config_json=json.dumps({"scenario": name, "engine_config_hash": engine_hash}, sort_keys=True),
                 cube_id=ctx.cube.cube_id,
                 protocol_hash=protocol.content_hash,
                 engine_config_hash=engine_hash,
@@ -985,21 +1095,14 @@ class Pipeline:
                 continue
             today = close[k][members]
             yesterday = close[k - 1][members]
-            valid = (
-                np.isfinite(today)
-                & np.isfinite(yesterday)
-                & (yesterday > 0.0)
-                & (today > 0.0)
-            )
+            valid = np.isfinite(today) & np.isfinite(yesterday) & (yesterday > 0.0) & (today > 0.0)
             if not bool(np.any(valid)):
                 out[k - lo] = 0.0
                 continue
             out[k - lo] = math.log1p(float(np.mean(today[valid] / yesterday[valid] - 1.0)))
         return np.ascontiguousarray(out, dtype=np.float64)
 
-    def _perturbation_cuts(
-        self, *, sessions: Sequence[date], lo: int, hi: int, spec: StrategySpec
-    ) -> tuple[int, ...]:
+    def _perturbation_cuts(self, *, sessions: Sequence[date], lo: int, hi: int, spec: StrategySpec) -> tuple[int, ...]:
         """Cut rows for the causal perturbation: rows inside a test year that has a preceding test year.
 
         The preceding year is what guarantees the rescore of the cut's year still sees uncorrupted training
@@ -1010,9 +1113,7 @@ class Pipeline:
         first_year = int(spec.scorer.first_test_year)
         test_years = set(range(first_year, sessions[hi].year + 1))
         pool = [
-            row
-            for row in range(lo, hi)
-            if sessions[row].year in test_years and (sessions[row].year - 1) in test_years
+            row for row in range(lo, hi) if sessions[row].year in test_years and (sessions[row].year - 1) in test_years
         ]
         if not pool:
             return ()
@@ -1078,13 +1179,27 @@ class Pipeline:
             capital=capital,
         )
         del perturbed_panel, rescored
-        corrupted_inputs = _corrupt_hedge_inputs(ctx.hedge_inputs, cut, sessions=sessions, rng=rng)
+        use_trend = spec.trend_overlay is not None
+        if use_trend:
+            assert ctx.trend_inputs is not None  # guaranteed by _data_end_row
+            corrupted_inputs = _corrupt_hedge_inputs(ctx.trend_inputs, cut, sessions=sessions, rng=rng)
+            corrupted_levels = np.ascontiguousarray(np.asarray(corrupted_inputs.index_level, dtype=np.float64))
+            assert spec.trend_overlay is not None
+            recorder = _RecordingOverlay(
+                TrendOverlay(
+                    spec.trend_overlay,
+                    index_level=corrupted_levels,
+                    rebalance_offset=0,
+                )
+            )
+        else:
+            corrupted_inputs = _corrupt_hedge_inputs(ctx.hedge_inputs, cut, sessions=sessions, rng=rng)
+            recorder = _RecordingOverlay(BetaNeutralOverlay(spec.hedge, rebalance_offset=0))
         assert ctx.cash_returns is not None  # guaranteed by _data_end_row
         corrupted_cash = _corrupt_cash_returns(ctx.cash_returns, cut, rng)
         cut_session = sessions[cut]
         corrupted_arrays = _corrupt_market_arrays(market_arrays, cut, rng)
         corrupted_dividends = _corrupt_dividends(ctx.dividends, cut_session, rng)
-        recorder = _RecordingOverlay(BetaNeutralOverlay(spec.hedge, rebalance_offset=0))
         rerun = ctx.ledger_runner(
             cube=corrupted_cube,
             targets=perturbed_targets,
@@ -1177,7 +1292,6 @@ class Pipeline:
             )
             _log_memory_phase(f"cut{position}")
         return int(total)
-
 
     @staticmethod
     def _corrupt_cube(cube: ResearchCube, cut: int, seed: int) -> ResearchCube:
