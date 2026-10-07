@@ -188,7 +188,7 @@ def _scan(
         if "warmup" in lowered:
             _skip("warmup")
             continue
-        if lowered.startswith("data/evidence") or "aggregate" in lowered:
+        if lowered.split("/", maxsplit=2)[:2] == ["data", "evidence"] or "aggregate" in lowered:
             _skip("aggregate")
             continue
         raw = payload_path.read_bytes()
