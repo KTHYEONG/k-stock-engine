@@ -106,18 +106,21 @@ class OverlayMarket:
 
 @dataclass(frozen=True, slots=True)
 class OverlayTarget:
-    """Short futures contracts (≥ 0) and inverse-ETF value in KRW (≥ 0) to hold after the next session."""
+    """Net short futures contracts (signed: negative = net long) and inverse-ETF value in KRW (>= 0) to hold
+    after the next session."""
 
     contracts: int
     inverse_value_krw: int
 
     def __post_init__(self) -> None:
-        for name in ("contracts", "inverse_value_krw"):
-            value = getattr(self, name)
-            if _reject_bool(value) or not isinstance(value, numbers.Integral):
-                raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
-            if int(value) < 0:
-                raise ValueError(f"{name} must be >= 0, got {value!r}")
+        contracts = self.contracts
+        if _reject_bool(contracts) or not isinstance(contracts, numbers.Integral):
+            raise ValueError(f"contracts must be an integer, got {contracts!r}")
+        inverse = self.inverse_value_krw
+        if _reject_bool(inverse) or not isinstance(inverse, numbers.Integral):
+            raise ValueError(f"inverse_value_krw must be an integer >= 0, got {inverse!r}")
+        if int(inverse) < 0:
+            raise ValueError(f"inverse_value_krw must be >= 0, got {inverse!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +131,7 @@ class OverlayState:
     ``session_idx`` (decisions are made after the 18:00 data release, so the session's own close is known).
     ``stock_book_nav`` = free cash + dividend receivable + stock market value - tax_payable (margin and inverse
     excluded) — the same SB used for ``stock_book_returns``.
+    ``contracts`` is the signed net short count (negative = net long).
     """
 
     session_idx: int
@@ -160,14 +164,14 @@ def ceil_amount_krw(rate: float | Decimal, *factors: int | float) -> int:
 
 
 def required_reserve_krw(*, contracts: int, level: float, config: DerivativeConfig) -> int:
-    """``ceil((initial_margin_rate + margin_buffer_rate) · contracts · multiplier · level)``."""
+    """``ceil((initial_margin_rate + margin_buffer_rate) · |contracts| · multiplier · level)``; margin is charged on
+    gross exposure whichever the side."""
     if _reject_bool(contracts) or not isinstance(contracts, numbers.Integral):
-        raise ValueError(f"contracts must be an integer >= 0, got {contracts!r}")
+        raise ValueError(f"contracts must be an integer, got {contracts!r}")
     count = int(contracts)
-    if count < 0:
-        raise ValueError(f"contracts must be >= 0, got {contracts!r}")
     if count == 0:
         return 0
+    count = abs(count)
     if _reject_bool(level) or not isinstance(level, (int, float)):
         raise PITDataError(f"index level must be finite, got {level!r}")
     level_f = float(level)
