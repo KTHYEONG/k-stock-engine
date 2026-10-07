@@ -905,3 +905,90 @@ def test_reference_benchmark_parity() -> None:
         diffs.append(abs(growth - 1.0 - stored[nxt]))
     assert len(diffs) >= 200
     assert max(diffs) <= 1e-9
+
+
+def _band_arrays() -> Any:
+    import numpy as _np
+
+    from types import SimpleNamespace as _NS
+
+    close = _np.array([[1000, 1000]], dtype=_np.int64)
+    present = _np.array([[True, True]])
+    return _NS(int_fields={"close": close}, bool_fields={"present": present})
+
+
+def test_band_skips_small_drift_trades_large_drift() -> None:
+    from src.backtest.costs import Side as _Side
+    from src.backtest.engine import _target_orders as _orders
+
+    arrays = _band_arrays()
+    weight = {0: 0.1}
+    # nav 1M, close 1000 -> target 100 shares.
+    assert _orders(
+        weights=weight, arrays=arrays, t=0, holdings={0: 120}, nav=1_000_000,
+        buffer_scale=1.0, rebalance_band=0.5,
+    ) == []
+    got = _orders(
+        weights=weight, arrays=arrays, t=0, holdings={0: 160}, nav=1_000_000,
+        buffer_scale=1.0, rebalance_band=0.5,
+    )
+    assert len(got) == 1
+    assert got[0].side is _Side.SELL
+    assert got[0].quantity == 60
+    boundary = _orders(
+        weights=weight, arrays=arrays, t=0, holdings={0: 150}, nav=1_000_000,
+        buffer_scale=1.0, rebalance_band=0.5,
+    )
+    assert len(boundary) == 1
+    assert boundary[0].quantity == 50
+    assert _orders(
+        weights=weight, arrays=arrays, t=0, holdings={0: 120}, nav=1_000_000, buffer_scale=1.0,
+    ) != []
+
+
+def test_band_never_suppresses_exits_or_entries() -> None:
+    from src.backtest.costs import Side as _Side
+    from src.backtest.engine import _target_orders as _orders
+
+    arrays = _band_arrays()
+    exited = _orders(
+        weights={}, arrays=arrays, t=0, holdings={0: 120}, nav=1_000_000,
+        buffer_scale=1.0, rebalance_band=0.9,
+    )
+    assert len(exited) == 1
+    assert exited[0].side is _Side.SELL
+    assert exited[0].quantity == 120
+    for weights in ({0: 0.0}, {0: 0.0001}):
+        zero_target = _orders(
+            weights=weights, arrays=arrays, t=0, holdings={0: 120}, nav=1_000_000,
+            buffer_scale=1.0, rebalance_band=0.9,
+        )
+        assert len(zero_target) == 1
+        assert zero_target[0].quantity == 120
+    entered = _orders(
+        weights={1: 0.1}, arrays=arrays, t=0, holdings={}, nav=1_000_000,
+        buffer_scale=1.0, rebalance_band=0.9,
+    )
+    assert len(entered) == 1
+    assert entered[0].side is _Side.BUY
+    assert entered[0].quantity == 100
+
+
+def test_zero_band_is_identity_and_range_validated(tmp_path: Path) -> None:
+    sessions = _sessions(3)
+    rows = [_flat_row(day, "KRX:A", 100) for day in sessions]
+    panel = _write_panel(tmp_path / "gold", "market_panel_band", rows)
+    _write_exits(panel, [])
+    arrays = load_market_arrays(panel_dir=panel, cache_root=tmp_path / "cache")
+    events = build_engine_events(arrays=arrays, panel_dir=panel, dividends=None)
+    kwargs: dict[str, Any] = {
+        "arrays": arrays, "events": events, "targets": {0: {0: 0.5}},
+        "config": _config(initial_cash=1_000_000, impact_k=0.0, commission="0"),
+        "deposits": {}, "rules": _rules(), "start": sessions[0], "end": sessions[-1],
+    }
+    default = run_backtest(**kwargs)
+    explicit = run_backtest(**kwargs, rebalance_band=0.0)
+    assert default.ledger_hash == explicit.ledger_hash
+    for bad in (-0.1, 1.0, math.inf, math.nan, True):
+        with pytest.raises(ValueError, match="rebalance_band"):
+            run_backtest(**kwargs, rebalance_band=bad)
