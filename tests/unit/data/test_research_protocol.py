@@ -227,3 +227,32 @@ def test_unknown_champion_key_rejected(tmp_path: Path) -> None:
     bad.write_text(base.replace('paired_horizon = "full"', 'paired_horizon = "5y"'), encoding="utf-8")
     with pytest.raises(ConfigError):
         load_research_protocol(bad, scope)
+
+
+def test_v5_file_disables_noninferiority_path(tmp_path: Path) -> None:
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
+    assert protocol.champion.noninferiority_margin is None
+    assert protocol.champion.tail_quantile == 0.05
+    assert protocol.champion.tail_block_sessions == 21
+
+
+def test_out_of_range_margin_rejected(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+
+    def _with_margin(val: str) -> Path:
+        p = tmp_path / f"margin-{abs(hash(val))}.toml"
+        p.write_text(base.replace("[champion]\n", f"[champion]\nnoninferiority_margin = {val}\n"), encoding="utf-8")
+        return p
+
+    with pytest.raises(ConfigError):
+        load_research_protocol(_with_margin("0.0"), scope)
+    with pytest.raises(ConfigError):
+        load_research_protocol(_with_margin("0.5"), scope)
+

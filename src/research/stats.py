@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 __all__ = [
     "GrowthProfile",
     "PairedDelta",
+    "PairedRiskDelta",
     "PointMetrics",
     "annualized_log_growth",
     "block_bootstrap_annualized_means",
@@ -21,6 +22,7 @@ __all__ = [
     "growth_profile",
     "max_drawdown",
     "paired_growth_delta",
+    "paired_growth_tail_delta",
     "point_metrics",
 ]
 
@@ -266,6 +268,105 @@ def paired_growth_delta(
         p_positive=float(np.mean(deltas > 0.0)),
         sessions=int(xa.size),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PairedRiskDelta:
+    """Paired bootstrap summaries on the same resampled paths: annualised growth difference and tail-risk difference.
+
+    ``tail`` is CVaR(challenger) − CVaR(champion) of the path's non-overlapping ``tail_block_sessions`` log-return
+    sums at quantile ``tail_quantile``; positive means a shallower loss tail.
+    """
+
+    growth: PairedDelta
+    tail: PairedDelta
+
+
+def _cvar_nonoverlapping(path: NDArray[np.float64], *, tail_block_sessions: int, tail_quantile: float) -> float:
+    m = path.size // tail_block_sessions
+    usable = m * tail_block_sessions
+    sums = path[:usable].reshape(m, tail_block_sessions).sum(axis=1)
+    k = max(1, round(tail_quantile * m))
+    sums.sort()
+    return float(np.mean(sums[:k]))
+
+
+def paired_growth_tail_delta(
+    a: NDArray[np.float64],
+    b: NDArray[np.float64],
+    *,
+    block: int,
+    draws: int,
+    seed: int,
+    horizon: int,
+    sessions_per_year: int,
+    alpha: float,
+    tail_block_sessions: int,
+    tail_quantile: float,
+) -> PairedRiskDelta:
+    """Same block starts for both streams in every draw (shared market noise cancels), as ``paired_growth_delta``.
+
+    Why CVaR of monthly blocks and not MDD: drawdown depth is set by one or two episodes per sample, so its
+    paired difference has no power; the worst-tail mean of ~100 monthly blocks is estimable.
+
+    Raises ValueError for the same argument errors as ``paired_growth_delta``, for ``tail_block_sessions < 1`` or
+    ``> horizon``, or for ``tail_quantile`` outside (0, 0.5].
+    """
+    xa = np.asarray(a, dtype=np.float64)
+    xb = np.asarray(b, dtype=np.float64)
+    if xa.ndim != 1 or xa.size == 0 or xb.ndim != 1 or xb.size == 0:
+        raise ValueError("inputs must be non-empty 1-D arrays")
+    if xa.size != xb.size:
+        raise ValueError(f"paired streams must share length, got {xa.size} vs {xb.size}")
+    _check_bootstrap_args(xa.size, block=block, draws=draws, horizon=horizon, sessions_per_year=sessions_per_year)
+    level = float(alpha)
+    if not math.isfinite(level) or not 0.0 < level < 0.5:
+        raise ValueError(f"alpha must satisfy 0 < alpha < 0.5, got {alpha!r}")
+    if tail_block_sessions < 1 or tail_block_sessions > horizon:
+        raise ValueError(
+            f"tail_block_sessions must satisfy 1 <= tail_block_sessions <= horizon ({horizon}), "
+            f"got {tail_block_sessions}"
+        )
+    t_q = float(tail_quantile)
+    if not math.isfinite(t_q) or not 0.0 < t_q <= 0.5:
+        raise ValueError(f"tail_quantile must satisfy 0 < tail_quantile <= 0.5, got {tail_quantile!r}")
+
+    rng = np.random.default_rng(seed)
+    upper = xa.size - block
+    growth_deltas = np.empty(draws, dtype=np.float64)
+    tail_deltas = np.empty(draws, dtype=np.float64)
+    for i in range(draws):
+        parts_a: list[NDArray[np.float64]] = []
+        parts_b: list[NDArray[np.float64]] = []
+        filled = 0
+        while filled < horizon:
+            start = int(rng.integers(0, upper + 1))
+            need = horizon - filled
+            parts_a.append(xa[start : start + block][:need])
+            parts_b.append(xb[start : start + block][:need])
+            filled += parts_a[-1].size
+        path_a = np.concatenate(parts_a)
+        path_b = np.concatenate(parts_b)
+        growth_deltas[i] = float((np.mean(path_a) - np.mean(path_b)) * sessions_per_year)
+        cvar_a = _cvar_nonoverlapping(path_a, tail_block_sessions=tail_block_sessions, tail_quantile=t_q)
+        cvar_b = _cvar_nonoverlapping(path_b, tail_block_sessions=tail_block_sessions, tail_quantile=t_q)
+        tail_deltas[i] = float(cvar_a - cvar_b)
+
+    growth = PairedDelta(
+        mean=float(np.mean(growth_deltas)),
+        lower=float(np.quantile(growth_deltas, level)),
+        upper=float(np.quantile(growth_deltas, 1.0 - level)),
+        p_positive=float(np.mean(growth_deltas > 0.0)),
+        sessions=int(xa.size),
+    )
+    tail = PairedDelta(
+        mean=float(np.mean(tail_deltas)),
+        lower=float(np.quantile(tail_deltas, level)),
+        upper=float(np.quantile(tail_deltas, 1.0 - level)),
+        p_positive=float(np.mean(tail_deltas > 0.0)),
+        sessions=int(xa.size),
+    )
+    return PairedRiskDelta(growth=growth, tail=tail)
 
 
 def breakeven_slippage_ticks(growth_by_ticks: Mapping[float, float]) -> float:
