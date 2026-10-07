@@ -28,6 +28,7 @@ from src.backtest.overlay import (
     OverlayMarket,
     OverlayState,
     OverlayTarget,
+    ceil_amount_krw,
     futures_expiry_rows,
     required_reserve_krw,
 )
@@ -882,14 +883,13 @@ def test_config_and_target_validation() -> None:
             _derivatives(**kwargs)
     assert _derivatives(margin_topup_trigger_fraction=1.0).margin_topup_trigger_fraction == 1.0
 
-    with pytest.raises(ValueError, match="must"):
-        OverlayTarget(contracts=-1, inverse_value_krw=0)
+    assert OverlayTarget(contracts=-3, inverse_value_krw=0).contracts == -3
     with pytest.raises(ValueError, match="must"):
         OverlayTarget(contracts=True, inverse_value_krw=0)
     with pytest.raises(ValueError, match="must"):
         OverlayTarget(contracts=1, inverse_value_krw=-1)
 
-    for bad in (-1, True, 1.5):
+    for bad in (True, 1.5):
         with pytest.raises(ValueError, match="contracts must be"):
             required_reserve_krw(contracts=bad, level=1000.0, config=config)  # type: ignore[arg-type]
     for bad in (float("nan"), -1.0, 0.0):
@@ -1228,3 +1228,88 @@ def test_perturbation_cut_no_longer_blows_up(monkeypatch: pytest.MonkeyPatch) ->
 
     assert ledger.contracts == expected
     assert counter["n"] <= 60
+
+
+def test_required_reserve_is_symmetric() -> None:
+    config = _derivatives()
+    for k in (1, 7):
+        assert required_reserve_krw(contracts=-k, level=1000.0, config=config) == (
+            required_reserve_krw(contracts=k, level=1000.0, config=config)
+        )
+    assert required_reserve_krw(contracts=0, level=1000.0, config=config) == 0
+
+
+def test_short_replay_matches_pre_signed_ledger_hash(tmp_path: Path) -> None:
+    sessions = _sessions(5, date(2025, 3, 10))
+    result = _run(
+        tmp_path, name="short_hash", sessions=sessions,
+        market=_market(sessions, [1000.0, 1000.0, 990.0, 980.0, 970.0]),
+        derivatives=_derivatives(futures_cost_rate=0.0005),
+        policy=_hold({0: (2, 0), 2: (1, 0)}), config=_config(), targets={0: {0: 0.5}},
+    )
+    # Captured from the pre-signed HEAD engine, including stock sizing, roll and rebalance.
+    assert result.ledger_hash == "1ac471aa57efc7d77627a45f1f7aa6f1673998b352be66c85358903511dea5c7"
+
+
+def test_long_roll_executes_on_expiry(tmp_path: Path) -> None:
+    sessions = _sessions(5, date(2025, 3, 10))
+    result = _run(
+        tmp_path, name="long_roll", sessions=sessions, market=_market(sessions, 1000.0),
+        derivatives=_derivatives(futures_cost_rate=0.0005),
+        policy=_hold({0: (-1, 0)}), config=_config(),
+    )
+    assert [(e.session_idx, e.cash_delta) for e in _kinds(result, JournalKind.FUTURES_ROLL)] == [(3, -10_000)]
+    _assert_reconciles(result, 10_000_000)
+
+
+def test_long_maintenance_reduces_magnitude_without_borrowing() -> None:
+    config = _band_derivatives(futures_cost_rate=0.0005)
+    ledger = Ledger(initial_cash=4_515_000)
+    ledger.transfer_margin(session_idx=0, amount=4_515_000)
+    ledger.trade_futures(session_idx=0, contracts=-3, level=1000.0, multiplier=10_000, cost_rate=0.0005)
+    ledger.settle_variation(session_idx=1, prev_level=1000.0, level=910.0, multiplier=10_000)
+    _sync_futures(ledger, session_idx=1, target_contracts=-3, level=910.0, config=config, multiplier=10_000)
+    assert (ledger.contracts, ledger.margin, ledger.cash) == (-1, 1_365_000, 425_900)
+
+
+@pytest.mark.parametrize(("available", "expected"), [(3_015_000, -2), (3_014_999, -1)])
+def test_funded_side_flip_charges_gross_commission(available: int, expected: int) -> None:
+    config = _derivatives(futures_cost_rate=0.0005)
+    ledger = Ledger(initial_cash=available)
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    _sync_futures(ledger, session_idx=1, target_contracts=-2, level=1000.0, config=config, multiplier=10_000)
+    assert ledger.contracts == expected
+    assert ledger.margin == required_reserve_krw(contracts=expected, level=1000.0, config=config)
+    assert ledger.cash == available - ledger.margin - 5_000 * abs(expected - 1)
+    assert ledger.journal[1].quantity_delta == expected - 1
+
+
+@pytest.mark.parametrize("cost_rate", [0.0, 0.0005, 0.2])
+def test_signed_funding_matches_exhaustive_scan(cost_rate: float) -> None:
+    config = _derivatives(futures_cost_rate=cost_rate)
+    for target in (-7, -1, 1, 7):
+        sign = 1 if target > 0 else -1
+        for held in (-9, -3, 0, 3, 9):
+            for available in (0, 1_500_000, 3_015_000, 10_000_000):
+                expected = 0
+                for magnitude in range(abs(target), -1, -1):
+                    candidate = sign * magnitude
+                    reserve = required_reserve_krw(contracts=candidate, level=1000.0, config=config)
+                    commission = ceil_amount_krw(cost_rate, abs(candidate - held), 10_000, 1000.0)
+                    if reserve + commission <= available:
+                        expected = candidate
+                        break
+                assert _largest_fundable_contracts(
+                    target_contracts=target, held=held, available=available, level=1000.0,
+                    config=config, multiplier=10_000,
+                ) == expected
+
+
+def test_negative_target_accepted_negative_inverse_rejected() -> None:
+    assert OverlayTarget(contracts=-3, inverse_value_krw=0).contracts == -3
+    with pytest.raises(ValueError, match="must"):
+        OverlayTarget(contracts=0, inverse_value_krw=-1)
+    with pytest.raises(ValueError, match="must"):
+        OverlayTarget(contracts=0, inverse_value_krw=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must"):
+        OverlayTarget(contracts=0, inverse_value_krw=1.5)  # type: ignore[arg-type]
