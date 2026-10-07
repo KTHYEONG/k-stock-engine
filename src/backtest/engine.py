@@ -240,13 +240,13 @@ def _futures_commission(rate: float, *, delta: int, multiplier: int, level: floa
 
 
 def _maintenance_floor(contracts: int, *, level: float, config: DerivativeConfig, multiplier: int) -> int:
-    """``ceil(trigger · initial_margin_rate · contracts · multiplier · level)`` (``0`` when flat)."""
-    if contracts <= 0:
+    """``ceil(trigger · initial_margin_rate · |contracts| · multiplier · level)`` (``0`` when flat)."""
+    if contracts == 0:
         return 0
     rate = Decimal(str(float(config.margin_topup_trigger_fraction))) * Decimal(
         str(float(config.initial_margin_rate))
     )
-    return ceil_amount_krw(rate, contracts, multiplier, float(level))
+    return ceil_amount_krw(rate, abs(int(contracts)), multiplier, float(level))
 
 
 def _largest_fundable_contracts(
@@ -258,31 +258,31 @@ def _largest_fundable_contracts(
     config: DerivativeConfig,
     multiplier: int,
 ) -> int:
-    """Largest ``k`` in ``[0, target_contracts]`` with ``required_reserve(k) + commission(k - held) <= available``,
-    or ``0`` when none qualifies.
+    """Largest-magnitude ``k`` with the sign of ``target_contracts`` and ``|k| <= |target_contracts|`` such that
+    ``required_reserve(k) + commission(k - held) <= available``, or ``0`` when none qualifies.
 
     Why: choosing the funded contract count must not scale with the contract count. When the account is far larger
     than the hedge target's notional (or a corrupted replay inflates it), a linear scan from the target costs
-    seconds per call; the reserve is non-decreasing in ``k`` and the commission is never negative, so no ``k``
+    seconds per call; the reserve is non-decreasing in ``|k|`` and the commission is never negative, so no ``k``
     whose reserve alone exceeds ``available`` can qualify and the search can start at the reserve bound.
 
     Args:
-        target_contracts: Pending overlay target (>= 0).
-        held: Contracts currently held (>= 0); only the commission term depends on it.
+        target_contracts: Pending overlay target (signed; negative = net long).
+        held: Contracts currently held (signed); only the commission term depends on it.
         available: Margin plus spendable cash in whole KRW (may be <= 0).
         level: Positive finite futures-underlying level.
         config: Derivative terms (margin and buffer rates, cost rate).
         multiplier: KRW per index point per contract.
 
     Returns:
-        The chosen contract count; identical to the first qualifying candidate of a descending scan from
-        ``target_contracts``.
+        The chosen contract count; identical to the first qualifying candidate of a magnitude-descending scan from
+        ``target_contracts`` toward zero.
 
     Raises:
         PITDataError / ValueError: propagated unchanged from ``required_reserve_krw`` for a non-positive or
-            non-finite ``level`` or a negative contract count.
+            non-finite ``level``.
     """
-    if target_contracts <= 0:
+    if target_contracts == 0:
         return 0
     if isinstance(level, bool) or not isinstance(level, (int, float)):
         required_reserve_krw(contracts=target_contracts, level=level, config=config)
@@ -298,12 +298,16 @@ def _largest_fundable_contracts(
     bound = int(
         (Decimal(int(available)) / capacity).to_integral_value(rounding=ROUND_FLOOR)
     )
-    start = min(int(target_contracts), bound)
+    target_int = int(target_contracts)
+    sign = 1 if target_int > 0 else -1
+    start_mag = min(abs(target_int), bound)
     cost_rate = float(config.futures_cost_rate)
-    for candidate in range(start, -1, -1):
+    held_int = int(held)
+    for magnitude in range(start_mag, -1, -1):
+        candidate = sign * magnitude
         reserve = required_reserve_krw(contracts=candidate, level=level, config=config)
         commission = _futures_commission(
-            cost_rate, delta=candidate - int(held), multiplier=int(multiplier), level=level,
+            cost_rate, delta=candidate - held_int, multiplier=int(multiplier), level=level,
         )
         if reserve + commission <= available:
             return candidate
@@ -324,8 +328,8 @@ def _sync_futures(
     Three cases (``h`` held, ``k*`` pending target, ``R`` reserve, ``M`` maintenance floor, ``available`` =
     margin + free cash - tax_payable). (a) Hold (``k* == h`` and margin >= ``M(h)``): no futures trade and no
     top-up; excess above ``R(h)`` is still released, but anything inside ``[M(h), R(h)]`` is left alone. (b)
-    Margin call (``k* == h`` and margin < ``M(h)``): largest ``k <= h`` with ``R(k) + commission <= available``,
-    then sync to exactly ``R(k)``. (c) Rebalance (``k* != h``): largest ``k <= k*`` funded the same way, then sync
+    Margin call (``k* == h`` and margin < ``M(h)``): largest same-side ``|k| <= |h|`` with ``R(k) + commission <= available``,
+    then sync to exactly ``R(k)``. (c) Rebalance (``k* != h``): largest same-side ``|k| <= |k*|`` funded the same way, then sync
     to ``R(k)``. In every case unaffordable targets shrink (down to flat) instead of borrowing, and a margin the
     cash cannot restore stays negative for a later session to repay.
 
@@ -584,14 +588,14 @@ def run_backtest(
             assert derivatives is not None
             level_t = _index_level(index_levels, t)
             inverse_price = _inverse_int(inverse_closes, t)
-            if ledger.contracts > 0:
+            if ledger.contracts != 0:
                 ledger.settle_variation(
                     session_idx=t,
                     prev_level=_index_level(index_levels, t - 1),
                     level=level_t,
                     multiplier=multiplier,
                 )
-            if t in expiry_rows and ledger.contracts > 0:
+            if t in expiry_rows and ledger.contracts != 0:
                 ledger.roll_futures(
                     session_idx=t, level=level_t, multiplier=multiplier,
                     cost_rate=float(derivatives.futures_cost_rate),

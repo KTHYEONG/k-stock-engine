@@ -94,7 +94,7 @@ def _checked_level(value: float, *, what: str) -> float:
 
 
 def _floored_mark(contracts: int, multiplier: int, level: float) -> int:
-    """Short-position mark ``floor(-contracts · multiplier · level)`` in whole KRW, exactly."""
+    """Signed net-short mark ``floor(-contracts · multiplier · level)`` in whole KRW, exactly."""
     return -ceil_amount_krw(contracts * multiplier, level)
 
 
@@ -118,7 +118,7 @@ class Ledger:
     invested book at year end) accrues on the ``PAYABLE`` account, which nets the full
     liability out of NAV until it is settled.
 
-    The ``MARGIN`` account holds the short-index-futures position: margin transfers,
+    The ``MARGIN`` account holds the signed index-futures position: margin transfers,
     daily variation, commission, quarterly roll and the annual capital-gains tax all
     land there, so a hedge pays its own costs without touching free cash. Free cash
     never goes negative; margin may go negative (a liability restored by maintenance)
@@ -370,7 +370,7 @@ class Ledger:
     def settle_variation(
         self, *, session_idx: int, prev_level: float, level: float, multiplier: int
     ) -> int:
-        """Daily settlement of the held short contracts into margin.
+        """Daily settlement of the held signed position into margin: a long gains when the level rises.
 
         Delta = ``mark(level) - mark(prev_level)`` with ``mark(L) = floor(-contracts · multiplier · L)`` so the
         cumulative settled P&L equals the floored mark exactly. Adds delta to the year-to-date futures P&L.
@@ -397,12 +397,11 @@ class Ledger:
     def trade_futures(
         self, *, session_idx: int, contracts: int, level: float, multiplier: int, cost_rate: float
     ) -> None:
-        """Set the short position to ``contracts``.
-
-        Commission ``ceil(cost_rate · |Δ| · multiplier · level)`` is debited from MARGIN: the futures account
-        pays its own costs, so a hedge never draws on free cash and never refuses a trade for lack of funds.
-        """
-        target = _checked_int(contracts, what="contracts", minimum=0)
+        """Set the net short position to ``contracts`` (signed; negative = net long). Commission
+        ``ceil(cost_rate · |Δ| · multiplier · level)`` is debited from MARGIN."""
+        if isinstance(contracts, bool) or not isinstance(contracts, numbers.Integral):
+            raise ValueError(f"contracts must be an integer, got {contracts!r}")
+        target = int(contracts)
         mult = _checked_int(multiplier, what="multiplier", minimum=1)
         rate = _checked_cost_rate(cost_rate, what="cost_rate")
         mark_level = _checked_level(level, what="level")
@@ -425,13 +424,13 @@ class Ledger:
     def roll_futures(
         self, *, session_idx: int, level: float, multiplier: int, cost_rate: float
     ) -> None:
-        """Debit ``ceil(2 · cost_rate · contracts · multiplier · level)`` from MARGIN (close + reopen)."""
+        """Debit ``ceil(2 · cost_rate · |contracts| · multiplier · level)`` from MARGIN (close + reopen)."""
         mult = _checked_int(multiplier, what="multiplier", minimum=1)
         rate = _checked_cost_rate(cost_rate, what="cost_rate")
         mark_level = _checked_level(level, what="level")
         if self._contracts == 0:
             return
-        cost = ceil_amount_krw(2.0 * rate, self._contracts, mult, mark_level)
+        cost = ceil_amount_krw(2.0 * rate, abs(self._contracts), mult, mark_level)
         if cost <= 0:
             return
         self._margin -= cost
