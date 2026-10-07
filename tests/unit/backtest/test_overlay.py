@@ -138,6 +138,7 @@ def _run(
     start: date | None = None,
     end: date | None = None,
     cash_returns: np.ndarray | None = None,
+    leg_derivatives: Mapping[str, DerivativeConfig] | None = None,
 ) -> BacktestResult:
     arrays, events = _arrays(tmp_path, name, sessions, closes=closes)
     return run_backtest(
@@ -153,6 +154,7 @@ def _run(
         overlay=policy,
         overlay_market=market,
         derivatives=derivatives,
+        leg_derivatives=leg_derivatives,
     )
 
 
@@ -1313,3 +1315,362 @@ def test_negative_target_accepted_negative_inverse_rejected() -> None:
         OverlayTarget(contracts=0, inverse_value_krw=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="must"):
         OverlayTarget(contracts=0, inverse_value_krw=1.5)  # type: ignore[arg-type]
+
+
+def test_two_legs_conserve_krw(tmp_path: Path) -> None:
+    sessions = _sessions(5, date(2025, 3, 10))
+    kq_levels = np.array([1000.0, 1005.0, 995.0, 1010.0, 1000.0], dtype=np.float64)
+    market = OverlayMarket(
+        index_level=np.array([300.0, 302.0, 298.0, 305.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(5, 10_000.0, dtype=np.float64),
+        legs={"kq150": kq_levels},
+    )
+    kq_config = _derivatives(contract_multiplier_krw=10_000, futures_cost_rate=0.0001)
+    prim_config = _derivatives(contract_multiplier_krw=50_000, futures_cost_rate=0.0001)
+
+    # Policy targeting primary -1 (long) and secondary +1 (short)
+    policy = _Policy(lambda s: OverlayTarget(contracts=-1, inverse_value_krw=0, legs=(("kq150", 1),)))
+    result = _run(
+        tmp_path,
+        name="multileg_conserve",
+        sessions=sessions,
+        market=market,
+        derivatives=prim_config,
+        leg_derivatives={"kq150": kq_config},
+        policy=policy,
+        config=_config(initial_cash=50_000_000),
+    )
+
+    for rec in result.nav:
+        assert rec.nav == (
+            rec.cash + rec.dividend_receivable + rec.market_value + rec.margin + rec.inverse_value
+            - rec.tax_payable
+        )
+    trades = _kinds(result, JournalKind.FUTURES_TRADE)
+    assert {(e.leg, e.quantity_delta) for e in trades} == {(None, -1), ("kq150", 1)}
+    assert policy.states[-1].leg_contracts == (("kq150", 1),)
+
+
+def test_funding_priority_fills_primary_shrinks_secondary(tmp_path: Path) -> None:
+    # Set cash low enough so that primary reserve fits, but secondary reserve does not
+    # Primary: level 300, multiplier 50_000, initial 0.1, buffer 0.05 -> reserve rate 0.15 * 1 * 50_000 * 300 = 2,250,000
+    # Secondary: level 1000, mult 10_000, reserve rate 0.15 * 1 * 10_000 * 1000 = 1,500,000
+    # Total reserve for both: 3,750,000. If cash is 3,000,000:
+    # Primary fits (2.25M), remaining ~750k. Secondary target +1 needs 1.5M -> shrinks to 0!
+    sessions = _sessions(3, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0, 1000.0], dtype=np.float64)},
+    )
+    prim_config = _derivatives(contract_multiplier_krw=50_000, futures_cost_rate=0.0)
+    kq_config = _derivatives(contract_multiplier_krw=10_000, futures_cost_rate=0.0)
+
+    policy = _Policy(lambda s: OverlayTarget(contracts=-1, inverse_value_krw=0, legs=(("kq150", 1),)))
+    result = _run(
+        tmp_path,
+        name="funding_priority",
+        sessions=sessions,
+        market=market,
+        derivatives=prim_config,
+        leg_derivatives={"kq150": kq_config},
+        policy=policy,
+        config=_config(initial_cash=3_000_000),
+    )
+
+    # First decision at lo-1 (session 0): target is primary -1, secondary 1.
+    # At session 1 close: primary -1 is filled, secondary 1 cannot fit -> shrinks to 0.
+    last_state = policy.states[-1]
+    assert last_state.contracts == -1
+    assert last_state.leg_contracts == () or dict(last_state.leg_contracts).get("kq150", 0) == 0
+
+
+def test_unknown_leg_rejected(tmp_path: Path) -> None:
+    sessions = _sessions(3, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+    )
+    # Policy targets unknown leg 'kq150' not in leg_derivatives
+    policy = _Policy(lambda s: OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1),)))
+    with pytest.raises(ValueError, match="unknown target leg"):
+        _run(
+            tmp_path,
+            name="unknown_leg",
+            sessions=sessions,
+            market=market,
+            derivatives=_derivatives(),
+            policy=policy,
+            config=_config(),
+        )
+
+
+def test_mismatched_tax_terms_rejected(tmp_path: Path) -> None:
+    sessions = _sessions(3, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0, 1000.0], dtype=np.float64)},
+    )
+    prim_cfg = _derivatives(futures_tax_rate=Decimal("0.11"))
+    kq_cfg = _derivatives(futures_tax_rate=Decimal("0.20"))
+
+    with pytest.raises(ValueError, match="futures_tax_rate"):
+        _run(
+            tmp_path,
+            name="tax_mismatch",
+            sessions=sessions,
+            market=market,
+            derivatives=prim_cfg,
+            leg_derivatives={"kq150": kq_cfg},
+            policy=_flat_policy(),
+            config=_config(),
+        )
+
+
+def test_stock_sizing_reserves_both_legs(tmp_path: Path) -> None:
+    # Check that stock sizing NAV subtracts R_primary + R_secondary
+    sessions = _sessions(3, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0, 1000.0], dtype=np.float64)},
+    )
+    prim_cfg = _derivatives(contract_multiplier_krw=50_000)
+    kq_cfg = _derivatives(contract_multiplier_krw=10_000)
+
+    # Primary reserve: 0.15 * 1 * 50_000 * 300 = 2,250,000
+    # Secondary reserve: 0.15 * 1 * 10_000 * 1000 = 1,500,000
+    # Total reserve = 3,750,000
+    policy = _Policy(lambda s: OverlayTarget(contracts=-1, inverse_value_krw=0, legs=(("kq150", 1),)))
+    # With targets weight 1.0 on instrument 0, check buy quantity
+    result = _run(
+        tmp_path,
+        name="sizing_reserve",
+        sessions=sessions,
+        market=market,
+        derivatives=prim_cfg,
+        leg_derivatives={"kq150": kq_cfg},
+        policy=policy,
+        config=_config(initial_cash=10_000_000, impact_k=0.0, commission="0"),
+        targets={1: {0: 1.0}},
+        closes=100,
+    )
+    # At session 1 decision, NAV = 10,000,000. Sizing NAV = 10,000,000 - 3,750,000 = 6,250,000.
+    # Target buy order at session 2 open auction: 6,250,000 / 100 = 62,500 shares.
+    buys = [f for f in result.fills if f.order.side.name == "BUY"]
+    assert len(buys) == 1
+    assert buys[0].order.quantity == 62_500
+    assert buys[0].quantity == 62_500
+
+
+def test_overlay_dataclasses_validation() -> None:
+    # OverlayMarket validations
+    with pytest.raises(ValueError, match="legs must be a Mapping"):
+        OverlayMarket(index_level=np.zeros(2), inverse_close=np.zeros(2), legs=[])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayMarket(index_level=np.zeros(2), inverse_close=np.zeros(2), legs={"": np.zeros(2)})
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayMarket(index_level=np.zeros(2), inverse_close=np.zeros(2), legs={"primary": np.zeros(2)})
+    with pytest.raises(ValueError, match="ndarray"):
+        OverlayMarket(index_level=np.zeros(2), inverse_close=np.zeros(2), legs={"kq150": [1, 2]})  # type: ignore[arg-type]
+
+    # OverlayTarget validations
+    with pytest.raises(ValueError, match="tuple"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=[])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="2-tuple"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=("bad",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("", 1),))
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("primary", 1),))
+    with pytest.raises(ValueError, match="duplicate"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1), ("kq150", 2)))
+    with pytest.raises(ValueError, match="sorted"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("z_leg", 1), ("a_leg", 1)))
+    with pytest.raises(ValueError, match="integer"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1.5),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="integer"):
+        OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", True),))  # type: ignore[arg-type]
+
+    # OverlayState validations
+    state_kwargs: dict[str, Any] = {
+        "session_idx": 0,
+        "nav": 1000,
+        "stock_book_nav": 1000,
+        "stock_book_returns": np.zeros(0),
+        "index_returns": np.zeros(0),
+        "index_level": 100.0,
+        "contracts": 0,
+        "inverse_units": 0,
+    }
+    with pytest.raises(ValueError, match="tuple"):
+        OverlayState(**state_kwargs, leg_contracts=[])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="2-tuple"):
+        OverlayState(**state_kwargs, leg_contracts=("bad",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayState(**state_kwargs, leg_contracts=(("", 1),))
+    with pytest.raises(ValueError, match="invalid leg name"):
+        OverlayState(**state_kwargs, leg_contracts=(("primary", 1),))
+    with pytest.raises(ValueError, match="duplicate"):
+        OverlayState(**state_kwargs, leg_contracts=(("kq150", 1), ("kq150", 2)))
+    with pytest.raises(ValueError, match="sorted"):
+        OverlayState(**state_kwargs, leg_contracts=(("z_leg", 1), ("a_leg", 1)))
+    with pytest.raises(ValueError, match="integer"):
+        OverlayState(**state_kwargs, leg_contracts=(("kq150", 1.5),))  # type: ignore[arg-type]
+
+
+def test_engine_leg_validation_errors(tmp_path: Path) -> None:
+    sessions = _sessions(3, date(2025, 3, 10))
+    kq_arr = np.array([1000.0, 1000.0, 1000.0], dtype=np.float64)
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": kq_arr},
+    )
+    prim_cfg = _derivatives()
+
+    # 1. leg in leg_derivatives absent from overlay_market.legs
+    with pytest.raises(ValueError, match=r"absent from overlay_market\.legs"):
+        _run(
+            tmp_path, name="absent_leg", sessions=sessions, market=market,
+            derivatives=prim_cfg, leg_derivatives={"other": _derivatives()},
+            policy=_flat_policy(), config=_config(),
+        )
+
+    # 2. leg deduction mismatch
+    with pytest.raises(ValueError, match="futures_annual_deduction_krw"):
+        _run(
+            tmp_path, name="deduct_mismatch", sessions=sessions, market=market,
+            derivatives=prim_cfg, leg_derivatives={"kq150": _derivatives(futures_annual_deduction_krw=0)},
+            policy=_flat_policy(), config=_config(),
+        )
+
+    # 3. leg array length mismatch
+    bad_market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0], dtype=np.float64)},
+    )
+    with pytest.raises(ValueError, match="align to sessions"):
+        _run(
+            tmp_path, name="arr_mismatch", sessions=sessions, market=bad_market,
+            derivatives=prim_cfg, leg_derivatives={"kq150": _derivatives()},
+            policy=_flat_policy(), config=_config(),
+        )
+
+
+def test_secondary_leg_exit_and_held_maintenance(tmp_path: Path) -> None:
+    # Test closing/flattening a secondary leg (target 0 when previously held)
+    # and testing hold condition when held secondary leg has target 0
+    sessions = _sessions(4, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(4, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0, 1000.0, 1000.0], dtype=np.float64)},
+    )
+    prim_cfg = _derivatives(contract_multiplier_krw=50_000)
+    kq_cfg = _derivatives(contract_multiplier_krw=10_000)
+
+    # Session 0 target: kq150 = 1 contract
+    # Session 1 target: kq150 = 0 (or omitted from target legs)
+    targets_map = {
+        0: OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1),)),
+        1: OverlayTarget(contracts=0, inverse_value_krw=0, legs=()),
+    }
+    policy = _Policy(lambda s: targets_map.get(s.session_idx))
+    result = _run(
+        tmp_path,
+        name="secondary_exit",
+        sessions=sessions,
+        market=market,
+        derivatives=prim_cfg,
+        leg_derivatives={"kq150": kq_cfg},
+        policy=policy,
+        config=_config(initial_cash=10_000_000),
+    )
+    # At session 1 close: kq150 is held (1)
+    # At session 2 close: target is 0 -> flattened!
+    state_s2 = policy.states[2]
+    assert state_s2.leg_contracts == ()
+
+
+def test_secondary_leg_non_finite_level_raises_pit_error(tmp_path: Path) -> None:
+    sessions = _sessions(3, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.array([300.0, 300.0, 300.0], dtype=np.float64),
+        inverse_close=np.full(3, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, math.nan, 1000.0], dtype=np.float64)},
+    )
+    prim_cfg = _derivatives()
+    kq_cfg = _derivatives()
+    policy = _Policy(lambda s: OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1),)))
+    with pytest.raises(PITDataError, match="level missing"):
+        _run(
+            tmp_path,
+            name="pit_leg_level",
+            sessions=sessions,
+            market=market,
+            derivatives=prim_cfg,
+            leg_derivatives={"kq150": kq_cfg},
+            policy=policy,
+            config=_config(),
+        )
+
+
+def test_opening_a_secondary_leg_never_liquidates_a_primary_inside_the_band() -> None:
+    """1 contract, cash 0, +1% (margin 1.415M in [M, R]); a new secondary target finds no funds and stays flat."""
+    derivatives = _band_derivatives()
+    ledger = Ledger(initial_cash=1_515_000)
+    ledger.transfer_margin(session_idx=0, amount=1_515_000)
+    ledger.trade_futures(session_idx=0, contracts=1, level=1000.0, multiplier=10_000, cost_rate=0.0)
+    ledger.settle_variation(session_idx=1, prev_level=1000.0, level=1010.0, multiplier=10_000)
+    assert ledger.margin == 1_415_000
+    journal_size = ledger.journal_size
+
+    _sync_futures(
+        ledger, session_idx=1, target_contracts=1, level=1010.0, config=derivatives, multiplier=10_000,
+        leg_targets={"kq150": 1}, leg_markets={"kq150": (derivatives, 1000.0)},
+    )
+
+    assert ledger.contracts == 1
+    assert ledger.legs == ()
+    assert ledger.margin == 1_415_000
+    assert ledger.journal_size == journal_size
+
+
+def test_unknown_leg_in_the_pre_window_target_rejected(tmp_path: Path) -> None:
+    sessions = _sessions(3, date(2025, 3, 10))
+    policy = _Policy(lambda s: OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1),)))
+    with pytest.raises(ValueError, match="unknown target leg"):
+        _run(
+            tmp_path, name="unknown_leg_pre", sessions=sessions, market=_market(sessions, 300.0),
+            derivatives=_derivatives(), policy=policy, config=_config(), start=sessions[1],
+        )
+    assert [state.session_idx for state in policy.states] == [0]
+
+
+def test_secondary_leg_levels_checked_once_per_run(tmp_path: Path) -> None:
+    sessions = _sessions(4, date(2025, 3, 10))
+    market = OverlayMarket(
+        index_level=np.full(4, 300.0, dtype=np.float64),
+        inverse_close=np.full(4, 10_000.0, dtype=np.float64),
+        legs={"kq150": np.array([1000.0, 1000.0, 1000.0, np.nan], dtype=np.float64)},
+    )
+    policy = _Policy(lambda s: OverlayTarget(contracts=0, inverse_value_krw=0, legs=(("kq150", 1),)))
+    with pytest.raises(PITDataError, match="kq150"):
+        _run(
+            tmp_path, name="leg_gap", sessions=sessions, market=market, derivatives=_derivatives(),
+            leg_derivatives={"kq150": _derivatives()}, policy=policy, config=_config(initial_cash=50_000_000),
+        )
+    assert len(policy.states) == 1
+
+
+def test_leg_derivatives_without_overlay_rejected(tmp_path: Path) -> None:
+    sessions = _sessions(3)
+    arrays, events = _arrays(tmp_path, "legs_no_overlay", sessions, closes=100)
+    with pytest.raises(ValueError, match="leg_derivatives requires an overlay"):
+        run_backtest(
+            arrays=arrays, events=events, targets={}, config=_config(), deposits={}, rules=_rules(),
+            start=sessions[0], end=sessions[-1], leg_derivatives={"kq150": _derivatives()},
+        )

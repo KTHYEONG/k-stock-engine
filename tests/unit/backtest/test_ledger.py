@@ -699,3 +699,79 @@ def test_short_only_replay_is_unchanged() -> None:
     ledger.roll_futures(session_idx=2, level=990.0, multiplier=10_000, cost_rate=0.001)
     assert ledger.margin == 200_000 - math.ceil(2 * 0.001 * 2 * 10_000 * 990.0)
     assert [e.quantity_delta for e in ledger.journal if e.kind is JournalKind.FUTURES_TRADE] == [2]
+
+
+def test_multileg_variation_settles_independently_into_one_margin() -> None:
+    ledger = Ledger(initial_cash=0)
+    # primary long -1 (gains on rise), secondary short +2 (gains on drop)
+    ledger.trade_futures(session_idx=0, contracts=-1, level=300.0, multiplier=50_000, cost_rate=0.0)
+    ledger.trade_futures(session_idx=0, contracts=2, level=1000.0, multiplier=10_000, cost_rate=0.0, leg="kq150")
+
+    delta_prim = ledger.settle_variation(
+        session_idx=1, prev_level=300.0, level=304.0, multiplier=50_000, leg="primary"
+    )
+    delta_sec = ledger.settle_variation(
+        session_idx=1, prev_level=1000.0, level=990.0, multiplier=10_000, leg="kq150"
+    )
+
+    # delta_prim: -(-1) * 50_000 * (304 - 300) = +200_000
+    # delta_sec: -(2) * 10_000 * (990 - 1000) = +200_000
+    assert delta_prim == 200_000
+    assert delta_sec == 200_000
+    assert ledger.margin == 400_000
+    assert ledger.leg_contracts("primary") == -1
+    assert ledger.leg_contracts("kq150") == 2
+    assert ledger.legs == (("kq150", 2),)
+
+
+def test_multileg_aggregate_futures_tax() -> None:
+    ledger = Ledger(initial_cash=0)
+    # Primary gain 5M, secondary loss 3M -> net +2M. With 2.5M deduction, tax = 0.
+    ledger.trade_futures(session_idx=0, contracts=-1, level=300.0, multiplier=1, cost_rate=0.0)
+    ledger.trade_futures(session_idx=0, contracts=1, level=100.0, multiplier=1, cost_rate=0.0, leg="kq150")
+
+    # Primary settles +5,000,000
+    ledger.settle_variation(session_idx=1, prev_level=300.0, level=5_000_300.0, multiplier=1)
+    # Secondary settles -3,000,000 (level rises from 100 to 3_000_100 on short contract)
+    ledger.settle_variation(session_idx=1, prev_level=100.0, level=3_000_100.0, multiplier=1, leg="kq150")
+
+    assert ledger.margin == 2_000_000
+    tax = ledger.settle_futures_tax(
+        session_idx=2,
+        config=_derivatives(futures_tax_rate=Decimal("0.11"), futures_annual_deduction_krw=2_500_000),
+    )
+    assert tax == 0
+    assert ledger.margin == 2_000_000
+
+
+def test_secondary_journal_rows_are_tagged() -> None:
+    ledger = Ledger(initial_cash=0)
+    ledger.trade_futures(session_idx=0, contracts=1, level=300.0, multiplier=50_000, cost_rate=0.0001)
+    ledger.trade_futures(
+        session_idx=0, contracts=2, level=1000.0, multiplier=10_000, cost_rate=0.0001, leg="kq150"
+    )
+    ledger.settle_variation(session_idx=1, prev_level=300.0, level=299.0, multiplier=50_000)
+    ledger.settle_variation(
+        session_idx=1, prev_level=1000.0, level=990.0, multiplier=10_000, leg="kq150"
+    )
+    ledger.roll_futures(session_idx=2, level=299.0, multiplier=50_000, cost_rate=0.0001)
+    ledger.roll_futures(
+        session_idx=2, level=990.0, multiplier=10_000, cost_rate=0.0001, leg="kq150"
+    )
+
+    primary_entries = [e for e in ledger.journal if e.leg is None]
+    secondary_entries = [e for e in ledger.journal if e.leg == "kq150"]
+
+    assert all(e.leg is None for e in primary_entries)
+    # secondary entries: trade (1), commission (1), variation (1), roll (1) -> 4 entries
+    assert len(secondary_entries) == 4
+    for e in secondary_entries:
+        assert e.leg == "kq150"
+
+    # Test flattening secondary leg (contracts=0)
+    ledger.trade_futures(
+        session_idx=3, contracts=0, level=990.0, multiplier=10_000, cost_rate=0.0001, leg="kq150"
+    )
+    assert ledger.leg_contracts("kq150") == 0
+    assert ledger.legs == ()
+    assert ledger.journal[-2].leg == "kq150"

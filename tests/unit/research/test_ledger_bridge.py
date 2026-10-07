@@ -553,3 +553,25 @@ def test_ledger_outcome_diagnostics_and_overlay(tmp_path: Path) -> None:
     )
     assert hedged.sessions == outcome.sessions
     assert rng is not None
+
+
+def test_overlay_market_with_legs_construction() -> None:
+    from src.research.hedge import HedgeInputs
+    from src.research.ledger_bridge import overlay_market_with_legs
+
+    days = (date(2025, 1, 6), date(2025, 1, 7))
+    primary = HedgeInputs(
+        sessions=days,
+        index_level=np.array([300.0, 305.0]),
+        inverse_close=np.array([10_000.0, 10_000.0]),
+    )
+    sec1 = HedgeInputs(
+        sessions=days,
+        index_level=np.array([1000.0, 995.0]),
+        inverse_close=np.array([5_000.0, 5_000.0]),
+    )
+    market = overlay_market_with_legs(primary, {"kq150": sec1})
+    assert np.array_equal(market.index_level, primary.index_level)
+    assert np.array_equal(market.inverse_close, primary.inverse_close)
+    assert "kq150" in market.legs
+    assert np.array_equal(market.legs["kq150"], sec1.index_level)
