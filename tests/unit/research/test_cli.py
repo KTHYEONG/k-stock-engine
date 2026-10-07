@@ -284,6 +284,8 @@ def test_champion_lifecycle(
         "delta_lower",
         "challenger_j",
         "champion_j",
+        "alpha_effective",
+        "paired_horizon_sessions",
         "decision_path",
     }
     assert challenged["delta_mean"] > challenged["delta_lower"] > 0.0

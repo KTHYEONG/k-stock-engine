@@ -29,14 +29,25 @@ _NOW = datetime(2026, 9, 30, tzinfo=UTC)
 _SPY = 252
 
 
-def _protocol(*, require_neighbors: bool = True) -> ResearchProtocol:
+def _protocol(
+    *,
+    require_neighbors: bool = True,
+    paired_horizon: str = "evaluation",
+    multiplicity: str = "none",
+) -> ResearchProtocol:
     from src.data.research_protocol import load_research_protocol
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
     base = load_research_protocol(Path("config/research/protocol.toml"), scope)
     evaluation = base.evaluation.model_copy(update={"draws": 200, "block_sessions": 5, "horizon_sessions": 30})
-    champion = base.champion.model_copy(update={"require_neighbors": require_neighbors})
+    champion = base.champion.model_copy(
+        update={
+            "require_neighbors": require_neighbors,
+            "paired_horizon": paired_horizon,
+            "multiplicity": multiplicity,
+        }
+    )
     return base.model_copy(update={"evaluation": evaluation, "champion": champion})
 
 
@@ -203,6 +214,7 @@ def _decide(
     challenger_spec: StrategySpec,
     champion_spec: StrategySpec,
     protocol: ResearchProtocol | None = None,
+    prior_decisions: int = 0,
 ) -> ChallengeDecision:
     protocol = protocol if protocol is not None else _protocol()
     return decide_challenge(
@@ -213,6 +225,7 @@ def _decide(
         champion_spec=champion_spec,
         protocol=protocol,
         policy=_policy(protocol),
+        prior_decisions=prior_decisions,
     )
 
 
@@ -589,18 +602,7 @@ def test_promote_requires_the_saved_decision(tmp_path: Path) -> None:
     assert store.decisions() == (decision,)
     assert store.decision_path(decision.digest).is_file()
 
-    blocked = ChallengeDecision(
-        challenger_hash=decision.challenger_hash,
-        champion_hash=decision.champion_hash,
-        run_ids=decision.run_ids,
-        window=decision.window,
-        paired=decision.paired,
-        challenger_j=decision.challenger_j,
-        champion_j=decision.champion_j,
-        neighbors=decision.neighbors,
-        knob_changes=decision.knob_changes,
-        reasons=("paired_lower_bound",),
-    )
+    blocked = replace(decision, reasons=("paired_lower_bound",))
     store.save_decision(blocked)
     with pytest.raises(ValueError, match="not promotable"):
         store.promote(decision=blocked, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW)
@@ -640,18 +642,7 @@ def test_promote_refuses_a_stale_champion_and_mismatched_run(tmp_path: Path) -> 
             spec_path=Path("c.toml"),
             now=_NOW,
         )
-    shifted = ChallengeDecision(
-        challenger_hash=decision.challenger_hash,
-        champion_hash=decision.champion_hash,
-        run_ids=decision.run_ids,
-        window=(sessions[0], date(2019, 3, 15)),
-        paired=decision.paired,
-        challenger_j=decision.challenger_j,
-        champion_j=decision.champion_j,
-        neighbors=decision.neighbors,
-        knob_changes=decision.knob_changes,
-        reasons=(),
-    )
+    shifted = replace(decision, window=(sessions[0], date(2019, 3, 15)), reasons=())
     store.save_decision(shifted)
     with pytest.raises(ValueError, match="different window"):
         store.promote(decision=shifted, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW)
@@ -873,3 +864,209 @@ def test_trend_knobs_need_neighbors() -> None:
     )
     assert decision.knob_changes == ("trend_overlay.ma_sessions",)
     assert decision.reasons == ("neighbors_missing:trend_overlay.ma_sessions",)
+
+
+def test_full_horizon_tightens_the_interval() -> None:
+    sessions = _sessions(2000)
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    champion = _run(champion_spec, sessions, drift=0.0008, noise=0.004, seed=3)
+    challenger = _run(challenger_spec, sessions, drift=0.0012, noise=0.004, seed=4)
+    base_protocol = _protocol()
+    base_protocol = base_protocol.model_copy(update={"evaluation": base_protocol.evaluation.model_copy(
+        update={"horizon_sessions": 1260, "block_sessions": 63, "draws": 400}
+    )})
+    base_policy = _policy(base_protocol)
+    narrow = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=base_protocol.model_copy(
+            update={"champion": base_protocol.champion.model_copy(update={"paired_horizon": "full"})}
+        ),
+    )
+    wide = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=base_protocol,
+    )
+    assert narrow.paired_horizon_sessions == len(sessions)
+    assert wide.paired_horizon_sessions == base_policy.horizon_sessions
+    assert narrow.paired.lower > wide.paired.lower
+    assert narrow.paired.mean == pytest.approx(wide.paired.mean, abs=0.005)
+
+
+def test_bonferroni_uses_prior_decisions() -> None:
+    sessions = _sessions()
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"num_leaves": 31})
+    protocol = _protocol(multiplicity="bonferroni_decisions")
+    challenger = _run(challenger_spec, sessions, drift=0.0012, noise=0.004, seed=4)
+    champion = _run(champion_spec, sessions, drift=0.0008)
+    assert protocol.champion.alpha == pytest.approx(0.05)
+    decision = _decide(
+        challenger=challenger,
+        champion=champion,
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+        prior_decisions=4,
+    )
+    assert decision.alpha_effective == pytest.approx(0.01)
+    assert decision.prior_decisions == 4
+    assert decision_from_canonical_json(decision.canonical_json()) == decision
+    rng = np.random.default_rng(protocol.evaluation.seed)
+    difference = challenger.evidence.stress_slippage.log_returns - champion.evidence.stress_slippage.log_returns
+    deltas = [
+        np.concatenate([difference[start:start + 5] for start in rng.integers(0, 56, size=6)]).mean() * _SPY
+        for _ in range(200)
+    ]
+    assert decision.paired.lower == pytest.approx(float(np.quantile(deltas, 0.01)))
+    unadjusted = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+        prior_decisions=0,
+    )
+    assert unadjusted.alpha_effective == pytest.approx(0.05)
+    assert decision.paired.lower <= unadjusted.paired.lower
+    with pytest.raises(ValueError, match="prior_decisions"):
+        _decide(
+            challenger=_run(challenger_spec, sessions, drift=0.0012),
+            champion=_run(champion_spec, sessions, drift=0.0008),
+            challenger_spec=challenger_spec,
+            champion_spec=champion_spec,
+            protocol=protocol,
+            prior_decisions=-1,
+        )
+
+
+def test_legacy_decision_files_still_load() -> None:
+    sessions = _sessions()
+    champion_spec = _spec(policy={"n": 20})
+    challenger_spec = _spec(policy={"n": 25})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(_run(_spec(policy={"n": 30}), sessions, drift=0.0010),),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    payload = json.loads(decision.canonical_json())
+    del payload["alpha_effective"]
+    del payload["paired_horizon_sessions"]
+    del payload["prior_decisions"]
+    restored = decision_from_canonical_json(json.dumps(payload))
+    assert restored.challenger_hash == decision.challenger_hash
+    assert restored.champion_hash == decision.champion_hash
+    assert restored.run_ids == decision.run_ids
+    assert restored.paired.mean == pytest.approx(decision.paired.mean)
+    assert restored.alpha_effective == pytest.approx(0.05)
+    assert restored.paired_horizon_sessions == 1260
+    assert restored.prior_decisions == 0
+    customized = decision_from_canonical_json(json.dumps(payload), alpha=0.02, horizon_sessions=30)
+    assert customized.alpha_effective == 0.02
+    assert customized.paired_horizon_sessions == 30
+
+
+def test_ruin_guard_non_blocking_under_v5() -> None:
+    from src.research.evaluation import build_report_card
+
+    sessions = _sessions()
+    protocol, _ = _v5_protocol_and_scope()
+    assert protocol.evaluation.max_p_ruin == pytest.approx(1.0)
+    evidence = _evidence(sessions, drift=0.001)
+    logs = np.concatenate([np.full(10, -0.1), np.full(50, 0.03)])
+    evidence = replace(evidence, stress_slippage=_outcome(sessions, logs), stress_delay=_outcome(sessions, logs))
+    policy = _policy(protocol).model_copy(update={"block_sessions": 60, "horizon_sessions": 60, "draws": 2})
+    relaxed = build_report_card(
+        evidence, policy, spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_version=protocol.version,
+    )
+    assert relaxed.guards[0].value == 1.0
+    assert relaxed.passed is True
+    strict = build_report_card(
+        evidence, policy.model_copy(update={"max_p_ruin": 0.05}),
+        spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_version=protocol.version,
+    )
+    assert strict.passed is False
+
+
+def _v5_protocol_and_scope() -> tuple[ResearchProtocol, Any]:
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    from src.data.research_protocol import load_research_protocol
+
+    return load_research_protocol(Path("config/research/protocol.toml"), scope), scope
+
+
+@pytest.mark.parametrize("missing", [
+    None, "policy.trend_fail_weight_fraction", "book.rebalance_band",
+    "trend_overlay.ma_sessions", "trend_overlay.long_fraction", "trend_overlay.short_fraction",
+])
+def test_growth_runbook_neighbors_cover_strategy_knobs(missing: str | None) -> None:
+    from src.research.pipeline import load_strategy_spec
+
+    root = Path("config/research/strategies")
+    champion_spec = load_strategy_spec(root / "ml_sleeve_hedge.toml")
+    challenger_spec = load_strategy_spec(root / "ml_growth_t85_b50_k200.toml")
+    sessions = _sessions()
+    neighbor_specs = [
+        load_strategy_spec(path) for path in sorted(root.glob("ml_growth_*.toml"))
+        if path.name != "ml_growth_t85_b50_k200.toml"
+    ]
+    neighbors = tuple(
+        _run(spec, sessions, drift=0.0011) for spec in neighbor_specs
+        if missing not in knob_changes(challenger_spec, spec)
+    )
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008), neighbors=neighbors,
+        challenger_spec=challenger_spec, champion_spec=champion_spec,
+        protocol=_protocol(paired_horizon="full", multiplicity="bonferroni_decisions"),
+    )
+    assert "hedge.hedge_ratio" in decision.knob_changes
+    assert "trend_overlay.initial_margin_rate" in decision.knob_changes
+    assert decision.reasons == (() if missing is None else (f"neighbors_missing:{missing}",))
+
+
+def test_trend_contract_terms_are_audited_without_neighbor_requirement() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec()
+    challenger_spec = _trend_spec(trend_overlay={"initial_margin_rate": 0.15})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec, champion_spec=champion_spec,
+    )
+    assert decision.knob_changes == ("trend_overlay.initial_margin_rate",)
+    assert decision.promotable
+
+
+def test_trend_cadence_change_still_requires_neighbor() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec()
+    challenger_spec = _trend_spec(trend_overlay={"rebalance_every_sessions": 1})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec, champion_spec=champion_spec,
+    )
+    assert decision.reasons == ("neighbors_missing:trend_overlay.rebalance_every_sessions",)
+
+
+def test_overlay_removal_does_not_require_impossible_neighbors() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec()
+    challenger_spec = _spec()
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec, champion_spec=champion_spec,
+    )
+    assert decision.promotable

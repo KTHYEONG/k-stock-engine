@@ -1,4 +1,4 @@
-"""Research data-window guard, report-card policy and scenario bindings (protocol v4)."""
+"""Research data-window guard, report-card policy and scenario bindings (protocol v5)."""
 from __future__ import annotations
 
 import hashlib
@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -70,16 +70,27 @@ class ScenarioPolicy(BaseModel):
 
 
 class ChampionPolicy(BaseModel):
-    """Champion/challenger promotion rule parameters."""
+    """Champion/challenger promotion rule parameters.
+
+    ``paired_horizon``: ``"evaluation"`` bootstraps paired paths of ``evaluation.horizon_sessions`` (v4 behaviour);
+    ``"full"`` uses the full shared sample length. Why full: the decision compares expected growth, whose sampling
+    error shrinks with the whole sample; a 5-year path adds future-realisation noise that is not about which
+    strategy is better.
+    ``multiplicity``: ``"none"`` (v4) or ``"bonferroni_decisions"``. The latter tests at ``alpha / (1 + m)``, where m
+    is the number of saved decisions naming the current champion. Why: every challenge on the same champion is
+    another draw at the same data, so the family-wise error must be paid explicitly.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     alpha: Annotated[float, Field(gt=0.0, lt=0.5)]
     require_neighbors: bool
+    paired_horizon: Literal["evaluation", "full"] = "evaluation"
+    multiplicity: Literal["none", "bonferroni_decisions"] = "none"
 
 
 class ResearchProtocol(BaseModel):
-    """Data window, report-card policy and scenarios of the research program (v4).
+    """Data window, report-card policy and scenarios of the research program (v5).
 
     There is no sealed segment: any window between ``evaluation_start`` and the last certified session may
     be evaluated any number of times. Selection bias is handled by champion/challenger paired comparison

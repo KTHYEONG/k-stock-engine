@@ -1,4 +1,4 @@
-"""Protocol v4 binding and window-guard invariants."""
+"""Protocol v5 binding and window-guard invariants."""
 from __future__ import annotations
 
 from datetime import date
@@ -20,9 +20,9 @@ def _protocol():  # type: ignore[no-untyped-def]
     return load_research_protocol(Path("config/research/protocol.toml"), scope), scope
 
 
-def test_protocol_v4_loads() -> None:
+def test_protocol_v5_loads() -> None:
     protocol, _ = _protocol()
-    assert protocol.version == "research-protocol-v4"
+    assert protocol.version == "research-protocol-v5"
     assert protocol.evaluation_start == date(2017, 4, 1)
     assert protocol.sessions_per_year == 252
     assert protocol.primary_capital_krw == 100_000_000
@@ -32,7 +32,7 @@ def test_protocol_v4_loads() -> None:
     assert protocol.evaluation.horizon_sessions == 1260
     assert protocol.evaluation.objective_quantile == pytest.approx(0.10)
     assert protocol.evaluation.ruin_mdd_limit == pytest.approx(-0.5)
-    assert protocol.evaluation.max_p_ruin == pytest.approx(0.05)
+    assert protocol.evaluation.max_p_ruin == pytest.approx(1.0)
     assert protocol.evaluation.max_p_growth_le_zero == pytest.approx(0.05)
     assert tuple(protocol.evaluation.report_mdd_limits) == (-0.3, -0.5)
     assert protocol.evaluation.recent_sessions == 252
@@ -45,6 +45,8 @@ def test_protocol_v4_loads() -> None:
     assert protocol.scenarios.perturbation_seed == 7
     assert protocol.champion.alpha == pytest.approx(0.05)
     assert protocol.champion.require_neighbors is True
+    assert protocol.champion.paired_horizon == "full"
+    assert protocol.champion.multiplicity == "bonferroni_decisions"
 
 
 def test_content_hash_stable() -> None:
@@ -165,7 +167,7 @@ def test_load_protocol_domains(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("ruin_mdd_limit = -0.5", "ruin_mdd_limit = 0.0"), scope)
     with pytest.raises(ConfigError):
-        load_research_protocol(_bad("max_p_ruin = 0.05", "max_p_ruin = 2.0"), scope)
+        load_research_protocol(_bad("max_p_ruin = 1.0", "max_p_ruin = 2.0"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_bad("cost_grid_ticks = [0.0, 0.5, 1.0, 1.5]", "cost_grid_ticks = []"), scope)
     with pytest.raises(ConfigError):
@@ -178,3 +180,50 @@ def test_load_protocol_domains(tmp_path: Path) -> None:
         load_research_protocol(
             _bad("require_neighbors = true", 'require_neighbors = "maybe"'), scope
         )
+
+
+def test_v4_file_keeps_v4_semantics(tmp_path: Path) -> None:
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    lines = [
+        line
+        for line in Path("config/research/protocol.toml").read_text(encoding="utf-8").splitlines()
+        if line.strip() not in ('paired_horizon = "full"', 'multiplicity = "bonferroni_decisions"')
+    ]
+    v4_path = tmp_path / "protocol-v4.toml"
+    v4_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    protocol = load_research_protocol(v4_path, scope)
+    assert protocol.champion.paired_horizon == "evaluation"
+    assert protocol.champion.multiplicity == "none"
+
+
+def test_v5_keys_round_trip_and_change_the_hash(tmp_path: Path) -> None:
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    v5_path = Path("config/research/protocol.toml")
+    v5_protocol = load_research_protocol(v5_path, scope)
+    assert v5_protocol.champion.paired_horizon == "full"
+    assert v5_protocol.champion.multiplicity == "bonferroni_decisions"
+    lines = [
+        line
+        for line in v5_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() not in ('paired_horizon = "full"', 'multiplicity = "bonferroni_decisions"')
+    ]
+    stripped_path = tmp_path / "protocol-stripped.toml"
+    stripped_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    stripped = load_research_protocol(stripped_path, scope)
+    assert stripped.content_hash != v5_protocol.content_hash
+
+
+def test_unknown_champion_key_rejected(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+    bad = tmp_path / "bad-horizon.toml"
+    bad.write_text(base.replace('paired_horizon = "full"', 'paired_horizon = "5y"'), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_research_protocol(bad, scope)
