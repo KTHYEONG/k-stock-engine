@@ -79,6 +79,10 @@ class ChampionPolicy(BaseModel):
     ``multiplicity``: ``"none"`` (v4) or ``"bonferroni_decisions"``. The latter tests at ``alpha / (1 + m)``, where m
     is the number of saved decisions naming the current champion. Why: every challenge on the same champion is
     another draw at the same data, so the family-wise error must be paid explicitly.
+    ``noninferiority_margin`` (None = path disabled): δ, the annual log-growth loss tolerated when the tail risk is
+    shown to shrink. Why declared and not fitted: a margin chosen after seeing a candidate's interval would make the
+    gate a formality.
+    ``tail_quantile`` / ``tail_block_sessions``: the CVaR definition of the non-inferiority path.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -87,6 +91,9 @@ class ChampionPolicy(BaseModel):
     require_neighbors: bool
     paired_horizon: Literal["evaluation", "full"] = "evaluation"
     multiplicity: Literal["none", "bonferroni_decisions"] = "none"
+    noninferiority_margin: Annotated[float, Field(gt=0.0, lt=0.5)] | None = None
+    tail_quantile: Annotated[float, Field(gt=0.0, le=0.5)] = 0.05
+    tail_block_sessions: PositiveInt = 21
 
 
 class ResearchProtocol(BaseModel):
