@@ -631,10 +631,10 @@ def test_capital_is_part_of_the_run_identity(tmp_path: Path, monkeypatch: pytest
     assert len(pipe._ctx.registry.runs(run_id=small.report.run_id)) == per_run
     assert len(pipe._ctx.registry.runs(run_id=large.report.run_id)) == per_run
     written = sorted(path.name for path in (tmp_path / "reports").glob("*.json"))
-    assert written == [
+    assert written == sorted([
         f"{spec.spec_hash}_{large.report.run_id}.json",
         f"{spec.spec_hash}_{small.report.run_id}.json",
-    ]
+    ])
 
 
 def test_non_primary_capital_keeps_integrity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1121,7 +1121,10 @@ def _causal_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str) -> An
 def test_perturbation_result_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pipe, run = _causal_run(tmp_path, monkeypatch, "a")
     assert run.evidence.perturbation_mismatches == 0
-    assert run.report.digest == "8c732e8664c9fcb5657b260c0b7b022d5c43a1e6bd4888ad8e58fc1138d0e541"
+    monkeypatch.setattr(type(pipe), "_perturbation_cuts", lambda self, **kwargs: ())
+    _, unperturbed = _causal_run(tmp_path, monkeypatch, "b")
+    assert run.report.canonical_json() == unperturbed.report.canonical_json()
+    assert run.report.digest == unperturbed.report.digest
     assert len(pipe._ctx.registry.runs(run_id=run.report.run_id)) == 9
 
 
@@ -1398,3 +1401,44 @@ def test_lazy_corruption_still_catches_a_panel_leak(tmp_path: Path, monkeypatch:
     assert run.evidence.perturbation_mismatches > 0
     assert {c.name: c for c in run.report.integrity}["perturbation_mismatches"].passed is False
     assert run.report.passed is False
+
+
+def test_band_reaches_every_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.pipeline as pipeline_mod
+
+    sessions = _sessions()
+    pipe = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    spec = _spec(book={"rebalance_band": 0.5})
+    calls: list[dict[str, Any]] = []
+    runner = pipe._ctx.ledger_runner
+    simulator = pipeline_mod.simulate
+    sim_bands: list[float] = []
+
+    def _sim_spy(*args: Any, **kwargs: Any) -> Any:
+        sim_bands.append(kwargs["rebalance_band"])
+        return simulator(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "simulate", _sim_spy)
+
+    def _spy(**kwargs: Any) -> Any:
+        calls.append(dict(kwargs))
+        return runner(**kwargs)
+
+    object.__setattr__(pipe._ctx, "ledger_runner", _spy)
+    real_cuts = type(pipe)._perturbation_cuts
+
+    def _one_cut(self: Any, **kwargs: Any) -> Any:
+        got = real_cuts(self, **kwargs)
+        if got:
+            return (got[0],)
+        lo, hi = int(kwargs["lo"]), int(kwargs["hi"])
+        return (lo + 1,) if hi > lo + 1 else ()
+
+    monkeypatch.setattr(type(pipe), "_perturbation_cuts", _one_cut)
+    pipe.evaluate(spec)
+    ticks = list(pipe._ctx.protocol.scenarios.cost_grid_ticks)
+    assert len(calls) == 3 + len(ticks) + 2 + 1
+    assert calls
+    assert all(float(call.get("rebalance_band", -1.0)) == 0.5 for call in calls)
+    assert sim_bands == [0.5]

@@ -78,15 +78,27 @@ def _target_orders(
     holdings: Mapping[int, int],
     nav: int,
     buffer_scale: float,
+    rebalance_band: float = 0.0,
 ) -> list[Order]:
+    """Orders moving holdings toward ``weights``; resizes of continuing positions inside the band are skipped."""
     orders: list[Order] = []
     close = arrays.int_fields["close"][t]
     present = arrays.bool_fields["present"][t]
     for instrument_idx, weight in weights.items():
         if not present[instrument_idx] or int(close[instrument_idx]) == 0:
             continue
-        target_q = math.floor(weight * float(nav) * buffer_scale / float(close[instrument_idx]))
-        delta = target_q - holdings.get(instrument_idx, 0)
+        price = float(close[instrument_idx])
+        target_q = math.floor(weight * float(nav) * buffer_scale / price)
+        held = holdings.get(instrument_idx, 0)
+        delta = target_q - held
+        if (
+            rebalance_band > 0.0
+            and held > 0
+            and float(weight) > 0.0
+            and target_q > 0
+            and abs(delta) * price < rebalance_band * target_q * price
+        ):
+            continue
         if delta > 0:
             orders.append(Order(instrument_idx, Side.BUY, delta, t))
         elif delta < 0:
@@ -419,6 +431,7 @@ def run_backtest(
     overlay: OverlayPolicy | None = None,
     overlay_market: OverlayMarket | None = None,
     derivatives: DerivativeConfig | None = None,
+    rebalance_band: float = 0.0,
 ) -> BacktestResult:
     """Replay pre-decided target weights on the fixed session timeline.
 
@@ -451,6 +464,9 @@ def run_backtest(
         raise ValueError(f"run window [{start}, {end}] is not within the panel sessions")
     lo, hi = session_index[start], session_index[end]
     n_instruments = len(arrays.instrument_ids)
+    if isinstance(rebalance_band, bool) or not math.isfinite(float(rebalance_band)) or not 0.0 <= float(rebalance_band) < 1.0:
+        raise ValueError(f"rebalance_band must satisfy 0 <= b < 1, got {rebalance_band!r}")
+    band = float(rebalance_band)
     schedule = _validate_targets(targets, lo=lo, hi=hi, n_instruments=n_instruments)
     given = (overlay is not None, overlay_market is not None, derivatives is not None)
     if any(given) and not all(given):
@@ -498,7 +514,7 @@ def run_backtest(
         pending.extend(
             _target_orders(
                 weights=schedule[lo - 1], arrays=arrays, t=lo - 1, holdings={},
-                nav=config.initial_cash, buffer_scale=buffer_scale,
+                nav=config.initial_cash, buffer_scale=buffer_scale, rebalance_band=band,
             )
         )
     pending_overlay: OverlayTarget | None = None
@@ -685,7 +701,7 @@ def run_backtest(
         if t in schedule and t >= lo:
             pending = carried + _target_orders(
                 weights=schedule[t], arrays=arrays, t=t, holdings=ledger.positions(),
-                nav=sizing_nav, buffer_scale=buffer_scale,
+                nav=sizing_nav, buffer_scale=buffer_scale, rebalance_band=band,
             )
         else:
             pending = carried

@@ -212,6 +212,7 @@ def run_ledger(
     auction_slippage_ticks: float | None = None,
     sessions_per_year: int = 252,
     market_arrays: MarketArrays | None = None,
+    rebalance_band: float = 0.0,
 ) -> LedgerOutcome:
     """Replay screening targets through the integer-ledger engine.
 
@@ -276,6 +277,7 @@ def run_ledger(
         overlay=overlay,
         overlay_market=overlay_market,
         derivatives=derivatives,
+        rebalance_band=rebalance_band,
     )
     sessions = tuple(arrays.sessions[record.session_idx] for record in result.nav)
     logs = np.empty(len(result.nav), dtype=np.float64)

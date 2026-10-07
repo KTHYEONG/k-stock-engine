@@ -851,13 +851,15 @@ class Pipeline:
                 auction_slippage_ticks=slip_ticks,
                 sessions_per_year=spy,
                 market_arrays=market_arrays,
+                rebalance_band=float(spec.book.rebalance_band),
             )
         _log_memory_phase("scenarios")
 
         index_log_returns = self._index_log_returns(window_sessions)
         universe_ew = self._universe_ew_log_returns(lo, hi, uni_full, close_full)
         float_result = simulate(
-            ctx.cube, executable, start=start, end=end, config=self._sim_config(capital), authorization=auth
+            ctx.cube, executable, start=start, end=end, config=self._sim_config(capital), authorization=auth,
+            rebalance_band=float(spec.book.rebalance_band),
         )
         fast_sim_growth = float(
             annualized_log_growth(np.asarray(float_result.log_returns), sessions_per_year=spy)
@@ -1104,6 +1106,7 @@ class Pipeline:
             auction_slippage_ticks=None,
             sessions_per_year=spy,
             market_arrays=corrupted_arrays,
+            rebalance_band=float(spec.book.rebalance_band),
         )
         total = 0
         for row, weights in executable.items():

@@ -359,3 +359,53 @@ def test_simulator_ledger_pricing_parity() -> None:
         config=_config(auction_slippage_ticks=0.5), authorization=_auth(sessions[0], sessions[-1]),
     )
     assert float(half_tick.cost[1] / half_tick.turnover[1]) == pytest.approx(25.0 / 10000.0, rel=1e-9)
+
+
+def test_zero_band_is_bitwise_identity() -> None:
+    sessions = synthetic_sessions(5)
+    cube = synthetic_cube(sessions, INSTRS)
+    targets = {
+        0: np.array([0.5, 0.3, 0.0]),
+        1: np.array([0.4, 0.4, 0.0]),
+        2: np.array([0.0, 0.5, 0.3]),
+    }
+    auth = _auth(sessions[0], sessions[-1])
+    cfg = _config()
+    base = simulate(cube, targets, start=sessions[0], end=sessions[-1], config=cfg, authorization=auth)
+    banded = simulate(
+        cube, targets, start=sessions[0], end=sessions[-1], config=cfg, authorization=auth,
+        rebalance_band=0.0,
+    )
+    for name in ("nav_krw", "log_returns", "turnover", "cost", "holdings"):
+        assert np.array_equal(np.asarray(getattr(base, name)), np.asarray(getattr(banded, name)))
+    assert base.blocked_buy_share == banded.blocked_buy_share
+
+
+def test_band_reduces_turnover_without_touching_exits() -> None:
+    sessions = synthetic_sessions(6)
+    cube = _cube_with_returns(sessions)
+    drifted = {
+        0: np.array([0.5, 0.3, 0.0]),
+        1: np.array([0.48, 0.32, 0.0]),
+        2: np.array([0.0, 0.5, 0.3]),
+        3: np.array([0.0, 0.48, 0.32]),
+        4: np.zeros(3),
+    }
+    auth = _auth(sessions[0], sessions[-1])
+    cfg = _config()
+    plain = simulate(cube, drifted, start=sessions[0], end=sessions[-1], config=cfg, authorization=auth)
+    banded = simulate(
+        cube, drifted, start=sessions[0], end=sessions[-1], config=cfg, authorization=auth,
+        rebalance_band=0.5,
+    )
+    assert float(np.sum(banded.turnover)) <= float(np.sum(plain.turnover))
+    assert float(np.sum(banded.turnover[:3])) <= float(np.sum(plain.turnover[:3]))
+    assert float(banded.turnover[3]) > 0.0
+    assert banded.holdings[3] == 2
+    assert banded.holdings[-1] == 0
+    assert banded.turnover[-1] > 0.0
+    with pytest.raises(ValueError, match="rebalance_band"):
+        simulate(
+            cube, drifted, start=sessions[0], end=sessions[-1], config=cfg, authorization=auth,
+            rebalance_band=1.0,
+        )
