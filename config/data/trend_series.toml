@@ -1,0 +1,7 @@
+# KOSPI 200 trend-overlay underlying (KRX idx/kospi_dd_trd) and the KODEX inverse ETF.
+collection_start = 2017-01-02
+index_class = "KOSPI"
+index_name = "코스피 200"
+inverse_ticker = "114800"        # KODEX inverse (KOSPI 200), listed 2009
+available_time = "18:00:00"
+source = "krx_trend_series"

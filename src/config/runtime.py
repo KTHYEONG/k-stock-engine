@@ -25,6 +25,7 @@ class RuntimeConfig(BaseModel):
     market_rules: Path
     reference_benchmarks: Path
     hedge_series: Path
+    trend_series: Path
     cash_series: Path
     engine: Path
     research_protocol: Path

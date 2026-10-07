@@ -11,9 +11,11 @@ import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from src.config.providers import ProviderPolicy
+from src.config.runtime import RuntimeConfig
 from src.core.pit import EvidenceKind, PITDataError
 from src.core.time import KRX_TZ
 from src.data.evidence_sources import (
@@ -21,6 +23,7 @@ from src.data.evidence_sources import (
     KRX_DAILY_MARKET_SOURCE,
     KRX_HEDGE_SERIES_SOURCE,
     KRX_SECURITY_MASTER_SOURCE,
+    KRX_TREND_SERIES_SOURCE,
 )
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
@@ -36,16 +39,19 @@ __all__ = [
     "KRX_JOBS",
     "KRX_QUOTA_PROVIDER",
     "KRX_SECURITY_MASTER_SOURCE",
+    "KRX_TREND_SERIES_SOURCE",
     "KrxCashSeriesJob",
     "KrxDailyMarketJob",
     "KrxHedgeSeriesJob",
     "KrxSecurityMasterJob",
+    "KrxTrendSeriesJob",
     "build_krx_job_context",
     "completed_sessions",
     "krx_cash_series_scoped_payload",
     "krx_daily_market_scoped_payload",
     "krx_hedge_series_scoped_payload",
     "krx_security_master_scoped_payload",
+    "krx_trend_series_scoped_payload",
     "last_completed_session_day",
     "resolve_krx_job",
 ]
@@ -143,6 +149,27 @@ def krx_hedge_series_scoped_payload(
     *, records: Sequence[Mapping[str, Any]], session: date, retrieved_at: datetime
 ) -> ScopedRawPayload:
     """Convert one validated KRX hedge-series page to a scoped payload."""
+    return _index_series_payload(
+        records=records, session=session, retrieved_at=retrieved_at,
+        source=KRX_HEDGE_SERIES_SOURCE, label="krx:hedge-series",
+    )
+
+
+def krx_trend_series_scoped_payload(
+    *, records: Sequence[Mapping[str, Any]], session: date, retrieved_at: datetime
+) -> ScopedRawPayload:
+    """Convert one validated KRX trend-series page to a scoped payload."""
+    return _index_series_payload(
+        records=records, session=session, retrieved_at=retrieved_at,
+        source=KRX_TREND_SERIES_SOURCE, label="krx:trend-series",
+    )
+
+
+def _index_series_payload(
+    *, records: Sequence[Mapping[str, Any]], session: date, retrieved_at: datetime,
+    source: str, label: str,
+) -> ScopedRawPayload:
+    """Build one index-plus-inverse-ETF payload under ``source`` with ``label`` prefix."""
     body = json.dumps(
         {"session": session.isoformat(), "records": [dict(record) for record in records]},
         sort_keys=True,
@@ -150,15 +177,81 @@ def krx_hedge_series_scoped_payload(
     ).encode("utf-8")
     return ScopedRawPayload(
         kind=EvidenceKind.DAILY_MARKET,
-        source=KRX_HEDGE_SERIES_SOURCE,
+        source=source,
         natural_key=session.isoformat(),
         as_of=session,
         fiscal_period=None,
         status=EvidenceStatus.SUCCESS,
         payload=body,
         retrieved_at=retrieved_at,
-        source_label=f"krx:hedge-series:{session.isoformat()}",
+        source_label=f"{label}:{session.isoformat()}",
     )
+
+
+def _pending_index_series(
+    *, source: str, config_path_of: Callable[[RuntimeConfig], Path], ctx: JobContext
+) -> Sequence[JobUnit]:
+    """Completed sessions of one index-series config without an answered receipt."""
+    from src.config import load_runtime_config
+    from src.data.hedge_series_silver import load_hedge_series_config
+
+    config = load_hedge_series_config(config_path_of(load_runtime_config()))
+    sessions = completed_sessions(evidence_start=config.collection_start, now=ctx.now())
+    if not sessions:
+        return ()
+    answered = ctx.catalog.latest(source=source, natural_keys={day.isoformat() for day in sessions})
+    units: list[JobUnit] = []
+    for day in sessions:
+        entry = answered.get(day.isoformat())
+        if entry is not None and entry.status in _ANSWERED:
+            continue
+        units.append(
+            JobUnit(
+                source=source,
+                natural_key=day.isoformat(),
+                payload={"session": day.isoformat()},
+                max_requests=_MAX_REQUESTS_PER_SESSION,
+            )
+        )
+    return units
+
+
+def _fetch_index_series(
+    *, ctx: JobContext, units: Sequence[JobUnit],
+    config_path_of: Callable[[RuntimeConfig], Path], source: str, label: str,
+) -> Sequence[ScopedRawPayload]:
+    """Fetch one index-plus-inverse-ETF page per unit, tagging payloads with ``source``/``label``."""
+    from src.config import load_runtime_config
+    from src.data.hedge_series_silver import load_hedge_series_config
+
+    config = load_hedge_series_config(config_path_of(load_runtime_config()))
+    retrieved_at = ctx.now()
+    out: list[ScopedRawPayload] = []
+    for unit in units:
+        session = date.fromisoformat(unit.payload["session"])
+        records = list(
+            ctx.collector.fetch_hedge_records(
+                session,
+                etf_tickers=(config.inverse_ticker,),
+                index_name=config.index_name,
+                index_class=config.index_class,
+            )
+        )
+        if not records:
+            out.append(
+                _krx_empty_scoped_payload(
+                    kind=EvidenceKind.DAILY_MARKET, source=source, session=session,
+                    retrieved_at=retrieved_at
+                )
+            )
+            continue
+        out.append(
+            _index_series_payload(
+                records=records, session=session, retrieved_at=retrieved_at,
+                source=source, label=label,
+            )
+        )
+    return out
 
 
 def krx_cash_series_scoped_payload(
@@ -295,54 +388,47 @@ class KrxHedgeSeriesJob:
     kind = EvidenceKind.DAILY_MARKET
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
-        from src.config import load_runtime_config
-        from src.data.hedge_series_silver import load_hedge_series_config
-
-        hedge = load_hedge_series_config(load_runtime_config().hedge_series)
-        sessions = completed_sessions(evidence_start=hedge.collection_start, now=ctx.now())
-        if not sessions:
-            return ()
-        answered = ctx.catalog.latest(source=self.source, natural_keys={day.isoformat() for day in sessions})
-        units: list[JobUnit] = []
-        for day in sessions:
-            entry = answered.get(day.isoformat())
-            if entry is not None and entry.status in _ANSWERED:
-                continue
-            units.append(
-                JobUnit(
-                    source=self.source,
-                    natural_key=day.isoformat(),
-                    payload={"session": day.isoformat()},
-                    max_requests=_MAX_REQUESTS_PER_SESSION,
-                )
-            )
-        return units
+        return _pending_index_series(
+            source=self.source,
+            config_path_of=lambda runtime: runtime.hedge_series,
+            ctx=ctx,
+        )
 
     def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
-        from src.config import load_runtime_config
-        from src.data.hedge_series_silver import load_hedge_series_config
+        return _fetch_index_series(
+            ctx=ctx,
+            units=units,
+            config_path_of=lambda runtime: runtime.hedge_series,
+            source=self.source,
+            label="krx:hedge-series",
+        )
 
-        hedge = load_hedge_series_config(load_runtime_config().hedge_series)
-        retrieved_at = ctx.now()
-        out: list[ScopedRawPayload] = []
-        for unit in units:
-            session = date.fromisoformat(unit.payload["session"])
-            records = list(
-                ctx.collector.fetch_hedge_records(
-                    session, etf_tickers=(hedge.inverse_ticker,), index_name=hedge.index_name
-                )
-            )
-            if not records:
-                out.append(
-                    _krx_empty_scoped_payload(
-                        kind=self.kind, source=self.source, session=session, retrieved_at=retrieved_at
-                    )
-                )
-                continue
-            out.append(
-                krx_hedge_series_scoped_payload(records=records, session=session, retrieved_at=retrieved_at)
-            )
-        return out
+    def health_check(self, ctx: JobContext) -> None:
+        ctx.collector.health_check()
+
+
+class KrxTrendSeriesJob:
+    """KOSPI 200 index and KOSPI 200 inverse-ETF pages for every completed session (trend-overlay underlying)."""
+
+    name = "krx_trend_series"
+    source = KRX_TREND_SERIES_SOURCE
+    kind = EvidenceKind.DAILY_MARKET
+
+    def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
+        return _pending_index_series(
+            source=self.source,
+            config_path_of=lambda runtime: runtime.trend_series,
+            ctx=ctx,
+        )
+
+    def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
+        return _fetch_index_series(
+            ctx=ctx,
+            units=units,
+            config_path_of=lambda runtime: runtime.trend_series,
+            source=self.source,
+            label="krx:trend-series",
+        )
 
     def health_check(self, ctx: JobContext) -> None:
         ctx.collector.health_check()
@@ -409,6 +495,7 @@ KRX_JOBS: Mapping[str, JobSpec] = {
     KrxDailyMarketJob.name: KrxDailyMarketJob(),
     KrxSecurityMasterJob.name: KrxSecurityMasterJob(),
     KrxHedgeSeriesJob.name: KrxHedgeSeriesJob(),
+    KrxTrendSeriesJob.name: KrxTrendSeriesJob(),
     KrxCashSeriesJob.name: KrxCashSeriesJob(),
 }
 
