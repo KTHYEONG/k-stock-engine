@@ -6,6 +6,11 @@ stress stream with a paired block bootstrap, so shared market noise cancels and 
 sensitive than either absolute statistic. A wrong promotion can therefore only swap in a strategy that is
 statistically indistinguishable from the champion; the neighbor-plateau rule keeps numeric knobs off knife
 edges and the report card's cost grid covers execution-cost uncertainty.
+
+Two promotion paths share the report, J, neighbor-coverage, alpha and horizon gates. Superiority needs the
+paired growth lower bound above 0. Non-inferiority (enabled by a declared margin δ) needs the growth lower bound
+above -δ and the paired monthly-block CVaR lower bound above 0, because the superiority test alone can never
+promote a change that keeps growth while cutting tail risk. Superiority wins when both pass.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast, get_args
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,7 +33,7 @@ from src.core.pit import PITDataError
 from src.data.research_protocol import ResearchProtocol
 from src.research.evaluation import EvaluationEvidence, EvaluationPolicy
 from src.research.pipeline import EvaluationRun, StrategySpec, strategy_spec_from_canonical_json
-from src.research.stats import PairedDelta, paired_growth_delta
+from src.research.stats import PairedDelta, PairedRiskDelta, paired_growth_tail_delta
 
 __all__ = [
     "ChallengeDecision",
@@ -41,6 +46,7 @@ __all__ = [
 ]
 
 STRESS_STREAMS = ("stress_slippage", "stress_delay")
+PromotionPath = Literal["superiority", "noninferiority", "none"]
 TREND_CONTRACT_KNOBS = frozenset({
     "trend_overlay.contract_multiplier_krw",
     "trend_overlay.initial_margin_rate",
@@ -87,11 +93,14 @@ class ChallengeDecision:
     reasons: tuple[str, ...]  # failed rules; empty when promotable
     alpha_effective: float
     paired_horizon_sessions: int
+    path: PromotionPath
+    tail: PairedDelta | None  # challenger - champion CVaR delta; None when the path is disabled
+    noninferiority_margin: float | None
     prior_decisions: int = 0
 
     @property
     def promotable(self) -> bool:
-        return not self.reasons
+        return self.path != "none"
 
     def canonical_json(self) -> str:
         """Key-sorted compact JSON; byte-identical for identical evidence."""
@@ -103,12 +112,17 @@ class ChallengeDecision:
             "champion_j": _canon(self.champion_j),
             "knob_changes": list(self.knob_changes),
             "neighbors": [[spec_hash, _delta_fields(delta)] for spec_hash, delta in self.neighbors],
+            "noninferiority_margin": (
+                _canon(self.noninferiority_margin) if self.noninferiority_margin is not None else None
+            ),
             "paired": _delta_fields(self.paired),
             "paired_horizon_sessions": int(self.paired_horizon_sessions),
+            "path": self.path,
             "prior_decisions": self.prior_decisions,
             "promotable": self.promotable,
             "reasons": list(self.reasons),
             "run_ids": list(self.run_ids),
+            "tail": _delta_fields(self.tail) if self.tail is not None else None,
             "window": [self.window[0].isoformat(), self.window[1].isoformat()],
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -174,31 +188,32 @@ def decide_challenge(
         paired_horizon_sessions = len(sessions)
     else:
         paired_horizon_sessions = int(policy.horizon_sessions)
-    paired = _paired_delta(
-        challenger, champion, stream=stream, policy=policy,
+    paired_risk = _paired_risk_delta(
+        challenger, champion, stream=stream, policy=policy, protocol=protocol,
         alpha=alpha_effective, horizon=paired_horizon_sessions,
     )
-    neighbor_deltas = tuple(
+    paired = paired_risk.growth
+    neighbor_risk_deltas = tuple(
         (
             run.report.spec_hash,
-            _paired_delta(
-                run, champion, stream=stream, policy=policy,
+            _paired_risk_delta(
+                run, champion, stream=stream, policy=policy, protocol=protocol,
                 alpha=alpha_effective, horizon=paired_horizon_sessions,
             ),
         )
         for run in neighbor_runs
     )
+    neighbor_deltas = tuple((spec_hash, risk.growth) for spec_hash, risk in neighbor_risk_deltas)
     changes = knob_changes(challenger_spec, champion_spec)
 
     reasons: list[str] = []
     if not challenger.report.passed:
         reasons.append("report_failed")
-    if not (math.isfinite(paired.lower) and paired.lower > 0.0):
-        reasons.append("paired_lower_bound")
     challenger_j = float(challenger.report.objective_j)
     champion_j = float(champion.report.objective_j)
     if not (math.isfinite(challenger_j) and math.isfinite(champion_j) and challenger_j >= champion_j):
         reasons.append("objective_j")
+
     if protocol.champion.require_neighbors and changes:
         covered = _knob_coverage(challenger_spec, neighbor_runs)
         exempt = set(TREND_CONTRACT_KNOBS)
@@ -211,9 +226,53 @@ def decide_challenge(
             if knob.startswith("scorer.") or knob in covered or knob in exempt:
                 continue
             reasons.append(f"neighbors_missing:{knob}")
+
+    superiority_failures: list[str] = []
+    if not (math.isfinite(paired.lower) and paired.lower > 0.0):
+        superiority_failures.append("superiority:paired_lower_bound")
+    if protocol.champion.require_neighbors and changes:
         for spec_hash, delta in neighbor_deltas:
             if not (math.isfinite(delta.mean) and delta.mean > 0.0):
-                reasons.append(f"neighbor_not_better:{spec_hash}")
+                superiority_failures.append(f"superiority:neighbor_not_better:{spec_hash}")
+
+    delta_margin = protocol.champion.noninferiority_margin
+    noninferiority_failures: list[str] = []
+    if delta_margin is not None:
+        tail_delta = paired_risk.tail
+        if not (math.isfinite(paired.lower) and paired.lower > -float(delta_margin)):
+            noninferiority_failures.append("noninferiority:growth_margin")
+        if not (math.isfinite(tail_delta.lower) and tail_delta.lower > 0.0):
+            noninferiority_failures.append("noninferiority:tail_lower_bound")
+        if protocol.champion.require_neighbors and changes:
+            for spec_hash, risk in neighbor_risk_deltas:
+                if not (math.isfinite(risk.growth.mean) and risk.growth.mean > -float(delta_margin)):
+                    noninferiority_failures.append(f"noninferiority:neighbor_growth_margin:{spec_hash}")
+                if not (math.isfinite(risk.tail.mean) and risk.tail.mean > 0.0):
+                    noninferiority_failures.append(f"noninferiority:neighbor_tail_not_better:{spec_hash}")
+
+    superiority_passed = (len(reasons) == 0 and len(superiority_failures) == 0)
+    noninferiority_passed = (
+        delta_margin is not None
+        and len(reasons) == 0
+        and len(noninferiority_failures) == 0
+    )
+
+    path: PromotionPath
+    if superiority_passed:
+        path = "superiority"
+        all_reasons = tuple(reasons)
+    elif noninferiority_passed:
+        path = "noninferiority"
+        all_reasons = tuple(reasons)
+    else:
+        path = "none"
+        combined_reasons = list(reasons)
+        combined_reasons.extend(superiority_failures)
+        if delta_margin is not None:
+            combined_reasons.extend(noninferiority_failures)
+        all_reasons = tuple(combined_reasons)
+
+    tail = paired_risk.tail if delta_margin is not None else None
 
     return ChallengeDecision(
         challenger_hash=challenger.report.spec_hash,
@@ -225,9 +284,12 @@ def decide_challenge(
         champion_j=champion_j,
         neighbors=neighbor_deltas,
         knob_changes=changes,
-        reasons=tuple(reasons),
+        reasons=all_reasons,
         alpha_effective=alpha_effective,
         paired_horizon_sessions=paired_horizon_sessions,
+        path=path,
+        tail=tail,
+        noninferiority_margin=float(delta_margin) if delta_margin is not None else None,
         prior_decisions=prior_decisions,
     )
 
@@ -453,6 +515,15 @@ def decision_from_canonical_json(
             if "paired_horizon_sessions" in raw
             else horizon_sessions
         )
+        reasons = tuple(str(item) for item in raw["reasons"])
+        raw_path = str(raw["path"]) if "path" in raw else ("superiority" if len(reasons) == 0 else "none")
+        if raw_path not in get_args(PromotionPath):
+            raise ValueError(f"unknown promotion path {raw_path!r}")
+        path = cast(PromotionPath, raw_path)
+        tail = _delta_from_fields(raw["tail"]) if raw.get("tail") is not None else None
+        noninferiority_margin = (
+            _num(raw["noninferiority_margin"]) if raw.get("noninferiority_margin") is not None else None
+        )
         return ChallengeDecision(
             challenger_hash=str(raw["challenger_hash"]),
             champion_hash=str(raw["champion_hash"]),
@@ -463,9 +534,12 @@ def decision_from_canonical_json(
             champion_j=_num(raw["champion_j"]),
             neighbors=tuple((str(item[0]), _delta_from_fields(item[1])) for item in raw["neighbors"]),
             knob_changes=tuple(str(item) for item in raw["knob_changes"]),
-            reasons=tuple(str(item) for item in raw["reasons"]),
+            reasons=reasons,
             alpha_effective=alpha_effective,
             paired_horizon_sessions=paired_horizon_sessions,
+            path=path,
+            tail=tail,
+            noninferiority_margin=noninferiority_margin,
             prior_decisions=raw.get("prior_decisions", 0),
         )
     except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -518,16 +592,17 @@ def _knob_coverage(challenger: StrategySpec, neighbors: Sequence[EvaluationRun])
     return covered
 
 
-def _paired_delta(
+def _paired_risk_delta(
     challenger: EvaluationRun,
     champion: EvaluationRun,
     *,
     stream: str,
     policy: EvaluationPolicy,
+    protocol: ResearchProtocol,
     alpha: float,
     horizon: int,
-) -> PairedDelta:
-    return paired_growth_delta(
+) -> PairedRiskDelta:
+    return paired_growth_tail_delta(
         _stress_stream(challenger.evidence, stream),
         _stress_stream(champion.evidence, stream),
         block=int(policy.block_sessions),
@@ -536,6 +611,8 @@ def _paired_delta(
         horizon=int(horizon),
         sessions_per_year=int(policy.sessions_per_year),
         alpha=float(alpha),
+        tail_block_sessions=int(protocol.champion.tail_block_sessions),
+        tail_quantile=float(protocol.champion.tail_quantile),
     )
 
 
