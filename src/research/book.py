@@ -21,12 +21,18 @@ __all__ = ["BookSpec", "build_sleeve_targets", "combine_sleeve_targets", "mean_s
 
 
 class BookSpec(BaseModel):
-    """Sleeve count and stock planning fraction; part of the strategy identity."""
+    """Sleeve count, stock planning fraction and execution band; part of the strategy identity.
+
+    Continuing holdings with positive targets skip resizes when the absolute value drift is
+    below ``rebalance_band * target value``. Resizing pays slippage, impact and sell tax;
+    entries, zero targets and forced exits are never suppressed. Zero disables the band.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     sleeves: int
     stock_capital_fraction: float
+    rebalance_band: float = 0.0
 
     @field_validator("sleeves")
     @classmethod
@@ -43,9 +49,25 @@ class BookSpec(BaseModel):
             raise ValueError(f"stock_capital_fraction must satisfy 0 < f <= 1, got {value!r}")
         return out
 
+    @field_validator("rebalance_band", mode="before")
+    @classmethod
+    def _band(cls, value: object) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"rebalance_band must satisfy 0 <= b < 1, got {value!r}")
+        out = float(value)  # type: ignore[arg-type]
+        if not math.isfinite(out) or not 0.0 <= out < 1.0:
+            raise ValueError(f"rebalance_band must satisfy 0 <= b < 1, got {value!r}")
+        return out
+
     def canonical_json(self) -> str:
-        """Canonical JSON with sorted keys and compact separators."""
-        return json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        """Canonical JSON with sorted keys and compact separators.
+
+        ``rebalance_band`` is emitted only when non-zero so pre-band specs keep their hash.
+        """
+        payload = self.model_dump(mode="json")
+        if self.rebalance_band == 0.0:
+            del payload["rebalance_band"]
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def sleeve_capital_krw(total_capital_krw: int, spec: BookSpec) -> int:
