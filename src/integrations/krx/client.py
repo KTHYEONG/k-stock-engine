@@ -101,6 +101,7 @@ class KrxApiClient:
         "KOSDAQ_TRADE": "sto/ksq_bydd_trd",
         "ETF_TRADE": "etp/etf_bydd_trd",
         "KOSDAQ_INDEX": "idx/kosdaq_dd_trd",
+        "KOSPI_INDEX": "idx/kospi_dd_trd",
     }
 
     def __init__(
@@ -210,44 +211,55 @@ class KrxApiClient:
         return records
 
     def fetch_hedge_records(
-        self, as_of: date, *, etf_tickers: Sequence[str], index_name: str
+        self, as_of: date, *, etf_tickers: Sequence[str], index_name: str, index_class: str = "KOSDAQ"
     ) -> list[dict[str, Any]]:
         """Return the validated hedge-series records of one session: the requested ETF rows (tagged
-        ``"_endpoint": "etf"``) and the KOSDAQ index row named ``index_name`` (tagged ``"_endpoint": "index"``).
+        ``"_endpoint": "etf"``) and the index row with ``IDX_CLSS == index_class`` and ``IDX_NM == index_name``
+        (tagged ``"_endpoint": "index"``).
 
-        Empty list only when both pages are empty without a holiday message. Raises KrxHolidayError (via the
-        shared page reader) on a reported holiday, ProviderTerminalError when exactly one of the two pages is
-        empty, the index row is missing/duplicated, a requested ETF row is duplicated, or ``BAS_DD`` differs
-        from ``as_of`` or a price field is not positive.
+        ``index_class`` selects the KRX index page: ``"KOSDAQ"`` reads ``idx/kosdaq_dd_trd``, ``"KOSPI"`` reads
+        ``idx/kospi_dd_trd``. Why a class and not a free endpoint: the class is also the row filter, so a page and a
+        filter can never disagree.
+
+        Empty list only when both pages are empty without a holiday message.
+
+        Raises:
+            ValueError: ``index_class`` is not ``"KOSDAQ"`` or ``"KOSPI"``, or as before for the other arguments.
+            KrxHolidayError, ProviderTerminalError: as before.
         """
         if not isinstance(as_of, date):
             raise ValueError("as_of must be a date")
+        if index_class not in ("KOSDAQ", "KOSPI"):
+            raise ValueError(f'index_class must be "KOSDAQ" or "KOSPI", got {index_class!r}')
         if not isinstance(index_name, str) or not index_name.strip():
             raise ValueError("index_name must be a non-empty string")
         wanted = tuple(str(ticker).strip() for ticker in etf_tickers)
         if any(not ticker for ticker in wanted):
             raise ValueError("etf_tickers must contain non-empty strings")
+        index_endpoint = (
+            self.ENDPOINTS["KOSDAQ_INDEX"] if index_class == "KOSDAQ" else self.ENDPOINTS["KOSPI_INDEX"]
+        )
         etf_page = self._records(self.ENDPOINTS["ETF_TRADE"], as_of)
-        index_page = self._records(self.ENDPOINTS["KOSDAQ_INDEX"], as_of)
+        index_page = self._records(index_endpoint, as_of)
         if not etf_page and not index_page:
             return []
         if not etf_page or not index_page:
             raise ProviderTerminalError(
                 f"KRX hedge-series page is incomplete for {as_of.isoformat()}",
                 provider=_PROVIDER,
-                endpoint=self.ENDPOINTS["ETF_TRADE"] if not etf_page else self.ENDPOINTS["KOSDAQ_INDEX"],
+                endpoint=self.ENDPOINTS["ETF_TRADE"] if not etf_page else index_endpoint,
             )
         index_rows = [
             record
             for record in index_page
-            if str(record.get("IDX_CLSS") or "").strip() == "KOSDAQ"
+            if str(record.get("IDX_CLSS") or "").strip() == index_class
             and str(record.get("IDX_NM") or "") == index_name
         ]
         if len(index_rows) != 1:
             raise ProviderTerminalError(
                 f"KRX hedge-series index row is missing or duplicated for {as_of.isoformat()}",
                 provider=_PROVIDER,
-                endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+                endpoint=index_endpoint,
             )
         out: list[dict[str, Any]] = []
         for ticker in wanted:
@@ -294,13 +306,13 @@ class KrxApiClient:
                     raise ProviderTerminalError(
                         f"KRX hedge-series index level is not positive for {as_of.isoformat()}",
                         provider=_PROVIDER,
-                        endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+                        endpoint=index_endpoint,
                     ) from None
                 if not level > 0:
                     raise ProviderTerminalError(
                         f"KRX hedge-series index level is not positive for {as_of.isoformat()}",
                         provider=_PROVIDER,
-                        endpoint=self.ENDPOINTS["KOSDAQ_INDEX"],
+                        endpoint=index_endpoint,
                     )
             else:
                 try:

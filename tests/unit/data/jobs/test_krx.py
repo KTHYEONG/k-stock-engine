@@ -268,8 +268,8 @@ class _HedgeCollector:
         self._pages = {day: [dict(row) for row in rows] for day, rows in dict(pages or {}).items()}
         self.fetch_calls: list = []
 
-    def fetch_hedge_records(self, session, *, etf_tickers, index_name):  # type: ignore[no-untyped-def]
-        self.fetch_calls.append((session, tuple(etf_tickers), index_name))
+    def fetch_hedge_records(self, session, *, etf_tickers, index_name, index_class="KOSDAQ"):  # type: ignore[no-untyped-def]
+        self.fetch_calls.append((session, tuple(etf_tickers), index_name, index_class))
         return [dict(row) for row in self._pages.get(session, ())]
 
     def health_check(self) -> None:
@@ -380,7 +380,7 @@ def test_hedge_fetch_persists_success(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
     assert report.status == "complete"
     assert report.done == 3
-    assert collector.fetch_calls[0] == (SESSIONS[0], ("251340",), "코스닥 150")
+    assert collector.fetch_calls[0] == (SESSIONS[0], ("251340",), "코스닥 150", "KOSDAQ")
     entries = ctx.catalog.latest(
         source=krx_jobs.KRX_HEDGE_SERIES_SOURCE, natural_keys={day.isoformat() for day in SESSIONS}
     )
@@ -399,3 +399,62 @@ def test_hedge_fetch_persists_success(monkeypatch: pytest.MonkeyPatch, tmp_path:
         ],
     )
     assert [payload.source_label for payload in payloads] == [f"krx:hedge-series:{SESSIONS[0].isoformat()}"]
+
+
+def _trend_runtime(tmp_path: Path):  # type: ignore[no-untyped-def]
+    return _runtime(tmp_path)
+
+
+def test_trend_series_payload_labels_and_source() -> None:
+    import src.data.jobs.krx as krx_jobs
+
+    payload = krx_jobs.krx_trend_series_scoped_payload(
+        records=[_hedge_index_record(SESSIONS[0])],
+        session=SESSIONS[0],
+        retrieved_at=NOW_AFTER_CLOSE,
+    )
+
+    assert payload.source == krx_jobs.KRX_TREND_SERIES_SOURCE
+    assert payload.source_label == f"krx:trend-series:{SESSIONS[0].isoformat()}"
+
+
+def test_trend_job_registered_and_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import src.data.jobs.krx as krx_jobs
+    from src.data.jobs.runner import JobUnit
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    assert isinstance(krx_jobs.resolve_krx_job("krx_trend_series"), krx_jobs.KrxTrendSeriesJob)
+    runtime = _trend_runtime(tmp_path)
+    provider = _provider()
+
+    pages = {
+        day: [
+            _hedge_index_record(day) | {"IDX_CLSS": "KOSPI", "IDX_NM": "코스피 200"},
+            _hedge_etf_record(day) | {"ISU_CD": "114800"},
+        ]
+        for day in SESSIONS
+    }
+    collector = _HedgeCollector(pages=pages)
+    ctx = _ctx(runtime, provider, collector=collector)
+    units = krx_jobs.KrxTrendSeriesJob().pending(ctx)
+    assert [unit.natural_key for unit in units] == [day.isoformat() for day in SESSIONS]
+    payloads = krx_jobs.KrxTrendSeriesJob().fetch(
+        ctx,
+        [
+            JobUnit(
+                source=krx_jobs.KRX_TREND_SERIES_SOURCE,
+                natural_key=SESSIONS[0].isoformat(),
+                payload={"session": SESSIONS[0].isoformat()},
+                max_requests=2,
+            )
+        ],
+    )
+    assert [payload.source_label for payload in payloads] == [f"krx:trend-series:{SESSIONS[0].isoformat()}"]
+    assert collector.fetch_calls[0][2] == "코스피 200"
+    assert collector.fetch_calls[0][3] == "KOSPI"
+    assert collector.fetch_calls[0][1] == ("114800",)
+    ctx.writer.persist_many(payloads)
+    assert [unit.natural_key for unit in krx_jobs.KrxTrendSeriesJob().pending(ctx)] == [
+        day.isoformat() for day in SESSIONS[1:]
+    ]
+    assert len(krx_jobs.KrxHedgeSeriesJob().pending(ctx)) == len(SESSIONS)

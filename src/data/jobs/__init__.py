@@ -27,6 +27,7 @@ from src.data.jobs.krx import (
     KrxDailyMarketJob,
     KrxHedgeSeriesJob,
     KrxSecurityMasterJob,
+    KrxTrendSeriesJob,
     build_krx_job_context,
     resolve_krx_job,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "KrxDailyMarketJob",
     "KrxHedgeSeriesJob",
     "KrxSecurityMasterJob",
+    "KrxTrendSeriesJob",
     "LsInvestorFlowJob",
     "build_job_context",
     "build_kind_job_context",

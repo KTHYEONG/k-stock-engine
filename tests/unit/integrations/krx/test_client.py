@@ -356,3 +356,71 @@ def test_hedge_records_reject_bad_prices() -> None:
     bad_etf = _client(_hedge_handler([_hedge_etf_row(TDD_CLSPRC="abc")], [_hedge_index_row()]))
     with pytest.raises(ProviderTerminalError):
         bad_etf.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+
+def _kospi_handler(etf_rows, index_rows):  # type: ignore[no-untyped-def]
+    def _handle(endpoint, params):  # type: ignore[no-untyped-def]
+        if endpoint == "etp/etf_bydd_trd":
+            return _FakeResponse({"OutBlock_1": [dict(row) for row in etf_rows]})
+        if endpoint == "idx/kospi_dd_trd":
+            return _FakeResponse({"OutBlock_1": [dict(row) for row in index_rows]})
+        raise AssertionError(f"unexpected endpoint {endpoint}")
+
+    return _handle
+
+
+def _kospi_index_row(**overrides):  # type: ignore[no-untyped-def]
+    row = {"IDX_CLSS": "KOSPI", "IDX_NM": "코스피 200", "BAS_DD": "20260105", "CLSPRC_IDX": "1109.05"}
+    row.update(overrides)
+    return row
+
+
+def test_hedge_records_kospi_class_reads_kospi_page() -> None:
+    client = _client(_kospi_handler([_hedge_etf_row(ISU_CD="114800")], [_kospi_index_row(IDX_CLSS=" KOSPI ")]))
+
+    records = client.fetch_hedge_records(
+        SESSION, etf_tickers=("114800",), index_name="코스피 200", index_class="KOSPI"
+    )
+
+    assert len(records) == 2
+    by_tag = {record["_endpoint"]: record for record in records}
+    assert by_tag["index"]["CLSPRC_IDX"] == "1109.05"
+    assert [call[0] for call in client._transport.calls] == ["etp/etf_bydd_trd", "idx/kospi_dd_trd"]
+    assert "idx/kosdaq_dd_trd" not in [call[0] for call in client._transport.calls]
+
+
+def test_hedge_records_default_class_is_unchanged() -> None:
+    etf_rows = [_hedge_etf_row()]
+    index_rows = [_hedge_index_row()]
+    client = _client(_hedge_handler(etf_rows, index_rows))
+
+    records = client.fetch_hedge_records(SESSION, etf_tickers=("251340",), index_name="코스닥 150")
+
+    assert [call[0] for call in client._transport.calls] == ["etp/etf_bydd_trd", "idx/kosdaq_dd_trd"]
+    assert len(records) == 2
+
+
+def test_hedge_records_unknown_class_rejected_before_request() -> None:
+    client = _client(_hedge_handler([_hedge_etf_row()], [_hedge_index_row()]))
+
+    with pytest.raises(ValueError, match="index_class"):
+        client.fetch_hedge_records(
+            SESSION, etf_tickers=("251340",), index_name="코스닥 150", index_class="KRX"
+        )
+
+    assert client._transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "row", [_kospi_index_row(IDX_NM="코스피 100"), _kospi_index_row(IDX_CLSS="KOSDAQ"),
+            _kospi_index_row(IDX_NM="코스피 200 ")],
+)
+def test_hedge_records_missing_kospi_row_fails_closed(row) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.errors import ProviderTerminalError
+
+    client = _client(_kospi_handler([_hedge_etf_row(ISU_CD="114800")], [row]))
+
+    with pytest.raises(ProviderTerminalError):
+        client.fetch_hedge_records(
+            SESSION, etf_tickers=("114800",), index_name="코스피 200", index_class="KOSPI"
+        )
