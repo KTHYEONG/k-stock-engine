@@ -230,3 +230,21 @@ def test_mean_sleeve_returns() -> None:
         mean_sleeve_returns([])
     with pytest.raises(ValueError, match="1-D"):
         mean_sleeve_returns([np.array([[0.01]])])
+
+
+def test_zero_band_keeps_identity() -> None:
+    spec = BookSpec(sleeves=5, stock_capital_fraction=0.75)
+    payload = spec.canonical_json()
+    assert "rebalance_band" not in payload
+    assert payload == '{"sleeves":5,"stock_capital_fraction":0.75}'
+    assert BookSpec(sleeves=5, stock_capital_fraction=0.75, rebalance_band=0.0).canonical_json() == payload
+
+
+def test_band_out_of_range_rejected() -> None:
+    for bad in (-0.1, 1.0, float("nan"), float("inf"), True, False):
+        with pytest.raises(ValueError, match="rebalance_band"):
+            BookSpec(sleeves=5, stock_capital_fraction=0.75, rebalance_band=bad)  # type: ignore[arg-type]
+    assert BookSpec(sleeves=5, stock_capital_fraction=0.75, rebalance_band=0.5).rebalance_band == 0.5
+    assert BookSpec(sleeves=5, stock_capital_fraction=0.75, rebalance_band=0.5).canonical_json() == (
+        '{"rebalance_band":0.5,"sleeves":5,"stock_capital_fraction":0.75}'
+    )

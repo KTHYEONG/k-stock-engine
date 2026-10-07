@@ -156,6 +156,7 @@ def simulate(
     end: date,
     config: SimConfig,
     authorization: WindowAuthorization,
+    rebalance_band: float = 0.0,
 ) -> SimResult:
     """Simulate target weights on the fixed session timeline in weight space.
 
@@ -165,9 +166,12 @@ def simulate(
     Raises:
         WindowError: ``[start, end]`` is not inside ``[authorization.start, authorization.end]``.
         ValueError: ``start``/``end`` outside the cube sessions, a target row outside
-            ``[lo - 1 - delay, hi - 1 - delay]``, a target vector of the wrong length, or negative /
-            non-finite weights or a row sum above 1.
+            ``[lo - 1 - delay, hi - 1 - delay]``, a target vector of the wrong length, negative /
+            non-finite weights or a row sum above 1, or ``rebalance_band`` outside ``[0, 1)``.
     """
+    if isinstance(rebalance_band, bool) or not math.isfinite(float(rebalance_band)) or not 0.0 <= float(rebalance_band) < 1.0:
+        raise ValueError(f"rebalance_band must satisfy 0 <= b < 1, got {rebalance_band!r}")
+    band = float(rebalance_band)
     if start < authorization.start or end > authorization.end:
         raise WindowError(f"run window [{start}, {end}] is not inside the authorization")
     sessions = list(cube.sessions)
@@ -237,6 +241,9 @@ def simulate(
             w = np.asarray(targets[d], dtype=np.float64)
             target_value = w * pre_nav * buffer_scale
             delta = target_value - holdings
+            if band > 0.0:
+                keep = (holdings > 0.0) & (target_value > 0.0) & (np.abs(delta) < band * target_value)
+                delta = np.where(keep, 0.0, delta)
             sizable = np.isfinite(adtv[d]) & (adtv[d] > 0) & np.isfinite(vol60[d])
             sell_ok = (
                 np.asarray(present[t], dtype=bool)
