@@ -41,6 +41,15 @@ __all__ = [
 ]
 
 STRESS_STREAMS = ("stress_slippage", "stress_delay")
+TREND_CONTRACT_KNOBS = frozenset({
+    "trend_overlay.contract_multiplier_krw",
+    "trend_overlay.initial_margin_rate",
+    "trend_overlay.margin_buffer_rate",
+    "trend_overlay.margin_topup_trigger_fraction",
+    "trend_overlay.futures_cost_rate",
+    "trend_overlay.futures_tax_rate",
+    "trend_overlay.futures_annual_deduction_krw",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +85,9 @@ class ChallengeDecision:
     neighbors: tuple[tuple[str, PairedDelta], ...]  # (neighbor spec_hash, Δg vs champion)
     knob_changes: tuple[str, ...]  # dotted paths of differing numeric policy/book/hedge/scorer leaves
     reasons: tuple[str, ...]  # failed rules; empty when promotable
+    alpha_effective: float
+    paired_horizon_sessions: int
+    prior_decisions: int = 0
 
     @property
     def promotable(self) -> bool:
@@ -84,6 +96,7 @@ class ChallengeDecision:
     def canonical_json(self) -> str:
         """Key-sorted compact JSON; byte-identical for identical evidence."""
         payload = {
+            "alpha_effective": _canon(self.alpha_effective),
             "challenger_hash": self.challenger_hash,
             "challenger_j": _canon(self.challenger_j),
             "champion_hash": self.champion_hash,
@@ -91,6 +104,8 @@ class ChallengeDecision:
             "knob_changes": list(self.knob_changes),
             "neighbors": [[spec_hash, _delta_fields(delta)] for spec_hash, delta in self.neighbors],
             "paired": _delta_fields(self.paired),
+            "paired_horizon_sessions": int(self.paired_horizon_sessions),
+            "prior_decisions": self.prior_decisions,
             "promotable": self.promotable,
             "reasons": list(self.reasons),
             "run_ids": list(self.run_ids),
@@ -113,20 +128,27 @@ def decide_challenge(
     champion_spec: StrategySpec,
     protocol: ResearchProtocol,
     policy: EvaluationPolicy,
+    prior_decisions: int = 0,
 ) -> ChallengeDecision:
     """Apply the promotion rule.
 
     Promotable iff all hold:
       1. ``challenger.report.passed``;
-      2. paired Δg (challenger minus champion) lower bound at ``protocol.champion.alpha`` > 0, computed on the
-         stress stream named by the challenger's ``objective_stream`` for both runs;
+      2. paired Δg (challenger minus champion) lower bound at ``alpha_eff`` > 0, computed on the
+         stress stream named by the challenger's ``objective_stream`` for both runs, where ``alpha_eff``
+         is ``alpha / (1 + prior_decisions)`` under ``multiplicity="bonferroni_decisions"`` else ``alpha``,
+         and the paired bootstrap horizon is ``len(sessions)`` under ``paired_horizon="full"`` else
+         ``policy.horizon_sessions``;
       3. ``challenger J ≥ champion J``;
       4. when ``knob_changes`` is non-empty and ``require_neighbors``: at least one neighbor per changed knob
-         was supplied and every neighbor has mean Δg vs champion > 0.
+         was supplied and every neighbor has mean Δg vs champion > 0. Exchange contract terms and overlay
+         activation are exempt; trend MA and long/short fractions still require neighbors on introduction.
 
-    Raises ValueError when the two runs' sessions differ (never compares different windows) or when a run was
-    not produced by the spec it is paired with.
+    Raises ValueError when the two runs' sessions differ (never compares different windows), when a run was
+    not produced by the spec it is paired with, or when ``prior_decisions`` is negative.
     """
+    if isinstance(prior_decisions, bool) or not isinstance(prior_decisions, int) or prior_decisions < 0:
+        raise ValueError(f"prior_decisions must be an int >= 0, got {prior_decisions!r}")
     sessions = tuple(champion.evidence.sessions)
     if not sessions:
         raise ValueError("champion evidence sessions must be non-empty")
@@ -144,9 +166,26 @@ def decide_challenge(
     stream = str(challenger.report.objective_stream)
     if stream not in STRESS_STREAMS:
         raise ValueError(f"objective stream must be one of {STRESS_STREAMS}, got {stream!r}")
-    paired = _paired_delta(challenger, champion, stream=stream, protocol=protocol, policy=policy)
+    if protocol.champion.multiplicity == "bonferroni_decisions":
+        alpha_effective = float(protocol.champion.alpha) / (1 + prior_decisions)
+    else:
+        alpha_effective = float(protocol.champion.alpha)
+    if protocol.champion.paired_horizon == "full":
+        paired_horizon_sessions = len(sessions)
+    else:
+        paired_horizon_sessions = int(policy.horizon_sessions)
+    paired = _paired_delta(
+        challenger, champion, stream=stream, policy=policy,
+        alpha=alpha_effective, horizon=paired_horizon_sessions,
+    )
     neighbor_deltas = tuple(
-        (run.report.spec_hash, _paired_delta(run, champion, stream=stream, protocol=protocol, policy=policy))
+        (
+            run.report.spec_hash,
+            _paired_delta(
+                run, champion, stream=stream, policy=policy,
+                alpha=alpha_effective, horizon=paired_horizon_sessions,
+            ),
+        )
         for run in neighbor_runs
     )
     changes = knob_changes(challenger_spec, champion_spec)
@@ -162,8 +201,14 @@ def decide_challenge(
         reasons.append("objective_j")
     if protocol.champion.require_neighbors and changes:
         covered = _knob_coverage(challenger_spec, neighbor_runs)
+        exempt = set(TREND_CONTRACT_KNOBS)
+        if (challenger_spec.trend_overlay is None) != (champion_spec.trend_overlay is None):
+            # One-overlay accounting forbids a hedge-ratio neighbor while the trend overlay is active.
+            exempt.update({"hedge.hedge_ratio", "trend_overlay.rebalance_every_sessions"})
+        if challenger_spec.trend_overlay is None:
+            exempt.update(knob for knob in changes if knob.startswith("trend_overlay."))
         for knob in changes:
-            if knob.startswith("scorer.") or knob in covered:
+            if knob.startswith("scorer.") or knob in covered or knob in exempt:
                 continue
             reasons.append(f"neighbors_missing:{knob}")
         for spec_hash, delta in neighbor_deltas:
@@ -181,6 +226,9 @@ def decide_challenge(
         neighbors=neighbor_deltas,
         knob_changes=changes,
         reasons=tuple(reasons),
+        alpha_effective=alpha_effective,
+        paired_horizon_sessions=paired_horizon_sessions,
+        prior_decisions=prior_decisions,
     )
 
 
@@ -391,10 +439,20 @@ def champion_record_fields(record: ChampionRecord) -> dict[str, Any]:
     }
 
 
-def decision_from_canonical_json(payload: str) -> ChallengeDecision:
+def decision_from_canonical_json(
+    payload: str, *, alpha: float = 0.05, horizon_sessions: int = 1260,
+) -> ChallengeDecision:
     """Rebuild a decision from its canonical JSON (the saved ``decisions/<digest>.json`` content)."""
     try:
         raw = json.loads(payload)
+        alpha_effective = (
+            _num(raw["alpha_effective"]) if "alpha_effective" in raw else alpha
+        )
+        paired_horizon_sessions = (
+            int(raw["paired_horizon_sessions"])
+            if "paired_horizon_sessions" in raw
+            else horizon_sessions
+        )
         return ChallengeDecision(
             challenger_hash=str(raw["challenger_hash"]),
             champion_hash=str(raw["champion_hash"]),
@@ -406,6 +464,9 @@ def decision_from_canonical_json(payload: str) -> ChallengeDecision:
             neighbors=tuple((str(item[0]), _delta_from_fields(item[1])) for item in raw["neighbors"]),
             knob_changes=tuple(str(item) for item in raw["knob_changes"]),
             reasons=tuple(str(item) for item in raw["reasons"]),
+            alpha_effective=alpha_effective,
+            paired_horizon_sessions=paired_horizon_sessions,
+            prior_decisions=raw.get("prior_decisions", 0),
         )
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid challenge decision payload: {exc}") from exc
@@ -462,8 +523,9 @@ def _paired_delta(
     champion: EvaluationRun,
     *,
     stream: str,
-    protocol: ResearchProtocol,
     policy: EvaluationPolicy,
+    alpha: float,
+    horizon: int,
 ) -> PairedDelta:
     return paired_growth_delta(
         _stress_stream(challenger.evidence, stream),
@@ -471,9 +533,9 @@ def _paired_delta(
         block=int(policy.block_sessions),
         draws=int(policy.draws),
         seed=int(policy.seed),
-        horizon=int(policy.horizon_sessions),
+        horizon=int(horizon),
         sessions_per_year=int(policy.sessions_per_year),
-        alpha=float(protocol.champion.alpha),
+        alpha=float(alpha),
     )
 
 
