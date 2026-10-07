@@ -14,7 +14,7 @@ from numpy.typing import NDArray
 
 from src.backtest.costs import CostConfig, dividend_withholding
 from src.backtest.events import DividendEvent
-from src.backtest.overlay import ceil_amount_krw
+from src.backtest.overlay import PRIMARY_LEG, ceil_amount_krw
 from src.core.pit import PITDataError
 
 if TYPE_CHECKING:
@@ -60,6 +60,7 @@ class JournalEntry:
     cash_delta: int
     quantity_delta: int
     account: LedgerAccount = LedgerAccount.CASH
+    leg: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,7 @@ class Ledger:
         "_positions",
         "_receivable",
         "_receivable_by_pay",
+        "_secondary_contracts",
         "_tax_payable",
         "_ytd_cash_yield",
         "_ytd_futures_pnl",
@@ -154,6 +156,7 @@ class Ledger:
         self._tax_payable = 0
         self._margin = 0
         self._contracts = 0
+        self._secondary_contracts: dict[str, int] = {}
         self._inverse_units = 0
         self._inverse_basis = 0
         self._ytd_futures_pnl = 0
@@ -368,7 +371,13 @@ class Ledger:
         )
 
     def settle_variation(
-        self, *, session_idx: int, prev_level: float, level: float, multiplier: int
+        self,
+        *,
+        session_idx: int,
+        prev_level: float,
+        level: float,
+        multiplier: int,
+        leg: str = PRIMARY_LEG,
     ) -> int:
         """Daily settlement of the held signed position into margin: a long gains when the level rises.
 
@@ -376,26 +385,39 @@ class Ledger:
         cumulative settled P&L equals the floored mark exactly. Adds delta to the year-to-date futures P&L.
         """
         mult = _checked_int(multiplier, what="multiplier", minimum=1)
-        if self._contracts == 0:
+        held = self.leg_contracts(leg)
+        if held == 0:
             return 0
         prev = _checked_level(prev_level, what="prev_level")
         cur = _checked_level(level, what="level")
-        delta = _floored_mark(self._contracts, mult, cur) - _floored_mark(
-            self._contracts, mult, prev
-        )
+        delta = _floored_mark(held, mult, cur) - _floored_mark(held, mult, prev)
         if delta == 0:
             return 0
         self._margin += delta
         self._ytd_futures_pnl += delta
+        journal_leg = None if leg == PRIMARY_LEG else leg
         self._journal.append(
             JournalEntry(
-                session_idx, JournalKind.VARIATION_MARGIN, None, delta, 0, LedgerAccount.MARGIN
+                session_idx,
+                JournalKind.VARIATION_MARGIN,
+                None,
+                delta,
+                0,
+                LedgerAccount.MARGIN,
+                leg=journal_leg,
             )
         )
         return delta
 
     def trade_futures(
-        self, *, session_idx: int, contracts: int, level: float, multiplier: int, cost_rate: float
+        self,
+        *,
+        session_idx: int,
+        contracts: int,
+        level: float,
+        multiplier: int,
+        cost_rate: float,
+        leg: str = PRIMARY_LEG,
     ) -> None:
         """Set the net short position to ``contracts`` (signed; negative = net long). Commission
         ``ceil(cost_rate · |Δ| · multiplier · level)`` is debited from MARGIN."""
@@ -405,37 +427,69 @@ class Ledger:
         mult = _checked_int(multiplier, what="multiplier", minimum=1)
         rate = _checked_cost_rate(cost_rate, what="cost_rate")
         mark_level = _checked_level(level, what="level")
-        delta = target - self._contracts
+        held = self.leg_contracts(leg)
+        delta = target - held
         if delta == 0:
             return
-        self._contracts = target
+        if leg == PRIMARY_LEG:
+            self._contracts = target
+        else:
+            if target != 0:
+                self._secondary_contracts[leg] = target
+            else:
+                self._secondary_contracts.pop(leg, None)
+        journal_leg = None if leg == PRIMARY_LEG else leg
         self._journal.append(
-            JournalEntry(session_idx, JournalKind.FUTURES_TRADE, None, 0, delta)
+            JournalEntry(
+                session_idx, JournalKind.FUTURES_TRADE, None, 0, delta, leg=journal_leg
+            )
         )
         commission = ceil_amount_krw(rate, abs(delta), mult, mark_level)
         if commission > 0:
             self._margin -= commission
             self._journal.append(
                 JournalEntry(
-                    session_idx, JournalKind.FUTURES_COMMISSION, None, -commission, 0, LedgerAccount.MARGIN
+                    session_idx,
+                    JournalKind.FUTURES_COMMISSION,
+                    None,
+                    -commission,
+                    0,
+                    LedgerAccount.MARGIN,
+                    leg=journal_leg,
                 )
             )
 
     def roll_futures(
-        self, *, session_idx: int, level: float, multiplier: int, cost_rate: float
+        self,
+        *,
+        session_idx: int,
+        level: float,
+        multiplier: int,
+        cost_rate: float,
+        leg: str = PRIMARY_LEG,
     ) -> None:
         """Debit ``ceil(2 · cost_rate · |contracts| · multiplier · level)`` from MARGIN (close + reopen)."""
         mult = _checked_int(multiplier, what="multiplier", minimum=1)
         rate = _checked_cost_rate(cost_rate, what="cost_rate")
         mark_level = _checked_level(level, what="level")
-        if self._contracts == 0:
+        held = self.leg_contracts(leg)
+        if held == 0:
             return
-        cost = ceil_amount_krw(2.0 * rate, abs(self._contracts), mult, mark_level)
+        cost = ceil_amount_krw(2.0 * rate, abs(held), mult, mark_level)
         if cost <= 0:
             return
         self._margin -= cost
+        journal_leg = None if leg == PRIMARY_LEG else leg
         self._journal.append(
-            JournalEntry(session_idx, JournalKind.FUTURES_ROLL, None, -cost, 0, LedgerAccount.MARGIN)
+            JournalEntry(
+                session_idx,
+                JournalKind.FUTURES_ROLL,
+                None,
+                -cost,
+                0,
+                LedgerAccount.MARGIN,
+                leg=journal_leg,
+            )
         )
 
     def buy_inverse(
@@ -526,6 +580,17 @@ class Ledger:
             JournalEntry(session_idx, JournalKind.FUTURES_TAX, None, -tax, 0, LedgerAccount.MARGIN)
         )
         return tax
+
+    def leg_contracts(self, leg: str) -> int:
+        """Net-short contracts held in the named leg (primary leg if ``PRIMARY_LEG``)."""
+        if leg == PRIMARY_LEG:
+            return self._contracts
+        return self._secondary_contracts.get(leg, 0)
+
+    @property
+    def legs(self) -> tuple[tuple[str, int], ...]:
+        """Secondary legs with a non-zero position, sorted by name."""
+        return tuple(sorted((k, v) for k, v in self._secondary_contracts.items() if v != 0))
 
     @property
     def contracts(self) -> int:
