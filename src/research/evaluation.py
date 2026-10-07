@@ -27,7 +27,7 @@ __all__ = [
 
 
 class EvaluationPolicy(BaseModel):
-    """Report-card parameters bound from protocol v4 (frozen, extra=forbid)."""
+    """Report-card parameters bound from protocol v5 (frozen, extra=forbid)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

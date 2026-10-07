@@ -229,6 +229,7 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
     champion = pipeline.evaluate(champion_spec)
     neighbors = [_load_spec(path) for path in (args.neighbors or [])]
     neighbor_runs = tuple(pipeline.evaluate(neighbor) for neighbor in neighbors)
+    prior_decisions = sum(1 for d in store.decisions() if d.champion_hash == current.spec_hash)
     decision = decide_challenge(
         challenger=challenger,
         champion=champion,
@@ -237,6 +238,7 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
         champion_spec=champion_spec,
         protocol=protocol,
         policy=policy,
+        prior_decisions=prior_decisions,
     )
     path = store.save_decision(decision)
     return {
@@ -246,6 +248,8 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
         "delta_lower": decision.paired.lower,
         "challenger_j": decision.challenger_j,
         "champion_j": decision.champion_j,
+        "alpha_effective": decision.alpha_effective,
+        "paired_horizon_sessions": decision.paired_horizon_sessions,
         "decision_path": str(path),
     }
 

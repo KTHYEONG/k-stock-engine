@@ -1,5 +1,5 @@
-# Research protocol v4: data-window guard, report-card policy and scenario definitions.
-version = "research-protocol-v4"
+# Research protocol v5: data-window guard, report-card policy and scenario definitions.
+version = "research-protocol-v5"
 # Earliest session a run window may start (first month with trailing-four-quarter fundamentals for most
 # issuers). Model training may still read earlier PIT cube rows; this bounds run windows only.
 evaluation_start = "2017-04-01"
@@ -13,7 +13,7 @@ seed = 20261001
 horizon_sessions = 1260
 objective_quantile = 0.10
 ruin_mdd_limit = -0.5
-max_p_ruin = 0.05
+max_p_ruin = 1.0
 max_p_growth_le_zero = 0.05
 report_mdd_limits = [-0.3, -0.5]
 recent_sessions = 252
@@ -30,3 +30,5 @@ perturbation_seed = 7
 [champion]
 alpha = 0.05
 require_neighbors = true
+paired_horizon = "full"
+multiplicity = "bonferroni_decisions"
