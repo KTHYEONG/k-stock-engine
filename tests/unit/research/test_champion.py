@@ -1373,3 +1373,96 @@ def test_unknown_decision_path_rejected() -> None:
     payload["path"] = "maybe"
     with pytest.raises(ValueError, match="unknown promotion path"):
         decision_from_canonical_json(json.dumps(payload))
+
+
+def test_signal_switch_exempts_ma_sessions() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec(trend_overlay={"signal": "ma", "ma_sessions": 50})
+    challenger_spec = _trend_spec(
+        trend_overlay={
+            "signal": "tsmom",
+            "ma_sessions": None,
+            "tsmom_horizons": (21, 63, 126, 252),
+            "vol_cap": 0.25,
+            "vol_window_sessions": 60,
+        }
+    )
+    decision = decide_challenge(
+        challenger=_run(challenger_spec, sessions, drift=0.001),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=_protocol(),
+        policy=_policy(_protocol()),
+    )
+    assert "neighbors_missing:trend_overlay.ma_sessions" not in decision.reasons
+    assert "neighbors_missing:trend_overlay.vol_cap" in decision.reasons
+    assert "neighbors_missing:trend_overlay.vol_window_sessions" not in decision.reasons
+
+
+def _regime_spec(**overrides: Any) -> StrategySpec:
+    from src.research.regime_hedge import RegimeHedgeSpec
+
+    regime_kw: dict[str, Any] = {
+        "tsmom_horizons": (5, 10, 15, 20),
+        "target_vol": 0.10,
+        "max_fraction": 1.5,
+        "vol_window_sessions": 20,
+        "rebalance_every_sessions": 5,
+        "contract_multiplier_krw": 10000,
+        "initial_margin_rate": 0.2,
+        "margin_buffer_rate": 0.1,
+        "margin_topup_trigger_fraction": 0.75,
+        "futures_cost_rate": 0.0003,
+        "futures_tax_rate": 0.11,
+        "futures_annual_deduction_krw": 2500000,
+    }
+    regime_kw.update(overrides.pop("regime_hedge", {}))
+    base = _trend_spec(**overrides)
+    return base.model_copy(update={"regime_hedge": RegimeHedgeSpec(**regime_kw)})
+
+
+def test_regime_hedge_conventions_and_contracts_are_exempt() -> None:
+    sessions = _sessions()
+    champion_spec = _regime_spec()
+    challenger_spec = _regime_spec(regime_hedge={"max_fraction": 2.0})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    assert decision.knob_changes == ("regime_hedge.max_fraction",)
+    assert "neighbors_missing:regime_hedge.max_fraction" not in decision.reasons
+    assert decision.promotable
+
+
+def test_regime_hedge_target_vol_requires_neighbors_on_introduction() -> None:
+    sessions = _sessions()
+    champion_spec = _trend_spec()
+    challenger_spec = _regime_spec()
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    assert "neighbors_missing:regime_hedge.target_vol" in decision.reasons
+    for knob in decision.knob_changes:
+        if knob != "regime_hedge.target_vol":
+            assert f"neighbors_missing:{knob}" not in decision.reasons
+
+    neighbor_spec = _regime_spec(regime_hedge={"target_vol": 0.12})
+    neighbor_run = _run(neighbor_spec, sessions, drift=0.0011)
+    decision_with_neighbor = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(neighbor_run,),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    assert "neighbors_missing:regime_hedge.target_vol" not in decision_with_neighbor.reasons
+
+

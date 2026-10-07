@@ -44,10 +44,20 @@ from src.research.hedge import (
     HedgeSpec,
     derivative_config,
 )
-from src.research.ledger_bridge import LedgerOutcome, overlay_market_from_inputs
+from src.research.ledger_bridge import (
+    LedgerOutcome,
+    overlay_market_from_inputs,
+    overlay_market_with_legs,
+)
 from src.research.model import ScoreMatrix, ScorerConfig, walk_forward_scores
 from src.research.panel import FEATURE_NAMES, HORIZONS, FeaturePanel, build_panel
 from src.research.policy import TrendCashPolicy, universe_mask
+from src.research.regime_hedge import (
+    CompositeOverlay,
+    RegimeHedgeLeg,
+    RegimeHedgeSpec,
+    regime_hedge_derivative_config,
+)
 from src.research.registry import RunRegistry, RunReturns
 from src.research.simulator import SimConfig, simulate
 from src.research.stats import annualized_log_growth
@@ -88,11 +98,14 @@ class StrategySpec(BaseModel):
     book: BookSpec
     hedge: HedgeSpec
     trend_overlay: TrendOverlaySpec | None = None
+    regime_hedge: RegimeHedgeSpec | None = None
 
     @model_validator(mode="after")
     def _check_sleeves(self) -> StrategySpec:
         if int(self.book.sleeves) != int(self.policy.rebalance_every_sessions):
             raise ValueError("book.sleeves must equal policy.rebalance_every_sessions")
+        if self.regime_hedge is not None and (self.trend_overlay is None or float(self.hedge.hedge_ratio) != 0.0):
+            raise ValueError("regime_hedge requires trend_overlay is not None and hedge.hedge_ratio == 0")
         if self.trend_overlay is not None and float(self.hedge.hedge_ratio) != 0.0:
             raise ValueError("one overlay per account")
         return self
@@ -108,6 +121,8 @@ class StrategySpec(BaseModel):
         }
         if self.trend_overlay is not None:
             payload["trend_overlay"] = json.loads(self.trend_overlay.canonical_json())
+        if self.regime_hedge is not None:
+            payload["regime_hedge"] = json.loads(self.regime_hedge.canonical_json())
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property
@@ -128,7 +143,7 @@ def load_strategy_spec(path: Path) -> StrategySpec:
         raise ValueError(f"invalid strategy TOML: {path}: {exc}") from exc
     if not isinstance(raw, dict):  # pragma: no cover - tomllib always returns a dict
         raise ValueError(f"invalid strategy TOML: {path}")
-    allowed = {"policy", "scorer", "book", "hedge", "trend_overlay"}
+    allowed = {"policy", "scorer", "book", "hedge", "trend_overlay", "regime_hedge"}
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
@@ -155,7 +170,18 @@ def load_strategy_spec(path: Path) -> StrategySpec:
     except Exception as exc:
         raise ValueError(f"invalid [trend_overlay] table: {exc}") from exc
     try:
-        return StrategySpec(policy=policy, scorer=scorer, book=book, hedge=hedge, trend_overlay=trend)
+        regime = RegimeHedgeSpec.model_validate(raw["regime_hedge"]) if "regime_hedge" in raw else None
+    except Exception as exc:
+        raise ValueError(f"invalid [regime_hedge] table: {exc}") from exc
+    try:
+        return StrategySpec(
+            policy=policy,
+            scorer=scorer,
+            book=book,
+            hedge=hedge,
+            trend_overlay=trend,
+            regime_hedge=regime,
+        )
     except Exception as exc:
         raise ValueError(f"invalid strategy spec: {exc}") from exc
 
@@ -172,7 +198,16 @@ def strategy_spec_from_canonical_json(payload: str) -> StrategySpec:
             scorer=ScorerConfig.model_validate(raw["scorer"]),
             book=BookSpec.model_validate(raw["book"]),
             hedge=HedgeSpec.model_validate(raw["hedge"]),
-            trend_overlay=(TrendOverlaySpec.model_validate(raw["trend_overlay"]) if "trend_overlay" in raw else None),
+            trend_overlay=(
+                TrendOverlaySpec.model_validate(raw["trend_overlay"])
+                if "trend_overlay" in raw
+                else None
+            ),
+            regime_hedge=(
+                RegimeHedgeSpec.model_validate(raw["regime_hedge"])
+                if "regime_hedge" in raw
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid strategy canonical JSON: {exc}") from exc
@@ -262,9 +297,10 @@ class _OverlayDecision:
     session_idx: int
     contracts: int | None
     inverse_value_krw: int | None
+    legs: tuple[tuple[str, int], ...] = ()
 
-    def key(self) -> tuple[int | None, int | None]:
-        return (self.contracts, self.inverse_value_krw)
+    def key(self) -> tuple[int | None, int | None, tuple[tuple[str, int], ...]]:
+        return (self.contracts, self.inverse_value_krw, self.legs)
 
 
 class _RecordingOverlay:
@@ -285,6 +321,7 @@ class _RecordingOverlay:
                 session_idx=int(state.session_idx),
                 contracts=None if decision is None else int(decision.contracts),
                 inverse_value_krw=None if decision is None else int(decision.inverse_value_krw),
+                legs=() if decision is None else decision.legs,
             )
         )
         return decision
@@ -616,10 +653,8 @@ class Pipeline:
 
     def _trend_scenario_overlay(
         self, spec: StrategySpec, name: str, *, delay_n: int, extra_cost: float
-    ) -> tuple[Any, Any, Any]:
-        """Triple ``(overlay, overlay_market, derivatives)`` for a trend-overlay scenario."""
-        from src.research.ledger_bridge import overlay_market_from_inputs
-
+    ) -> tuple[Any, Any, Any, Mapping[str, Any] | None]:
+        """Quadruple ``(overlay, overlay_market, derivatives, leg_derivatives)`` for a trend-overlay scenario."""
         inputs = self._ctx.trend_inputs
         if inputs is None:
             raise PITDataError("evaluate requires the trend return series")
@@ -627,22 +662,49 @@ class Pipeline:
         assert base is not None
         delay = 0
         effective = base
+        base_regime = spec.regime_hedge
+        effective_regime = base_regime
         if name == "stress_delay":
             delay = int(delay_n)
         elif name == "stress_slippage":
             effective = base.model_copy(update={"futures_cost_rate": float(base.futures_cost_rate) + float(extra_cost)})
+            if base_regime is not None:
+                effective_regime = base_regime.model_copy(
+                    update={"futures_cost_rate": float(base_regime.futures_cost_rate) + float(extra_cost)}
+                )
         elif name == "unhedged":
             effective = base.model_copy(update={"long_fraction": 0.0, "short_fraction": 0.0})
-        overlay = TrendOverlay(
+            if base_regime is not None:
+                effective_regime = base_regime.model_copy(update={"max_fraction": 0.0})
+        primary_overlay = TrendOverlay(
             effective,
             index_level=np.ascontiguousarray(np.asarray(inputs.index_level, dtype=np.float64)),
             rebalance_offset=0,
             execution_delay=delay,
         )
+        if effective_regime is not None:
+            hedge_in = self._ctx.hedge_inputs
+            assert hedge_in is not None
+            secondary_leg = RegimeHedgeLeg(
+                effective_regime,
+                index_level=np.ascontiguousarray(np.asarray(hedge_in.index_level, dtype=np.float64)),
+                rebalance_offset=0,
+                execution_delay=delay,
+            )
+            overlay: Any = CompositeOverlay(primary_overlay, {"kq150": secondary_leg})
+            scenario_market = overlay_market_with_legs(inputs, {"kq150": hedge_in})
+            leg_derivatives: Mapping[str, Any] | None = {
+                "kq150": regime_hedge_derivative_config(effective_regime)
+            }
+        else:
+            overlay = primary_overlay
+            scenario_market = overlay_market_from_inputs(inputs)
+            leg_derivatives = None
         return (
             overlay,
-            overlay_market_from_inputs(inputs),
+            scenario_market,
             trend_derivative_config(effective),
+            leg_derivatives,
         )
 
     def panel_for(self, last_row: int) -> FeaturePanel:
@@ -821,9 +883,18 @@ class Pipeline:
 
         use_trend = spec.trend_overlay is not None
         if use_trend:
+            assert spec.trend_overlay is not None
             assert ctx.trend_inputs is not None  # guaranteed by _data_end_row
-            overlay_market = overlay_market_from_inputs(ctx.trend_inputs)
-            derivatives = trend_derivative_config(spec.trend_overlay)  # type: ignore[arg-type]
+            if spec.regime_hedge is not None:
+                overlay_market = overlay_market_with_legs(ctx.trend_inputs, {"kq150": ctx.hedge_inputs})
+                derivatives = trend_derivative_config(spec.trend_overlay)
+                leg_derivatives: Mapping[str, Any] | None = {
+                    "kq150": regime_hedge_derivative_config(spec.regime_hedge)
+                }
+            else:
+                overlay_market = overlay_market_from_inputs(ctx.trend_inputs)
+                derivatives = trend_derivative_config(spec.trend_overlay)
+                leg_derivatives = None
         else:
             overlay_market = overlay_market_from_inputs(ctx.hedge_inputs)
             derivatives = derivative_config(spec.hedge)
@@ -836,6 +907,7 @@ class Pipeline:
                 )
             )
             unhedged_derivatives = derivative_config(spec.hedge.model_copy(update={"hedge_ratio": 0.0}))
+            leg_derivatives = None
 
         scenario_names = (
             ["base", "stress_slippage", "stress_delay"]
@@ -850,12 +922,13 @@ class Pipeline:
             overlay: Any
             slip_ticks: float | None
             scenario_market = overlay_market
+            outcome_leg_derivatives: Mapping[str, Any] | None = None
             if use_trend:
                 if name == "stress_delay":
                     targets = delayed
                     extra = 0.0
                     slip_ticks = None
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec, name, delay_n=delay_n, extra_cost=0.0
                     )
                     overlay = inner
@@ -863,7 +936,7 @@ class Pipeline:
                     targets = executable
                     extra = float(scenarios.stress_extra_slippage)
                     slip_ticks = None
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec,
                         name,
                         delay_n=delay_n,
@@ -874,7 +947,7 @@ class Pipeline:
                     targets = executable
                     extra = 0.0
                     slip_ticks = float(name[len("cost_") :])
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec, "base", delay_n=delay_n, extra_cost=0.0
                     )
                     overlay = inner
@@ -882,7 +955,7 @@ class Pipeline:
                     targets = executable
                     extra = 0.0
                     slip_ticks = None
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec, name, delay_n=delay_n, extra_cost=0.0
                     )
                     overlay = inner
@@ -890,7 +963,7 @@ class Pipeline:
                     targets = placebo_executable
                     extra = 0.0
                     slip_ticks = None
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec, "base", delay_n=delay_n, extra_cost=0.0
                     )
                     overlay = inner
@@ -898,45 +971,52 @@ class Pipeline:
                     targets = executable
                     extra = 0.0
                     slip_ticks = None
-                    inner, scenario_market, outcome_derivatives = self._trend_scenario_overlay(
+                    inner, scenario_market, outcome_derivatives, outcome_leg_derivatives = self._trend_scenario_overlay(
                         spec, "base", delay_n=delay_n, extra_cost=0.0
                     )
                     outcome_derivatives = derivatives
+                    outcome_leg_derivatives = leg_derivatives
                     base_recorder = _RecordingOverlay(inner)
                     overlay = base_recorder
             elif name == "stress_delay":
                 targets = delayed
                 overlay = BetaNeutralOverlay(spec.hedge, rebalance_offset=0, execution_delay=delay_n)
                 outcome_derivatives = derivatives
+                outcome_leg_derivatives = None
                 extra = 0.0
                 slip_ticks = None
             elif name == "stress_slippage":
                 targets = executable
                 overlay = BetaNeutralOverlay(spec.hedge, rebalance_offset=0)
                 outcome_derivatives = stressed_derivatives
+                outcome_leg_derivatives = None
                 extra = float(scenarios.stress_extra_slippage)
                 slip_ticks = None
             elif name.startswith("cost_"):
                 targets = executable
                 overlay = BetaNeutralOverlay(spec.hedge, rebalance_offset=0)
                 outcome_derivatives = derivatives
+                outcome_leg_derivatives = None
                 extra = 0.0
                 slip_ticks = float(name[len("cost_") :])
             elif name == "unhedged":
                 targets = executable
                 overlay = BetaNeutralOverlay(spec.hedge.model_copy(update={"hedge_ratio": 0.0}), rebalance_offset=0)
                 outcome_derivatives = unhedged_derivatives
+                outcome_leg_derivatives = None
                 extra = 0.0
                 slip_ticks = None
             elif name == "placebo":
                 targets = placebo_executable
                 overlay = BetaNeutralOverlay(spec.hedge, rebalance_offset=0)
                 outcome_derivatives = derivatives
+                outcome_leg_derivatives = None
                 extra = 0.0
                 slip_ticks = None
             else:
                 targets = executable
                 outcome_derivatives = derivatives
+                outcome_leg_derivatives = None
                 extra = 0.0
                 slip_ticks = None
                 base_recorder = _RecordingOverlay(BetaNeutralOverlay(spec.hedge, rebalance_offset=0))
@@ -958,6 +1038,7 @@ class Pipeline:
                 overlay=overlay,
                 overlay_market=scenario_market if use_trend else overlay_market,
                 derivatives=outcome_derivatives,
+                leg_derivatives=outcome_leg_derivatives,
                 extra_slippage=extra,
                 auction_slippage_ticks=slip_ticks,
                 sessions_per_year=spy,
@@ -991,6 +1072,7 @@ class Pipeline:
             hi=hi,
             capital=capital,
             derivatives=derivatives,
+            leg_derivatives=leg_derivatives,
             auth=auth,
         )
         evidence = EvaluationEvidence(
@@ -1181,20 +1263,42 @@ class Pipeline:
         del perturbed_panel, rescored
         use_trend = spec.trend_overlay is not None
         if use_trend:
-            assert ctx.trend_inputs is not None  # guaranteed by _data_end_row
-            corrupted_inputs = _corrupt_hedge_inputs(ctx.trend_inputs, cut, sessions=sessions, rng=rng)
-            corrupted_levels = np.ascontiguousarray(np.asarray(corrupted_inputs.index_level, dtype=np.float64))
             assert spec.trend_overlay is not None
-            recorder = _RecordingOverlay(
-                TrendOverlay(
-                    spec.trend_overlay,
-                    index_level=corrupted_levels,
+            assert ctx.trend_inputs is not None  # guaranteed by _data_end_row
+            corrupted_trend_inputs = _corrupt_hedge_inputs(ctx.trend_inputs, cut, sessions=sessions, rng=rng)
+            corrupted_trend_levels = np.ascontiguousarray(np.asarray(corrupted_trend_inputs.index_level, dtype=np.float64))
+            primary_overlay = TrendOverlay(
+                spec.trend_overlay,
+                index_level=corrupted_trend_levels,
+                rebalance_offset=0,
+            )
+            if spec.regime_hedge is not None:
+                corrupted_hedge_inputs = _corrupt_hedge_inputs(ctx.hedge_inputs, cut, sessions=sessions, rng=rng)
+                corrupted_hedge_levels = np.ascontiguousarray(np.asarray(corrupted_hedge_inputs.index_level, dtype=np.float64))
+                secondary_leg = RegimeHedgeLeg(
+                    spec.regime_hedge,
+                    index_level=corrupted_hedge_levels,
                     rebalance_offset=0,
                 )
-            )
+                recorder = _RecordingOverlay(
+                    CompositeOverlay(
+                        primary=primary_overlay,
+                        legs={"kq150": secondary_leg},
+                    )
+                )
+                corrupted_market = overlay_market_with_legs(corrupted_trend_inputs, {"kq150": corrupted_hedge_inputs})
+                cut_leg_derivatives: Mapping[str, Any] | None = {
+                    "kq150": regime_hedge_derivative_config(spec.regime_hedge)
+                }
+            else:
+                recorder = _RecordingOverlay(primary_overlay)
+                corrupted_market = overlay_market_from_inputs(corrupted_trend_inputs)
+                cut_leg_derivatives = None
         else:
             corrupted_inputs = _corrupt_hedge_inputs(ctx.hedge_inputs, cut, sessions=sessions, rng=rng)
             recorder = _RecordingOverlay(BetaNeutralOverlay(spec.hedge, rebalance_offset=0))
+            corrupted_market = overlay_market_from_inputs(corrupted_inputs)
+            cut_leg_derivatives = None
         assert ctx.cash_returns is not None  # guaranteed by _data_end_row
         corrupted_cash = _corrupt_cash_returns(ctx.cash_returns, cut, rng)
         cut_session = sessions[cut]
@@ -1215,8 +1319,9 @@ class Pipeline:
             authorization=auth,
             cash_returns=corrupted_cash,
             overlay=recorder,
-            overlay_market=overlay_market_from_inputs(corrupted_inputs),
+            overlay_market=corrupted_market,
             derivatives=derivatives,
+            leg_derivatives=cut_leg_derivatives,
             extra_slippage=0.0,
             auction_slippage_ticks=None,
             sessions_per_year=spy,
@@ -1260,6 +1365,7 @@ class Pipeline:
         hi: int,
         capital: int,
         derivatives: Any,
+        leg_derivatives: Any = None,
         auth: WindowAuthorization,
     ) -> int:
         """Account-level causal check: corrupt every input after each cut row, then require rows ``<= cut``
