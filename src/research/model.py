@@ -17,7 +17,7 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from src.data.research_protocol import WindowAuthorization, WindowError
-from src.research.panel import FEATURE_NAMES, FeaturePanel
+from src.research.panel import FEATURE_SETS, FeaturePanel, feature_names_for
 
 __all__ = ["ScoreMatrix", "ScorerConfig", "walk_forward_scores"]
 
@@ -34,6 +34,7 @@ class ScorerConfig(BaseModel):
     [redacted]
     [redacted]
     [redacted]
+    ``FEATURE_SETS``; part of the identity.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -55,6 +56,14 @@ class ScorerConfig(BaseModel):
     [redacted]
     [redacted]
     [redacted]
+    feature_set: str = "full62"
+
+    @field_validator("feature_set")
+    @classmethod
+    def _known_feature_set(cls, value: object) -> str:
+        if not isinstance(value, str) or value not in FEATURE_SETS:
+            raise ValueError(f"feature_set must be one of {sorted(FEATURE_SETS)}, got {value!r}")
+        return value
 
     @field_validator("horizons")
     @classmethod
@@ -73,8 +82,14 @@ class ScorerConfig(BaseModel):
         return pct
 
     def canonical_json(self) -> str:
-        """Canonical JSON of the config with sorted keys and compact separators."""
-        return json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        """Canonical JSON of the config with sorted keys and compact separators.
+
+        ``feature_set`` is emitted only when non-default so pre-set specs keep their hash.
+        """
+        payload = self.model_dump(mode="json")
+        if self.feature_set == "full62":
+            del payload["feature_set"]
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property
     def config_hash(self) -> str:
@@ -276,7 +291,7 @@ def walk_forward_scores(
         raise ValueError(f"test_years {years} begins before first_test_year {config.first_test_year}")
     if list(years) != sorted(years) or len(set(years)) != len(years):
         raise ValueError(f"test_years must be strictly ascending, got {years}")
-    feat_mats = [np.asarray(panel.features[name]) for name in FEATURE_NAMES]
+    feat_mats = [np.asarray(panel.features[name]) for name in feature_names_for(config.feature_set)]
     shape = feat_mats[0].shape
     if any(mat.shape != shape for mat in feat_mats):
         raise ValueError("panel feature arrays have mismatched shapes")
