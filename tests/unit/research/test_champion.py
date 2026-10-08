@@ -17,6 +17,7 @@ from src.research.champion import (
     ChallengeDecision,
     ChampionRecord,
     ChampionStore,
+    champion_record_fields,
     decision_from_canonical_json,
     decide_challenge,
     knob_changes,
@@ -34,6 +35,7 @@ def _protocol(
     require_neighbors: bool = True,
     paired_horizon: str = "evaluation",
     multiplicity: str = "none",
+    noninferiority_margin: float | None = None,
 ) -> ResearchProtocol:
     from src.data.research_protocol import load_research_protocol
     from src.data.research_scope import load_research_scope
@@ -46,6 +48,7 @@ def _protocol(
             "require_neighbors": require_neighbors,
             "paired_horizon": paired_horizon,
             "multiplicity": multiplicity,
+            "noninferiority_margin": noninferiority_margin,
         }
     )
     return base.model_copy(update={"evaluation": evaluation, "champion": champion})
@@ -1466,3 +1469,68 @@ def test_regime_hedge_target_vol_requires_neighbors_on_introduction() -> None:
     assert "neighbors_missing:regime_hedge.target_vol" not in decision_with_neighbor.reasons
 
 
+
+
+def _waivable(decision: ChallengeDecision, *, mean: float = -0.011, tail_lower: float = 0.0006) -> ChallengeDecision:
+    """The promotable fixture turned into a decision that fails only the growth tests (the stage-2 shape)."""
+    return replace(
+        decision,
+        path="none",
+        reasons=("superiority:paired_lower_bound", "noninferiority:growth_margin"),
+        paired=replace(decision.paired, mean=mean, lower=-0.069),
+        tail=replace(decision.paired, mean=0.03, lower=tail_lower),
+        noninferiority_margin=0.03,
+    )
+
+
+def test_policy_override_records_the_waived_decision_and_rationale(tmp_path: Path) -> None:
+    store, challenger_spec, challenger_run, decision = _promotable(tmp_path)
+    waived = _waivable(decision)
+    store.save_decision(waived)
+    record = store.adopt_policy(
+        decision=waived, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW,
+        rationale="  crisis volatility cap adopted as a risk limit  ",
+    )
+    assert record.reason == "policy_override"
+    assert record.rationale == "crisis volatility cap adopted as a risk limit"
+    assert record.decision_digest == waived.digest
+    assert store.current() == record
+    assert store.history()[-1] == record
+    assert len(store.history()) == 2
+
+
+def test_policy_override_refuses_what_it_may_not_waive(tmp_path: Path) -> None:
+    store, challenger_spec, challenger_run, decision = _promotable(tmp_path)
+    before = store.current()
+
+    def attempt(candidate: ChallengeDecision, rationale: str = "risk limit") -> None:
+        store.adopt_policy(
+            decision=candidate, run=challenger_run, spec=challenger_spec, spec_path=Path("c.toml"), now=_NOW,
+            rationale=rationale,
+        )
+
+    waived = _waivable(decision)
+    with pytest.raises(ValueError, match="never saved"):
+        attempt(waived)
+    store.save_decision(waived)
+    with pytest.raises(ValueError, match="non-empty rationale"):
+        attempt(waived, rationale="   ")
+    with pytest.raises(ValueError, match="use promote"):
+        attempt(decision)
+    for bad, match in (
+        (replace(waived, reasons=(*waived.reasons, "objective_j")), "non-waivable"),
+        (replace(waived, reasons=(*waived.reasons, "noninferiority:tail_lower_bound")), "non-waivable"),
+        (_waivable(decision, mean=-0.05), "outside the declared margin"),
+        (_waivable(decision, tail_lower=0.0), "not significant"),
+        (replace(waived, tail=None), "non-inferiority evidence"),
+    ):
+        store.save_decision(bad)
+        with pytest.raises(ValueError, match=match):
+            attempt(bad)
+    assert store.current() == before
+    assert len(store.history()) == 1
+
+
+def test_records_without_a_rationale_keep_their_serialized_shape(tmp_path: Path) -> None:
+    _, _, _, record = _store_with_champion(tmp_path)
+    assert "rationale" not in champion_record_fields(record)

@@ -49,6 +49,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _common_args(promote)
     promote.add_argument("--spec", type=Path, required=True)
     promote.add_argument("--bootstrap", action="store_true")
+    promote.add_argument(
+        "--policy-override",
+        metavar="RATIONALE",
+        default=None,
+        help="adopt a saved non-promotable decision as a risk policy when only the growth-margin tests failed",
+    )
     return parser
 
 
@@ -270,8 +276,16 @@ def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
         current = store.current()
         if current is None:
             raise ValueError("no champion to promote over: pass --bootstrap")
-        decision = _saved_decision(store, spec_hash=spec.spec_hash, run=run, champion=current)
-        record = store.promote(decision=decision, run=run, spec=spec, spec_path=Path(args.spec), now=now)
+        override = args.policy_override
+        decision = _saved_decision(
+            store, spec_hash=spec.spec_hash, run=run, champion=current, promotable=override is None
+        )
+        if override is None:
+            record = store.promote(decision=decision, run=run, spec=spec, spec_path=Path(args.spec), now=now)
+        else:
+            record = store.adopt_policy(
+                decision=decision, run=run, spec=spec, spec_path=Path(args.spec), now=now, rationale=override
+            )
     _LOG.info(
         "[PORTFOLIO] champion promoted spec_hash=%s reason=%s J=%.6f",
         record.spec_hash,
@@ -287,8 +301,9 @@ def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
     }
 
 
-def _saved_decision(store: Any, *, spec_hash: str, run: Any, champion: Any) -> Any:
-    """The one saved promotable decision for this spec vs the current champion on the current window.
+def _saved_decision(store: Any, *, spec_hash: str, run: Any, champion: Any, promotable: bool = True) -> Any:
+    """The one saved decision (promotable, or non-promotable for a policy override) for this spec vs the current
+    champion on the current window.
 
     Re-evaluating the challenger first turns the stored ``run_id`` into a freshness check: a decision made
     before the cube grew names a different run and is therefore refused.
@@ -297,7 +312,7 @@ def _saved_decision(store: Any, *, spec_hash: str, run: Any, champion: Any) -> A
     matches = [
         decision
         for decision in store.decisions()
-        if decision.promotable
+        if decision.promotable == promotable
         and decision.challenger_hash == spec_hash
         and decision.champion_hash == champion.spec_hash
         and decision.window == window
@@ -305,7 +320,8 @@ def _saved_decision(store: Any, *, spec_hash: str, run: Any, champion: Any) -> A
     ]
     if not matches:
         raise ValueError(
-            "no saved promotable decision for this spec against the current champion on the current window: "
+            f"no saved {'promotable ' if promotable else 'non-promotable '}decision for this spec against the "
+            "current champion on the current window: "
             "run 'challenge --spec PATH' first"
         )
     if len(matches) > 1:
