@@ -344,3 +344,44 @@ def test_promote_refuses_ambiguous_decisions(
 
     assert main(["promote", "--spec", str(challenger_toml)]) == 1
     assert "2 saved decisions match" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+
+
+def test_policy_override_flag_adopts_a_saved_non_promotable_decision(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--policy-override selects the non-promotable decision and hands the rationale to the store."""
+    import src.research.cli as cli_module
+    from tests.unit.research.test_pipeline import _clean_scores, _context, _sessions
+
+    sessions = _sessions()
+    pipeline = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    object.__setattr__(pipeline._ctx, "ledger_runner", _ledger_by_breadth(sessions))
+    _patch_pipeline(monkeypatch, pipeline)
+    store = _patch_store(monkeypatch, tmp_path / "champion")
+    champion_toml = _write_spec(tmp_path / "champion.toml", n=2)
+    challenger_toml = _write_spec(tmp_path / "challenger.toml", n=4)
+    assert cli_module.main(["promote", "--spec", str(champion_toml), "--bootstrap"]) == 0
+    capsys.readouterr()
+
+    assert cli_module.main(["promote", "--spec", str(challenger_toml), "--policy-override", "risk limit"]) == 1
+    assert "no saved non-promotable decision" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+
+    seen: dict[str, object] = {}
+    current = store.current()
+
+    def fake_saved(_store: object, **kwargs: object) -> str:
+        seen["promotable"] = kwargs["promotable"]
+        return "decision"
+
+    def fake_adopt(**kwargs: object) -> object:
+        seen["rationale"] = kwargs["rationale"]
+        seen["decision"] = kwargs["decision"]
+        return current
+
+    monkeypatch.setattr(cli_module, "_saved_decision", fake_saved)
+    monkeypatch.setattr(store, "adopt_policy", fake_adopt)
+    assert cli_module.main(["promote", "--spec", str(challenger_toml), "--policy-override", "risk limit"]) == 0
+    assert seen == {"promotable": False, "rationale": "risk limit", "decision": "decision"}
