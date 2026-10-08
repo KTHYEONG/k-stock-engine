@@ -219,7 +219,7 @@ def test_partial_downtrend_scales_by_abs_s() -> None:
     horizons = (2, 4, 6, 8)
     spec = _spec(tsmom_horizons=horizons, rebalance_every_sessions=1, vol_window_sessions=5, max_fraction=1.0, target_vol=1.0)
 
-    # Let's construct a levels array ending at row 15 where:
+    # Construct levels array ending at row 15 where:
     # level_15 < level_13, level_15 < level_11, level_15 < level_9, but level_15 > level_7
     levels = np.full(20, 1000.0)
     levels[15 - 2] = 1100.0  # past h=2
