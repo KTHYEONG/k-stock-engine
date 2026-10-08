@@ -2017,3 +2017,48 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
         assert spec.regime_hedge.futures_tax_rate == pytest.approx(spec.trend_overlay.futures_tax_rate)
         assert spec.regime_hedge.futures_annual_deduction_krw == spec.trend_overlay.futures_annual_deduction_krw
         assert spec.regime_hedge.futures_cost_rate == pytest.approx(spec.trend_overlay.futures_cost_rate)
+
+
+def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
+    """Invariant: the f52_n10 challenger TOML round-trips scorer.feature_set and policy.n."""
+    from src.research.pipeline import _scores_identity, load_strategy_spec, strategy_spec_from_canonical_json
+
+    strat_dir = Path("config/research/strategies")
+    spec = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_f52_n10.toml")
+    restored = strategy_spec_from_canonical_json(spec.canonical_json())
+    assert restored.scorer.feature_set == "dedup52_v1"
+    assert restored.policy.n == 10
+    assert restored == spec
+    champion = load_strategy_spec(strat_dir / "ml_regime_s2_volcap.toml")
+    assert _scores_identity(spec) != _scores_identity(champion)
+    assert restored.policy.model_dump() != champion.policy.model_dump()
+    champion_policy = champion.policy.model_dump()
+    restored_policy = restored.policy.model_dump()
+    assert {k: v for k, v in restored_policy.items() if k != "n"} == {
+        k: v for k, v in champion_policy.items() if k != "n"
+    }
+    assert restored.scorer.feature_set != champion.scorer.feature_set
+    assert restored.scorer.model_dump(exclude={"feature_set"}) == champion.scorer.model_dump(
+        exclude={"feature_set"}
+    )
+    assert restored.book == champion.book
+    assert restored.hedge == champion.hedge
+    assert restored.trend_overlay == champion.trend_overlay
+    assert restored.regime_hedge == champion.regime_hedge
+    for fname, expected_n in (
+        ("ml_regime_s2_volcap_f52_n8.toml", 8),
+        ("ml_regime_s2_volcap_f52_n12.toml", 12),
+        ("ml_regime_s2_volcap_f52_n20.toml", 20),
+    ):
+        neighbor = load_strategy_spec(strat_dir / fname)
+        assert neighbor.scorer.feature_set == "dedup52_v1"
+        assert neighbor.policy.n == expected_n
+        expected = champion.model_copy(
+            update={
+                "scorer": champion.scorer.model_copy(update={"feature_set": "dedup52_v1"}),
+                "policy": champion.policy.model_copy(update={"n": expected_n}),
+            }
+        )
+        assert neighbor == expected
+        assert strategy_spec_from_canonical_json(neighbor.canonical_json()) == neighbor
+        assert _scores_identity(neighbor) == _scores_identity(spec)
