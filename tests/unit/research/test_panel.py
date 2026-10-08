@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from src.research.cube import ResearchCube
-from src.research.panel import FEATURE_NAMES, HORIZONS, FeaturePanel, build_panel
+from src.research.panel import FEATURE_NAMES, FEATURE_SETS, HORIZONS, FeaturePanel, build_panel, feature_names_for
 
 INSTS = ("KRX:000001", "KRX:000002")
 
@@ -276,3 +276,98 @@ def test_panel_outputs_are_read_only_float32() -> None:
         assert not arr.flags.writeable
     assert list(panel.features) == list(FEATURE_NAMES)
     assert list(panel.labels) == list(HORIZONS)
+
+
+def test_full_set_equals_production_names() -> None:
+    assert feature_names_for("full62") == FEATURE_NAMES
+    assert FEATURE_SETS["full62"] is FEATURE_NAMES
+    with pytest.raises(TypeError):
+        FEATURE_SETS["full62"] = ()  # type: ignore[index]
+
+
+def test_dedup_set_is_the_frozen_52_name_subset() -> None:
+    names = feature_names_for("dedup52_v1")
+    assert len(names) == 52
+    assert len(set(names)) == 52
+    assert set(names) <= set(FEATURE_NAMES)
+    assert names == (
+        "upvol20",
+        "turn20",
+        "lnadtv",
+        "size",
+        "vol_surge5_60",
+        "tv_z1",
+        "ret_5",
+        "ret_1d",
+        "dev_ma20",
+        "ret_21",
+        "gap1",
+        "dist_hi20",
+        "fl_ins5",
+        "fl_ind60",
+        "fl_for5",
+        "fl_ins20",
+        "fl_for20",
+        "fl_for60",
+        "fl_ind20",
+        "fl_ind5",
+        "fl_ins60",
+        "sue_ni_e",
+        "sue_op_e",
+        "post_ear",
+        "earn_age",
+        "sue_sales_e",
+        "ear",
+        "absgap20",
+        "on20",
+        "on60",
+        "id20",
+        "id60",
+        "max21",
+        "skew60",
+        "ivol60",
+        "pvol20",
+        "min21",
+        "vol_ratio",
+        "beta60",
+        "lo52",
+        "dev_ma60",
+        "mom_63_21",
+        "mom_126_21",
+        "hi52",
+        "mom_252_21",
+        "ep",
+        "opa",
+        "bm",
+        "gpa",
+        "accrual",
+        "sales_g",
+        "asset_g",
+    )
+    for dropped in (
+        "ret_10",
+        "dev_ma120",
+        "vol20",
+        "vol60",
+        "range20",
+        "dvol60",
+        "amihud20",
+        "roe",
+        "sue_op",
+        "sue_ni",
+    ):
+        assert dropped not in names
+
+
+def test_unknown_set_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unknown feature_set"):
+        feature_names_for("nope")
+
+
+def test_feature_set_validation_fails_closed() -> None:
+    from src.research.panel import _validate_feature_sets
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _validate_feature_sets({"bad": ("ret_1d", "ret_1d")})
+    with pytest.raises(ValueError, match="outside FEATURE_NAMES"):
+        _validate_feature_sets({"bad": ("ret_1d", "nope")})

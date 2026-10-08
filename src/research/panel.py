@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final
 
 import numpy as np
@@ -12,7 +14,7 @@ from numpy.typing import NDArray
 
 from src.research.cube import ResearchCube
 
-__all__ = ["FEATURE_NAMES", "HORIZONS", "FeaturePanel", "build_panel"]
+__all__ = ["FEATURE_NAMES", "FEATURE_SETS", "HORIZONS", "FeaturePanel", "build_panel", "feature_names_for"]
 
 _LOG = logging.getLogger(__name__)
 
@@ -82,6 +84,99 @@ FEATURE_NAMES: Final[tuple[str, ...]] = (
     "ear",
     "post_ear",
 )
+
+# dedup52_v1: greedy removal of features with mean cross-sectional rank correlation
+# >= 0.80 to an already retained feature, families ordered by ablation importance;
+# probe 2026-10-08.
+_DEDUP52_V1: Final[tuple[str, ...]] = (
+    "upvol20",
+    "turn20",
+    "lnadtv",
+    "size",
+    "vol_surge5_60",
+    "tv_z1",
+    "ret_5",
+    "ret_1d",
+    "dev_ma20",
+    "ret_21",
+    "gap1",
+    "dist_hi20",
+    "fl_ins5",
+    "fl_ind60",
+    "fl_for5",
+    "fl_ins20",
+    "fl_for20",
+    "fl_for60",
+    "fl_ind20",
+    "fl_ind5",
+    "fl_ins60",
+    "sue_ni_e",
+    "sue_op_e",
+    "post_ear",
+    "earn_age",
+    "sue_sales_e",
+    "ear",
+    "absgap20",
+    "on20",
+    "on60",
+    "id20",
+    "id60",
+    "max21",
+    "skew60",
+    "ivol60",
+    "pvol20",
+    "min21",
+    "vol_ratio",
+    "beta60",
+    "lo52",
+    "dev_ma60",
+    "mom_63_21",
+    "mom_126_21",
+    "hi52",
+    "mom_252_21",
+    "ep",
+    "opa",
+    "bm",
+    "gpa",
+    "accrual",
+    "sales_g",
+    "asset_g",
+)
+
+_FEATURE_SETS_RAW: Final[dict[str, tuple[str, ...]]] = {
+    "full62": FEATURE_NAMES,
+    "dedup52_v1": _DEDUP52_V1,
+}
+
+def _validate_feature_sets(sets: Mapping[str, tuple[str, ...]]) -> None:
+    for _set_name, _set_names in sets.items():
+        if len(set(_set_names)) != len(_set_names):
+            raise ValueError(f"feature set {_set_name!r} contains duplicate names")
+        unknown = set(_set_names) - set(FEATURE_NAMES)
+        if unknown:
+            raise ValueError(f"feature set {_set_name!r} has names outside FEATURE_NAMES: {sorted(unknown)}")
+
+
+_validate_feature_sets(_FEATURE_SETS_RAW)
+
+FEATURE_SETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(dict(_FEATURE_SETS_RAW))
+
+
+def feature_names_for(feature_set: str) -> tuple[str, ...]:
+    """Ordered feature names the scorer trains on for a named, frozen feature set.
+
+    Why named sets instead of free lists: a feature set is part of the strategy identity; a name that maps to one frozen
+    ordered tuple keeps stored champion specs reproducible and makes every change an explicit new set.
+    Order matters: LightGBM column sampling is seeded per column position, so a reordering is a different model.
+
+    Raises:
+        ValueError: ``feature_set`` is not a key of ``FEATURE_SETS``.
+    """
+    try:
+        return FEATURE_SETS[feature_set]
+    except KeyError:
+        raise ValueError(f"unknown feature_set {feature_set!r}") from None
+
 
 _PRICE_FEATURES: Final[frozenset[str]] = frozenset(
     {

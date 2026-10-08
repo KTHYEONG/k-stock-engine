@@ -9,7 +9,7 @@ import pytest
 import src.research.model as model_mod
 from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.model import ScoreMatrix, ScorerConfig, _ensemble_average, walk_forward_scores
-from src.research.panel import FEATURE_NAMES, FeaturePanel
+from src.research.panel import FEATURE_NAMES, FeaturePanel, feature_names_for
 
 N_SESS = 1150
 N_INST = 6
@@ -404,3 +404,116 @@ def test_no_full_float64_feature_copy(monkeypatch: pytest.MonkeyPatch) -> None:
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     assert peak - before < 0.25 * 62 * n_s * n_n * 8
+
+
+def test_default_feature_set_keeps_config_hash() -> None:
+    import json
+
+    default = ScorerConfig()
+    explicit = ScorerConfig(feature_set="full62")
+    assert default.canonical_json() == explicit.canonical_json()
+    assert "feature_set" not in json.loads(default.canonical_json())
+    legacy_payload = default.model_dump(mode="json", exclude={"feature_set"})
+    assert default.canonical_json() == json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    assert default.config_hash == explicit.config_hash
+
+
+def test_non_default_feature_set_changes_identity() -> None:
+    import json
+
+    other = ScorerConfig(feature_set="dedup52_v1")
+    assert json.loads(other.canonical_json())["feature_set"] == "dedup52_v1"
+    assert other.config_hash != ScorerConfig().config_hash
+
+
+def test_unknown_feature_set_rejected() -> None:
+    with pytest.raises(ValueError, match="feature_set"):
+        ScorerConfig(feature_set="x")
+
+
+def test_scorer_uses_only_the_configured_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    widths: list[int] = []
+    names = feature_names_for("dedup52_v1")
+    expected = np.stack(
+        [
+            ((values[:, :, None] > values[:, None, :]).sum(axis=2) + 0.5) / N_INST
+            for name in names
+            for values in (panel.features[name],)
+        ],
+        axis=2,
+    )
+    prediction_rows = [r for r, day in enumerate(sess) if day.year == 2018]
+    prediction_widths: list[int] = []
+
+    class _OrderedBooster(_StubBooster):
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            prediction_widths.append(data.shape[1])
+            np.testing.assert_array_equal(data, expected[prediction_rows].reshape(-1, 52))
+            return super().predict(data)
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        widths.append(int(np.asarray(tx).shape[1]))
+        train_rows = np.asarray(rows, dtype=int)
+        instruments = np.tile(np.arange(N_INST), len(train_rows) // N_INST)
+        np.testing.assert_array_equal(tx, expected[train_rows, instruments])
+        return _OrderedBooster(scale=1.0)
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    walk_forward_scores(
+        panel,
+        _universe(),
+        sess,
+        _tiny_config(feature_set="dedup52_v1"),
+        test_years=(2018,),
+        authorization=_auth(sess),
+    )
+    assert widths
+    assert all(w == 52 for w in widths)
+    assert prediction_widths == widths
+
+
+def test_unused_features_cannot_influence_scores() -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    base = walk_forward_scores(
+        panel,
+        _universe(),
+        sess,
+        _tiny_config(feature_set="dedup52_v1"),
+        test_years=(2018,),
+        authorization=_auth(sess),
+    )
+    assert np.isfinite(base.scores).any()
+    noisy_feats = dict(panel.features)
+    rng = np.random.default_rng(1234)
+    blown = rng.standard_normal((N_SESS, N_INST))
+    noisy_feats["vol60"] = np.ascontiguousarray(blown, dtype=np.float32)
+    noisy = FeaturePanel(features=noisy_feats, labels=panel.labels, last_row=panel.last_row)
+    other = walk_forward_scores(
+        noisy,
+        _universe(),
+        sess,
+        _tiny_config(feature_set="dedup52_v1"),
+        test_years=(2018,),
+        authorization=_auth(sess),
+    )
+    assert _equal_with_nan(np.asarray(base.scores), np.asarray(other.scores))
+
+
+def test_missing_configured_feature_fails_closed() -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    feats = dict(panel.features)
+    del feats["ivol60"]
+    pruned = FeaturePanel(features=feats, labels=panel.labels, last_row=panel.last_row)
+    with pytest.raises(KeyError, match="ivol60"):
+        walk_forward_scores(
+            pruned,
+            _universe(),
+            sess,
+            _tiny_config(feature_set="dedup52_v1"),
+            test_years=(2018,),
+            authorization=_auth(sess),
+        )
