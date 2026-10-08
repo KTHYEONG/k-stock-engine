@@ -82,8 +82,9 @@ class ChampionRecord:
     report_digest: str
     objective_j: float
     promoted_at: datetime
-    reason: str  # "bootstrap" | "challenge"
+    reason: str  # "bootstrap" | "challenge" | "policy_override"
     decision_digest: str | None
+    rationale: str | None = None  # operator's stated reason; only a "policy_override" record carries one
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +433,75 @@ class ChampionStore:
         given run is the decision's challenger run."""
         if not decision.promotable:
             raise ValueError(f"decision {decision.digest[:12]} is not promotable: {list(decision.reasons)}")
+        self._verify_decision_context(decision, run=run, spec=spec)
+        record = self._record(
+            run=run,
+            spec=spec,
+            spec_path=spec_path,
+            now=now,
+            reason="challenge",
+            decision_digest=decision.digest,
+        )
+        self._replace_current(record)
+        self._append_history(record)
+        return record
+
+    def adopt_policy(
+        self,
+        *,
+        decision: ChallengeDecision,
+        run: EvaluationRun,
+        spec: StrategySpec,
+        spec_path: Path,
+        now: datetime,
+        rationale: str,
+    ) -> ChampionRecord:
+        """Operator decision to adopt a risk policy whose growth margin could not be proven statistically.
+
+        Only the statistical growth tests may be waived (superiority and ``noninferiority:growth_margin``), and
+        only when the saved decision shows the point estimate inside the margin, a tail-risk improvement with a
+        positive lower bound, ``J`` not below the champion's and every neighbor's tail and growth in order.
+        Why: the paired growth bound has no power to certify a few-percentage-point loss on one 9-year path, so a
+        risk limit the data clearly favours would otherwise be unadoptable. The record carries the failed
+        decision's digest and the rationale so the exception stays auditable.
+
+        Raises ValueError for a blank rationale, a decision that is not saved or does not match the current
+        champion/run/spec/window, or one whose failures include anything other than the waivable growth tests.
+        """
+        if not rationale.strip():
+            raise ValueError("a policy override needs a non-empty rationale")
+        if decision.promotable:
+            raise ValueError(f"decision {decision.digest[:12]} is promotable; use promote")
+        blocking = [
+            reason
+            for reason in decision.reasons
+            if not (reason.startswith("superiority:") or reason == "noninferiority:growth_margin")
+        ]
+        if blocking:
+            raise ValueError(f"decision {decision.digest[:12]} fails non-waivable rules: {blocking}")
+        margin = decision.noninferiority_margin
+        tail = decision.tail
+        if margin is None or tail is None:
+            raise ValueError("a policy override needs the non-inferiority evidence (margin and tail) in the decision")
+        if not (math.isfinite(decision.paired.mean) and decision.paired.mean > -margin):
+            raise ValueError("paired growth point estimate is outside the declared margin")
+        if not (math.isfinite(tail.lower) and tail.lower > 0.0):
+            raise ValueError("tail-risk improvement is not significant (lower bound <= 0)")
+        self._verify_decision_context(decision, run=run, spec=spec)
+        record = self._record(
+            run=run,
+            spec=spec,
+            spec_path=spec_path,
+            now=now,
+            reason="policy_override",
+            decision_digest=decision.digest,
+            rationale=rationale.strip(),
+        )
+        self._replace_current(record)
+        self._append_history(record)
+        return record
+
+    def _verify_decision_context(self, decision: ChallengeDecision, *, run: EvaluationRun, spec: StrategySpec) -> None:
         if not self.decision_path(decision.digest).is_file():
             raise ValueError(f"decision {decision.digest[:12]} was never saved")
         current = self.current()
@@ -448,17 +518,6 @@ class ChampionStore:
             raise ValueError("spec is not the decision's challenger spec")
         if _window_of(run) != decision.window:
             raise ValueError("decision was decided on a different window")
-        record = self._record(
-            run=run,
-            spec=spec,
-            spec_path=spec_path,
-            now=now,
-            reason="challenge",
-            decision_digest=decision.digest,
-        )
-        self._replace_current(record)
-        self._append_history(record)
-        return record
 
     @staticmethod
     def _record(
@@ -469,6 +528,7 @@ class ChampionStore:
         now: datetime,
         reason: str,
         decision_digest: str | None,
+        rationale: str | None = None,
     ) -> ChampionRecord:
         if run.report.spec_hash != spec.spec_hash:
             raise ValueError("run was not produced by this spec")
@@ -482,6 +542,7 @@ class ChampionStore:
             promoted_at=now,
             reason=reason,
             decision_digest=decision_digest,
+            rationale=rationale,
         )
 
     def _replace_current(self, record: ChampionRecord) -> None:
@@ -509,7 +570,7 @@ class ChampionStore:
 
 def champion_record_fields(record: ChampionRecord) -> dict[str, Any]:
     """JSON-safe payload of one champion record (the shape stored in ``current.json`` and ``history.jsonl``)."""
-    return {
+    fields: dict[str, Any] = {
         "decision_digest": record.decision_digest,
         "objective_j": _canon(record.objective_j),
         "promoted_at": record.promoted_at.isoformat(),
@@ -520,6 +581,9 @@ def champion_record_fields(record: ChampionRecord) -> dict[str, Any]:
         "spec_json": record.spec_json,
         "spec_path": record.spec_path,
     }
+    if record.rationale is not None:
+        fields["rationale"] = record.rationale  # absent otherwise so pre-override records keep their bytes
+    return fields
 
 
 def decision_from_canonical_json(
@@ -684,6 +748,7 @@ def _record_from_fields(raw: Mapping[str, Any]) -> ChampionRecord:
             promoted_at=datetime.fromisoformat(str(raw["promoted_at"])),
             reason=str(raw["reason"]),
             decision_digest=None if raw["decision_digest"] is None else str(raw["decision_digest"]),
+            rationale=None if raw.get("rationale") is None else str(raw["rationale"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise PITDataError(f"invalid champion record: {exc}") from exc
