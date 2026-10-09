@@ -21,7 +21,7 @@ from src.data.datasets import (
     publish_dataset,
 )
 
-DEFINITIONS_VERSION = "reference-benchmarks-v1"
+REVISION = "reference-benchmarks-v1"
 
 _COLUMNS: list[str] = [
     "session",
@@ -76,8 +76,8 @@ def load_benchmark_definitions(path: Path) -> tuple[str, tuple[BenchmarkDefiniti
         raise
     except ValueError as exc:
         raise PITDataError(f"reference benchmark definitions are unreadable: {path}") from exc
-    if not isinstance(document, dict) or document.get("version") != DEFINITIONS_VERSION:
-        raise PITDataError(f"reference benchmark definitions require version {DEFINITIONS_VERSION!r}: {path}")
+    if not isinstance(document, dict) or document.get("version") != REVISION:
+        raise PITDataError(f"reference benchmark definitions require version {REVISION!r}: {path}")
     raw_definitions = document.get("benchmarks")
     if not isinstance(raw_definitions, list):
         raise PITDataError(f"reference benchmark definitions require a benchmarks list: {path}")
@@ -106,7 +106,7 @@ def load_benchmark_definitions(path: Path) -> tuple[str, tuple[BenchmarkDefiniti
         definitions.append(
             BenchmarkDefinition(benchmark_id=benchmark_id, weighting=weighting, min_adtv20_krw=threshold)
         )
-    return (DEFINITIONS_VERSION, tuple(definitions))
+    return (REVISION, tuple(definitions))
 
 
 def _load_panel_frame(market_panel_path: Path) -> tuple[str, pl.DataFrame, list[Any]]:

@@ -1,4 +1,4 @@
-"""Account-engine evaluation pipeline invariants (protocol v4)."""
+"""Account-engine evaluation pipeline invariants (protocol)."""
 
 from __future__ import annotations
 

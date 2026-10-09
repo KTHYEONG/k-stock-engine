@@ -1,4 +1,4 @@
-"""Ordinary-universe v2 identity and publication tests."""
+"""Ordinary-universe identity and publication tests."""
 from __future__ import annotations
 
 import json

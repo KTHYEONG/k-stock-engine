@@ -768,7 +768,8 @@ def test_committed_fixtures_match_expected_output() -> None:
     import json
     import os
 
-    from src.integrations.dart.document_statements import PARSER_VERSION, parse_filing_document
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
+    from src.integrations.dart.document_statements import parse_filing_document
 
     paths = sorted(glob.glob("tests/fixtures/dart_documents/*.zip"))
     assert paths, "no committed fixtures"
@@ -799,7 +800,7 @@ def test_committed_fixtures_match_expected_output() -> None:
                 ],
                 "checks": list(statements.checks),
             }
-        assert expected["parser_version"] == PARSER_VERSION
+        assert expected["parser_version"] == DOCUMENT_STATEMENTS_REVISION
         assert actual == expected["statements"], archive_path
         assert list(result.diagnostics) == expected["diagnostics"], archive_path
         assert expected["expected_values_source"], archive_path

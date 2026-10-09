@@ -11,7 +11,8 @@ import polars as pl
 import pytest
 
 from src.core.time import KRX_TZ
-from src.data.daily_market_silver import POLICY_VERSION, DailyMarketSilverPolicy, materialize_daily_market_silver
+from src.data.daily_market_silver import REVISION as DAILY_MARKET_SILVER_REVISION
+from src.data.daily_market_silver import DailyMarketSilverPolicy, materialize_daily_market_silver
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from tests.fixtures import seed_receipts
 from src.core.pit import PITDataError
@@ -546,7 +547,7 @@ def test_materialize_identity_unchanged_by_batching(tmp_path: Path) -> None:
     assert {digests[session] for session in sessions} == {
         entry["source_hash"] for entry in manifest.details["partitions"]
     }
-    _ = (hashlib, POLICY_VERSION, DailyMarketSilverPolicy)
+    _ = (hashlib, DAILY_MARKET_SILVER_REVISION, DailyMarketSilverPolicy)
 
 
 def test_materialize_parses_payload_once_per_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

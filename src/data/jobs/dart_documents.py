@@ -225,7 +225,7 @@ class DartDocumentReparseJob:
             return None
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
-        from src.integrations.dart.document_statements import PARSER_VERSION
+        from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
         usable = _usable_document_hashes(ctx)
         latest = _latest_fact_entries(ctx)
@@ -237,7 +237,7 @@ class DartDocumentReparseJob:
                 continue
             if meta.document_not_found:
                 continue
-            if meta.source_kind == "document_verified" and meta.parser_version == PARSER_VERSION:
+            if meta.source_kind == "document_verified" and meta.parser_version == DOCUMENT_STATEMENTS_REVISION:
                 continue
             if not meta.raw_document_hash or meta.raw_document_hash not in usable:
                 continue
@@ -288,7 +288,7 @@ class DartDocumentFetchJob:
     name = "dart_document_fetch"
 
     def pending(self, ctx: JobContext) -> Sequence[JobUnit]:
-        from src.integrations.dart.document_statements import PARSER_VERSION
+        from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
         try:
             relevant = relevant_fact_identities(ctx)
@@ -306,7 +306,7 @@ class DartDocumentFetchJob:
                 continue
             if meta.document_not_found:
                 continue
-            if meta.source_kind == "document_verified" and meta.parser_version == PARSER_VERSION:
+            if meta.source_kind == "document_verified" and meta.parser_version == DOCUMENT_STATEMENTS_REVISION:
                 continue
             if meta.raw_document_hash and meta.raw_document_hash in usable:
                 continue
@@ -325,7 +325,7 @@ class DartDocumentFetchJob:
         return units
 
     def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
-        from src.integrations.dart.accounts import MAPPING_VERSION
+        from src.integrations.dart.accounts import REVISION as ACCOUNTS_REVISION
         from src.integrations.dart.document_statements import document_verified_page, parse_filing_document
 
         documents = DartDocumentStore(ctx.runtime.workspace.bronze_root, catalog=ctx.catalog)
@@ -343,7 +343,7 @@ class DartDocumentFetchJob:
                     "status": "013",
                     "identity": dict(identity),
                     "records": [],
-                    "mapping_version": MAPPING_VERSION,
+                    "mapping_version": ACCOUNTS_REVISION,
                     "diagnostics": ("document_not_found",),
                     "raw_document_hash": None,
                     **identity,

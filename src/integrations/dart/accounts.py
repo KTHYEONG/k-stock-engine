@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Final
 
-MAPPING_VERSION: Final = "dart-fact-map-v1"
+REVISION: Final = "dart-fact-map-v1"
 
 _LOSS_ONLY_TO_FACT: Final = {
     "영업손실": "operating_profit",
