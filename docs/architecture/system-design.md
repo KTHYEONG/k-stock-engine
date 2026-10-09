@@ -198,7 +198,7 @@ uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 * **Champion store (`src/research/champion.py`)**: 챌린저와 현 챔피언을 **같은 세션·같은 스트레스 스트림**에서 페어드 블록 부트스트랩으로 비교한다(공통 시장 노이즈가 상쇄). 승격은 다음 두 경로 중 하나를 충족해야 한다:
   1. **우월성 경로 (Superiority)**: ① 챌린저 보고 카드 통과 ② 페어드 Δg 하한(α_eff, 한쪽) > 0 ③ 챌린저 J ≥ 챔피언 J ④ 숫자 노브 변경 시 노브별 이웃 변형의 평균 Δg > 0.
   2. **비열등성 경로 (Non-inferiority, δ 허용오차)**: 동일한 보고 카드 통과, J 비교, 이웃 조건 하에서, 페어드 Δg 하한 > -δ이면서 페어드 CVaR 차이 하한 > 0이면 승격한다. δ(`noninferiority_margin`)는 꼬리 위험 축소의 대가로 허용하는 연간 로그 성장률 손실로, v6은 3%p를 사전 선언하며 결과를 본 뒤 재조정하지 않는다(미설정 시 경로 비활성). CVaR은 경로를 겹치지 않는 `tail_block_sessions`(21) 세션 블록으로 나눈 로그수익 합 중 하위 `tail_quantile`(5%) 평균이다 — MDD는 1~2개 에피소드로 정해져 페어드 검정력이 없기 때문이다. 같은 α_eff·페어드 지평을 쓰므로 더 싼 두 번째 검정이 아니며, 둘 다 만족하면 우월성이 우선한다(판정 사유는 `superiority:`/`noninferiority:` 접두사로 기록).
-  `multiplicity="bonferroni_decisions"`에서는 α_eff = α/(1+m) (m은 현 챔피언을 지명한 저장 판정 수), `paired_horizon="full"`에서는 전체 공유 표본 길이로 부트스트랩한다. `<state>/research/champion/`에 `current.json`(원자 교체)·`history.jsonl`·`decisions/<digest>.json`(추가 전용)으로 남기며, 판정 JSON은 `alpha_effective`·`paired_horizon_sessions`·`path`를 기록한다. 승격 기록의 신원은 TOML 경로가 아니라 저장된 `spec_json`이다.
+  `multiplicity="bonferroni_decisions"`에서는 α_eff = α/(1+m) (m은 현 챔피언을 지명한 저장 판정 수), `paired_horizon="full"`에서는 전체 공유 표본 길이로 부트스트랩한다. `<state>/research/champion/`에 `current.json`(원자 교체)·`history.jsonl`·`decisions/<digest>.json`(추가 전용)으로 남기며, 판정 JSON은 `alpha_effective`·`paired_horizon_sessions`·`path`를 기록한다. 승격 기록의 신원은 TOML 경로가 아니라 저장된 `spec_json`이다. 챔피언 파일은 저장된 spec_json에서 생성되는 뷰이며 해시가 어긋나면 challenge/promote가 중단된다.
 
 이웃 검증은 전략 선택에 적용한다. 추세 오버레이 및 레짐 헷지의 계약승수·증거금/버퍼·추가증거금 트리거·비용·세율·연간 공제는 계약 조건으로 면제하되 `knob_changes`에 기록한다. 오버레이 도입/제거 시 `hedge.hedge_ratio`와 새 오버레이의 리밸런싱 주기는 구조 전환으로 면제한다(활성 추세 오버레이에 헤지 비율을 더하는 이웃은 단일 오버레이 불변식을 위반). 도입 시에도 MA/신호·롱/숏 비중, 주식 정책과 북의 밴드는 이웃 검증을 요구한다. 오버레이 제거 시 제거된 노브는 면제하며, 양쪽에 오버레이가 있는 경우 리밸런싱 주기 변경은 이웃 검증을 요구한다. 제공한 모든 이웃의 평균 Δg > 0 (또는 비열등성 경로 시 평균 Δg > -δ 및 평균 tail Δ > 0), 보고 카드 통과, 페어드 하한과 J 조건은 그대로 적용한다.
 
@@ -207,12 +207,13 @@ uv run pytest tests/unit/core/test_package_dependency_boundaries.py
 uv run python -m src.data.cli collect-krx-hedge-series
 uv run python -m src.data.cli build-hedge-series-silver
 # 평가 실행 (단일 사전 등록 스펙) → 리포트 카드 JSON
-uv run python -m src.research evaluate --spec config/research/strategies/ml_sleeve_hedge.toml
+uv run python -m src.research evaluate --spec config/research/challenge/<name>.toml
 # 챔피언 최초 등록 / 대결 판정(상태 불변) / 승격 / 현재 상태
-uv run python -m src.research promote --spec config/research/strategies/ml_sleeve_hedge.toml --bootstrap
+uv run python -m src.research promote --spec config/research/challenge/<name>.toml --bootstrap
 uv run python -m src.research challenge --spec <challenger.toml> --neighbors <neighbor.toml ...>
 uv run python -m src.research promote --spec <challenger.toml>
 uv run python -m src.research champion
+uv run python -m src.research champion --sync-file  # 저장된 spec_json을 config/research/champion.toml에 동기화
 ```
 
 ### 6.1 Champion Status (챔피언 상태)
