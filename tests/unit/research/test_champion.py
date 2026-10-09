@@ -1138,7 +1138,7 @@ def _v5_protocol_and_scope() -> tuple[ResearchProtocol, Any]:
 def test_growth_runbook_neighbors_cover_strategy_knobs(missing: str | None) -> None:
     from src.research.pipeline import load_strategy_spec
 
-    root = Path("config/research/strategies")
+    root = Path("tests/fixtures/strategies")
     champion_spec = load_strategy_spec(root / "ml_sleeve_hedge.toml")
     challenger_spec = load_strategy_spec(root / "ml_growth_t85_b50_k200.toml")
     sessions = _sessions()

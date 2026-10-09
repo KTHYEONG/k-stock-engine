@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.core.pit import PITDataError
 from src.data.research_protocol import WindowError
+
+if TYPE_CHECKING:
+    from src.research.champion import ChampionRecord
 
 __all__ = ["main"]
 
@@ -39,6 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     champion = sub.add_parser("champion")
     _common_args(champion)
+    champion.add_argument("--sync-file", action="store_true")
 
     challenge = sub.add_parser("challenge")
     _common_args(challenge)
@@ -207,15 +214,109 @@ def _champion_store(args: argparse.Namespace) -> Any:
     return ChampionStore(runtime.workspace.state_root / "research" / "champion")
 
 
+def _champion_file_path(args: argparse.Namespace) -> Path:
+    from src.config.runtime import load_runtime_config
+
+    return load_runtime_config().champion_file
+
+
+def _champion_futures_constants(args: argparse.Namespace) -> Path:
+    from src.config.runtime import load_runtime_config
+
+    return load_runtime_config().futures_constants
+
+
+def _repo_relative_champion(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(Path(__file__).resolve().parents[2]).as_posix()
+    except (OSError, ValueError):
+        return path.as_posix()
+
+
+def _champion_file_state(current: ChampionRecord, path: Path, futures_constants: Path) -> str:
+    """``"missing"``, ``"drift"`` or ``"synced"``: whether ``path`` resolves to the stored champion's ``spec_hash``."""
+    target = Path(path)
+    if not target.exists():
+        return "missing"
+    if not target.is_file():
+        return "drift"
+    from src.research.pipeline import load_strategy_spec
+
+    try:
+        file_spec = load_strategy_spec(target, futures_constants=Path(futures_constants))
+    except (OSError, ValueError):
+        return "drift"
+    return "synced" if file_spec.spec_hash == current.spec_hash else "drift"
+
+
+def _write_champion_file(current: ChampionRecord, path: Path, futures_constants: Path) -> None:
+    """Atomically replace ``path`` with the rendered stored champion spec."""
+    from src.research.pipeline import strategy_spec_from_canonical_json
+    from src.research.strategy_file import render_strategy_toml
+
+    spec = strategy_spec_from_canonical_json(current.spec_json)
+    text = render_strategy_toml(spec, futures_constants=Path(futures_constants))
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            os.replace(temporary, target)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+def _file_spec_hash(path: Path, futures_constants: Path) -> str:
+    from src.research.pipeline import load_strategy_spec
+
+    try:
+        return load_strategy_spec(Path(path), futures_constants=Path(futures_constants)).spec_hash
+    except (OSError, ValueError):
+        return "unreadable"
+
+
+def _require_champion_file_synced(current: ChampionRecord, path: Path, futures_constants: Path) -> None:
+    state = _champion_file_state(current, path, futures_constants)
+    if state == "synced":
+        return
+    file_hash = "missing" if state == "missing" else _file_spec_hash(path, futures_constants)
+    raise ValueError(
+        f"champion file {path} is {state}: file spec {file_hash} != champion {current.spec_hash}; "
+        "run 'champion --sync-file' or restore the file"
+    )
+
+
+def _rewrite_champion_file(record: ChampionRecord, args: argparse.Namespace) -> None:
+    _write_champion_file(record, _champion_file_path(args), _champion_futures_constants(args))
+
+
 def _run_champion(args: argparse.Namespace) -> Mapping[str, object]:
     from src.research.champion import champion_record_fields
 
     store = _champion_store(args)
     current = store.current()
     history = store.history()[-5:]
+    if getattr(args, "sync_file", False):
+        if current is None:
+            raise ValueError("no champion: run 'promote --spec PATH --bootstrap' first")
+        path = _champion_file_path(args)
+        _write_champion_file(current, path, _champion_futures_constants(args))
+        return {"champion_file": _repo_relative_champion(Path(path)), "state": "synced"}
+    if current is None:
+        state = "missing"
+    else:
+        state = _champion_file_state(current, _champion_file_path(args), _champion_futures_constants(args))
     return {
         "champion": None if current is None else champion_record_fields(current),
         "history": [champion_record_fields(record) for record in history],
+        "champion_file_state": state,
     }
 
 
@@ -228,6 +329,7 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
     current = store.current()
     if current is None:
         raise ValueError("no champion: run 'promote --spec PATH --bootstrap' first")
+    _require_champion_file_synced(current, _champion_file_path(args), _champion_futures_constants(args))
     pipeline = _pipeline_for(args)
     protocol = pipeline._ctx.protocol
     policy = EvaluationPolicy.model_validate(protocol.evaluation.model_dump())
@@ -269,6 +371,11 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
 
 def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
     store = _champion_store(args)
+    if not args.bootstrap:
+        current = store.current()
+        if current is None:
+            raise ValueError("no champion to promote over: pass --bootstrap")
+        _require_champion_file_synced(current, _champion_file_path(args), _champion_futures_constants(args))
     spec = _load_spec(args.spec)
     pipeline = _pipeline_for(args)
     run = pipeline.evaluate(spec)
@@ -280,6 +387,7 @@ def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
         if current is None:
             raise ValueError("no champion to promote over: pass --bootstrap")
         override = args.policy_override
+        _require_champion_file_synced(current, _champion_file_path(args), _champion_futures_constants(args))
         decision = _saved_decision(
             store, spec_hash=spec.spec_hash, run=run, champion=current, promotable=override is None
         )
@@ -295,6 +403,7 @@ def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
         record.reason,
         record.objective_j,
     )
+    _rewrite_champion_file(record, args)
     return {
         "spec_hash": record.spec_hash,
         "reason": record.reason,

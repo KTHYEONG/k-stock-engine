@@ -1494,7 +1494,7 @@ def _with_trend_inputs(pipe: Any, sessions: list[date]) -> Any:
 def test_pre_overlay_spec_identity_unchanged() -> None:
     from src.research.pipeline import load_strategy_spec
 
-    spec = load_strategy_spec(__import__("pathlib").Path("config/research/strategies/ml_sleeve_hedge.toml"))
+    spec = load_strategy_spec(__import__("pathlib").Path("tests/fixtures/strategies/ml_sleeve_hedge.toml"))
     assert spec.spec_hash == "4ec4b1c58d8c722954a20cb7507dc9f7943bbd8d769fc040676696484f1c1dc9"
 
 
@@ -1784,7 +1784,7 @@ def _regime_spec(**overrides: Any) -> Any:
 def test_champion_identity_unchanged_with_regime_hedge_support() -> None:
     from src.research.pipeline import load_strategy_spec
 
-    champion_path = Path("config/research/strategies/ml_growth_t85_b50_k200.toml")
+    champion_path = Path("tests/fixtures/strategies/ml_growth_t85_b50_k200.toml")
     spec = load_strategy_spec(champion_path)
     assert spec.spec_hash == "8c2aad2c8c3c5a133e7a3c6cef3134f43b89749dd87fa3d2f57c223118e4676c"
     assert spec.regime_hedge is None
@@ -1930,7 +1930,7 @@ def test_perturbation_detects_a_leaking_regime_hedge_leg(tmp_path: Path, monkeyp
 def test_load_strategy_spec_invalid_regime_hedge_table(tmp_path: Path) -> None:
     from src.research.pipeline import load_strategy_spec
 
-    base_toml = Path("config/research/strategies/ml_growth_t85_b50_k200.toml").read_text(encoding="utf-8")
+    base_toml = Path("tests/fixtures/strategies/ml_growth_t85_b50_k200.toml").read_text(encoding="utf-8")
     content = base_toml + "\n[regime_hedge]\ntarget_vol = 'invalid_not_a_float'\n"
     p = tmp_path / "bad.toml"
     p.write_text(content, encoding="utf-8")
@@ -1955,7 +1955,7 @@ def test_staged_strategy_tomls_load_and_differ_only_in_targeted_knobs() -> None:
     from src.research.champion import knob_changes
     from src.research.pipeline import load_strategy_spec
 
-    strat_dir = Path("config/research/strategies")
+    strat_dir = Path("tests/fixtures/strategies")
     specs = {fname: load_strategy_spec(strat_dir / fname) for fname in _STAGED_REGIME_SPECS}
 
     # Stage 1: neighbors differ from challenger only in regime_hedge.target_vol
@@ -2009,7 +2009,7 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
     """Invariant: in every staged file, the [regime_hedge] tax terms equal the [trend_overlay] tax terms."""
     from src.research.pipeline import load_strategy_spec
 
-    strat_dir = Path("config/research/strategies")
+    strat_dir = Path("tests/fixtures/strategies")
     for fname in _STAGED_REGIME_SPECS:
         spec = load_strategy_spec(strat_dir / fname)
         assert spec.trend_overlay is not None
@@ -2023,7 +2023,7 @@ def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
     """Invariant: the f52_n10 challenger TOML round-trips scorer.feature_set and policy.n."""
     from src.research.pipeline import _scores_identity, load_strategy_spec, strategy_spec_from_canonical_json
 
-    strat_dir = Path("config/research/strategies")
+    strat_dir = Path("tests/fixtures/strategies")
     spec = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_f52_n10.toml")
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
     assert restored.scorer.feature_set == "dedup52_v1"
@@ -2067,7 +2067,7 @@ def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
 def test_big3_strategy_loads_with_full62_and_three_seeds() -> None:
     from src.research.pipeline import load_strategy_spec, strategy_spec_from_canonical_json
 
-    strat_dir = Path("config/research/strategies")
+    strat_dir = Path("tests/fixtures/strategies")
     spec = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_big3.toml")
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
     assert restored == spec
