@@ -91,7 +91,7 @@ def test_resolve_metadata_matches_direct_derivation(tmp_path: Path) -> None:
     )
     from src.data.fact_page_meta import FactPageMetaStore
     from src.data.jobs.dart_documents import _is_document_not_found
-    from src.integrations.dart.document_statements import PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     pages = {
         f"{CORP}:2023:11011": _standard_page(),
@@ -103,7 +103,7 @@ def test_resolve_metadata_matches_direct_derivation(tmp_path: Path) -> None:
         ),
         f"{CORP}:2020:11011": _legacy_page(
             source_kind="document_verified",
-            parser_version=PARSER_VERSION,
+            parser_version=DOCUMENT_STATEMENTS_REVISION,
             diagnostics=("document_not_found",),
         ),
     }

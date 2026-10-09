@@ -1376,8 +1376,8 @@ def _verified_zip_bytes() -> bytes:
 def test_verified_document_page_carries_basis_and_archive(monkeypatch) -> None:
     from datetime import date
 
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
     from src.integrations.dart.document_statements import (
-        PARSER_VERSION,
         DocumentParseResult,
         PeriodBasis,
         StatementFact,
@@ -1413,13 +1413,13 @@ def test_verified_document_page_carries_basis_and_archive(monkeypatch) -> None:
     assert page["source_kind"] == "document_verified"
     assert page["status"] == "000"
     assert page["fs_div"] == "CFS"
-    assert page["parser_version"] == PARSER_VERSION
+    assert page["parser_version"] == DOCUMENT_STATEMENTS_REVISION
     assert page["checks"] == ["bs_balance"]
     assert page["raw_archive"] == archive
     assert page["raw_document_hash"] is not None
     assert len(page["records"]) == 2
     assert all(record["period_basis"] for record in page["records"])
-    assert all(record["parser_version"] == PARSER_VERSION for record in page["records"])
+    assert all(record["parser_version"] == DOCUMENT_STATEMENTS_REVISION for record in page["records"])
 
 
 def test_unverified_document_is_extraction_failed(monkeypatch) -> None:

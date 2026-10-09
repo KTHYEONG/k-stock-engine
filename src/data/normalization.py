@@ -12,9 +12,7 @@ import polars as pl
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
-
-_DART_MAPPING_VERSION = "dart-fact-map-v1"
-
+from src.integrations.dart import accounts
 
 TRUSTED_FACT_SOURCE_KINDS: Final[frozenset[str]] = frozenset({"opendart_standard"})
 
@@ -46,9 +44,9 @@ def _document_record_trusted(record: Mapping[str, Any]) -> bool | None:
     which quarantines the whole filing fail closed. A period-basis mismatch
     returns ``False`` so only that record is dropped.
     """
-    from src.integrations.dart.document_statements import PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
-    if str(record.get("parser_version") or "") != PARSER_VERSION:
+    if str(record.get("parser_version") or "") != DOCUMENT_STATEMENTS_REVISION:
         return None
     checks = record.get("checks")
     if isinstance(checks, str):
@@ -102,7 +100,7 @@ def _flatten_dart_fact_pages(page_list: list[Any]) -> list[Mapping[str, Any]]:
     for page in page_list:
         if isinstance(page, Mapping) and "records" in page and isinstance(page["records"], list):
             page_kind = str(page.get("source_kind") or "opendart_standard")
-            page_version = str(page.get("mapping_version") or _DART_MAPPING_VERSION)
+            page_version = str(page.get("mapping_version") or accounts.REVISION)
             page_hash = page.get("raw_document_hash")
             raw_identity = page.get("identity")
             page_identity: Mapping[str, Any] = raw_identity if isinstance(raw_identity, Mapping) else {}
@@ -411,7 +409,7 @@ def normalize_dart_financial_facts_with_quarantine(
             if key in seen:
                 continue
             seen.add(key)
-            mapping_version = str(rec.get("mapping_version") or _DART_MAPPING_VERSION)
+            mapping_version = str(rec.get("mapping_version") or accounts.REVISION)
             if dart_corp_code and ticker_by_corp_code and bridge_receipt_hash and ticker_by_corp_code.get(dart_corp_code) == ticker:
                 mapping_version = f"{mapping_version}+bridge:{bridge_receipt_hash}"
             raw_hash = rec.get("raw_document_hash")

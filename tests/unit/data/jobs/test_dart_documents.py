@@ -503,8 +503,8 @@ def test_document_job_edge_branches(tmp_path: Path, monkeypatch) -> None:
 
 def test_fetch_skips_current_verified_with_archive(tmp_path: Path, monkeypatch) -> None:
     from src.data.jobs.dart_documents import DartDocumentFetchJob
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
     from src.integrations.dart.document_statements import (
-        PARSER_VERSION,
         DocumentParseResult,
         document_verified_page,
     )
@@ -529,7 +529,7 @@ def test_fetch_skips_current_verified_with_archive(tmp_path: Path, monkeypatch) 
             document_hash=receipt.content_hash,
         )
     )
-    assert page["parser_version"] == PARSER_VERSION
+    assert page["parser_version"] == DOCUMENT_STATEMENTS_REVISION
     _persist_fact(ctx, page)
 
     assert DartDocumentFetchJob().pending(ctx) == []

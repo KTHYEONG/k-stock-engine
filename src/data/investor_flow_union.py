@@ -17,7 +17,7 @@ from src.data.datasets import (
     publish_dataset,
 )
 
-POLICY_VERSION = "investor-flow-ls-kis-union-v1"
+REVISION = "investor-flow-ls-kis-union-v1"
 _SCHEMA: dict[str, Any] = {
     "session": pl.Date,
     "instrument_id": pl.String,
@@ -101,7 +101,7 @@ def materialize_investor_flow_union(
     identity = DatasetIdentity(
         kind="investor_flow",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "ls": dataset_reference(ls_id, kind="investor_flow_ls"),
             "kis_supplement": dataset_reference(kis_id, kind="investor_flow_kis_supplement"),

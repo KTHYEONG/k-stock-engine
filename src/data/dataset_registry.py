@@ -205,7 +205,7 @@ class DatasetRegistry:
         return tuple(candidates)
 
     def _dataset_directories(self) -> tuple[Path, ...]:
-        """Return physically present v2 dataset directories for lineage checks."""
+        """Return physically present dataset directories for lineage checks."""
 
         directories: list[Path] = []
         for root in self._layer_roots():

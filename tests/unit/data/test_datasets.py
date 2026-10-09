@@ -11,9 +11,9 @@ import polars as pl
 import pytest
 
 from src.core.pit import PITDataError
+from src.data.datasets import SCHEMA_VERSION as DATASETS_SCHEMA_VERSION
 from src.data.datasets import (
     MANIFEST_NAME,
-    MANIFEST_SCHEMA,
     DatasetCheck,
     DatasetIdentity,
     DatasetLayer,
@@ -322,7 +322,7 @@ def test_manifest_schema_is_v2_and_json_is_readable(tmp_path: Path) -> None:
     raw = json.loads((published.path / MANIFEST_NAME).read_text(encoding="utf-8"))
     manifest = load_manifest(published.path)
 
-    assert raw["schema"] == MANIFEST_SCHEMA
+    assert raw["schema"] == DATASETS_SCHEMA_VERSION
     assert manifest.details == {"counter": 3}
     assert manifest.created_at.utcoffset() is not None
 

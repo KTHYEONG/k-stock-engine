@@ -21,7 +21,7 @@ from src.integrations.dart.accounts import (
 )
 from src.integrations.dart.html_tables import decode_member, read_blocks
 
-PARSER_VERSION: Final = "dart-document-statements-v3"
+REVISION: Final = "dart-document-statements-v3"
 
 MIN_BODY_AMOUNT_ROWS: Final[int] = 3
 
@@ -824,7 +824,7 @@ def document_verified_page(
     else becomes an ``extraction_failed`` page with no records. Both carry
     the archive hash so the document jobs stay idempotent.
     """
-    from src.integrations.dart.accounts import MAPPING_VERSION
+    from src.integrations.dart.accounts import REVISION as ACCOUNTS_REVISION
 
     biz_year = str(identity.get("biz_year") or "").strip()
     reprt_code = str(identity.get("reprt_code") or "").strip()
@@ -839,8 +839,8 @@ def document_verified_page(
             "status": "extraction_failed",
             "identity": dict(identity),
             "records": [],
-            "mapping_version": MAPPING_VERSION,
-            "parser_version": PARSER_VERSION,
+            "mapping_version": ACCOUNTS_REVISION,
+            "parser_version": REVISION,
             "diagnostics": tuple(result.diagnostics),
             **base_identity,
             "raw_document_hash": document_hash,
@@ -870,8 +870,8 @@ def document_verified_page(
             "period_basis": item.basis.value,
             "restatement_id": "r0",
             "source_kind": "document_verified",
-            "mapping_version": MAPPING_VERSION,
-            "parser_version": PARSER_VERSION,
+            "mapping_version": ACCOUNTS_REVISION,
+            "parser_version": REVISION,
             "checks": list(statements.checks),
             "raw_document_hash": document_hash,
         }
@@ -882,8 +882,8 @@ def document_verified_page(
         "status": "000",
         "identity": request_identity,
         "records": records,
-        "mapping_version": MAPPING_VERSION,
-        "parser_version": PARSER_VERSION,
+        "mapping_version": ACCOUNTS_REVISION,
+        "parser_version": REVISION,
         "checks": list(statements.checks),
         "period_end": statements.period_end.isoformat(),
         "unit_multipliers": dict(statements.unit_multipliers),
