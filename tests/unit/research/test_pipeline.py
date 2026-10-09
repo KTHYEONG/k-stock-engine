@@ -2062,3 +2062,25 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
         assert neighbor == expected
         assert strategy_spec_from_canonical_json(neighbor.canonical_json()) == neighbor
         assert _scores_identity(neighbor) == _scores_identity(spec)
+
+
+[redacted]
+    from src.research.pipeline import load_strategy_spec, strategy_spec_from_canonical_json
+
+    strat_dir = Path("config/research/strategies")
+    [redacted]
+    restored = strategy_spec_from_canonical_json(spec.canonical_json())
+    assert restored == spec
+    assert restored.scorer.feature_set == "full62"
+    [redacted]
+    [redacted]
+    [redacted]
+    [redacted]
+    [redacted]
+    [redacted]
+    [redacted]
+    assert restored.policy == champion.policy
+    assert restored.book == champion.book
+    assert restored.hedge == champion.hedge
+    assert restored.trend_overlay == champion.trend_overlay
+    assert restored.regime_hedge == champion.regime_hedge
