@@ -55,12 +55,19 @@ def _build_parser() -> argparse.ArgumentParser:
     promote = sub.add_parser("promote")
     _common_args(promote)
     promote.add_argument("--spec", type=Path, required=True)
-    promote.add_argument("--bootstrap", action="store_true")
-    promote.add_argument(
+    exclusive = promote.add_mutually_exclusive_group()
+    exclusive.add_argument("--bootstrap", action="store_true")
+    exclusive.add_argument(
         "--policy-override",
         metavar="RATIONALE",
         default=None,
         help="adopt a saved non-promotable decision as a risk policy when only the growth-margin tests failed",
+    )
+    exclusive.add_argument(
+        "--rebaseline",
+        metavar="RATIONALE",
+        default=None,
+        help="adopt the equal-design seed-averaged successor when every ledger hash is identical",
     )
     return parser
 
@@ -370,9 +377,13 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
 
 
 def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.research.champion import with_seeds
+    from src.research.pipeline import strategy_spec_from_canonical_json
+
     store = _champion_store(args)
+    rebaseline_rationale = getattr(args, "rebaseline", None)
+    current = store.current()
     if not args.bootstrap:
-        current = store.current()
         if current is None:
             raise ValueError("no champion to promote over: pass --bootstrap")
         _require_champion_file_synced(current, _champion_file_path(args), _champion_futures_constants(args))
@@ -382,6 +393,20 @@ def _run_promote(args: argparse.Namespace) -> Mapping[str, object]:
     now = pipeline._ctx.now()
     if args.bootstrap:
         record = store.bootstrap(run=run, spec=spec, spec_path=Path(args.spec), now=now)
+    elif rebaseline_rationale is not None:
+        assert current is not None
+        stored = strategy_spec_from_canonical_json(current.spec_json)
+        baseline_spec = with_seeds(stored, tuple(spec.scorer.seeds))
+        baseline_run = pipeline.evaluate(baseline_spec)
+        record = store.rebaseline(
+            run=run,
+            baseline_run=baseline_run,
+            spec=spec,
+            baseline_spec=baseline_spec,
+            spec_path=Path(args.spec),
+            now=now,
+            rationale=rebaseline_rationale,
+        )
     else:
         current = store.current()
         if current is None:
