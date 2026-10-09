@@ -79,10 +79,11 @@ class _StubBooster:
         return np.asarray(arr[:, 0] * self._scale + self._offset, dtype=np.float64)
 
 
-def test_year_scores_ignore_the_future() -> None:
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+def test_year_scores_ignore_the_future(seeds: tuple[int, ...]) -> None:
     sess = _sessions()
     panel = _synthetic_panel()
-    cfg = _tiny_config()
+    cfg = _tiny_config(seeds=seeds)
     base = walk_forward_scores(panel, _universe(), sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
     first_2019 = next(i for i, day in enumerate(sess) if day.year == 2019)
     noisy_feats = dict(panel.features)
@@ -413,7 +414,7 @@ def test_default_feature_set_keeps_config_hash() -> None:
     explicit = ScorerConfig(feature_set="full62")
     assert default.canonical_json() == explicit.canonical_json()
     assert "feature_set" not in json.loads(default.canonical_json())
-    legacy_payload = default.model_dump(mode="json", exclude={"feature_set"})
+    legacy_payload = default.model_dump(mode="json", exclude={"feature_set", "seeds"})
     assert default.canonical_json() == json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
     assert default.config_hash == explicit.config_hash
 
@@ -601,11 +602,12 @@ def test_fold_workers_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert model_mod._fold_workers(4) == 1
 
 
-def test_concurrent_equals_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+def test_concurrent_equals_sequential(monkeypatch: pytest.MonkeyPatch, seeds: tuple[int, ...]) -> None:
     sess = _sessions()
     panel = _synthetic_panel()
     uni = _universe()
-    cfg = _tiny_config(horizons=(5, 10, 21), num_threads=4)
+    cfg = _tiny_config(horizons=(5, 10, 21), num_threads=4, seeds=seeds)
     monkeypatch.setattr(model_mod, "_fold_workers", lambda n: 1)
     seq = walk_forward_scores(panel, uni, sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
     monkeypatch.setattr(model_mod, "_fold_workers", lambda n: 3)
@@ -660,5 +662,180 @@ def test_all_year_folds_validated_before_submission(monkeypatch: pytest.MonkeyPa
         walk_forward_scores(
             invalid, _universe(), sess, _tiny_config(horizons=(5, 10, 21)),
             test_years=(2018,), authorization=_auth(sess)
+        )
+    assert not calls
+
+
+def test_empty_seeds_keeps_config_hash() -> None:
+    import json
+
+    default = ScorerConfig()
+    explicit = ScorerConfig(seeds=())
+    assert default.canonical_json() == explicit.canonical_json()
+    assert "seeds" not in json.loads(default.canonical_json())
+    assert model_mod._member_seeds(default) == (default.seed,)
+    assert model_mod._member_seeds(explicit) == (explicit.seed,)
+
+
+def test_seeds_change_identity() -> None:
+    import json
+
+    cfg = ScorerConfig(seed=11, seeds=(11, 12, 13))
+    assert json.loads(cfg.canonical_json())["seeds"] == [11, 12, 13]
+    assert cfg.config_hash != ScorerConfig().config_hash
+    assert model_mod._member_seeds(cfg) == (11, 12, 13)
+
+
+def test_invalid_seeds_rejected() -> None:
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=(11,))
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=(11, 11))
+    with pytest.raises(ValueError, match="seed"):
+        ScorerConfig(seed=11, seeds=(12, 13))
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=(True, 2))  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=(11, "x"))  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="seeds"):
+        ScorerConfig(seeds=(11, -1))
+    assert ScorerConfig(seeds=[]).seeds == ()
+
+
+def test_ensemble_equals_mean_of_member_runs() -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    uni[:, 0] = False
+    thin = next(i for i, day in enumerate(sess) if day.year == 2018) + 10
+    uni[thin, 3:] = False
+    auth = _auth(sess)
+    ensemble = walk_forward_scores(
+        panel, uni, sess, _tiny_config(seed=3, seeds=(3, 4)),
+        test_years=(2018, 2019), authorization=auth,
+    )
+    first = walk_forward_scores(
+        panel, uni, sess, _tiny_config(seed=3), test_years=(2018, 2019), authorization=auth
+    )
+    second = walk_forward_scores(
+        panel, uni, sess, _tiny_config(seed=4), test_years=(2018, 2019), authorization=auth
+    )
+    expected = np.asarray(
+        _ensemble_average(
+            [np.asarray(first.scores), np.asarray(second.scores)], _tiny_config().min_cross_section
+        )
+    )
+    expected = np.ascontiguousarray(np.where(uni, expected, np.nan), dtype=np.float32)
+    assert np.asarray(ensemble.scores).tobytes() == expected.tobytes()
+    assert np.isfinite(ensemble.scores).any()
+    assert np.isnan(ensemble.scores[:, 0]).all()
+    assert np.isnan(ensemble.scores[thin]).all()
+    assert ensemble.config_hash == _tiny_config(seed=3, seeds=(3, 4)).config_hash
+
+
+def test_members_differ_only_by_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    seen: list[tuple[str, tuple[tuple[str, object], ...], int]] = []
+    seed_keys = {"seed", "bagging_seed", "feature_fraction_seed", "data_random_seed"}
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        assert isinstance(params, dict)
+        rest = tuple(sorted((k, v) for k, v in params.items() if k not in seed_keys))
+        digest = hashlib.sha256(
+            np.ascontiguousarray(np.asarray(rows)).tobytes()
+            + np.ascontiguousarray(tx).tobytes()
+            + np.ascontiguousarray(ty).tobytes()
+        ).hexdigest()
+        assert rounds == 5
+        assert params["seed"] == seed
+        assert params["bagging_seed"] == (seed + 1) % 2147483647
+        assert params["feature_fraction_seed"] == (seed + 2) % 2147483647
+        assert params["data_random_seed"] == (seed + 3) % 2147483647
+        seen.append((digest, rest, int(seed)))
+        return _StubBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    walk_forward_scores(
+        panel, _universe(), sess, _tiny_config(horizons=(5, 10), seed=3, seeds=(3, 4)),
+        test_years=(2018, 2019), authorization=_auth(sess),
+    )
+    assert len(seen) == 2 * 2 * 2
+    groups: dict[tuple[str, tuple[tuple[str, object], ...]], list[int]] = {}
+    for digest, rest, seed in seen:
+        groups.setdefault((digest, rest), []).append(seed)
+    assert len(groups) == 2 * 2
+    for seeds in groups.values():
+        assert len(seeds) == 2
+        assert sorted(seeds)[1] - sorted(seeds)[0] == 1
+
+
+def test_prediction_design_shared_across_members(monkeypatch: pytest.MonkeyPatch) -> None:
+    import weakref
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    calls = 0
+    orig = model_mod._rank_stack
+    previous_prediction: weakref.ReferenceType[np.ndarray] | None = None
+
+    def _counting(*args: object, **kwargs: object) -> object:
+        nonlocal calls, previous_prediction
+        if previous_prediction is not None:
+            assert previous_prediction() is None
+        calls += 1
+        result = orig(*args, **kwargs)  # type: ignore[arg-type]
+        if calls > 1:
+            previous_prediction = weakref.ref(result[0])
+        return result
+
+    monkeypatch.setattr(model_mod, "_rank_stack", _counting)
+    monkeypatch.setattr(model_mod, "_train_booster", lambda *a, **k: _StubBooster())
+    walk_forward_scores(
+        panel, _universe(), sess, _tiny_config(seed=3, seeds=(3, 4, 5)),
+        test_years=(2018, 2019), authorization=_auth(sess),
+    )
+    assert calls == 1 + 2
+
+
+def test_member_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    failure = RuntimeError("boom-member")
+    bad_seed = (4 + 5 * 100003 + 2018 * 101) % 2147483647
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        if int(seed) == bad_seed:
+            raise failure
+        return _StubBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    with pytest.raises(RuntimeError, match="boom-member") as caught:
+        walk_forward_scores(
+            panel, _universe(), sess, _tiny_config(horizons=(5,), seed=3, seeds=(3, 4)),
+            test_years=(2018,), authorization=_auth(sess),
+        )
+    assert caught.value is failure
+
+
+def test_multi_member_fold_without_enough_data_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    calls: list[int] = []
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        calls.append(int(seed))
+        return _StubBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    with pytest.raises(ValueError, match="min_train_rows"):
+        walk_forward_scores(
+            panel, _universe(), sess,
+            _tiny_config(horizons=(5,), seed=3, seeds=(3, 4), min_train_rows=10**9),
+            test_years=(2018,), authorization=_auth(sess),
         )
     assert not calls
