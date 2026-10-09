@@ -218,7 +218,7 @@ def _run_champion(args: argparse.Namespace) -> Mapping[str, object]:
 
 
 def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
-    from src.research.champion import decide_challenge
+    from src.research.champion import decide_challenge, with_seeds
     from src.research.evaluation import EvaluationPolicy
     from src.research.pipeline import strategy_spec_from_canonical_json
 
@@ -232,7 +232,7 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
     challenger_spec = _load_spec(args.spec)
     champion_spec = strategy_spec_from_canonical_json(current.spec_json)
     challenger = pipeline.evaluate(challenger_spec)
-    champion = pipeline.evaluate(champion_spec)
+    champion = pipeline.evaluate(with_seeds(champion_spec, protocol.champion.champion_seeds))
     neighbors = [_load_spec(path) for path in (args.neighbors or [])]
     neighbor_runs = tuple(pipeline.evaluate(neighbor) for neighbor in neighbors)
     prior_decisions = sum(1 for d in store.decisions() if d.champion_hash == current.spec_hash)
@@ -251,6 +251,7 @@ def _run_challenge(args: argparse.Namespace) -> Mapping[str, object]:
         "promotable": decision.promotable,
         "path": decision.path,
         "reasons": list(decision.reasons),
+        "baseline_hash": decision.baseline_hash,
         "delta_mean": decision.paired.mean,
         "delta_lower": decision.paired.lower,
         "tail_mean": decision.tail.mean if decision.tail is not None else None,

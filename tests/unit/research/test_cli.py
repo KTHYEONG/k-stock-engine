@@ -12,12 +12,13 @@ import numpy as np
 import pytest
 
 
-def _write_spec(path: Path, *, n: int = 2, hedge_ratio: float = 1.0) -> Path:
+def _write_spec(path: Path, *, n: int = 2, hedge_ratio: float = 1.0, seeds: bool = True) -> Path:
+    scorer_seeds = "seeds = [11, 12, 13]\n" if seeds else ""
     path.write_text(
         f'[policy]\nfamily = "ml_trend_cash"\nn = {n}\nrebalance_every_sessions = 5\n'
         "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
         "[scorer]\nfirst_test_year = 2019\nmin_train_rows = 1\nmin_cross_section = 1\n"
-        "num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\n"
+        f"num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\n{scorer_seeds}"
         "[book]\nsleeves = 5\nstock_capital_fraction = 0.75\n"
         f"[hedge]\nhedge_ratio = {hedge_ratio}\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
         "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
@@ -281,6 +282,7 @@ def test_champion_lifecycle(
         "promotable",
         "path",
         "reasons",
+        "baseline_hash",
         "delta_mean",
         "delta_lower",
         "tail_mean",
@@ -385,3 +387,54 @@ def test_policy_override_flag_adopts_a_saved_non_promotable_decision(
     monkeypatch.setattr(store, "adopt_policy", fake_adopt)
     assert cli_module.main(["promote", "--spec", str(challenger_toml), "--policy-override", "risk limit"]) == 0
     assert seen == {"promotable": False, "rationale": "risk limit", "decision": "decision"}
+
+
+def test_challenge_evaluates_the_reseeded_champion(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The comparator runs on with_seeds(stored) while the saved decision keeps the stored identity."""
+    from src.research.champion import with_seeds
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+    from tests.unit.research.test_pipeline import _clean_scores, _context, _sessions
+
+    sessions = _sessions()
+    pipeline = _context(tmp_path, sessions)
+    _clean_scores(monkeypatch)
+    object.__setattr__(pipeline._ctx, "ledger_runner", _ledger_by_breadth(sessions))
+    assert tuple(pipeline._ctx.protocol.champion.champion_seeds) == (11, 12, 13)
+
+    seen: list[str] = []
+    inner = pipeline.evaluate
+
+    class _Recording:
+        def __init__(self, ctx: object) -> None:
+            self._ctx = ctx
+
+        def evaluate(self, spec: Any, *, capital_krw: int | None = None) -> Any:
+            seen.append(spec.spec_hash)
+            return inner(spec, capital_krw=capital_krw)
+
+    _patch_pipeline(monkeypatch, _Recording(pipeline._ctx))
+    store = _patch_store(monkeypatch, tmp_path / "champion")
+
+    champion_toml = _write_spec(tmp_path / "champion.toml", n=2, seeds=False)
+    challenger_toml = _write_spec(tmp_path / "challenger.toml", n=4, seeds=True)
+    assert main(["promote", "--spec", str(champion_toml), "--bootstrap"]) == 0
+    capsys.readouterr()
+    seen.clear()
+
+    assert main(["challenge", "--spec", str(challenger_toml)]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    stored = load_strategy_spec(champion_toml)
+    challenger = load_strategy_spec(challenger_toml)
+    reseeded = with_seeds(stored, (11, 12, 13))
+    assert reseeded.spec_hash != stored.spec_hash
+    assert seen == [challenger.spec_hash, reseeded.spec_hash]
+    assert payload["baseline_hash"] == reseeded.spec_hash
+    saved = store.decisions()
+    assert len(saved) == 1
+    assert saved[0].champion_hash == stored.spec_hash
+    assert saved[0].baseline_hash == reseeded.spec_hash

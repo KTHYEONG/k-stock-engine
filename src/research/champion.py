@@ -43,6 +43,7 @@ __all__ = [
     "decide_challenge",
     "decision_from_canonical_json",
     "knob_changes",
+    "with_seeds",
 ]
 
 STRESS_STREAMS = ("stress_slippage", "stress_delay")
@@ -97,6 +98,7 @@ class ChallengeDecision:
 
     challenger_hash: str
     champion_hash: str
+    baseline_hash: str
     run_ids: tuple[str, str]  # (challenger, champion) on the same window
     window: tuple[date, date]
     paired: PairedDelta
@@ -120,6 +122,7 @@ class ChallengeDecision:
         """Key-sorted compact JSON; byte-identical for identical evidence."""
         payload = {
             "alpha_effective": _canon(self.alpha_effective),
+            "baseline_hash": self.baseline_hash,
             "challenger_hash": self.challenger_hash,
             "challenger_j": _canon(self.challenger_j),
             "champion_hash": self.champion_hash,
@@ -145,6 +148,14 @@ class ChallengeDecision:
     def digest(self) -> str:
         """SHA-256 hex of the canonical JSON."""
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+
+def with_seeds(spec: StrategySpec, seeds: tuple[int, ...]) -> StrategySpec:
+    """Reseed a single-seed comparator; preserve existing ensembles and empty requests."""
+    if not seeds or spec.scorer.seeds:
+        return spec
+    scorer = type(spec.scorer).model_validate({**spec.scorer.model_dump(), "seeds": seeds, "seed": seeds[0]})
+    return spec.model_copy(update={"scorer": scorer})
 
 
 def decide_challenge(
@@ -184,7 +195,8 @@ def decide_challenge(
         raise ValueError("challenger and champion must be evaluated on identical sessions")
     if challenger.report.spec_hash != challenger_spec.spec_hash:
         raise ValueError("challenger run was not produced by challenger_spec")
-    if champion.report.spec_hash != champion_spec.spec_hash:
+    reseeded_hash = with_seeds(champion_spec, tuple(protocol.champion.champion_seeds)).spec_hash
+    if champion.report.spec_hash != champion_spec.spec_hash and champion.report.spec_hash != reseeded_hash:
         raise ValueError("champion run was not produced by champion_spec")
     neighbor_runs = tuple(neighbors)
     for run in neighbor_runs:
@@ -221,6 +233,8 @@ def decide_challenge(
     changes = knob_changes(challenger_spec, champion_spec)
 
     reasons: list[str] = []
+    if protocol.champion.champion_seeds and not challenger_spec.scorer.seeds:
+        reasons.append("challenger_single_seed")
     if not challenger.report.passed:
         reasons.append("report_failed")
     challenger_j = float(challenger.report.objective_j)
@@ -298,7 +312,8 @@ def decide_challenge(
 
     return ChallengeDecision(
         challenger_hash=challenger.report.spec_hash,
-        champion_hash=champion.report.spec_hash,
+        champion_hash=champion_spec.spec_hash,
+        baseline_hash=champion.report.spec_hash,
         run_ids=(challenger.report.run_id, champion.report.run_id),
         window=(sessions[0], sessions[-1]),
         paired=paired,
@@ -612,6 +627,7 @@ def decision_from_canonical_json(
         return ChallengeDecision(
             challenger_hash=str(raw["challenger_hash"]),
             champion_hash=str(raw["champion_hash"]),
+            baseline_hash=str(raw.get("baseline_hash", raw["champion_hash"])),
             run_ids=(str(raw["run_ids"][0]), str(raw["run_ids"][1])),
             window=(date.fromisoformat(str(raw["window"][0])), date.fromisoformat(str(raw["window"][1]))),
             paired=_delta_from_fields(raw["paired"]),

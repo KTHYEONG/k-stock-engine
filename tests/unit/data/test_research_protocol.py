@@ -20,9 +20,9 @@ def _protocol():  # type: ignore[no-untyped-def]
     return load_research_protocol(Path("config/research/protocol.toml"), scope), scope
 
 
-def test_protocol_v6_loads() -> None:
+def test_protocol_v7_loads() -> None:
     protocol, _ = _protocol()
-    assert protocol.version == "research-protocol-v6"
+    assert protocol.version == "research-protocol-v7"
     assert protocol.evaluation_start == date(2017, 4, 1)
     assert protocol.sessions_per_year == 252
     assert protocol.primary_capital_krw == 100_000_000
@@ -50,6 +50,7 @@ def test_protocol_v6_loads() -> None:
     assert protocol.champion.noninferiority_margin == pytest.approx(0.03)
     assert protocol.champion.tail_quantile == pytest.approx(0.05)
     assert protocol.champion.tail_block_sessions == 21
+    assert protocol.champion.champion_seeds == (11, 12, 13)
 
 
 def test_content_hash_stable() -> None:
@@ -255,7 +256,7 @@ def test_v5_file_disables_noninferiority_path(tmp_path: Path) -> None:
         if not line.strip().startswith("noninferiority_margin")
     ]
     v5_path = tmp_path / "protocol-v5.toml"
-    v5_path.write_text("\n".join(lines).replace('version = "research-protocol-v6"', 'version = "research-protocol-v5"') + "\n", encoding="utf-8")
+    v5_path.write_text("\n".join(lines).replace('version = "research-protocol-v7"', 'version = "research-protocol-v5"') + "\n", encoding="utf-8")
     protocol = load_research_protocol(v5_path, scope)
     assert protocol.champion.noninferiority_margin is None
     assert protocol.champion.tail_quantile == 0.05
@@ -280,4 +281,43 @@ def test_out_of_range_margin_rejected(tmp_path: Path) -> None:
         load_research_protocol(_with_margin("0.0"), scope)
     with pytest.raises(ConfigError):
         load_research_protocol(_with_margin("0.5"), scope)
+
+
+def test_invalid_champion_seeds_rejected(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+
+    def _with_seeds(val: str) -> Path:
+        path = tmp_path / f"champion-seeds-{abs(hash(val)) % 100000}.toml"
+        path.write_text(base.replace("champion_seeds = [11, 12, 13]", f"champion_seeds = {val}"), encoding="utf-8")
+        return path
+
+    for bad in ("[11]", "[11, 11]", "[11, -1]", "[true, 12]"):
+        with pytest.raises(ConfigError):
+            load_research_protocol(_with_seeds(bad), scope)
+
+
+def test_champion_seeds_change_the_protocol_hash() -> None:
+    protocol, _ = _protocol()
+    reseeded = protocol.model_copy(
+        update={"champion": protocol.champion.model_copy(update={"champion_seeds": (11, 12, 14)})}
+    )
+    assert reseeded.content_hash != protocol.content_hash
+    cleared = protocol.model_copy(update={"champion": protocol.champion.model_copy(update={"champion_seeds": ()})})
+    assert cleared.content_hash != protocol.content_hash
+    assert cleared.champion.champion_seeds == ()
+
+
+def test_champion_seeds_accept_empty_and_tuple_forms() -> None:
+    from src.data.research_protocol import ChampionPolicy
+
+    kw: dict[str, object] = {"alpha": 0.05, "require_neighbors": True}
+    assert ChampionPolicy(**kw, champion_seeds=()).champion_seeds == ()  # type: ignore[arg-type]
+    assert ChampionPolicy(**kw, champion_seeds=[]).champion_seeds == ()  # type: ignore[arg-type]
+    assert ChampionPolicy(**kw, champion_seeds=(11, 12, 13)).champion_seeds == (11, 12, 13)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="champion_seeds"):
+        ChampionPolicy(**kw, champion_seeds=11)  # type: ignore[arg-type]
 
