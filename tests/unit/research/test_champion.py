@@ -1657,3 +1657,281 @@ def test_policy_override_refuses_what_it_may_not_waive(tmp_path: Path) -> None:
 def test_records_without_a_rationale_keep_their_serialized_shape(tmp_path: Path) -> None:
     _, _, _, record = _store_with_champion(tmp_path)
     assert "rationale" not in champion_record_fields(record)
+
+
+def _rebaseline_run(spec: StrategySpec, sessions: list[date]) -> EvaluationRun:
+    run = _run(spec, sessions, drift=0.0008)
+    scenarios = {
+        name: replace(getattr(run.evidence, name), ledger_hash=f"ledger-{name}")
+        for name in ("base", "stress_slippage", "stress_delay", "unhedged", "placebo")
+    }
+    cost_grid = {
+        tick: replace(outcome, ledger_hash=f"ledger-cost-{tick}")
+        for tick, outcome in run.evidence.cost_grid.items()
+    }
+    return replace(run, evidence=replace(run.evidence, **scenarios, cost_grid=cost_grid))
+
+
+def _rebaseline_fixture(
+    tmp_path: Path,
+) -> tuple[ChampionStore, StrategySpec, StrategySpec, EvaluationRun, EvaluationRun, ChampionRecord]:
+    from src.research.champion import with_seeds
+
+    sessions = _sessions()
+    store, champion_spec, _, current = _store_with_champion(tmp_path)
+    seeds = (11, 12, 13)
+    spec = _spec(scorer={"seeds": seeds, "seed": 11, "num_threads": 4})
+    baseline_spec = with_seeds(champion_spec, seeds)
+    assert baseline_spec.spec_hash != champion_spec.spec_hash
+    run = _rebaseline_run(spec, sessions)
+    baseline_run = _rebaseline_run(baseline_spec, sessions)
+    return store, spec, baseline_spec, run, baseline_run, current
+
+
+def test_rebaseline_adopts_equal_design_successor(tmp_path: Path) -> None:
+    store, spec, baseline_spec, run, baseline_run, current = _rebaseline_fixture(tmp_path)
+    record = store.rebaseline(
+        run=run, baseline_run=baseline_run, spec=spec, baseline_spec=baseline_spec,
+        spec_path=Path("config/research/challenge/three_seeds.toml"), now=_NOW, rationale="remove seed luck",
+    )
+    assert store.current() == record
+    assert len(store.history()) == 2
+    assert record.reason == "rebaseline"
+    assert record.decision_digest is None
+    assert "replaces" in (record.rationale or "")
+    assert current.spec_hash[:12] in (record.rationale or "")
+    assert record.spec_hash == spec.spec_hash
+
+
+def test_rebaseline_refuses_differing_cost_entry(tmp_path: Path) -> None:
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    tampered_logs = np.ascontiguousarray(
+        np.asarray(baseline_run.evidence.cost_grid[1.0].log_returns, dtype=np.float64).copy()
+    )
+    tampered_logs[-1] = np.nextafter(tampered_logs[-1], tampered_logs[-1] + 1.0)
+    tampered = replace(
+        baseline_run,
+        evidence=replace(
+            baseline_run.evidence,
+            cost_grid={**baseline_run.evidence.cost_grid, 1.0: replace(
+                baseline_run.evidence.cost_grid[1.0], log_returns=tampered_logs)},
+        ),
+    )
+    with pytest.raises(ValueError, match="cost_grid"):
+        store.rebaseline(
+            run=run, baseline_run=tampered, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+    drifted = replace(
+        baseline_run,
+        evidence=replace(baseline_run.evidence, stress_slippage=replace(
+            baseline_run.evidence.stress_slippage, log_returns=tampered_logs)),
+    )
+    with pytest.raises(ValueError, match="stress_slippage"):
+        store.rebaseline(
+            run=run, baseline_run=drifted, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+
+
+def test_rebaseline_refuses_design_and_comparator_problems(tmp_path: Path) -> None:
+    from src.research.champion import same_design
+
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    sessions = _sessions()
+    other = _spec(policy={"n": 99}, scorer={"seeds": (11, 12, 13), "seed": 11})
+    other_run = _run(other, sessions, drift=0.0008)
+    with pytest.raises(ValueError, match="same_design"):
+        store.rebaseline(
+            run=other_run, baseline_run=baseline_run, spec=other, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert same_design(spec, baseline_spec) is True
+    assert same_design(spec, other) is False
+    assert same_design(_spec(), _spec(policy={"n": 21})) is False
+    foreign = spec
+    foreign_run = run
+    with pytest.raises(ValueError, match="with_seeds"):
+        store.rebaseline(
+            run=foreign_run, baseline_run=foreign_run, spec=foreign,
+            baseline_spec=foreign, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    single = _spec()
+    single_run = _run(single, sessions, drift=0.0008)
+    with pytest.raises(ValueError, match="seeds"):
+        store.rebaseline(
+            run=single_run, baseline_run=single_run, spec=single,
+            baseline_spec=single, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+
+
+def test_same_design_thread_count_and_alias_are_neutral() -> None:
+    from src.research.champion import same_design
+
+    base = _spec(scorer={"feature_set": "dedup52_v1", "num_threads": 8})
+    twin = _spec(scorer={"feature_set": "dedup52", "num_threads": 4})
+    assert same_design(base, twin) is True
+    other = _spec(scorer={"feature_set": "full62", "num_threads": 4})
+    assert same_design(base, other) is False
+
+
+def test_rebaseline_refuses_guard_failures(tmp_path: Path) -> None:
+    from src.research.champion import ChampionStore
+
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    sessions = _sessions()
+    with pytest.raises(ValueError, match="non-empty rationale"):
+        store.rebaseline(
+            run=run, baseline_run=baseline_run, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="   ",
+        )
+    with pytest.raises(ValueError, match="did not pass"):
+        store.rebaseline(
+            run=_run(spec, sessions, drift=0.0008, passed=False), baseline_run=baseline_run,
+            spec=spec, baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    with pytest.raises(ValueError, match="not produced by this spec"):
+        store.rebaseline(
+            run=_run(_spec(policy={"n": 99}), sessions, drift=0.0008), baseline_run=baseline_run,
+            spec=spec, baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    with pytest.raises(ValueError, match="baseline_spec"):
+        store.rebaseline(
+            run=run, baseline_run=_run(_spec(policy={"n": 99}), sessions, drift=0.0008),
+            spec=spec, baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    current = store.current()
+    assert current is not None
+    from src.research.champion import ChampionStore as _Store
+
+    seeded_store = _Store(tmp_path / "seeded")
+    seeded_run = _run(spec, sessions, drift=0.0008)
+    seeded_store.bootstrap(run=seeded_run, spec=spec, spec_path=Path("c.toml"), now=_NOW)
+    seeded_baseline = _run(baseline_spec, sessions, drift=0.0008)
+    with pytest.raises(ValueError, match="nothing to rebaseline"):
+        seeded_store.rebaseline(
+            run=seeded_run, baseline_run=seeded_baseline, spec=spec,
+            baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    mismatch = _spec(scorer={"seeds": (21, 22, 23), "seed": 21, "num_threads": 4})
+    mismatch_run = _run(mismatch, sessions, drift=0.0008)
+    with pytest.raises(ValueError, match="seeds must equal"):
+        store.rebaseline(
+            run=mismatch_run, baseline_run=baseline_run, spec=mismatch,
+            baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    empty = ChampionStore(tmp_path / "empty")
+    with pytest.raises(ValueError, match="no champion"):
+        empty.rebaseline(
+            run=run, baseline_run=baseline_run, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    shifted = replace(run, evidence=replace(run.evidence, sessions=tuple(_sessions(50))))
+    with pytest.raises(ValueError, match="sessions"):
+        store.rebaseline(
+            run=shifted, baseline_run=baseline_run, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+
+
+def test_same_design_unknown_feature_set_is_false() -> None:
+    from src.research.champion import same_design
+
+    spec = _spec()
+    bogus = spec.model_copy(update={"scorer": spec.scorer.model_copy(update={"feature_set": "bogus"})})
+    assert same_design(bogus, bogus) is False
+    assert same_design(spec, bogus) is False
+
+
+def test_rebaseline_refuses_ledger_hash_and_cost_keys(tmp_path: Path) -> None:
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    hashed = replace(
+        baseline_run,
+        evidence=replace(
+            baseline_run.evidence,
+            stress_delay=replace(baseline_run.evidence.stress_delay, ledger_hash="deadbeef"),
+        ),
+    )
+    with pytest.raises(ValueError, match="stress_delay"):
+        store.rebaseline(
+            run=run, baseline_run=hashed, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    dropped = replace(
+        baseline_run, evidence=replace(baseline_run.evidence, cost_grid={0.0: baseline_run.evidence.cost_grid[0.0]})
+    )
+    with pytest.raises(ValueError, match="cost_grid"):
+        store.rebaseline(
+            run=run, baseline_run=dropped, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+
+
+@pytest.mark.parametrize("scenario", [
+    "base", "stress_slippage", "stress_delay", "unhedged", "placebo", 0.0, 1.0,
+])
+@pytest.mark.parametrize("mismatch", ["ledger_hash", "log_returns", "sessions", "missing_hash"])
+def test_rebaseline_requires_complete_scenario_identity(
+    tmp_path: Path, scenario: str | float, mismatch: str,
+) -> None:
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    evidence = baseline_run.evidence
+    if isinstance(scenario, str):
+        outcome = getattr(evidence, scenario)
+        name = scenario
+    else:
+        outcome = evidence.cost_grid[scenario]
+        name = f"cost_grid[{scenario}]"
+    if mismatch == "log_returns":
+        logs = outcome.log_returns.copy()
+        logs[-1] = np.nextafter(logs[-1], np.inf)
+        changed = replace(outcome, log_returns=logs)
+    elif mismatch == "sessions":
+        changed = replace(outcome, sessions=tuple(reversed(outcome.sessions)))
+    else:
+        changed = replace(outcome, ledger_hash="" if mismatch == "missing_hash" else "different-ledger")
+    if isinstance(scenario, str):
+        evidence = replace(evidence, **{scenario: changed})
+    else:
+        evidence = replace(evidence, cost_grid={**evidence.cost_grid, scenario: changed})
+    before_current = (tmp_path / "champion" / "current.json").read_bytes()
+    before_history = (tmp_path / "champion" / "history.jsonl").read_bytes()
+    with pytest.raises(ValueError, match="rebaseline evidence differs") as exc:
+        store.rebaseline(
+            run=run, baseline_run=replace(baseline_run, evidence=evidence), spec=spec,
+            baseline_spec=baseline_spec, spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert name in str(exc.value)
+    assert (tmp_path / "champion" / "current.json").read_bytes() == before_current
+    assert (tmp_path / "champion" / "history.jsonl").read_bytes() == before_history
+
+
+def test_rebaseline_refuses_two_missing_ledger_hashes(tmp_path: Path) -> None:
+    store, spec, baseline_spec, run, baseline_run, _ = _rebaseline_fixture(tmp_path)
+    run = replace(run, evidence=replace(run.evidence, base=replace(run.evidence.base, ledger_hash="")))
+    baseline_run = replace(baseline_run, evidence=replace(
+        baseline_run.evidence, base=replace(baseline_run.evidence.base, ledger_hash=""),
+    ))
+    with pytest.raises(ValueError, match="base: missing ledger_hash"):
+        store.rebaseline(
+            run=run, baseline_run=baseline_run, spec=spec, baseline_spec=baseline_spec,
+            spec_path=Path("c.toml"), now=_NOW, rationale="x",
+        )
+    assert len(store.history()) == 1
+
+
+def test_rebaseline_challenge_config_is_equal_design() -> None:
+    from src.research.champion import same_design, with_seeds
+    from src.research.pipeline import load_strategy_spec
+
+    stored = load_strategy_spec(Path("config/research/champion.toml"))
+    successor = load_strategy_spec(Path("config/research/challenge/three_seeds.toml"))
+    assert successor.scorer.seeds == (11, 12, 13)
+    assert successor.scorer.num_threads == 4
+    assert successor.scorer.feature_set == "dedup52"
+    assert same_design(successor, with_seeds(stored, successor.scorer.seeds))
