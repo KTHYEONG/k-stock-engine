@@ -108,7 +108,7 @@ flowchart TD
 > **단일 전략 경로**: `panel → scorer → policy → sleeves/book → account engine (ledger) → report card`  
 > **평가 단위**: ML 상위 20선 + `ret21 > 0` 추세 규칙의 5-슬리브 주식북에 KOSDAQ 150 베타중립 헤지를 얹은 북을 **정수 원장 하나**(주식·KQ150 선물·인버스 ETF·현금 수익 동시 정산)로 평가한다  
 > **판정**: 목적함수 J = 5년 부트스트랩 성장률의 하위 10% 분위수(더 나은 스트레스 스트림 기준). 무결성(인과적 섭동 불일치 0)과 생존 가드(P(5y MDD ≤ −50%) ≤ 5%, P(5y g ≤ 0) ≤ 5%)만 승격을 막고, 연율·MDD·calmar·비용 그리드·손익분기 틱은 진단 보고용이다  
-> **실행**: `uv run python -m src.research evaluate --spec config/research/strategies/ml_sleeve_hedge.toml` → 최초 챔피언은 `promote --spec <PATH> --bootstrap`, 대결은 `challenge --spec <PATH> --neighbors <PATH ...>`(판정 저장, 상태 불변), 승격은 `promote --spec <PATH>`, 현재 상태는 `champion` 으로 읽는다. 기록은 `<state>/research/champion/`(`current.json` 원자 교체 + `history.jsonl` + `decisions/<digest>.json`)에 남는다
+> **실행**: `uv run python -m src.research evaluate --spec config/research/challenge/<name>.toml` → 최초 챔피언은 `promote --spec <PATH> --bootstrap`, 대결은 `challenge --spec <PATH> --neighbors <PATH ...>`(판정 저장, 상태 불변), 승격은 `promote --spec <PATH>`, 현재 상태는 `champion` 으로 읽는다. 기록은 `<state>/research/champion/`(`current.json` 원자 교체 + `history.jsonl` + `decisions/<digest>.json`)에 남는다. 챔피언 파일(`config/research/champion.toml`)은 저장된 spec_json의 뷰이며 `champion --sync-file`로 동기화한다
 
 | 항목 | 상태 | 비고 |
 | :--- | :---: | :--- |

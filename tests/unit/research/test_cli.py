@@ -166,6 +166,8 @@ def _patch_store(monkeypatch: pytest.MonkeyPatch, root: Path) -> Any:
 
     store = ChampionStore(root)
     monkeypatch.setattr(cli_module, "_champion_store", lambda args: store)
+    champion_file = root.parent / "champion.toml"
+    monkeypatch.setattr(cli_module, "_champion_file_path", lambda args: champion_file)
     return store
 
 
@@ -213,7 +215,7 @@ def test_champion_command_on_empty_store(
     _patch_store(monkeypatch, tmp_path / "champion")
     assert main(["champion"]) == 0
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert payload == {"champion": None, "history": []}
+    assert payload == {"champion": None, "history": [], "champion_file_state": "missing"}
 
 
 def test_challenge_without_champion_fails_closed(
@@ -236,7 +238,9 @@ def test_champion_store_resolves_the_state_root(
     from src.research.cli import main
 
     assert main(["champion", "--data-root", str(tmp_path)]) == 0
-    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == {"champion": None, "history": []}
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == {
+        "champion": None, "history": [], "champion_file_state": "missing"
+    }
 
 
 def test_champion_lifecycle(
@@ -438,3 +442,307 @@ def test_challenge_evaluates_the_reseeded_champion(
     assert len(saved) == 1
     assert saved[0].champion_hash == stored.spec_hash
     assert saved[0].baseline_hash == reseeded.spec_hash
+
+
+def _bootstrap_record(tmp_path: Path, spec_path: Path) -> Any:
+    from datetime import UTC, datetime
+
+    from src.research.champion import ChampionStore
+    from src.research.pipeline import load_strategy_spec
+
+    spec = load_strategy_spec(spec_path)
+    store = ChampionStore(tmp_path / "champion")
+    run = _fake_run_for(spec)
+    record = store.bootstrap(
+        run=run, spec=spec, spec_path=spec_path, now=datetime(2026, 9, 30, tzinfo=UTC)
+    )
+    return store, spec, record
+
+
+def _fake_run_for(spec: Any) -> Any:
+    from types import SimpleNamespace
+
+    report = SimpleNamespace(
+        spec_hash=spec.spec_hash,
+        run_id="r" * 20,
+        passed=True,
+        objective_j=0.12,
+        digest="d" * 64,
+        metrics={"g": 0.2, "mdd": -0.1},
+    )
+    return SimpleNamespace(report=report)
+
+
+def _sync_helpers(
+    monkeypatch: pytest.MonkeyPatch, store: Any, champion_file: Path
+) -> None:
+    import src.research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_champion_store", lambda args: store)
+    monkeypatch.setattr(cli_module, "_champion_file_path", lambda args: champion_file)
+
+
+def test_champion_file_fresh_is_synced(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, main
+
+    store, spec, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert _champion_file_state(record, tmp_path / "absent.toml", futures) == "missing"
+    assert main(["champion", "--sync-file"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["state"] == "synced"
+    assert payload["champion_file"].endswith("champion.toml")
+    assert _champion_file_state(record, champion_file, futures) == "synced"
+    assert main(["champion"]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["champion_file_state"] == "synced"
+
+
+def test_champion_file_drift_guards_challenge_and_promote(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, main
+    from src.research.pipeline import load_strategy_spec
+
+    champion_toml = _write_spec(tmp_path / "c.toml", n=2)
+    store, spec, _ = _bootstrap_record(tmp_path, champion_toml)
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert main(["champion", "--sync-file"]) == 0
+    capsys.readouterr()
+    text = champion_file.read_text(encoding="utf-8")
+    champion_file.write_text(text.replace("n = 2", "n = 4"), encoding="utf-8")
+    current = store.current()
+    assert current is not None
+    assert _champion_file_state(current, champion_file, futures) == "drift"
+    challenger_toml = _write_spec(tmp_path / "challenger.toml", n=4)
+    _patch_pipeline(monkeypatch, _FakePipeline([], tmp_path))
+    assert main(["challenge", "--spec", str(challenger_toml)]) == 1
+    error = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert current.spec_hash in error
+    assert load_strategy_spec(champion_file).spec_hash in error
+    assert "champion --sync-file" in error
+    assert main(["promote", "--spec", str(challenger_toml)]) == 1
+    assert "champion --sync-file" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert main(["evaluate", "--spec", str(challenger_toml)]) == 0
+
+
+def test_champion_file_missing_then_repaired(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, main
+
+    store, _, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert _champion_file_state(record, champion_file, futures) == "missing"
+    assert main(["champion"]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["champion_file_state"] == "missing"
+    assert main(["champion", "--sync-file"]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["state"] == "synced"
+    assert _champion_file_state(record, champion_file, futures) == "synced"
+
+
+@pytest.mark.parametrize("policy_override", [False, True])
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_promotion_rewrites_the_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    policy_override: bool, write_fails: bool,
+) -> None:
+    import os
+
+    from src.research.cli import _champion_file_state, _write_champion_file, main
+    from src.research.pipeline import load_strategy_spec
+    from src.research.strategy_file import render_strategy_toml
+    from tests.unit.research.test_champion import _promotable, _waivable
+
+    store, challenger, run, decision = _promotable(tmp_path)
+    if policy_override:
+        decision = _waivable(decision)
+    store.save_decision(decision)
+    first = store.current()
+    assert first is not None
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _write_champion_file(first, champion_file, futures)
+    before_file = champion_file.read_bytes()
+    challenger_file = tmp_path / "challenger.toml"
+    challenger_file.write_text(render_strategy_toml(challenger, futures_constants=futures), encoding="utf-8")
+    _sync_helpers(monkeypatch, store, champion_file)
+    _patch_pipeline(
+        monkeypatch, SimpleNamespace(_ctx=SimpleNamespace(now=lambda: first.promoted_at), evaluate=lambda spec: run)
+    )
+    argv = ["promote", "--spec", str(challenger_file)]
+    if policy_override:
+        argv.extend(["--policy-override", "risk limit"])
+    replace = os.replace
+
+    def fail_file_replace(src: Any, dst: Any) -> None:
+        if Path(dst) == champion_file:
+            raise OSError("disk full")
+        replace(src, dst)
+
+    with monkeypatch.context() as patch:
+        if write_fails:
+            patch.setattr(os, "replace", fail_file_replace)
+        assert main(argv) == int(write_fails)
+    capsys.readouterr()
+    second = store.current()
+    assert second is not None
+    assert second.spec_hash == challenger.spec_hash != first.spec_hash
+    assert second.reason == ("policy_override" if policy_override else "challenge")
+    assert second.spec_json == challenger.canonical_json()
+    assert store.history()[-1] == second
+    before_store = (tmp_path / "champion" / "current.json").read_bytes()
+    if write_fails:
+        assert champion_file.read_bytes() == before_file
+        assert list(tmp_path.glob(".*.tmp")) == []
+        assert _champion_file_state(second, champion_file, futures) == "drift"
+        assert main(["challenge", "--spec", str(challenger_file)]) == 1
+        assert "champion --sync-file" in json.loads(capsys.readouterr().out)["error"]
+        assert main(["champion", "--sync-file"]) == 0
+        capsys.readouterr()
+    assert (tmp_path / "champion" / "current.json").read_bytes() == before_store
+    assert _champion_file_state(second, champion_file, futures) == "synced"
+    assert load_strategy_spec(champion_file).spec_hash == second.spec_hash
+
+
+def test_sync_write_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from src.research.cli import _write_champion_file
+
+    _, _, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _write_champion_file(record, champion_file, futures)
+    before = champion_file.read_text(encoding="utf-8")
+
+    def _boom(src: object, dst: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        _write_champion_file(record, champion_file, futures)
+    assert champion_file.read_text(encoding="utf-8") == before
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_store_identity_unaffected(tmp_path: Path) -> None:
+    import json as _json
+    from src.research.cli import _write_champion_file
+
+    store, spec, _ = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    current = store.current()
+    assert current is not None
+    before = (tmp_path / "champion" / "current.json").read_bytes()
+    _write_champion_file(current, tmp_path / "champion.toml", Path("config/market/futures.toml"))
+    assert (tmp_path / "champion" / "current.json").read_bytes() == before
+    raw = _json.loads((tmp_path / "champion" / "current.json").read_text(encoding="utf-8"))
+    assert set(raw) == {
+        "decision_digest",
+        "objective_j",
+        "promoted_at",
+        "reason",
+        "report_digest",
+        "run_id",
+        "spec_hash",
+        "spec_json",
+        "spec_path",
+    }
+    assert raw["spec_json"] == spec.canonical_json()
+
+
+def test_sync_writes_use_distinct_temporary_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from src.research.cli import _write_champion_file
+    from src.research.pipeline import load_strategy_spec
+
+    _, _, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    path = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    replace = os.replace
+    temporary_paths: list[Path] = []
+
+    def interleave(src: Any, dst: Any) -> None:
+        temporary_paths.append(Path(src))
+        if len(temporary_paths) == 1:
+            _write_champion_file(record, path, futures)
+        replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", interleave)
+    _write_champion_file(record, path, futures)
+    assert len(set(temporary_paths)) == 2
+    assert list(tmp_path.glob(".*.tmp")) == []
+    assert load_strategy_spec(path).spec_hash == record.spec_hash
+
+
+def test_sync_reports_repo_relative_path_outside_repo_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.config.runtime import load_runtime_config
+    from src.research.cli import _repo_relative_champion
+
+    path = load_runtime_config().champion_file
+    monkeypatch.chdir(tmp_path)
+    assert _repo_relative_champion(path) == "config/research/champion.toml"
+
+
+def test_champion_file_state_edge_cases(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, _file_spec_hash, _repo_relative_champion
+
+    _, _, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    futures = Path("config/market/futures.toml")
+    champion_dir = tmp_path / "champion_dir"
+    champion_dir.mkdir()
+    assert _champion_file_state(record, champion_dir, futures) == "drift"
+    broken = tmp_path / "broken.toml"
+    broken.write_text("[[[", encoding="utf-8")
+    assert _champion_file_state(record, broken, futures) == "drift"
+    assert _file_spec_hash(broken, futures) == "unreadable"
+    assert _repo_relative_champion(Path("/nowhere/x.toml")) == "/nowhere/x.toml"
+
+
+def test_sync_file_without_champion_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import main
+
+    _patch_store(monkeypatch, tmp_path / "champion")
+    assert main(["champion", "--sync-file"]) == 1
+    assert "no champion" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+
+
+def test_champion_paths_resolve_from_runtime_config() -> None:
+    from argparse import Namespace
+
+    import src.research.cli as cli_module
+
+    args = Namespace(scope_config=None, data_root=None)
+    assert cli_module._champion_file_path(args).name == "champion.toml"
+    assert cli_module._champion_futures_constants(args).name == "futures.toml"
+
+
+def test_missing_file_guard_names_the_champion(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import main
+
+    store, _, _ = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    _sync_helpers(monkeypatch, store, tmp_path / "champion.toml")
+    challenger_toml = _write_spec(tmp_path / "challenger.toml", n=4)
+    _patch_pipeline(monkeypatch, _FakePipeline([], tmp_path))
+    assert main(["challenge", "--spec", str(challenger_toml)]) == 1
+    error = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    current = store.current()
+    assert current is not None
+    assert "missing" in error
+    assert current.spec_hash in error
