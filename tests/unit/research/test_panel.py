@@ -364,6 +364,27 @@ def test_unknown_set_fails_closed() -> None:
         feature_names_for("nope")
 
 
+def test_dedup_alias_is_the_same_set() -> None:
+    assert feature_names_for("dedup52") == feature_names_for("dedup52_v1")
+    assert len(feature_names_for("dedup52")) == 52
+
+
+def test_hand_written_files_do_not_use_the_alias() -> None:
+    from pathlib import Path
+
+    roots = [Path("tests/fixtures"), Path("config/research/challenge")]
+    hits: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.toml")):
+            if path.name == "champion.toml":
+                continue
+            if "dedup52_v1" in path.read_text(encoding="utf-8"):
+                hits.append(str(path))
+    assert hits == []
+
+
 def test_feature_set_validation_fails_closed() -> None:
     from src.research.panel import _validate_feature_sets
 

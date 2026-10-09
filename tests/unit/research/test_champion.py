@@ -166,7 +166,7 @@ def _card(
     return ReportCard(
         spec_hash=spec_hash,
         run_id=run_id,
-        protocol_version="research-protocol-v4",
+        protocol_id="abc123def456",
         start=sessions[0],
         end=sessions[-1],
         objective_j=float(objective_j),
@@ -1111,13 +1111,13 @@ def test_ruin_guard_non_blocking_under_v5() -> None:
     evidence = replace(evidence, stress_slippage=_outcome(sessions, logs), stress_delay=_outcome(sessions, logs))
     policy = _policy(protocol).model_copy(update={"block_sessions": 60, "horizon_sessions": 60, "draws": 2})
     relaxed = build_report_card(
-        evidence, policy, spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_version=protocol.version,
+        evidence, policy, spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_id=protocol.protocol_id,
     )
     assert relaxed.guards[0].value == 1.0
     assert relaxed.passed is True
     strict = build_report_card(
         evidence, policy.model_copy(update={"max_p_ruin": 0.05}),
-        spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_version=protocol.version,
+        spec_hash=_spec().spec_hash, run_id="run-ruin", protocol_id=protocol.protocol_id,
     )
     assert strict.passed is False
 
