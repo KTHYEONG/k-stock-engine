@@ -12,7 +12,7 @@ min_adtv20_krw = 500000000
 min_price_krw = 1000
 
 [scorer]                          # frozen, identical to the previous strategy file
-feature_set = "dedup52_v1"  # probe 2026-10-08: rank-corr >= 0.80 duplicates removed (62 -> 52)
+feature_set = "dedup52"  # probe 2026-10-08: rank-corr >= 0.80 duplicates removed (62 -> 52)
 horizons = [5, 10, 21]
 num_boost_round = 300
 learning_rate = 0.03

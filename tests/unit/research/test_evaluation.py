@@ -79,7 +79,7 @@ def test_j_picks_worse_stress_stream():
 
     evidence = _evidence()
     policy = _policy()
-    report = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_id="abc")
     slip = growth_profile(
         np.asarray(evidence.stress_slippage.log_returns), block=21, draws=100, seed=11,
         horizon=126, sessions_per_year=252, quantile=0.10, mdd_limits=(-0.3, -0.5, -0.5),
@@ -91,6 +91,16 @@ def test_j_picks_worse_stress_stream():
     worse = "stress_delay" if delay.g_quantile < slip.g_quantile else "stress_slippage"
     assert report.objective_stream == worse
     assert report.objective_j == pytest.approx(min(slip.g_quantile, delay.g_quantile))
+
+
+def test_report_carries_the_protocol_id():
+    import json
+
+    report = build_report_card(_evidence(), _policy(), spec_hash="s", run_id="r", protocol_id="abc")
+    assert report.protocol_id == "abc"
+    payload = json.loads(report.canonical_json())
+    assert payload["protocol_id"] == "abc"
+    assert "protocol_version" not in payload
 
 
 def test_ruin_guard_blocks_but_diagnostics_populated():
@@ -112,7 +122,7 @@ def test_ruin_guard_blocks_but_diagnostics_populated():
         fast_sim_growth=0.0,
         perturbation_mismatches=0,
     )
-    report = build_report_card(evidence, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(evidence, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert report.passed is False
     assert any(not guard.passed for guard in report.guards)
     assert math.isfinite(report.metrics["g"])
@@ -123,7 +133,7 @@ def test_ruin_guard_blocks_but_diagnostics_populated():
 
 def test_integrity_blocks_on_perturbation():
     evidence = _evidence(mismatches=1)
-    report = build_report_card(evidence, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(evidence, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert report.passed is False
     assert any(c.name == "perturbation_mismatches" and not c.passed for c in report.integrity)
 
@@ -142,7 +152,7 @@ def test_length_mismatch_is_integrity_failure():
         universe_ew_log_returns=evidence.universe_ew_log_returns,
         fast_sim_growth=evidence.fast_sim_growth, perturbation_mismatches=0,
     )
-    report = build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert report.passed is False
     assert any(not c.passed for c in report.integrity)
 
@@ -166,8 +176,8 @@ def test_regime_split_and_canonical_json():
         fast_sim_growth=0.1, perturbation_mismatches=0,
     )
     policy = _policy()
-    first = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_version="v4")
-    second = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_version="v4")
+    first = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_id="abc")
+    second = build_report_card(evidence, policy, spec_hash="s", run_id="r", protocol_id="abc")
     assert set(first.regime_growth) == {"index_up_years", "index_down_years"}
     assert first.digest == second.digest
     assert first.digest == hashlib.sha256(first.canonical_json().encode()).hexdigest()
@@ -206,7 +216,7 @@ def test_empty_sessions_raises():
         fast_sim_growth=0.0, perturbation_mismatches=0,
     )
     with pytest.raises(ValueError, match="non-empty"):
-        build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+        build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
 
 
 def test_nonfinite_and_single_point_grid_edges():
@@ -225,7 +235,7 @@ def test_nonfinite_and_single_point_grid_edges():
         index_log_returns=np.full(60, math.nan), universe_ew_log_returns=np.full(60, math.nan),
         fast_sim_growth=math.nan, perturbation_mismatches=0,
     )
-    report = build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(broken, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert report.passed is False
     assert math.isnan(report.breakeven_ticks)
     assert "cost_commission_per_year" in report.metrics
@@ -250,7 +260,7 @@ def test_edge_branches_cover_helpers():
         universe_ew_log_returns=np.zeros(0, dtype=np.float64),
         fast_sim_growth=math.inf, perturbation_mismatches=0,
     )
-    report = build_report_card(base, _policy(block_sessions=21), spec_hash="s", run_id="r", protocol_version="v4")
+    report = build_report_card(base, _policy(block_sessions=21), spec_hash="s", run_id="r", protocol_id="abc")
     assert report.passed is False
     assert math.isnan(report.metrics["g"])
     assert "-inf" in report.canonical_json() or "nan" in report.canonical_json()
@@ -271,7 +281,7 @@ def test_edge_branches_cover_helpers():
             universe_ew_log_returns=ev2.universe_ew_log_returns,
             fast_sim_growth=ev2.fast_sim_growth, perturbation_mismatches=0,
         )
-        rep = build_report_card(ev, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+        rep = build_report_card(ev, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
         assert math.isfinite(rep.metrics["beta_to_index"])
 
     # bad report limit rejected
@@ -290,7 +300,7 @@ def test_edge_branches_cover_helpers():
         universe_ew_log_returns=ev2.universe_ew_log_returns,
         fast_sim_growth=0.0, perturbation_mismatches=0,
     )
-    rep3 = build_report_card(ev3, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    rep3 = build_report_card(ev3, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert math.isnan(rep3.metrics["cost_commission_per_year"])
 
     # zero-drawdown -> calmar inf branch; empty yearly branch via short base
@@ -307,7 +317,7 @@ def test_edge_branches_cover_helpers():
         universe_ew_log_returns=np.full(400, 0.001),
         fast_sim_growth=0.0, perturbation_mismatches=0,
     )
-    rep4 = build_report_card(ev4, _policy(), spec_hash="s", run_id="r", protocol_version="v4")
+    rep4 = build_report_card(ev4, _policy(), spec_hash="s", run_id="r", protocol_id="abc")
     assert rep4.passed is False
 
     # empty/raw and all-nan point branches
@@ -332,6 +342,6 @@ def test_edge_branches_cover_helpers():
         universe_ew_log_returns=np.zeros(0, dtype=np.float64),
         fast_sim_growth=0.0, perturbation_mismatches=0,
     )
-    rep5 = build_report_card(ev5, _policy(block_sessions=4, draws=10, horizon_sessions=8), spec_hash="s", run_id="r", protocol_version="v4")
+    rep5 = build_report_card(ev5, _policy(block_sessions=4, draws=10, horizon_sessions=8), spec_hash="s", run_id="r", protocol_id="abc")
     assert rep5.passed is False
     assert math.isnan(rep5.metrics["g"])

@@ -1,4 +1,4 @@
-"""Research data-window guard, report-card policy and scenario bindings (protocol v7)."""
+"""Research data-window guard, report-card policy and scenario bindings."""
 from __future__ import annotations
 
 import hashlib
@@ -72,11 +72,11 @@ class ScenarioPolicy(BaseModel):
 class ChampionPolicy(BaseModel):
     """Champion/challenger promotion rule parameters.
 
-    ``paired_horizon``: ``"evaluation"`` bootstraps paired paths of ``evaluation.horizon_sessions`` (v4 behaviour);
+    ``paired_horizon``: ``"evaluation"`` bootstraps paired paths of ``evaluation.horizon_sessions``;
     ``"full"`` uses the full shared sample length. Why full: the decision compares expected growth, whose sampling
     error shrinks with the whole sample; a 5-year path adds future-realisation noise that is not about which
     strategy is better.
-    ``multiplicity``: ``"none"`` (v4) or ``"bonferroni_decisions"``. The latter tests at ``alpha / (1 + m)``, where m
+    ``multiplicity``: ``"none"`` or ``"bonferroni_decisions"``. The latter tests at ``alpha / (1 + m)``, where m
     is the number of saved decisions naming the current champion. Why: every challenge on the same champion is
     another draw at the same data, so the family-wise error must be paid explicitly.
     ``noninferiority_margin`` (None = path disabled): δ, the annual log-growth loss tolerated when the tail risk is
@@ -125,28 +125,35 @@ class ChampionPolicy(BaseModel):
 
 
 class ResearchProtocol(BaseModel):
-    """Data window, report-card policy and scenarios of the research program (v7).
+    """Data window, report-card policy and scenarios of the research program.
 
     There is no sealed segment: any window between ``evaluation_start`` and the last certified session may
     be evaluated any number of times. Selection bias is handled by champion/challenger paired comparison
     plus neighbor plateaus and the cost grid, not by withholding history.
 
-    Protocol v6 supports two promotion paths:
+    Supports two promotion paths:
     1. Superiority: paired growth lower bound > 0.
     2. Non-inferiority: paired growth lower bound > -δ (where δ is noninferiority_margin) and paired monthly-block
        CVaR (expected tail loss) lower bound > 0, ensuring statistically verified tail-risk reduction within tolerated
        annual log-growth loss δ.
+
+    Any protocol edit changes ``protocol_id`` and with it every ``run_id``, so saved challenge
+    decisions become stale and must be re-run.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    version: str
     evaluation_start: date
     sessions_per_year: int
     primary_capital_krw: int
     evaluation: EvaluationPolicySettings
     scenarios: ScenarioPolicy
     champion: ChampionPolicy
+
+    @property
+    def protocol_id(self) -> str:
+        """First 12 hex characters of ``content_hash``; the short identity shown in reports."""
+        return self.content_hash[:12]
 
     @property
     def content_hash(self) -> str:
@@ -157,7 +164,6 @@ class ResearchProtocol(BaseModel):
             "primary_capital_krw": self.primary_capital_krw,
             "scenarios": self.scenarios.model_dump(mode="json"),
             "sessions_per_year": self.sessions_per_year,
-            "version": self.version,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -180,7 +186,6 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
     except ValueError as exc:
         raise ConfigError(f"research protocol is invalid TOML: {path}") from exc
     allowed_top = {
-        "version",
         "evaluation_start",
         "sessions_per_year",
         "primary_capital_krw",
@@ -208,7 +213,6 @@ def load_research_protocol(path: Path, scope: ResearchScope) -> ResearchProtocol
         scenarios = ScenarioPolicy.model_validate(raw["scenarios"])
         champion = ChampionPolicy.model_validate(raw["champion"])
         protocol = ResearchProtocol(
-            version=str(raw.get("version")),
             evaluation_start=evaluation_start,
             sessions_per_year=int(raw["sessions_per_year"]),
             primary_capital_krw=int(raw["primary_capital_krw"]),

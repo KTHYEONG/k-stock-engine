@@ -85,9 +85,10 @@ FEATURE_NAMES: Final[tuple[str, ...]] = (
     "post_ear",
 )
 
-# dedup52_v1: greedy removal of features with mean cross-sectional rank correlation
-# >= 0.80 to an already retained feature, families ordered by ablation importance;
-# probe 2026-10-08.
+# dedup52: greedy removal of features with mean cross-sectional rank correlation
+# >= 0.80 to an already retained feature, families ordered by ablation importance.
+# dedup52_v1 is the legacy alias of the same tuple so stored specs keep loading;
+# new files must use dedup52.
 _DEDUP52_V1: Final[tuple[str, ...]] = (
     "upvol20",
     "turn20",
@@ -145,6 +146,7 @@ _DEDUP52_V1: Final[tuple[str, ...]] = (
 
 _FEATURE_SETS_RAW: Final[dict[str, tuple[str, ...]]] = {
     "full62": FEATURE_NAMES,
+    "dedup52": _DEDUP52_V1,
     "dedup52_v1": _DEDUP52_V1,
 }
 
