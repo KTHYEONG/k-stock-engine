@@ -130,23 +130,15 @@ class StrategySpec(BaseModel):
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
 
-def load_strategy_spec(path: Path) -> StrategySpec:
+def load_strategy_spec(path: Path, *, futures_constants: Path | None = None) -> StrategySpec:
     """Load a TOML with ``[policy]``, ``[scorer]``, ``[book]`` and ``[hedge]`` tables."""
-    import tomllib
+    from src.research.strategy_file import resolve_strategy_tables
 
-    try:
-        with open(path, "rb") as handle:
-            raw = tomllib.load(handle)
-    except OSError:
-        raise
-    except ValueError as exc:
-        raise ValueError(f"invalid strategy TOML: {path}: {exc}") from exc
-    if not isinstance(raw, dict):  # pragma: no cover - tomllib always returns a dict
-        raise ValueError(f"invalid strategy TOML: {path}")
-    allowed = {"policy", "scorer", "book", "hedge", "trend_overlay", "regime_hedge"}
-    unknown = set(raw) - allowed
-    if unknown:
-        raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
+    if futures_constants is None:
+        from src.config.runtime import load_runtime_config
+
+        futures_constants = load_runtime_config().futures_constants
+    raw = resolve_strategy_tables(Path(path), futures_constants=Path(futures_constants))
     if "policy" not in raw or "scorer" not in raw or "book" not in raw or "hedge" not in raw:
         raise ValueError("strategy TOML must declare [policy], [scorer], [book] and [hedge] tables")
     try:
