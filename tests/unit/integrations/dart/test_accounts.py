@@ -18,9 +18,10 @@ STANDARD_PAIRS = {
 
 
 def test_standard_mapping_pairs_resolve_to_the_same_facts() -> None:
-    from src.integrations.dart.accounts import MAPPING_VERSION, map_standardized_account
+    from src.integrations.dart.accounts import REVISION as ACCOUNTS_REVISION
+    from src.integrations.dart.accounts import map_standardized_account
 
-    assert MAPPING_VERSION == "dart-fact-map-v1"
+    assert ACCOUNTS_REVISION == "dart-fact-map-v1"
     for (account_id, account_nm), expected in STANDARD_PAIRS.items():
         assert map_standardized_account(account_id=account_id, account_nm=account_nm) == expected
 

@@ -746,9 +746,9 @@ def test_materialize_volatility_skips_invalid_rows(tmp_path: Path) -> None:
 
 
 def test_materialize_policy_version_bump(tmp_path: Path) -> None:
-    from src.data.market_panel import POLICY_VERSION
+    from src.data.market_panel import REVISION as MARKET_PANEL_REVISION
 
-    assert POLICY_VERSION == "krx-market-panel-v4"
+    assert MARKET_PANEL_REVISION == "krx-market-panel-v4"
     daily = {DAY0: [_drow(DAY0, "005930", close=10000, change=0)]}
     daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
     result = materialize_market_panel(

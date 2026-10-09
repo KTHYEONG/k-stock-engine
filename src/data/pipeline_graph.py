@@ -361,7 +361,8 @@ def _preview_ordinary_universe(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be universe identity from catalog Bronze digests."""
 
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.ordinary_universe import POLICY_VERSION, catalog_master_receipts, catalog_master_sessions
+    from src.data.ordinary_universe import REVISION as ORDINARY_UNIVERSE_REVISION
+    from src.data.ordinary_universe import catalog_master_receipts, catalog_master_sessions
 
     sessions = catalog_master_sessions(ctx.catalog)
     receipts = catalog_master_receipts(ctx.catalog, sessions=sessions)
@@ -369,7 +370,7 @@ def _preview_ordinary_universe(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="ordinary_universe",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=ORDINARY_UNIVERSE_REVISION,
         inputs={"bronze_master": dataset_digest(source_hashes)},
         params={
             "calendar_digest": hashlib.sha256(
@@ -381,7 +382,8 @@ def _preview_ordinary_universe(ctx: RefreshContext) -> DatasetIdentity:
 
 def _preview_daily_market(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be daily-market identity from catalog Bronze digests."""
-    from src.data.daily_market_silver import POLICY_VERSION, DailyMarketSilverPolicy
+    from src.data.daily_market_silver import REVISION as DAILY_MARKET_SILVER_REVISION
+    from src.data.daily_market_silver import DailyMarketSilverPolicy
     from src.data.datasets import DatasetLayer as _Layer
     from src.data.datasets import universe_sessions
 
@@ -396,7 +398,7 @@ def _preview_daily_market(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="daily_market",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=DAILY_MARKET_SILVER_REVISION,
         inputs={
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
             "bronze_daily": dataset_digest(source_hashes),
@@ -411,7 +413,8 @@ def _preview_daily_market(ctx: RefreshContext) -> DatasetIdentity:
 def _preview_investor_flow_ls(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be LS flow identity from the catalog blob digest."""
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.investor_flow_silver import POLICY_VERSION, InvestorFlowSilverPolicy
+    from src.data.investor_flow_silver import REVISION as INVESTOR_FLOW_SILVER_REVISION
+    from src.data.investor_flow_silver import InvestorFlowSilverPolicy
 
     universe_id = ctx.registry.require("ordinary_universe")
     bronze_flow = ctx.catalog.blob_digest(source="ls_investor_flow")
@@ -419,7 +422,7 @@ def _preview_investor_flow_ls(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="investor_flow_ls",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=INVESTOR_FLOW_SILVER_REVISION,
         inputs={
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
             "bronze_flow": bronze_flow,
@@ -439,8 +442,8 @@ def _preview_market_actions(ctx: RefreshContext) -> DatasetIdentity:
     from src.data.datasets import DatasetLayer as _Layer
     from src.data.jobs.universe import read_corp_code_bridge as _read_bridge
     from src.data.kind_notices import kind_source_digest
+    from src.data.market_actions import REVISION as MARKET_ACTIONS_REVISION
     from src.data.market_actions import (
-        POLICY_VERSION,
         corp_bridge_digest,
         daily_flags_source_digest,
         disclosure_source_digest,
@@ -452,7 +455,7 @@ def _preview_market_actions(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="market_actions",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=MARKET_ACTIONS_REVISION,
         inputs=market_actions_dataset_inputs(
             bronze_disclosures=disclosure_source_digest(ctx.catalog),
             corp_code_bridge=corp_bridge_digest(dict(mapping)),
@@ -474,7 +477,8 @@ def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
     from src.config.runtime import load_runtime_config
     from src.core.market_rules import load_krx_market_rules
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.market_panel import POLICY_VERSION, MarketPanelPolicy, _rules_fingerprint
+    from src.data.market_panel import REVISION as MARKET_PANEL_REVISION
+    from src.data.market_panel import MarketPanelPolicy, _rules_fingerprint
 
     daily_id = ctx.registry.require("daily_market")
     universe_id = ctx.registry.require("ordinary_universe")
@@ -484,7 +488,7 @@ def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="market_panel",
         layer=_Layer.GOLD,
-        policy_version=POLICY_VERSION,
+        policy_version=MARKET_PANEL_REVISION,
         inputs={
             "daily_market": dataset_reference(daily_id, kind="daily_market"),
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
@@ -505,10 +509,8 @@ def _preview_market_panel(ctx: RefreshContext) -> DatasetIdentity:
 def _preview_investor_flow_kis_supplement(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be KIS supplement identity from the catalog digest."""
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.investor_flow_kis_supplement import (
-        POLICY_VERSION,
-        InvestorFlowKisSupplementPolicy,
-    )
+    from src.data.investor_flow_kis_supplement import REVISION as INVESTOR_FLOW_KIS_SUPPLEMENT_REVISION
+    from src.data.investor_flow_kis_supplement import InvestorFlowKisSupplementPolicy
 
     universe_id = ctx.registry.require("ordinary_universe")
     daily_id = ctx.registry.require("daily_market")
@@ -518,7 +520,7 @@ def _preview_investor_flow_kis_supplement(ctx: RefreshContext) -> DatasetIdentit
     return DatasetIdentity(
         kind="investor_flow_kis_supplement",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=INVESTOR_FLOW_KIS_SUPPLEMENT_REVISION,
         inputs={
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),
             "daily_market": dataset_reference(daily_id, kind="daily_market"),
@@ -535,14 +537,14 @@ def _preview_investor_flow_kis_supplement(ctx: RefreshContext) -> DatasetIdentit
 def _preview_investor_flow(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be flow-union identity from resolved LS and KIS inputs."""
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.investor_flow_union import POLICY_VERSION
+    from src.data.investor_flow_union import REVISION as INVESTOR_FLOW_UNION_REVISION
 
     ls_id = ctx.registry.require("investor_flow_ls")
     kis_id = ctx.registry.require("investor_flow_kis_supplement")
     return DatasetIdentity(
         kind="investor_flow",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=INVESTOR_FLOW_UNION_REVISION,
         inputs={
             "ls": dataset_reference(ls_id, kind="investor_flow_ls"),
             "kis_supplement": dataset_reference(kis_id, kind="investor_flow_kis_supplement"),
@@ -554,7 +556,7 @@ def _preview_investor_flow(ctx: RefreshContext) -> DatasetIdentity:
 def _preview_industry(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be industry identity from the catalog blob digest."""
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.industry_silver import POLICY_VERSION
+    from src.data.industry_silver import REVISION as INDUSTRY_SILVER_REVISION
 
     bronze_classification = ctx.catalog.blob_digest(source="kis_industry")
     if bronze_classification == dataset_digest([]):
@@ -562,7 +564,7 @@ def _preview_industry(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="industry",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=INDUSTRY_SILVER_REVISION,
         inputs={"bronze_classification": bronze_classification},
         params={"symbols": None},
     )
@@ -606,7 +608,8 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
     ).hexdigest()
     from src.config import load_provider_policy, load_runtime_config
-    from src.integrations.dart.document_statements import PARSER_VERSION as _PARSER_VERSION
+    from src.data.incremental_normalization import REVISION as INCREMENTAL_NORMALIZATION_REVISION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     try:
         _trusted = bool(load_provider_policy(load_runtime_config()).dart.document_parser.trusted)
@@ -615,7 +618,7 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="financial_facts",
         layer=_Layer.SILVER,
-        policy_version="dart-incremental-v1",
+        policy_version=INCREMENTAL_NORMALIZATION_REVISION,
         inputs={
             "bronze_facts": dataset_digest(receipt_hashes),
             "superseded": dataset_digest(sorted(ctx.superseded_receipts)),
@@ -628,7 +631,7 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
             "calendar_digest": calendar_digest,
             "ticker_bridge": bridge_receipt_hash,
             "trust_document_facts": _trusted,
-            "document_parser_version": _PARSER_VERSION,
+            "document_parser_version": DOCUMENT_STATEMENTS_REVISION,
         },
     )
 
@@ -666,8 +669,8 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
 
     from src.core.time import KRX_TZ
     from src.data.datasets import DatasetLayer as _Layer
+    from src.data.dividend_events import REVISION as DIVIDEND_EVENTS_REVISION
     from src.data.dividend_events import (
-        POLICY_VERSION,
         _iter_decision_envelopes,
         dividend_dataset_inputs,
         dividend_policy_params,
@@ -694,7 +697,7 @@ def _preview_dividend_events(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="dividend_events",
         layer=_Layer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=DIVIDEND_EVENTS_REVISION,
         inputs=dividend_dataset_inputs(
             bronze_dividend_decisions=dataset_digest(envelope_hashes),
             corp_code_bridge=dataset_digest([bridge_receipt_hash]),
@@ -717,9 +720,7 @@ def _preview_earnings_releases(ctx: RefreshContext) -> DatasetIdentity:
 
     from src.core.time import KRX_TZ
     from src.data.datasets import DatasetLayer as _Layer
-    from src.data.earnings_releases import (
-        POLICY_VERSION as _EARNINGS_POLICY_VERSION,
-    )
+    from src.data.earnings_releases import REVISION as EARNINGS_RELEASES_REVISION
     from src.data.earnings_releases import _iter_release_envelopes, earnings_release_dataset_inputs
 
     envelopes = _iter_release_envelopes(ctx.catalog)
@@ -751,7 +752,7 @@ def _preview_earnings_releases(ctx: RefreshContext) -> DatasetIdentity:
     return DatasetIdentity(
         kind="earnings_releases",
         layer=_Layer.SILVER,
-        policy_version=_EARNINGS_POLICY_VERSION,
+        policy_version=EARNINGS_RELEASES_REVISION,
         inputs=earnings_release_dataset_inputs(
             bronze_earnings_releases=dataset_digest(envelope_hashes),
             corp_code_bridge=dataset_digest([bridge_receipt_hash]),
@@ -971,7 +972,7 @@ def plan_refresh(ctx: RefreshContext) -> tuple[BuildNode, ...]:
 
 
 def _disk_dataset_ids(ctx: RefreshContext, extra: set[str]) -> set[str]:
-    """Collect physically present v2 dataset ids for lineage verification."""
+    """Collect physically present dataset ids for lineage verification."""
     known = set(extra) | set(ctx.registry.retired())
     for root in (ctx.runtime.workspace.silver_root, ctx.runtime.workspace.gold_root):
         if not root.is_dir():

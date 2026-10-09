@@ -433,6 +433,22 @@ def test_financial_quality_skips_malformed_rows_without_failing() -> None:
     assert out.is_empty()
 
 
+def test_quality_from_files_rejects_unverified_facts(tmp_path) -> None:
+    from tests.fixtures import scope_runtime
+
+    from src.data.financial_quality import materialize_financial_quality_from_files
+
+    runtime = scope_runtime(tmp_path)
+    with pytest.raises(PITDataError, match="not a verified dataset"):
+        materialize_financial_quality_from_files(
+            runtime,
+            facts_dataset_id="financial_facts_0123456789abcdef",
+            decision_time=datetime(2024, 5, 1, tzinfo=UTC),
+            quarantine_file=None,
+            unresolved_events_file=None,
+        )
+
+
 def test_build_financial_quality_dataset_rejects_bad_decision_time(tmp_path) -> None:
     from tests.fixtures import scope_runtime
 

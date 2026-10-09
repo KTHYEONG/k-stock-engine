@@ -29,7 +29,7 @@ from src.core.time import KRX_TZ
 from src.data.datasets import load_manifest
 
 __all__ = [
-    "CUBE_POLICY_VERSION",
+    "REVISION",
     "CubeInputs",
     "ResearchCube",
     "assemble_dividends",
@@ -41,7 +41,7 @@ __all__ = [
     "research_cube_id",
 ]
 
-CUBE_POLICY_VERSION = "research-cube-v2"
+REVISION = "research-cube-v2"
 
 #: Cache layout version. Format 1 was a single ``<cube_id>.npz``; format 2 is a directory of ``.npy`` arrays
 #: that can be memory-mapped instead of read into anonymous memory.
@@ -160,7 +160,7 @@ def research_cube_id(inputs: CubeInputs) -> str:
     """Return ``research_cube_<hash16>`` for the given inputs."""
     payload = "|".join(
         [
-            CUBE_POLICY_VERSION,
+            REVISION,
             Path(inputs.market_panel).name,
             Path(inputs.dividend_events).name,
             Path(inputs.financial_facts).name,

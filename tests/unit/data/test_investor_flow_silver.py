@@ -11,8 +11,8 @@ import polars as pl
 import pytest
 
 from src.core.pit import EvidenceKind, PITDataError
+from src.data.investor_flow_silver import REVISION as INVESTOR_FLOW_SILVER_REVISION
 from src.data.investor_flow_silver import (
-    POLICY_VERSION,
     InvestorFlowSilverPolicy,
     materialize_investor_flow_silver,
 )
@@ -147,7 +147,7 @@ def test_builds_from_usable_catalog_blobs_only(tmp_path: Path) -> None:
     )
     assert result.rows == 1
     assert result.raw_pages == 1
-    assert POLICY_VERSION == "ls-t1702-net-shares-v2"
+    assert INVESTOR_FLOW_SILVER_REVISION == "ls-t1702-net-shares-v2"
 
 
 def test_uncatalogued_files_ignored(tmp_path: Path) -> None:

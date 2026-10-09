@@ -87,7 +87,7 @@ def stale_inputs_for_directory(
 
 
 def legacy_prunable_manifest(path: Path) -> Mapping[str, object] | None:
-    """A structurally valid pre-v2 dataset manifest eligible for pruning."""
+    """A structurally valid legacy dataset manifest eligible for pruning."""
     manifest_path = path / "manifest.json"
     if not manifest_path.is_file():
         manifest_path = path / "dataset_manifest.json"
