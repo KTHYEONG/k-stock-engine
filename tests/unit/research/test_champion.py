@@ -36,6 +36,7 @@ def _protocol(
     paired_horizon: str = "evaluation",
     multiplicity: str = "none",
     noninferiority_margin: float | None = None,
+    champion_seeds: tuple[int, ...] = (),
 ) -> ResearchProtocol:
     from src.data.research_protocol import load_research_protocol
     from src.data.research_scope import load_research_scope
@@ -49,6 +50,7 @@ def _protocol(
             "paired_horizon": paired_horizon,
             "multiplicity": multiplicity,
             "noninferiority_margin": noninferiority_margin,
+            "champion_seeds": champion_seeds,
         }
     )
     return base.model_copy(update={"evaluation": evaluation, "champion": champion})
@@ -975,6 +977,127 @@ def test_legacy_decision_files_still_load() -> None:
     customized = decision_from_canonical_json(json.dumps(payload), alpha=0.02, horizon_sessions=30)
     assert customized.alpha_effective == 0.02
     assert customized.paired_horizon_sessions == 30
+
+
+def test_with_seeds_reseeds_a_single_seed_spec() -> None:
+    from src.research.champion import with_seeds
+
+    spec = _spec(scorer={"seed": 42})
+    reseeded = with_seeds(spec, (11, 12, 13))
+    assert reseeded is not spec
+    assert reseeded.scorer.seeds == (11, 12, 13)
+    assert reseeded.scorer.seed == 11
+    assert reseeded.spec_hash != spec.spec_hash
+    assert reseeded.policy == spec.policy
+    assert reseeded.book == spec.book
+    assert reseeded.hedge == spec.hedge
+    assert reseeded.trend_overlay == spec.trend_overlay
+    assert reseeded.regime_hedge == spec.regime_hedge
+    rest = reseeded.scorer.model_dump(exclude={"seed", "seeds"})
+    assert rest == spec.scorer.model_dump(exclude={"seed", "seeds"})
+
+
+def test_with_seeds_leaves_multi_seed_or_empty_request_untouched() -> None:
+    from src.research.champion import with_seeds
+
+    multi = _spec(scorer={"seeds": (11, 12, 13)})
+    assert with_seeds(multi, (11, 12, 13)) is multi
+    assert with_seeds(multi, ()) is multi
+    single = _spec()
+    assert with_seeds(single, ()) is single
+
+
+@pytest.mark.parametrize("seeds", [(11,), (11, 11), (11, -1), (True, 12)])
+def test_with_seeds_rejects_invalid_ensemble(seeds: tuple[int, ...]) -> None:
+    from src.research.champion import with_seeds
+
+    with pytest.raises(ValueError, match="seeds"):
+        with_seeds(_spec(), seeds)
+
+
+def test_reseeded_champion_run_accepted_with_identity_kept(tmp_path: Path) -> None:
+    from src.research.champion import with_seeds
+
+    sessions = _sessions()
+    protocol = _protocol(champion_seeds=(11, 12, 13))
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"seeds": (11, 12, 13), "num_leaves": 31})
+    reseeded = with_seeds(champion_spec, (11, 12, 13))
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(reseeded, sessions, drift=0.0008),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.champion_hash == champion_spec.spec_hash
+    assert decision.baseline_hash == reseeded.spec_hash
+    assert decision.baseline_hash != decision.champion_hash
+    assert decision.knob_changes == ("scorer.num_leaves",)
+    assert decision.promotable is True
+    assert decision_from_canonical_json(decision.canonical_json()) == decision
+    store = ChampionStore(tmp_path / "champion")
+    store.bootstrap(
+        run=_run(champion_spec, sessions, drift=0.0008), spec=champion_spec,
+        spec_path=Path("champion.toml"), now=_NOW,
+    )
+    store.save_decision(decision)
+    promoted = store.promote(
+        decision=store.decisions()[0], run=_run(challenger_spec, sessions, drift=0.0012),
+        spec=challenger_spec, spec_path=Path("challenger.toml"), now=_NOW,
+    )
+    assert promoted.spec_hash == challenger_spec.spec_hash
+
+
+def test_foreign_champion_run_rejected() -> None:
+    sessions = _sessions()
+    protocol = _protocol(champion_seeds=(11, 12, 13))
+    champion_spec = _spec()
+    challenger_spec = _spec(scorer={"seeds": (11, 12, 13), "num_leaves": 31})
+    foreign = _spec(policy={"n": 99})
+    with pytest.raises(ValueError, match="champion run was not produced"):
+        _decide(
+            challenger=_run(challenger_spec, sessions, drift=0.0012),
+            champion=_run(foreign, sessions, drift=0.0008),
+            challenger_spec=challenger_spec,
+            champion_spec=champion_spec,
+            protocol=protocol,
+        )
+
+
+def test_single_seed_challenger_refused_under_champion_seeds() -> None:
+    sessions = _sessions()
+    protocol = _protocol(champion_seeds=(11, 12, 13))
+    champion_spec = _spec(policy={"n": 20})
+    challenger_spec = _spec(policy={"n": 25})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(_run(_spec(policy={"n": 30}), sessions, drift=0.0010),),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+        protocol=protocol,
+    )
+    assert decision.promotable is False
+    assert "challenger_single_seed" in decision.reasons
+
+
+def test_saved_v6_decision_without_baseline_hash_loads() -> None:
+    sessions = _sessions()
+    champion_spec = _spec(policy={"n": 20})
+    challenger_spec = _spec(policy={"n": 25})
+    decision = _decide(
+        challenger=_run(challenger_spec, sessions, drift=0.0012),
+        champion=_run(champion_spec, sessions, drift=0.0008),
+        neighbors=(_run(_spec(policy={"n": 30}), sessions, drift=0.0010),),
+        challenger_spec=challenger_spec,
+        champion_spec=champion_spec,
+    )
+    payload = json.loads(decision.canonical_json())
+    assert payload["baseline_hash"] == decision.baseline_hash
+    del payload["baseline_hash"]
+    restored = decision_from_canonical_json(json.dumps(payload))
+    assert restored.baseline_hash == restored.champion_hash == decision.champion_hash
 
 
 def test_ruin_guard_non_blocking_under_v5() -> None:

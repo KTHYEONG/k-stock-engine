@@ -1,4 +1,4 @@
-"""Research data-window guard, report-card policy and scenario bindings (protocol v6)."""
+"""Research data-window guard, report-card policy and scenario bindings (protocol v7)."""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +8,7 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.config.errors import ConfigError
 from src.core.pit import PITDataError
@@ -83,6 +83,7 @@ class ChampionPolicy(BaseModel):
     shown to shrink. Why declared and not fitted: a margin chosen after seeing a candidate's interval would make the
     gate a formality.
     ``tail_quantile`` / ``tail_block_sessions``: the CVaR definition of the non-inferiority path.
+    ``champion_seeds``: seeds of the comparator re-run of a single-seed champion.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -94,10 +95,37 @@ class ChampionPolicy(BaseModel):
     noninferiority_margin: Annotated[float, Field(gt=0.0, lt=0.5)] | None = None
     tail_quantile: Annotated[float, Field(gt=0.0, le=0.5)] = 0.05
     tail_block_sessions: PositiveInt = 21
+    champion_seeds: tuple[int, ...] = ()
+
+    @field_validator("champion_seeds", mode="before")
+    @classmethod
+    def _seeds_members(cls, value: object) -> tuple[int, ...]:
+        if isinstance(value, tuple) and len(value) == 0:
+            return ()
+        if isinstance(value, list):
+            items: tuple[object, ...] = tuple(value)
+        elif isinstance(value, tuple):
+            items = tuple(value)
+        else:
+            raise ValueError(f"champion_seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+        if len(items) == 0:
+            return ()
+        if len(items) < 2:
+            raise ValueError(f"champion_seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+        seen: set[int] = set()
+        out: list[int] = []
+        for entry in items:
+            if isinstance(entry, bool) or not isinstance(entry, int) or entry < 0:
+                raise ValueError(f"champion_seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+            if entry in seen:
+                raise ValueError(f"champion_seeds must hold distinct values, got {value!r}")
+            seen.add(entry)
+            out.append(entry)
+        return tuple(out)
 
 
 class ResearchProtocol(BaseModel):
-    """Data window, report-card policy and scenarios of the research program (v6).
+    """Data window, report-card policy and scenarios of the research program (v7).
 
     There is no sealed segment: any window between ``evaluation_start`` and the last certified session may
     be evaluated any number of times. Selection bias is handled by champion/challenger paired comparison
