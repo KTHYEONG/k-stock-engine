@@ -517,3 +517,148 @@ def test_missing_configured_feature_fails_closed() -> None:
             test_years=(2018,),
             authorization=_auth(sess),
         )
+
+
+def test_prediction_design_built_once_per_year(monkeypatch: pytest.MonkeyPatch) -> None:
+    import weakref
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    cfg = _tiny_config(horizons=(5, 10, 21))
+    calls = 0
+    orig = model_mod._rank_stack
+    previous_prediction: weakref.ReferenceType[np.ndarray] | None = None
+
+    def _counting(*args: object, **kwargs: object) -> object:
+        nonlocal calls, previous_prediction
+        if previous_prediction is not None:
+            assert previous_prediction() is None
+        calls += 1
+        result = orig(*args, **kwargs)  # type: ignore[arg-type]
+        if calls > 1:
+            previous_prediction = weakref.ref(result[0])
+        return result
+
+    monkeypatch.setattr(model_mod, "_rank_stack", _counting)
+    monkeypatch.setattr(model_mod, "_train_booster", lambda *a, **k: _StubBooster())
+    walk_forward_scores(panel, _universe(), sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
+    assert calls == 1 + 2
+
+
+def test_booster_thread_count_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    cfg = _tiny_config(horizons=(5, 10), num_threads=4)
+    seen: list[object] = []
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        seen.append(params["num_threads"])  # type: ignore[index]
+        return _StubBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    walk_forward_scores(panel, _universe(), sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
+    assert len(seen) == 2 * 2
+    assert all(v == 4 for v in seen)
+
+
+def test_fold_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    cfg = _tiny_config(horizons=(5, 10))
+    failure = RuntimeError("boom-fold")
+    failing_seed = (cfg.seed + 10 * 100003 + 2018 * 101) % 2147483647
+    predictions: list[int] = []
+
+    class _RecordingBooster(_StubBooster):
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            predictions.append(len(data))
+            return super().predict(data)
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        if seed == failing_seed:
+            raise failure
+        return _RecordingBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    with pytest.raises(RuntimeError, match="boom-fold") as caught:
+        walk_forward_scores(panel, _universe(), sess, cfg, test_years=(2018,), authorization=_auth(sess))
+    assert caught.value is failure
+    assert not predictions
+
+
+def test_fold_workers_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+    assert model_mod._fold_workers(8) == 1
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    assert model_mod._fold_workers(4) == 2
+    assert model_mod._fold_workers(8) == 1
+    assert model_mod._fold_workers(16) == 1
+    assert model_mod._fold_workers(0) == 1
+    assert model_mod._fold_workers(-1) == 1
+    monkeypatch.setattr(os, "cpu_count", lambda: None)  # type: ignore[return-value]
+    assert model_mod._fold_workers(4) == 1
+
+
+def test_concurrent_equals_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    cfg = _tiny_config(horizons=(5, 10, 21), num_threads=4)
+    monkeypatch.setattr(model_mod, "_fold_workers", lambda n: 1)
+    seq = walk_forward_scores(panel, uni, sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
+    monkeypatch.setattr(model_mod, "_fold_workers", lambda n: 3)
+    conc = walk_forward_scores(panel, uni, sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
+    assert np.isfinite(seq.scores).any()
+    assert seq.scores.tobytes() == conc.scores.tobytes()
+
+
+def test_folds_overlap_and_predictions_wait_in_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    from threading import Barrier, get_ident
+
+    sess = _sessions()
+    cfg = _tiny_config(horizons=(5, 10, 21))
+    caller = get_ident()
+    barrier = Barrier(3, timeout=10)
+    completed: list[int] = []
+
+    class _CallerBooster(_StubBooster):
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            assert get_ident() == caller
+            assert len(completed) == 3
+            return super().predict(data)
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        assert get_ident() != caller
+        barrier.wait()
+        completed.append(seed)
+        return _CallerBooster(scale=1.0)
+
+    monkeypatch.setattr(model_mod, "_fold_workers", lambda n: 3)
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    out = walk_forward_scores(
+        _synthetic_panel(), _universe(), sess, cfg, test_years=(2018,), authorization=_auth(sess)
+    )
+    assert np.isfinite(out.scores).any()
+
+
+def test_all_year_folds_validated_before_submission(monkeypatch: pytest.MonkeyPatch) -> None:
+    sess = _sessions()
+    panel = _synthetic_panel()
+    labels = dict(panel.labels)
+    labels[21] = np.full_like(labels[21], np.nan)
+    invalid = FeaturePanel(features=panel.features, labels=labels, last_row=panel.last_row)
+    calls: list[int] = []
+
+    def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
+        calls.append(seed)
+        return _StubBooster()
+
+    monkeypatch.setattr(model_mod, "_train_booster", _fake)
+    with pytest.raises(ValueError, match="fold year=2018 horizon=21 has 0 rows below min_train_rows"):
+        walk_forward_scores(
+            invalid, _universe(), sess, _tiny_config(horizons=(5, 10, 21)),
+            test_years=(2018,), authorization=_auth(sess)
+        )
+    assert not calls
