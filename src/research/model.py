@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import warnings
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -229,6 +231,13 @@ def _train_booster(
     return lgb.train(params, dataset, num_boost_round=num_boost_round)
 
 
+def _fold_workers(threads_per_booster: int) -> int:
+    """Bound concurrent fits while preserving each booster's configured thread count."""
+    if threads_per_booster <= 0:
+        return 1  # LightGBM uses the OpenMP default thread count for non-positive values.
+    return max(1, (os.cpu_count() or 1) // threads_per_booster)
+
+
 def _zscore_rows(mat: NDArray[np.float64], min_count: int) -> NDArray[np.float64]:
     out = np.full(mat.shape, np.nan, dtype=np.float64)
     for r in range(mat.shape[0]):
@@ -312,18 +321,28 @@ def walk_forward_scores(
         year_rows[year] = members
     weekly = list(_weekly_rows(sess, lo=0, hi=n_rows))
     train_x, train_r, train_i = _rank_stack(feat_mats, uni, weekly, config.min_cross_section)
-    per_horizon: list[NDArray[np.float64]] = []
-    for horizon in config.horizons:
+    horizons = tuple(int(h) for h in config.horizons)
+    targets: dict[int, NDArray[np.float64]] = {}
+    for horizon in horizons:
         lab = np.asarray(panel.labels[int(horizon)])
         if lab.shape != (n_rows, n_inst):
             raise ValueError(f"label array for horizon {horizon} has wrong shape {lab.shape}")
-        target = _winsor_z_by_date(
+        targets[horizon] = _winsor_z_by_date(
             lab, train_r, train_i, config.winsor_low_pct, config.winsor_high_pct, config.min_cross_section
         )
-        scored = np.full((n_rows, n_inst), np.nan, dtype=np.float64)
-        for year in years:
-            first = year_rows[year][0]
-            end = year_rows[year][-1] + 1
+    per_horizon: list[NDArray[np.float64]] = [
+        np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons
+    ]
+    workers = min(len(horizons), _fold_workers(config.num_threads))
+    for year in years:
+        first = year_rows[year][0]
+        end = year_rows[year][-1] + 1
+        pred_x, pred_r, pred_i = _rank_stack(
+            feat_mats, uni, range(first, end), config.min_cross_section
+        )
+        train_args: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
+        for hi, horizon in enumerate(horizons):
+            target = targets[horizon]
             mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
             n_train = int(mask.sum())
             _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
@@ -332,21 +351,29 @@ def walk_forward_scores(
                     f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
                 )
             seed = (int(config.seed) + int(horizon) * 100003 + int(year) * 101) % 2147483647
-            booster = _train_booster(
-                np.ascontiguousarray(train_x[mask]),
-                np.ascontiguousarray(target[mask]),
-                _lgbm_params(config, seed),
-                config.num_boost_round,
-                seed,
-                train_r[mask],
+            train_args.append(
+                (
+                    hi,
+                    seed,
+                    np.ascontiguousarray(train_x[mask]),
+                    np.ascontiguousarray(target[mask]),
+                    _lgbm_params(config, seed),
+                    train_r[mask],
+                )
             )
-            pred_x, pred_r, pred_i = _rank_stack(
-                feat_mats, uni, range(first, end), config.min_cross_section
-            )
-            if pred_r.size:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    _train_booster, tx, ty, params, config.num_boost_round, seed, rows
+                )
+                for hi, seed, tx, ty, params, rows in train_args
+            ]
+            boosters = [future.result() for future in futures]
+        if pred_r.size:
+            for (hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_args, boosters, strict=True):
                 preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
-                scored[pred_r, pred_i] = preds
-        per_horizon.append(scored)
+                per_horizon[hi][pred_r, pred_i] = preds
+        del pred_x, pred_r, pred_i, train_args, futures, boosters
     ensemble = _ensemble_average(per_horizon, config.min_cross_section)
     ensemble = np.where(uni, ensemble, np.nan)
     scores32 = np.ascontiguousarray(ensemble, dtype=np.float32)
