@@ -32,6 +32,8 @@ from numpy.typing import NDArray
 from src.core.pit import PITDataError
 from src.data.research_protocol import ResearchProtocol
 from src.research.evaluation import EvaluationEvidence, EvaluationPolicy
+from src.research.ledger_bridge import LedgerOutcome
+from src.research.panel import FEATURE_SETS
 from src.research.pipeline import EvaluationRun, StrategySpec, strategy_spec_from_canonical_json
 from src.research.stats import PairedDelta, PairedRiskDelta, paired_growth_tail_delta
 
@@ -43,6 +45,7 @@ __all__ = [
     "decide_challenge",
     "decision_from_canonical_json",
     "knob_changes",
+    "same_design",
     "with_seeds",
 ]
 
@@ -83,9 +86,9 @@ class ChampionRecord:
     report_digest: str
     objective_j: float
     promoted_at: datetime
-    reason: str  # "bootstrap" | "challenge" | "policy_override"
+    reason: str  # "bootstrap" | "challenge" | "policy_override" | "rebaseline"
     decision_digest: str | None
-    rationale: str | None = None  # operator's stated reason; only a "policy_override" record carries one
+    rationale: str | None = None  # operator's stated reason for policy overrides and rebaselines
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +151,27 @@ class ChallengeDecision:
     def digest(self) -> str:
         """SHA-256 hex of the canonical JSON."""
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+
+def same_design(a: StrategySpec, b: StrategySpec) -> bool:
+    """True when two specs differ at most in ``scorer.num_threads`` and in feature-set names that name the same tuple."""
+    a_alias = _canonical_feature_set_name(a.scorer.feature_set)
+    b_alias = _canonical_feature_set_name(b.scorer.feature_set)
+    if a_alias is None or b_alias is None:
+        return False
+    a_scorer = type(a.scorer).model_validate({**a.scorer.model_dump(), "num_threads": 1, "feature_set": a_alias})
+    b_scorer = type(b.scorer).model_validate({**b.scorer.model_dump(), "num_threads": 1, "feature_set": b_alias})
+    return a.model_copy(update={"scorer": a_scorer}).canonical_json() == b.model_copy(
+        update={"scorer": b_scorer}
+    ).canonical_json()
+
+
+def _canonical_feature_set_name(name: str) -> str | None:
+    try:
+        members = tuple(FEATURE_SETS[name])
+    except KeyError:
+        return None
+    return next(key for key, values in FEATURE_SETS.items() if tuple(values) == members)
 
 
 def with_seeds(spec: StrategySpec, seeds: tuple[int, ...]) -> StrategySpec:
@@ -516,6 +540,55 @@ class ChampionStore:
         self._append_history(record)
         return record
 
+    def rebaseline(
+        self,
+        *,
+        run: EvaluationRun,
+        baseline_run: EvaluationRun,
+        spec: StrategySpec,
+        baseline_spec: StrategySpec,
+        spec_path: Path,
+        now: datetime,
+        rationale: str,
+    ) -> ChampionRecord:
+        """Replace the champion by its equal-design successor; raises ValueError unless results are provably identical."""
+        current = self.current()
+        if current is None:
+            raise ValueError("no champion to rebaseline")
+        if not rationale.strip():
+            raise ValueError("a rebaseline needs a non-empty rationale")
+        if run.report.spec_hash != spec.spec_hash:
+            raise ValueError("run was not produced by this spec")
+        if baseline_run.report.spec_hash != baseline_spec.spec_hash:
+            raise ValueError("baseline run was not produced by baseline_spec")
+        if not run.report.passed:
+            raise ValueError("report card did not pass; refusing to rebaseline")
+        if not spec.scorer.seeds:
+            raise ValueError("a rebaseline successor needs non-empty seeds")
+        if tuple(spec.scorer.seeds) != tuple(baseline_spec.scorer.seeds):
+            raise ValueError("spec seeds must equal baseline_spec seeds")
+        if not same_design(spec, baseline_spec):
+            raise ValueError("spec and baseline_spec differ by more than num_threads/feature-set alias (same_design)")
+        if spec.spec_hash == current.spec_hash:
+            raise ValueError("successor spec_hash equals the current champion; nothing to rebaseline")
+        stored = strategy_spec_from_canonical_json(current.spec_json)
+        expected = with_seeds(stored, tuple(spec.scorer.seeds))
+        if baseline_spec.spec_hash != expected.spec_hash:
+            raise ValueError("baseline_spec must equal with_seeds(stored champion spec, seeds)")
+        _assert_identical_evidence(run, baseline_run)
+        record = self._record(
+            run=run,
+            spec=spec,
+            spec_path=spec_path,
+            now=now,
+            reason="rebaseline",
+            decision_digest=None,
+            rationale=f"{rationale.strip()} (replaces {current.spec_hash[:12]})",
+        )
+        self._replace_current(record)
+        self._append_history(record)
+        return record
+
     def _verify_decision_context(self, decision: ChallengeDecision, *, run: EvaluationRun, spec: StrategySpec) -> None:
         if not self.decision_path(decision.digest).is_file():
             raise ValueError(f"decision {decision.digest[:12]} was never saved")
@@ -730,6 +803,33 @@ def _window_of(run: EvaluationRun) -> tuple[date, date]:
     if not sessions:
         raise ValueError("run evidence sessions must be non-empty")
     return (sessions[0], sessions[-1])
+
+
+def _assert_identical_evidence(run: EvaluationRun, baseline_run: EvaluationRun) -> None:
+    if tuple(run.evidence.sessions) != tuple(baseline_run.evidence.sessions):
+        raise ValueError("rebaseline evidence differs in sessions")
+    pairs: list[tuple[str, LedgerOutcome, LedgerOutcome]] = [
+        ("base", run.evidence.base, baseline_run.evidence.base),
+        ("stress_slippage", run.evidence.stress_slippage, baseline_run.evidence.stress_slippage),
+        ("stress_delay", run.evidence.stress_delay, baseline_run.evidence.stress_delay),
+        ("unhedged", run.evidence.unhedged, baseline_run.evidence.unhedged),
+        ("placebo", run.evidence.placebo, baseline_run.evidence.placebo),
+    ]
+    if set(run.evidence.cost_grid) != set(baseline_run.evidence.cost_grid):
+        raise ValueError("rebaseline evidence differs in cost_grid keys")
+    pairs.extend(
+        (f"cost_grid[{tick}]", run.evidence.cost_grid[tick], baseline_run.evidence.cost_grid[tick])
+        for tick in sorted(run.evidence.cost_grid)
+    )
+    for name, first, second in pairs:
+        if first.sessions != second.sessions or first.sessions != run.evidence.sessions:
+            raise ValueError(f"rebaseline evidence differs in {name}: sessions mismatch")
+        if not first.ledger_hash or not second.ledger_hash:
+            raise ValueError(f"rebaseline evidence differs in {name}: missing ledger_hash")
+        if first.ledger_hash != second.ledger_hash:
+            raise ValueError(f"rebaseline evidence differs in {name}: ledger_hash mismatch")
+        if not np.array_equal(first.log_returns, second.log_returns):
+            raise ValueError(f"rebaseline evidence differs in {name}: log_returns mismatch")
 
 
 def _delta_fields(delta: PairedDelta) -> dict[str, Any]:
