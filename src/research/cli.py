@@ -145,9 +145,11 @@ def _pipeline_for(args: argparse.Namespace) -> Any:  # pragma: no cover - needs 
 
 
 def _load_spec(path: Path) -> Any:
+    from src.config.runtime import load_runtime_config
     from src.research.pipeline import load_strategy_spec
 
-    return load_strategy_spec(Path(path))
+    runtime_config = load_runtime_config()
+    return load_strategy_spec(Path(path), futures_constants=runtime_config.futures_constants)
 
 
 def _run_build_cube(args: argparse.Namespace) -> Mapping[str, object]:  # pragma: no cover - needs real datasets
