@@ -41,7 +41,7 @@ __all__ = [
     "materialize_market_actions",
 ]
 
-POLICY_VERSION = "market-actions-v10"
+REVISION = "market-actions-v10"
 
 _LOG = logging.getLogger(__name__)
 
@@ -365,7 +365,7 @@ def materialize_market_actions(
                 "effective_start": None,
                 "effective_end": None,
                 "cancellation": cancellation,
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
     designations = 0
@@ -413,7 +413,7 @@ def materialize_market_actions(
                         "effective_start": effective_start,
                         "effective_end": effective_end,
                         "cancellation": False,
-                        "policy_version": POLICY_VERSION,
+                        "policy_version": REVISION,
                     }
                 )
                 kind_actions += 1
@@ -454,7 +454,7 @@ def materialize_market_actions(
                     "effective_start": admin_form.effective_on,
                     "effective_end": None,
                     "cancellation": False,
-                    "policy_version": POLICY_VERSION,
+                    "policy_version": REVISION,
                 }
             )
             kind_actions += 1
@@ -487,7 +487,7 @@ def materialize_market_actions(
                 "effective_start": None,
                 "effective_end": None,
                 "cancellation": cancellation,
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
         if cancellation:
@@ -511,7 +511,7 @@ def materialize_market_actions(
                         "effective_start": day,
                         "effective_end": None,
                         "cancellation": False,
-                        "policy_version": POLICY_VERSION,
+                        "policy_version": REVISION,
                     }
                 )
                 designations += 1
@@ -528,7 +528,7 @@ def materialize_market_actions(
                         "effective_start": day,
                         "effective_end": None,
                         "cancellation": False,
-                        "policy_version": POLICY_VERSION,
+                        "policy_version": REVISION,
                     }
                 )
                 releases += 1
@@ -542,7 +542,7 @@ def materialize_market_actions(
     identity = DatasetIdentity(
         kind="market_actions",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs=market_actions_dataset_inputs(
             bronze_disclosures=disclosure_source_digest(catalog),
             corp_code_bridge=corp_bridge_digest(bridge),

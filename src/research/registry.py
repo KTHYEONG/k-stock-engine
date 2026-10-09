@@ -22,7 +22,7 @@ _LOG = logging.getLogger(__name__)
 
 #: Current index-line format. A line carrying another schema (or none) is provenance of an older format: it is
 #: never rewritten or deleted, and the reader skips it instead of failing on a format it no longer writes.
-_INDEX_SCHEMA = 2
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +203,7 @@ class RunRegistry:
                 raw = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise PITDataError(f"invalid run index line: {self._index}") from exc
-            if not isinstance(raw, dict) or raw.get("schema") != _INDEX_SCHEMA:
+            if not isinstance(raw, dict) or raw.get("schema") != _SCHEMA_VERSION:
                 legacy += 1
                 continue
             current.append(line)
@@ -267,7 +267,7 @@ class RunRegistry:
     def _append_index(self, record_id: str, record: RunRecord) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": _INDEX_SCHEMA,
+            "schema": _SCHEMA_VERSION,
             "record_id": record_id,
             "run_id": record.run_id,
             "family": record.family,

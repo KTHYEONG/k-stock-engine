@@ -12,8 +12,8 @@ import pytest
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
+from src.data.cash_series_silver import REVISION as CASH_SERIES_SILVER_REVISION
 from src.data.cash_series_silver import (
-    POLICY_VERSION,
     CashSeriesConfig,
     load_cash_series_config,
     materialize_cash_series_silver,
@@ -142,7 +142,7 @@ def test_silver_one_row_per_session(tmp_path: Path) -> None:
     assert _frame(result.dataset_path, DAY1)["available_at"].to_list() == [
         datetime(2026, 3, 4, 18, 0, tzinfo=KRX_TZ)
     ]
-    assert _frame(result.dataset_path, DAY1)["policy_version"].to_list() == [POLICY_VERSION]
+    assert _frame(result.dataset_path, DAY1)["policy_version"].to_list() == [CASH_SERIES_SILVER_REVISION]
 
 
 def test_missing_ticker_fails_closed(tmp_path: Path) -> None:
@@ -363,7 +363,7 @@ def test_materialize_is_idempotent(tmp_path: Path) -> None:
         config=_config(),
     )
     assert first.dataset_id == second.dataset_id
-    _ = POLICY_VERSION
+    _ = CASH_SERIES_SILVER_REVISION
 
 
 # --- Client-level guards exercising fetch_etf_rows branches ---

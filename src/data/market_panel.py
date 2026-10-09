@@ -28,7 +28,7 @@ from src.data.datasets import (
     read_dataset,
 )
 
-POLICY_VERSION = "krx-market-panel-v4"
+REVISION = "krx-market-panel-v4"
 
 _LOG = logging.getLogger(__name__)
 
@@ -488,7 +488,7 @@ def _build_bucket_frame(
         .with_columns(
             eligible=pl.col("eligible").fill_null(False),
             exclusion_reason=pl.col("exclusion_reason").fill_null("absent_from_universe"),
-            policy_version=pl.lit(POLICY_VERSION),
+            policy_version=pl.lit(REVISION),
         )
     )
     if blocks is not None and blocks.height:
@@ -589,7 +589,7 @@ def materialize_market_panel(
     identity = DatasetIdentity(
         kind="market_panel",
         layer=DatasetLayer.GOLD,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "daily_market": dataset_reference(daily_id, kind="daily_market"),
             "universe": dataset_reference(universe_id, kind="ordinary_universe"),

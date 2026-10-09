@@ -36,14 +36,14 @@ from src.integrations.dart.earnings_release import (
 )
 
 __all__ = [
-    "POLICY_VERSION",
+    "REVISION",
     "EarningsReleaseBenchmark",
     "benchmark_earnings_releases",
     "earnings_release_dataset_inputs",
     "materialize_earnings_releases",
 ]
 
-POLICY_VERSION = "earnings-releases-v2"
+REVISION = "earnings-releases-v2"
 _QUARANTINE_FILENAME = "quarantine.json"
 _FISCAL_RE = re.compile(r"^(\d{4})Q([1-4])$")
 _BENCHMARK_METRICS: tuple[str, ...] = ("sales", "operating_profit")
@@ -234,7 +234,7 @@ def materialize_earnings_releases(
                     "prior_year_value_krw": value.prior_year_krw,
                     "received_on": release.received_on,
                     "available_at": available_at,
-                    "policy_version": POLICY_VERSION,
+                    "policy_version": REVISION,
                 }
             )
     frame = (
@@ -247,7 +247,7 @@ def materialize_earnings_releases(
     identity = DatasetIdentity(
         kind="earnings_releases",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs=earnings_release_dataset_inputs(
             bronze_earnings_releases=dataset_digest(envelope_hashes),
             corp_code_bridge=dataset_digest([bridge_receipt_hash]),

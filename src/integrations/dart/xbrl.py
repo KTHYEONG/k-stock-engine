@@ -329,7 +329,8 @@ class DartXbrlCollector:
         fallback, and any other response failure returns an ``unavailable``
         record preserving the original error text in diagnostics.
         """
-        from src.integrations.dart.accounts import MAPPING_VERSION, map_standardized_account
+        from src.integrations.dart.accounts import REVISION as ACCOUNTS_REVISION
+        from src.integrations.dart.accounts import map_standardized_account
         from src.integrations.dart.document_statements import document_verified_page, parse_filing_document
         from src.integrations.errors import ProviderQuotaExhaustedError, ProviderRetryableError
 
@@ -339,7 +340,7 @@ class DartXbrlCollector:
                 "status": status,
                 "identity": dict(identity),
                 "records": [],
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": ("dart_quota_exhausted",),
                 "raw_document_hash": None,
                 **identity,
@@ -351,7 +352,7 @@ class DartXbrlCollector:
                 "status": status,
                 "identity": dict(identity),
                 "records": [],
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": (f"dart_error:{exc}",),
                 "raw_document_hash": None,
                 **identity,
@@ -491,7 +492,7 @@ class DartXbrlCollector:
                         "consolidated": fs_div_value == "CFS",
                         "restatement_id": "r0",
                         "source_kind": "opendart_standard",
-                        "mapping_version": MAPPING_VERSION,
+                        "mapping_version": ACCOUNTS_REVISION,
                         "raw_document_hash": None,
                     }
                 )
@@ -500,7 +501,7 @@ class DartXbrlCollector:
                 "status": "000",
                 "identity": dict(request_identity),
                 "records": canonical,
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": tuple(diagnostics),
                 "raw_document_hash": None,
                 "raw_provenance": dict(raw),
@@ -533,7 +534,7 @@ class DartXbrlCollector:
                 "status": last_status or "013",
                 "identity": dict(identity),
                 "records": [],
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": ("empty_archive",),
                 "raw_document_hash": None,
                 **identity,
@@ -546,7 +547,7 @@ class DartXbrlCollector:
                 "status": "013",
                 "identity": dict(identity),
                 "records": [],
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": ("document_not_found",),
                 "raw_document_hash": None,
                 **identity,
@@ -557,7 +558,7 @@ class DartXbrlCollector:
                 "status": last_status or "013",
                 "identity": dict(identity),
                 "records": [],
-                "mapping_version": MAPPING_VERSION,
+                "mapping_version": ACCOUNTS_REVISION,
                 "diagnostics": ("invalid_document_archive",),
                 "raw_document_hash": None,
                 **identity,

@@ -32,7 +32,7 @@ from src.integrations.dart.dividend_decision import (
     parse_dividend_decision,
 )
 
-POLICY_VERSION = "dividend-events-v3"
+REVISION = "dividend-events-v3"
 _QUARANTINE_FILENAME = "quarantine.json"
 _SCHEMA: dict[str, Any] = {
     "instrument_id": pl.String,
@@ -417,7 +417,7 @@ def materialize_dividend_events(
                 "pay_date_source": pay_source,
                 "rcept_no": decision.rcept_no,
                 "available_at": _resolve_available_at(decision.received_on, calendar=calendar),
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
     frame = (
@@ -429,7 +429,7 @@ def materialize_dividend_events(
     identity = DatasetIdentity(
         kind="dividend_events",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs=dividend_dataset_inputs(
             bronze_dividend_decisions=dataset_digest(envelope_hashes),
             corp_code_bridge=dataset_digest([bridge_receipt_hash]),

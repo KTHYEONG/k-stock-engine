@@ -26,7 +26,7 @@ __all__ = [
     "ReceiptIndexEntry",
 ]
 
-_CATALOG_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 2
 _LEGACY_SCHEMA_VERSION = 1
 _SQLITE_TIMEOUT_SECONDS = 30.0
 _BUSY_TIMEOUT_MS = 30_000
@@ -268,7 +268,7 @@ class ReceiptCatalog:
 
         Raises:
             PITDataError: the database is not a catalog, the version is
-                unknown, a ``v1`` database is read before it is migrated, or a
+                unknown, a legacy ``v1`` database is read before it is migrated, or a
                 table is missing its columns or indexes.
         """
         try:
@@ -282,13 +282,13 @@ class ReceiptCatalog:
                 raise PITDataError("receipt catalog metadata is missing")
             schema_version, sequence, row_count = metadata_rows[0]
             version = int(schema_version)
-            if version not in (_LEGACY_SCHEMA_VERSION, _CATALOG_SCHEMA_VERSION):
+            if version not in (_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION):
                 raise PITDataError(f"unsupported receipt catalog schema_version: {schema_version!r}")
             if version == _LEGACY_SCHEMA_VERSION and not allow_legacy:
                 raise PITDataError("receipt catalog needs migration")
             self._require_columns(connection, "receipts", _RECEIPT_COLUMNS)
             self._require_index(connection, "receipts", "idx_receipts_source_status")
-            if version >= _CATALOG_SCHEMA_VERSION:
+            if version >= _SCHEMA_VERSION:
                 self._require_columns(connection, "blobs", _BLOB_COLUMNS)
                 self._require_index(connection, "blobs", "idx_blobs_source_usable")
                 self._require_columns(connection, "ranges", _RANGE_COLUMNS)
@@ -371,16 +371,16 @@ class ReceiptCatalog:
         connection.execute(
             "INSERT OR IGNORE INTO catalog_metadata(singleton, schema_version, sequence, row_count) "
             "VALUES (1, ?, 0, 0)",
-            (_CATALOG_SCHEMA_VERSION,),
+            (_SCHEMA_VERSION,),
         )
 
     @staticmethod
     def _migrate_legacy_schema(connection: sqlite3.Connection) -> None:
-        """Bring a ``v1`` catalog to the current version in the caller's transaction."""
+        """Bring a legacy ``v1`` catalog to the current version in the caller's transaction."""
         ReceiptCatalog._create_blobs_and_ranges(connection)
         connection.execute(
             "UPDATE catalog_metadata SET schema_version = ? WHERE singleton = 1",
-            (_CATALOG_SCHEMA_VERSION,),
+            (_SCHEMA_VERSION,),
         )
 
     @staticmethod

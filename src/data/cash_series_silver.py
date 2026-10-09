@@ -28,7 +28,7 @@ from src.data.datasets import (
 from src.data.evidence_sources import KRX_CASH_SERIES_SOURCE
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
-POLICY_VERSION: Final = "krx-cash-series-v1"
+REVISION: Final = "krx-cash-series-v1"
 
 _LOG = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ def materialize_cash_series_silver(
     identity = DatasetIdentity(
         kind="cash_series",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"),
             "bronze_cash": resolve_bronze_digest(
@@ -221,7 +221,7 @@ def materialize_cash_series_silver(
                 "cash_close": cash_close,
                 "available_at": available_at,
                 "source_hash": entry.content_hash,
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
         frame = pl.DataFrame([rows[-1]], schema=_SCHEMA)

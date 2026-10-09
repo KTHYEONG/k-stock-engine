@@ -458,7 +458,7 @@ def materialize_financial_quality(
     policy: FinancialQualityPolicy = _DEFAULT_POLICY,
     certification: object | None = None,
 ) -> Path:
-    """Publish quality evidence through the v2 identity-bound dataset contract."""
+    """Publish quality evidence through the identity-bound dataset contract."""
 
     _ = dataset_id, certification
     destination = layer_root if layer_root is not None else root
@@ -596,7 +596,7 @@ def materialize_financial_quality_from_files(
     try:
         facts = read_dataset(facts_path).collect()
     except PITDataError as exc:
-        raise PITDataError(f"financial facts dataset is not a verified v2 dataset: {facts_path}") from exc
+        raise PITDataError(f"financial facts dataset is not a verified dataset: {facts_path}") from exc
     quarantine_records = (
         _read_quality_json_array(Path(quarantine_file), label="quarantine")
         if quarantine_file is not None

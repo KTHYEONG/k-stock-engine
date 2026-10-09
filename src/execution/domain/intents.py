@@ -15,7 +15,7 @@ from datetime import datetime
 
 from src.core.instruments import AssetKind
 
-INTENT_SCHEMA_VERSION = "v2"
+SCHEMA_VERSION = "v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +59,12 @@ class TradeIntent:
 
 
 def read_v1_intent(payload: Mapping[str, object]) -> TradeIntent:
-    """Migrate a serialized v1 intent (target-value order semantics).
+    """Migrate a serialized legacy v1 intent (target-value order semantics).
 
-    v1 payloads carried a signed ``target_value`` used as an order delta, no
+    Legacy v1 payloads carried a signed ``target_value`` used as an order delta, no
     account snapshot identity, and required a positive value. The migration
     preserves the old absolute notional as the new target position and rejects
-    an exit that cannot be reconciled: v1 exits (zero/negative) require an
+    an exit that cannot be reconciled: legacy v1 exits (zero/negative) require an
     explicit ``account_snapshot_id`` because a target position cannot be
     guessed from local order state.
     """

@@ -12,8 +12,8 @@ import pytest
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
+from src.data.hedge_series_silver import REVISION as HEDGE_SERIES_SILVER_REVISION
 from src.data.hedge_series_silver import (
-    POLICY_VERSION,
     HedgeSeriesConfig,
     load_hedge_series_config,
     materialize_hedge_series_silver,
@@ -262,7 +262,7 @@ def test_materialize_is_idempotent(tmp_path: Path) -> None:
     assert first.dataset_id == second.dataset_id
     assert second.dataset_path == first.dataset_path
     assert len([p for p in Path(silver_root).iterdir() if p.name.startswith("hedge_series_")]) == 1
-    _ = POLICY_VERSION
+    _ = HEDGE_SERIES_SILVER_REVISION
 
 
 def test_config_validation_rejects_bad_documents(tmp_path: Path) -> None:
@@ -543,7 +543,7 @@ def test_kosdaq_identity_is_byte_stable(tmp_path: Path) -> None:
     assert "source" not in manifest.params
     assert set(manifest.params) == {"collection_start", "index_name", "inverse_ticker", "available_time"}
     legacy_identity = DatasetIdentity(
-        kind="hedge_series", layer=DatasetLayer.SILVER, policy_version=POLICY_VERSION,
+        kind="hedge_series", layer=DatasetLayer.SILVER, policy_version=HEDGE_SERIES_SILVER_REVISION,
         inputs=manifest.inputs,
         params={
             "collection_start": DAY1.isoformat(), "index_name": "코스닥 150",

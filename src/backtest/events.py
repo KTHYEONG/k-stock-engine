@@ -95,7 +95,7 @@ def _exit_events(
         raise PITDataError(f"exit table verification failed: {panel_dir}") from exc
     exits_path = next((path for path in verified_paths if path.name == _EXIT_TABLE), None)
     if exits_path is None:
-        # Pre-v2 manifests kept the exit companion outside ``partitions``.
+        # Legacy manifests kept the exit companion outside ``partitions``.
         legacy_path = panel_dir / _EXIT_TABLE
         if not legacy_path.is_file():
             return {}

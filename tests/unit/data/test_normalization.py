@@ -341,7 +341,7 @@ def test_non_mapping_and_keyless_pages_skipped() -> None:
 
 
 def _document_record(*, filing_id: str, published_at, fact: str = 'assets', basis: str = 'point_in_time', extra: dict | None = None) -> dict:
-    from src.integrations.dart.document_statements import PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     record = {
         'ticker': '005930',
@@ -356,7 +356,7 @@ def _document_record(*, filing_id: str, published_at, fact: str = 'assets', basi
         'consolidated': True,
         'source_kind': 'document_verified',
         'period_basis': basis,
-        'parser_version': PARSER_VERSION,
+        'parser_version': DOCUMENT_STATEMENTS_REVISION,
         'checks': ['bs_balance'],
     }
     if extra:
@@ -365,13 +365,13 @@ def _document_record(*, filing_id: str, published_at, fact: str = 'assets', basi
 
 
 def _document_page(*, filing_id: str, published_at, records: list | None = None) -> dict:
-    from src.integrations.dart.document_statements import PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     if records is None:
         records = [_document_record(filing_id=filing_id, published_at=published_at)]
     return {
         'source_kind': 'document_verified',
-        'parser_version': PARSER_VERSION,
+        'parser_version': DOCUMENT_STATEMENTS_REVISION,
         'checks': ['bs_balance'],
         'records': records,
     }
@@ -977,10 +977,10 @@ def test_document_basis_boundaries() -> None:
     assert _expected_document_basis("capex", "99999") is None
     assert _expected_document_basis("mystery", "11011") is None
 
-    from src.integrations.dart.document_statements import PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     base = {
-        "parser_version": PARSER_VERSION,
+        "parser_version": DOCUMENT_STATEMENTS_REVISION,
         "checks": "bs_balance",
         "fact": "assets",
         "period_basis": "point_in_time",
@@ -1039,7 +1039,7 @@ def test_document_page_level_parser_inherited() -> None:
     del record['checks']
     page = {
         'source_kind': 'document_verified',
-        'parser_version': record.get('parser_version') or __import__('src.integrations.dart.document_statements', fromlist=['PARSER_VERSION']).PARSER_VERSION,
+        'parser_version': record.get('parser_version') or __import__('src.integrations.dart.document_statements', fromlist=['REVISION']).REVISION,
         'checks': ['bs_balance'],
         'records': [record],
     }

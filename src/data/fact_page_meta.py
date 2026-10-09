@@ -20,12 +20,12 @@ from typing import Any, Final
 from src.data.receipt_catalog import ReceiptIndexEntry
 
 __all__ = [
-    "DERIVATION_VERSION",
+    "REVISION",
     "FactPageMeta",
     "FactPageMetaStore",
 ]
 
-DERIVATION_VERSION: Final[int] = 1
+REVISION: Final[int] = 1
 
 _BATCH_SIZE: Final[int] = 500
 _SQLITE_TIMEOUT_SECONDS: Final[float] = 30.0
@@ -126,7 +126,7 @@ class FactPageMetaStore:
     """SQLite cache of ``FactPageMeta`` next to the receipt catalog.
 
     The cache is derived data: every row is a pure function of an immutable page blob and of
-    ``DERIVATION_VERSION``, so it can be deleted at any time and is rebuilt on demand. It is not part of
+    ``REVISION``, so it can be deleted at any time and is rebuilt on demand. It is not part of
     the receipt catalog schema or digest.
 
     Args:
@@ -199,7 +199,7 @@ class FactPageMetaStore:
                 " document_not_found, has_labels, is_financial, reprt_code, biz_year, rcept_no"
                 " FROM fact_page_meta WHERE content_hash IN (SELECT value FROM json_each(?))"
                 " AND derivation_version = ?",
-                (requested_json, DERIVATION_VERSION),
+                (requested_json, REVISION),
             ).fetchall()
             return {str(row[0]): _meta_from_row(row) for row in rows}
         except sqlite3.OperationalError:  # pragma: no cover - lock or missing table falls back to reads
@@ -253,7 +253,7 @@ class FactPageMetaStore:
                     [
                         (
                             meta.content_hash,
-                            DERIVATION_VERSION,
+                            REVISION,
                             meta.source_kind,
                             meta.status,
                             meta.parser_version,

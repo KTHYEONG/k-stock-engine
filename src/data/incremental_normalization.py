@@ -30,6 +30,7 @@ from src.data.normalization import (
 )
 
 AVAILABILITY_POLICY: Final = "next-session-after-effective-receipt-v2"
+REVISION: Final = "dart-incremental-v1"
 
 _FACT_IDENTITY = ("company_id", "fiscal_period", "filing_id", "fact", "restatement_id", "consolidated")
 
@@ -149,7 +150,7 @@ def _load_reference_tables(
     disclosures_dataset_id: str | None = None,
     financial_facts_dataset_id: str | None = None,
 ) -> tuple[list[dict[str, object]], str, str]:
-    """Load disclosure and prior-fact inputs from verified v2 datasets."""
+    """Load disclosure and prior-fact inputs from verified datasets."""
 
     def _flat(kind: str, explicit_id: str | None = None) -> tuple[pl.DataFrame | None, str | None]:
         if explicit_id is not None:
@@ -495,12 +496,12 @@ def refresh_dart_financial_facts(
     calendar_digest = hashlib.sha256(
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
     ).hexdigest()
-    from src.integrations.dart.document_statements import PARSER_VERSION as _PARSER_VERSION
+    from src.integrations.dart.document_statements import REVISION as DOCUMENT_STATEMENTS_REVISION
 
     identity = DatasetIdentity(
         kind="financial_facts",
         layer=DatasetLayer.SILVER,
-        policy_version="dart-incremental-v1",
+        policy_version=REVISION,
         inputs={
             "bronze_facts": dataset_digest(receipt_hashes),
             "superseded": dataset_digest(sorted(superseded_receipt_hashes)),
@@ -513,7 +514,7 @@ def refresh_dart_financial_facts(
             "calendar_digest": calendar_digest,
             "ticker_bridge": bridge_receipt_hash,
             "trust_document_facts": trust_document_facts,
-            "document_parser_version": _PARSER_VERSION,
+            "document_parser_version": DOCUMENT_STATEMENTS_REVISION,
         },
     )
     published = publish_dataset(

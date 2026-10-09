@@ -29,7 +29,7 @@ from src.data.datasets import (
 from src.data.evidence_sources import KRX_HEDGE_SERIES_SOURCE, KRX_TREND_SERIES_SOURCE
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
-POLICY_VERSION: Final = "krx-hedge-series-v1"
+REVISION: Final = "krx-hedge-series-v1"
 
 _LOG = logging.getLogger(__name__)
 
@@ -221,7 +221,7 @@ def materialize_hedge_series_silver(
     identity = DatasetIdentity(
         kind=dataset_kind,
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"),
             "bronze_hedge": resolve_bronze_digest(
@@ -272,7 +272,7 @@ def materialize_hedge_series_silver(
                 "inverse_close": inverse_close,
                 "available_at": available_at,
                 "source_hash": entry.content_hash,
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
         frame = pl.DataFrame([rows[-1]], schema=_SCHEMA)

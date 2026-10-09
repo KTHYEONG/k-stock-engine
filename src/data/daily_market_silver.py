@@ -26,7 +26,7 @@ from src.data.datasets import (
 )
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
-POLICY_VERSION = "krx-daily-market-v1"
+REVISION = "krx-daily-market-v1"
 _LOG = logging.getLogger(__name__)
 _MARKETS: frozenset[str] = frozenset({"KOSPI", "KOSDAQ"})
 
@@ -193,7 +193,7 @@ def materialize_daily_market_silver(
     universe_dataset_id: str | None = None,
     bronze_daily_digest: str | None = None,
 ) -> DailyMarketSilverResult:
-    """Normalize one hash-verified KRX page per certified session and publish v2."""
+    """Normalize one hash-verified KRX page per certified session and publish."""
 
     if not isinstance(policy.available_time, time):
         raise PITDataError("daily market available_time must be a time")
@@ -220,7 +220,7 @@ def materialize_daily_market_silver(
     identity = DatasetIdentity(
         kind="daily_market",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"),
             "bronze_daily": resolve_bronze_digest(
@@ -323,7 +323,7 @@ def materialize_daily_market_silver(
                     "invalid_reason": reason,
                     "available_at": available_at,
                     "source_hash": entry.content_hash,
-                    "policy_version": POLICY_VERSION,
+                    "policy_version": REVISION,
                 }
             )
         previous_closes = current_closes

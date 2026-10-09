@@ -22,7 +22,7 @@ from src.core.digest import dataset_digest as dataset_digest
 from src.core.pit import PITDataError
 
 MANIFEST_NAME: Final = "manifest.json"
-MANIFEST_SCHEMA: Final = "dataset-manifest-v2"
+SCHEMA_VERSION: Final = "dataset-manifest-v2"
 
 _DATASET_ID_RE: Final = re.compile(r"(?P<kind>[A-Za-z0-9][A-Za-z0-9_-]*)_(?P<digest>[0-9a-f]{16})\Z")
 _DATASET_INPUT_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*_[0-9a-f]{16}\Z")
@@ -133,7 +133,7 @@ class PublishedDataset:
 
 
 def dataset_reference(dataset_id: str, *, kind: str) -> str:
-    """Return a valid identity reference for a v2 or pre-v2 dataset name."""
+    """Return a valid identity reference for a current or legacy dataset name."""
 
     _validate_kind(kind)
     if isinstance(dataset_id, str) and _DATASET_ID_RE.fullmatch(dataset_id):
@@ -186,7 +186,7 @@ def publish_dataset(
     checks: Sequence[DatasetCheck] = (),
     details: Mapping[str, object] | None = None,
 ) -> PublishedDataset:
-    """Atomically publish a v2 manifest and all declared Parquet partitions.
+    """Atomically publish a manifest and all declared Parquet partitions.
 
     The staged directory is a sibling of the final dataset directory. An
     existing dataset is accepted only when its identity and partition table are
@@ -236,7 +236,7 @@ def publish_dataset(
             total_rows += frame.height
 
         manifest = DatasetManifest(
-            schema=MANIFEST_SCHEMA,
+            schema=SCHEMA_VERSION,
             dataset_id=dataset_id,
             kind=identity.kind,
             layer=identity.layer,
@@ -271,7 +271,7 @@ def publish_dataset(
 
 
 def load_manifest(dataset_dir: Path) -> DatasetManifest:
-    """Read and validate one v2 dataset manifest without reading Parquet data."""
+    """Read and validate one dataset manifest without reading Parquet data."""
 
     directory = Path(dataset_dir)
     path = directory / MANIFEST_NAME
@@ -283,7 +283,7 @@ def load_manifest(dataset_dir: Path) -> DatasetManifest:
         raise PITDataError(f"invalid dataset manifest: {path}")
     try:
         schema = _required_str(raw, "schema")
-        if schema != MANIFEST_SCHEMA:
+        if schema != SCHEMA_VERSION:
             raise PITDataError(f"unsupported dataset manifest schema: {schema!r}")
         dataset_id = _required_dataset_id(raw, "dataset_id")
         if dataset_id != directory.name:
@@ -426,13 +426,13 @@ def dataset_partition_paths(
     known_ids: Callable[[str], bool] | None = None,
     allow_legacy: bool = True,
 ) -> tuple[Path, ...]:
-    """Return verified partition paths for v2 and pre-v2 dataset directories.
+    """Return verified partition paths for current and legacy dataset directories.
 
-    R4b builders consume the v2 contract exclusively.  The small legacy reader
+    R4b builders consume the dataset contract exclusively.  The small legacy reader
     is retained at this boundary so a migration can be performed without
     making every builder understand the old manifest spelling.  A manifest
-    that declares the v2 schema is never downgraded to the compatibility path
-    when verification fails; otherwise a tampered v2 partition could be hidden
+    that declares the current schema is never downgraded to the compatibility path
+    when verification fails; otherwise a tampered partition could be hidden
     by the legacy fallback.
     """
 
@@ -444,13 +444,13 @@ def dataset_partition_paths(
     if not isinstance(raw, dict) or raw.get("dataset_id") != directory.name:
         raise PITDataError(f"invalid dataset manifest: {directory}")
 
-    if raw.get("schema") == MANIFEST_SCHEMA:
+    if raw.get("schema") == SCHEMA_VERSION:
         verification = verify_dataset(
             directory,
             known_ids=(known_ids or (lambda _dataset_id: True)),
         )
         if not verification.passed:
-            raise PITDataError(f"invalid v2 dataset: {'; '.join(verification.failures)}")
+            raise PITDataError(f"invalid dataset: {'; '.join(verification.failures)}")
         manifest = load_manifest(directory)
         return tuple(_safe_partition_path(directory, partition.path) for partition in manifest.partitions)
 
@@ -489,7 +489,7 @@ def read_dataset_compat(
     columns: Sequence[str] | None = None,
     known_ids: Callable[[str], bool] | None = None,
 ) -> pl.LazyFrame:
-    """Read a verified v2 dataset or a verified pre-v2 migration source.
+    """Read a verified dataset or a verified legacy migration source.
 
     New code should use :func:`read_dataset`.  This adapter exists only at
     migration and compatibility edges; it deliberately has no write path.
@@ -590,7 +590,7 @@ def universe_sessions(
     if not isinstance(raw, dict) or raw.get("dataset_id") != dataset.name:
         raise PITDataError("invalid ordinary-universe manifest")
 
-    if raw.get("schema") == MANIFEST_SCHEMA:
+    if raw.get("schema") == SCHEMA_VERSION:
         try:
             verification = verify_dataset(dataset, known_ids=lambda _dataset_id: True)
         except PITDataError as exc:
@@ -739,8 +739,8 @@ def _write_manifest(path: Path, manifest: DatasetManifest) -> None:
         "details": dict(manifest.details),
         "created_at": manifest.created_at.isoformat(),
     }
-    # Keep scalar builder diagnostics visible to pre-v2 operational readers;
-    # details remains the canonical v2 location and the identity never uses them.
+    # Keep scalar builder diagnostics visible to legacy operational readers;
+    # details remains the canonical location and the identity never uses them.
     for name, value in manifest.details.items():
         if name not in {"partitions", "table", "rows", "schema", "dataset_id"}:
             payload.setdefault(name, value)
