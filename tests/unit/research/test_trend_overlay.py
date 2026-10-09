@@ -255,7 +255,7 @@ def test_legacy_ma_spec_is_byte_identical() -> None:
     from pathlib import Path
     from src.research.pipeline import load_strategy_spec
 
-    champion = load_strategy_spec(Path("config/research/strategies/ml_growth_t85_b50_k200.toml"))
+    [redacted]
     [redacted]
     spec = champion.trend_overlay
     assert spec is not None
