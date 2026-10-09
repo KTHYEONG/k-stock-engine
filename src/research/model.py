@@ -16,12 +16,12 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.panel import FEATURE_SETS, FeaturePanel, feature_names_for
 
-__all__ = ["ScoreMatrix", "ScorerConfig", "walk_forward_scores"]
+__all__ = ["ScoreMatrix", "ScorerConfig", "_member_seeds", "walk_forward_scores"]
 
 _LOG = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class ScorerConfig(BaseModel):
     min_data_in_leaf=800; feature_fraction=0.7; bagging_fraction=0.7; bagging_freq=1; lambda_l2=50.0;
     seed=11; num_threads=8; min_cross_section=50; winsor_low_pct=1.0; winsor_high_pct=99.0;
     purge_extra_sessions=2; min_train_rows=20000; first_test_year=2018; feature_set="full62" — name in
-    ``FEATURE_SETS``; part of the identity.
+    ``FEATURE_SETS``; part of the identity; seeds=() — ensemble member seeds; empty means the single `seed`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -59,6 +59,43 @@ class ScorerConfig(BaseModel):
     min_train_rows: int = 20000
     first_test_year: int = 2018
     feature_set: str = "full62"
+    seeds: tuple[int, ...] = ()
+
+    @field_validator("seeds", mode="before")
+    @classmethod
+    def _seeds_members(cls, value: object) -> tuple[int, ...]:
+        if isinstance(value, tuple) and len(value) == 0:
+            return ()
+        if isinstance(value, list):
+            items: tuple[object, ...] = tuple(value)
+        elif isinstance(value, tuple):
+            items = tuple(value)
+        else:
+            raise ValueError(f"seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+        if len(items) == 0:
+            return ()
+        if len(items) < 2:
+            raise ValueError(f"seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+        seen: set[int] = set()
+        out: list[int] = []
+        for entry in items:
+            if isinstance(entry, bool):
+                raise ValueError(f"seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+            if not isinstance(entry, int):
+                raise ValueError(f"seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+            if entry < 0:
+                raise ValueError(f"seeds must be empty or hold >= 2 distinct ints >= 0, got {value!r}")
+            if entry in seen:
+                raise ValueError(f"seeds must hold distinct values, got {value!r}")
+            seen.add(entry)
+            out.append(entry)
+        return tuple(out)
+
+    @model_validator(mode="after")
+    def _seed_identity(self) -> ScorerConfig:
+        if self.seeds and int(self.seed) != int(self.seeds[0]):
+            raise ValueError(f"seed must equal seeds[0] when seeds is set, got {self.seed!r}")
+        return self
 
     @field_validator("feature_set")
     @classmethod
@@ -91,12 +128,23 @@ class ScorerConfig(BaseModel):
         payload = self.model_dump(mode="json")
         if self.feature_set == "full62":
             del payload["feature_set"]
+        if not self.seeds:
+            del payload["seeds"]
+        else:
+            payload["seeds"] = list(self.seeds)
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     @property
     def config_hash(self) -> str:
         """SHA-256 hex of the canonical JSON; part of the strategy identity."""
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+
+def _member_seeds(config: ScorerConfig) -> tuple[int, ...]:
+    """Seeds of the ensemble members: ``config.seeds`` when set, else ``(config.seed,)``."""
+    if config.seeds:
+        return tuple(int(s) for s in config.seeds)
+    return (int(config.seed),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,52 +378,117 @@ def walk_forward_scores(
         targets[horizon] = _winsor_z_by_date(
             lab, train_r, train_i, config.winsor_low_pct, config.winsor_high_pct, config.min_cross_section
         )
-    per_horizon: list[NDArray[np.float64]] = [
-        np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons
-    ]
-    workers = min(len(horizons), _fold_workers(config.num_threads))
-    for year in years:
-        first = year_rows[year][0]
-        end = year_rows[year][-1] + 1
-        pred_x, pred_r, pred_i = _rank_stack(
-            feat_mats, uni, range(first, end), config.min_cross_section
-        )
-        train_args: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
-        for hi, horizon in enumerate(horizons):
-            target = targets[horizon]
-            mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
-            n_train = int(mask.sum())
-            _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
-            if n_train < config.min_train_rows:
-                raise ValueError(
-                    f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
-                )
-            seed = (int(config.seed) + int(horizon) * 100003 + int(year) * 101) % 2147483647
-            train_args.append(
-                (
-                    hi,
-                    seed,
-                    np.ascontiguousarray(train_x[mask]),
-                    np.ascontiguousarray(target[mask]),
-                    _lgbm_params(config, seed),
-                    train_r[mask],
-                )
+    member_seeds = _member_seeds(config)
+    if len(member_seeds) == 1:
+        per_horizon: list[NDArray[np.float64]] = [
+            np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons
+        ]
+        workers = min(len(horizons), _fold_workers(config.num_threads))
+        for year in years:
+            first = year_rows[year][0]
+            end = year_rows[year][-1] + 1
+            pred_x, pred_r, pred_i = _rank_stack(
+                feat_mats, uni, range(first, end), config.min_cross_section
             )
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(
-                    _train_booster, tx, ty, params, config.num_boost_round, seed, rows
+            train_args: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
+            for hi, horizon in enumerate(horizons):
+                target = targets[horizon]
+                mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
+                n_train = int(mask.sum())
+                _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
+                if n_train < config.min_train_rows:
+                    raise ValueError(
+                        f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
+                    )
+                seed = (int(member_seeds[0]) + int(horizon) * 100003 + int(year) * 101) % 2147483647
+                train_args.append(
+                    (
+                        hi,
+                        seed,
+                        np.ascontiguousarray(train_x[mask]),
+                        np.ascontiguousarray(target[mask]),
+                        _lgbm_params(config, seed),
+                        train_r[mask],
+                    )
                 )
-                for hi, seed, tx, ty, params, rows in train_args
-            ]
-            boosters = [future.result() for future in futures]
-        if pred_r.size:
-            for (hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_args, boosters, strict=True):
-                preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
-                per_horizon[hi][pred_r, pred_i] = preds
-        del pred_x, pred_r, pred_i, train_args, futures, boosters
-    ensemble = _ensemble_average(per_horizon, config.min_cross_section)
-    ensemble = np.where(uni, ensemble, np.nan)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        _train_booster, tx, ty, params, config.num_boost_round, seed, rows
+                    )
+                    for hi, seed, tx, ty, params, rows in train_args
+                ]
+                boosters = [future.result() for future in futures]
+            if pred_r.size:
+                for (hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_args, boosters, strict=True):
+                    preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
+                    per_horizon[hi][pred_r, pred_i] = preds
+            del pred_x, pred_r, pred_i, train_args, futures, boosters
+        ensemble = _ensemble_average(per_horizon, config.min_cross_section)
+        ensemble = np.where(uni, ensemble, np.nan)
+        _LOG.info("[ALGO] member seed=%d done", int(member_seeds[0]))
+    else:
+        n_members = len(member_seeds)
+        member_horizon: list[list[NDArray[np.float64]]] = [
+            [np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons]
+            for _ in range(n_members)
+        ]
+        workers = min(len(horizons) * n_members, _fold_workers(config.num_threads))
+        for year in years:
+            first = year_rows[year][0]
+            end = year_rows[year][-1] + 1
+            pred_x, pred_r, pred_i = _rank_stack(
+                feat_mats, uni, range(first, end), config.min_cross_section
+            )
+            fold_design: list[tuple[int, NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]] = []
+            for hi, horizon in enumerate(horizons):
+                target = targets[horizon]
+                mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
+                n_train = int(mask.sum())
+                _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
+                if n_train < config.min_train_rows:
+                    raise ValueError(
+                        f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
+                    )
+                fold_design.append(
+                    (
+                        hi,
+                        np.ascontiguousarray(train_x[mask]),
+                        np.ascontiguousarray(target[mask]),
+                        train_r[mask],
+                    )
+                )
+            train_jobs: list[tuple[int, int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
+            for mi, member_seed in enumerate(member_seeds):
+                for hi, tx, ty, rows in fold_design:
+                    horizon = horizons[hi]
+                    seed = (int(member_seed) + int(horizon) * 100003 + int(year) * 101) % 2147483647
+                    train_jobs.append((mi, hi, seed, tx, ty, _lgbm_params(config, seed), rows))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        _train_booster, tx, ty, params, config.num_boost_round, seed, rows
+                    )
+                    for mi, hi, seed, tx, ty, params, rows in train_jobs
+                ]
+                boosters = [future.result() for future in futures]
+            if pred_r.size:
+                for (mi, hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_jobs, boosters, strict=True):
+                    preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
+                    member_horizon[mi][hi][pred_r, pred_i] = preds
+            del pred_x, pred_r, pred_i, fold_design, train_jobs, futures, boosters
+        member_scores: list[NDArray[np.float32]] = []
+        for mi, member_seed in enumerate(member_seeds):
+            part = _ensemble_average(member_horizon[mi], config.min_cross_section)
+            part = np.where(uni, part, np.nan)
+            member_scores.append(np.ascontiguousarray(part, dtype=np.float32))
+            _LOG.info("[ALGO] member seed=%d done", int(member_seed))
+        del member_horizon
+        ensemble = _ensemble_average(
+            [np.asarray(part, dtype=np.float64) for part in member_scores],
+            config.min_cross_section,
+        )
+        ensemble = np.where(uni, ensemble, np.nan)
     scores32 = np.ascontiguousarray(ensemble, dtype=np.float32)
     scores32.flags.writeable = False
     _LOG.info("[ALGO] scores years=%s horizons=%s", tuple(years), tuple(config.horizons))

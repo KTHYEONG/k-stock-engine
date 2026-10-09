@@ -2062,3 +2062,25 @@ def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
         assert neighbor == expected
         assert strategy_spec_from_canonical_json(neighbor.canonical_json()) == neighbor
         assert _scores_identity(neighbor) == _scores_identity(spec)
+
+
+def test_big3_strategy_loads_with_full62_and_three_seeds() -> None:
+    from src.research.pipeline import load_strategy_spec, strategy_spec_from_canonical_json
+
+    strat_dir = Path("config/research/strategies")
+    spec = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_big3.toml")
+    restored = strategy_spec_from_canonical_json(spec.canonical_json())
+    assert restored == spec
+    assert restored.scorer.feature_set == "full62"
+    assert restored.scorer.seeds == (11, 12, 13)
+    assert restored.scorer.num_leaves == 63
+    assert restored.scorer.min_data_in_leaf == 200
+    assert restored.scorer.learning_rate == pytest.approx(0.06)
+    assert restored.scorer.num_boost_round == 150
+    assert restored.scorer.seed == 11
+    champion = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_f52_n10.toml")
+    assert restored.policy == champion.policy
+    assert restored.book == champion.book
+    assert restored.hedge == champion.hedge
+    assert restored.trend_overlay == champion.trend_overlay
+    assert restored.regime_hedge == champion.regime_hedge
