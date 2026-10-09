@@ -1,4 +1,4 @@
-"""Protocol v5 binding and window-guard invariants."""
+"""Protocol binding and window-guard invariants."""
 from __future__ import annotations
 
 from datetime import date
@@ -20,9 +20,11 @@ def _protocol():  # type: ignore[no-untyped-def]
     return load_research_protocol(Path("config/research/protocol.toml"), scope), scope
 
 
-def test_protocol_v7_loads() -> None:
+def test_protocol_loads() -> None:
     protocol, _ = _protocol()
-    assert protocol.version == "research-protocol-v7"
+    assert protocol.protocol_id == protocol.content_hash[:12]
+    assert len(protocol.protocol_id) == 12
+    assert all(c in "0123456789abcdef" for c in protocol.protocol_id)
     assert protocol.evaluation_start == date(2017, 4, 1)
     assert protocol.sessions_per_year == 252
     assert protocol.primary_capital_krw == 100_000_000
@@ -58,6 +60,27 @@ def test_content_hash_stable() -> None:
     second, _ = _protocol()
     assert first.content_hash == second.content_hash
     assert len(first.content_hash) == 64
+    assert first.protocol_id == second.protocol_id
+
+
+def test_declared_version_is_rejected(tmp_path: Path) -> None:
+    from src.config import ConfigError
+    from src.data.research_scope import load_research_scope
+
+    scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
+    base = Path("config/research/protocol.toml").read_text(encoding="utf-8")
+    bad = tmp_path / "with-version.toml"
+    bad.write_text('version = "x"\n' + base, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"research protocol has unknown keys: .*version"):
+        load_research_protocol(bad, scope)
+
+
+def test_content_changes_change_the_id() -> None:
+    protocol, _ = _protocol()
+    altered = protocol.model_copy(
+        update={"champion": protocol.champion.model_copy(update={"alpha": 0.01})}
+    )
+    assert altered.protocol_id != protocol.protocol_id
 
 
 def test_unknown_protocol_key_rejected(tmp_path: Path) -> None:
@@ -186,7 +209,7 @@ def test_load_protocol_domains(tmp_path: Path) -> None:
         )
 
 
-def test_v4_file_keeps_v4_semantics(tmp_path: Path) -> None:
+def test_older_shape_protocol_still_loads(tmp_path: Path) -> None:
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
@@ -195,9 +218,9 @@ def test_v4_file_keeps_v4_semantics(tmp_path: Path) -> None:
         for line in Path("config/research/protocol.toml").read_text(encoding="utf-8").splitlines()
         if line.strip() not in ('paired_horizon = "full"', 'multiplicity = "bonferroni_decisions"')
     ]
-    v4_path = tmp_path / "protocol-v4.toml"
-    v4_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    protocol = load_research_protocol(v4_path, scope)
+    older_path = tmp_path / "protocol-older-shape.toml"
+    older_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    protocol = load_research_protocol(older_path, scope)
     assert protocol.champion.paired_horizon == "evaluation"
     assert protocol.champion.multiplicity == "none"
 
@@ -223,8 +246,8 @@ def test_champion_keys_round_trip_and_change_the_hash(tmp_path: Path) -> None:
     assert protocol.champion.multiplicity == "bonferroni_decisions"
     assert protocol.champion.noninferiority_margin == pytest.approx(0.03)
     for name, keys in (
-        ("v4-keys.toml", ("paired_horizon", "multiplicity")),
-        ("v5-keys.toml", ("noninferiority_margin",)),
+        ("without-paired-keys.toml", ("paired_horizon", "multiplicity")),
+        ("without-margin-key.toml", ("noninferiority_margin",)),
     ):
         stripped = load_research_protocol(_without_lines(path, tmp_path, name, keys), scope)
         assert stripped.content_hash != protocol.content_hash
@@ -245,7 +268,7 @@ def test_unknown_champion_key_rejected(tmp_path: Path) -> None:
         load_research_protocol(bad, scope)
 
 
-def test_v5_file_disables_noninferiority_path(tmp_path: Path) -> None:
+def test_file_without_margin_disables_noninferiority_path(tmp_path: Path) -> None:
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
@@ -255,14 +278,14 @@ def test_v5_file_disables_noninferiority_path(tmp_path: Path) -> None:
         for line in base.splitlines()
         if not line.strip().startswith("noninferiority_margin")
     ]
-    v5_path = tmp_path / "protocol-v5.toml"
-    v5_path.write_text("\n".join(lines).replace('version = "research-protocol-v7"', 'version = "research-protocol-v5"') + "\n", encoding="utf-8")
-    protocol = load_research_protocol(v5_path, scope)
+    older_path = tmp_path / "protocol-without-margin.toml"
+    older_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    protocol = load_research_protocol(older_path, scope)
     assert protocol.champion.noninferiority_margin is None
     assert protocol.champion.tail_quantile == 0.05
     assert protocol.champion.tail_block_sessions == 21
-    v6_protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
-    assert protocol.content_hash != v6_protocol.content_hash
+    current_protocol = load_research_protocol(Path("config/research/protocol.toml"), scope)
+    assert protocol.content_hash != current_protocol.content_hash
 
 
 def test_out_of_range_margin_rejected(tmp_path: Path) -> None:
@@ -320,4 +343,3 @@ def test_champion_seeds_accept_empty_and_tuple_forms() -> None:
     assert ChampionPolicy(**kw, champion_seeds=(11, 12, 13)).champion_seeds == (11, 12, 13)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="champion_seeds"):
         ChampionPolicy(**kw, champion_seeds=11)  # type: ignore[arg-type]
-

@@ -2026,7 +2026,7 @@ def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
     strat_dir = Path("tests/fixtures/strategies")
     spec = load_strategy_spec(strat_dir / "ml_regime_s2_volcap_f52_n10.toml")
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
-    assert restored.scorer.feature_set == "dedup52_v1"
+    assert restored.scorer.feature_set == "dedup52"
     assert restored.policy.n == 10
     assert restored == spec
     champion = load_strategy_spec(strat_dir / "ml_regime_s2_volcap.toml")
@@ -2051,11 +2051,11 @@ def test_f52_challenger_toml_round_trips_the_feature_set() -> None:
         ("ml_regime_s2_volcap_f52_n20.toml", 20),
     ):
         neighbor = load_strategy_spec(strat_dir / fname)
-        assert neighbor.scorer.feature_set == "dedup52_v1"
+        assert neighbor.scorer.feature_set == "dedup52"
         assert neighbor.policy.n == expected_n
         expected = champion.model_copy(
             update={
-                "scorer": champion.scorer.model_copy(update={"feature_set": "dedup52_v1"}),
+                "scorer": champion.scorer.model_copy(update={"feature_set": "dedup52"}),
                 "policy": champion.policy.model_copy(update={"n": expected_n}),
             }
         )
