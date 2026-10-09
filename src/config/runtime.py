@@ -29,7 +29,8 @@ class RuntimeConfig(BaseModel):
     cash_series: Path
     engine: Path
     research_protocol: Path
-    strategies_root: Path
+    futures_constants: Path
+    champion_file: Path
 
 
 def _repo_root_for(config_path: Path) -> Path:
@@ -74,9 +75,7 @@ def load_runtime_config(path: Path | None = None) -> RuntimeConfig:
     for key, candidate in resolved.items():
         if key in ("repo_root", *sorted(_MUTABLE_ROOTS)):
             continue
-        if key == "strategies_root":
-            if not candidate.is_dir():
-                raise ConfigError(f"runtime config {key!r} does not exist: {candidate}")
+        if key == "champion_file" and not candidate.exists():
             continue
         if not candidate.is_file():
             raise ConfigError(f"runtime config {key!r} does not exist: {candidate}")
