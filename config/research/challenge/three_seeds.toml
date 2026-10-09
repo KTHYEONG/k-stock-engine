@@ -1,0 +1,6 @@
+extends = "../champion.toml"
+
+[scorer]
+feature_set = "dedup52" # same 52 names as the legacy alias dedup52_v1
+seeds = [11, 12, 13] # 3-seed average removes seed luck
+num_threads = 4 # 4 threads x 2 concurrent folds; scores are bitwise identical to 8 threads

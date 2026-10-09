@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -746,3 +748,92 @@ def test_missing_file_guard_names_the_champion(
     assert current is not None
     assert "missing" in error
     assert current.spec_hash in error
+
+
+def _rebaseline_pipeline(monkeypatch: pytest.MonkeyPatch, *, differ: bool = False) -> Any:
+    import src.research.cli as cli_module
+    from tests.unit.research.test_champion import _rebaseline_run, _sessions as _build_sessions
+
+    sessions = _build_sessions()
+    calls: list[str] = []
+
+    class _Pipeline:
+        _ctx = SimpleNamespace(now=lambda: datetime(2026, 10, 9, tzinfo=UTC))
+
+        def evaluate(self, spec: Any, *, capital_krw: int | None = None) -> Any:
+            calls.append(spec.spec_hash)
+            run = _rebaseline_run(spec, sessions)
+            if differ and len(calls) == 2:
+                run = replace(run, evidence=replace(
+                    run.evidence, base=replace(run.evidence.base, ledger_hash="different-ledger"),
+                ))
+            return run
+
+    pipeline = _Pipeline()
+    monkeypatch.setattr(cli_module, "_pipeline_for", lambda args: pipeline)
+    return pipeline
+
+
+def test_promote_rebaseline_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, main
+    from src.research.pipeline import load_strategy_spec
+
+    champion_toml = _write_spec(tmp_path / "c.toml", n=2, seeds=False)
+    store, _, _ = _bootstrap_record(tmp_path, champion_toml)
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert main(["champion", "--sync-file"]) == 0
+    capsys.readouterr()
+    successor = _write_spec(tmp_path / "successor.toml", n=2, seeds=True)
+    successor.write_text(
+        successor.read_text(encoding="utf-8").replace("num_threads = 1", "num_threads = 4"),
+        encoding="utf-8",
+    )
+    _rebaseline_pipeline(monkeypatch)
+    assert main(["promote", "--spec", str(successor), "--rebaseline", "remove seed luck"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["reason"] == "rebaseline"
+    assert payload["spec_hash"] == load_strategy_spec(successor).spec_hash
+    current = store.current()
+    assert current is not None
+    assert current.reason == "rebaseline"
+    assert "replaces" in (current.rationale or "")
+    assert _champion_file_state(current, champion_file, futures) == "synced"
+    assert load_strategy_spec(champion_file).spec_hash == current.spec_hash
+
+
+def test_promote_rebaseline_refusal_leaves_store_and_file_untouched(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import main
+
+    champion_toml = _write_spec(tmp_path / "c.toml", n=2, seeds=False)
+    store, _, _ = _bootstrap_record(tmp_path, champion_toml)
+    champion_file = tmp_path / "champion.toml"
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert main(["champion", "--sync-file"]) == 0
+    capsys.readouterr()
+    before_store = (tmp_path / "champion" / "current.json").read_bytes()
+    before_file = champion_file.read_bytes()
+    successor = _write_spec(tmp_path / "successor.toml", n=2, seeds=True)
+    _rebaseline_pipeline(monkeypatch, differ=True)
+    assert main(["promote", "--spec", str(successor), "--rebaseline", "x"]) == 1
+    assert "base: ledger_hash mismatch" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert (tmp_path / "champion" / "current.json").read_bytes() == before_store
+    assert champion_file.read_bytes() == before_file
+    assert len(store.history()) == 1
+
+
+def test_promote_rebaseline_flags_are_exclusive(tmp_path: Path) -> None:
+    from src.research.cli import main
+
+    spec = _write_spec(tmp_path / "spec.toml")
+    with pytest.raises(SystemExit) as exc:
+        main(["promote", "--spec", str(spec), "--bootstrap", "--rebaseline", "x"])
+    assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc2:
+        main(["promote", "--spec", str(spec), "--policy-override", "x", "--rebaseline", "y"])
+    assert exc2.value.code == 2
