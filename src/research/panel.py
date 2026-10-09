@@ -85,13 +85,15 @@ FEATURE_NAMES: Final[tuple[str, ...]] = (
     "post_ear",
 )
 
-# subset_a_v1: greedy removal of features with mean cross-sectional rank correlation
-# >= 0.80 to an already retained feature, families ordered by ablation importance;
-# probe 2026-10-08.
+# subset_a: greedy removal of features with mean cross-sectional rank correlation
+# >= 0.80 to an already retained feature, families ordered by ablation importance.
+# subset_a_v1 is the legacy alias of the same tuple so stored specs keep loading;
+# new files must use subset_a.
 _SUBSET_A_V1: Final[tuple[str, ...]] = ()  # chosen set lives in the private strategy store
 
 _FEATURE_SETS_RAW: Final[dict[str, tuple[str, ...]]] = {
     "full62": FEATURE_NAMES,
+    "subset_a": _SUBSET_A_V1,
     "subset_a_v1": _SUBSET_A_V1,
 }
 

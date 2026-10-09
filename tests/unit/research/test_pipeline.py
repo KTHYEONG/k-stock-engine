@@ -2026,7 +2026,7 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
     strat_dir = Path("tests/fixtures/strategies")
     [redacted]
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
-    assert restored.scorer.feature_set == "subset_a_v1"
+    [redacted]
     [redacted]
     assert restored == spec
     [redacted]
@@ -2051,11 +2051,11 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
         [redacted]
     ):
         neighbor = load_strategy_spec(strat_dir / fname)
-        assert neighbor.scorer.feature_set == "subset_a_v1"
+        [redacted]
         assert neighbor.policy.n == expected_n
         expected = champion.model_copy(
             update={
-                "scorer": champion.scorer.model_copy(update={"feature_set": "subset_a_v1"}),
+                [redacted]
                 "policy": champion.policy.model_copy(update={"n": expected_n}),
             }
         )
