@@ -1081,7 +1081,7 @@ class Pipeline:
             perturbation_mismatches=int(mismatches),
         )
         report = build_report_card(
-            evidence, policy, spec_hash=spec.spec_hash, run_id=run_id, protocol_version=protocol.version
+            evidence, policy, spec_hash=spec.spec_hash, run_id=run_id, protocol_id=protocol.protocol_id
         )
         for name in scenario_names:
             outcome = outcomes[name]

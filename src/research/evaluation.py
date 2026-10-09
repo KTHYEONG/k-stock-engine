@@ -27,7 +27,7 @@ __all__ = [
 
 
 class EvaluationPolicy(BaseModel):
-    """Report-card parameters bound from protocol v5 (frozen, extra=forbid)."""
+    """Report-card parameters bound from the protocol (frozen, extra=forbid)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -122,7 +122,7 @@ class CheckResult:
 class ReportCard:
     spec_hash: str
     run_id: str
-    protocol_version: str
+    protocol_id: str
     start: date
     end: date
     objective_j: float
@@ -157,7 +157,7 @@ class ReportCard:
             "metrics": {k: _canon(v) for k, v in sorted(self.metrics.items())},
             "objective_j": _canon(self.objective_j),
             "objective_stream": self.objective_stream,
-            "protocol_version": self.protocol_version,
+            "protocol_id": self.protocol_id,
             "recent": {k: _canon(v) for k, v in sorted(self.recent.items())},
             "regime_growth": {k: _canon(v) for k, v in sorted(self.regime_growth.items())},
             "run_id": self.run_id,
@@ -330,7 +330,7 @@ def build_report_card(
     *,
     spec_hash: str,
     run_id: str,
-    protocol_version: str,
+    protocol_id: str,
 ) -> ReportCard:
     """Compute J on the stress stream with the lower objective quantile, guards on that same stream, and
     diagnostics from the base stream.
@@ -526,7 +526,7 @@ def build_report_card(
     return ReportCard(
         spec_hash=spec_hash,
         run_id=run_id,
-        protocol_version=protocol_version,
+        protocol_id=protocol_id,
         start=sessions[0],
         end=sessions[-1],
         objective_j=objective_j,

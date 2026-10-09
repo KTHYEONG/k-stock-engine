@@ -427,6 +427,29 @@ def test_non_default_feature_set_changes_identity() -> None:
     assert other.config_hash != ScorerConfig().config_hash
 
 
+def test_feature_set_alias_keeps_written_name_with_equal_scores() -> None:
+    import json
+
+    new = ScorerConfig(feature_set="dedup52")
+    legacy = ScorerConfig(feature_set="dedup52_v1")
+    assert json.loads(new.canonical_json())["feature_set"] == "dedup52"
+    assert json.loads(legacy.canonical_json())["feature_set"] == "dedup52_v1"
+    assert new.config_hash != legacy.config_hash
+    sess = _sessions()
+    panel = _synthetic_panel()
+    kwargs: dict[str, object] = {"num_boost_round": 2, "min_data_in_leaf": 2, "num_threads": 1}
+    base = walk_forward_scores(
+        panel, _universe(), sess, _tiny_config(feature_set="dedup52", **kwargs),
+        test_years=(2018,), authorization=_auth(sess),
+    )
+    aliased = walk_forward_scores(
+        panel, _universe(), sess, _tiny_config(feature_set="dedup52_v1", **kwargs),
+        test_years=(2018,), authorization=_auth(sess),
+    )
+    assert np.isfinite(base.scores).any()
+    assert np.asarray(base.scores).tobytes() == np.asarray(aliased.scores).tobytes()
+
+
 def test_unknown_feature_set_rejected() -> None:
     with pytest.raises(ValueError, match="feature_set"):
         ScorerConfig(feature_set="x")

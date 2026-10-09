@@ -1,5 +1,4 @@
-# Research protocol v7: data-window guard, report-card policy and scenario definitions.
-version = "research-protocol-v7"
+# Research protocol: data-window guard, report-card policy and scenario definitions.
 # Earliest session a run window may start (first month with trailing-four-quarter fundamentals for most
 # issuers). Model training may still read earlier PIT cube rows; this bounds run windows only.
 evaluation_start = "2017-04-01"
