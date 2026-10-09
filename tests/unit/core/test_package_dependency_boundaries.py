@@ -9,6 +9,7 @@ shrinks.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[3] / "src"
@@ -95,11 +96,22 @@ _RETIRED_PREFIXES = (
 )
 
 
+def _retired_reference_pattern() -> re.Pattern[str]:
+    return re.compile(r"\b(?:{})\b".format("|".join(re.escape(prefix) for prefix in _RETIRED_PREFIXES)))
+
+
+def test_retired_prefixes_match_complete_module_names() -> None:
+    pattern = _retired_reference_pattern()
+    for prefix in _RETIRED_PREFIXES:
+        assert pattern.search(f"from {prefix} import symbol")
+        assert pattern.search(f"from {prefix}.child import symbol")
+        assert not pattern.search(f"from {prefix}_file import symbol")
+
+
 def test_no_retired_prefix_references() -> None:
-    import re
 
     root = SRC.parent
-    pat = re.compile(r"(?:{})".format("|".join(re.escape(prefix) for prefix in _RETIRED_PREFIXES)))
+    pat = _retired_reference_pattern()
     active_files = [
         p
         for p in [*SRC.rglob("*.py"), *(root / "tests").rglob("*.py")]
