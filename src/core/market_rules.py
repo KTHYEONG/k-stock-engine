@@ -14,7 +14,7 @@ from typing import Any
 
 from src.core.pit import PITDataError
 
-VERSION = "krx-market-rules-v1"
+REVISION = "krx-market-rules-v1"
 _TOP_LEVEL_KEYS = frozenset({"version", "sources", "tick_regimes", "sell_tax_regimes", "price_limit_regimes"})
 _MARKETS = ("KOSPI", "KOSDAQ")
 
@@ -286,7 +286,7 @@ def parse_krx_market_rules(document: Mapping[str, Any]) -> KrxMarketRules:
     if set(document.keys()) != set(_TOP_LEVEL_KEYS):
         raise PITDataError(f"invalid top-level keys {sorted(document.keys())}")
     version = document["version"]
-    if version != VERSION:
+    if version != REVISION:
         raise PITDataError(f"unsupported version {version!r}")
     sources = document["sources"]
     if not isinstance(sources, (list, tuple)) or not sources or any(not isinstance(s, str) or not s for s in sources):

@@ -27,7 +27,7 @@ from src.data.flow_targets import FlowTargets
 from src.data.investor_flow_gap import compute_missing_investor_flow_cells
 from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
-POLICY_VERSION = "kis-investor-trade-net-shares-supplement-v2"
+REVISION = "kis-investor-trade-net-shares-supplement-v2"
 
 _LOG = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ def materialize_investor_flow_kis_supplement(
             .dt.replace_time_zone(str(KRX_TZ))
             .alias("available_at"),
             "source_hash",
-            pl.lit(POLICY_VERSION).alias("policy_version"),
+            pl.lit(REVISION).alias("policy_version"),
         )
         .cast(pl.Schema(_SCHEMA))
         .sort(["session", "ticker"])
@@ -290,7 +290,7 @@ def materialize_investor_flow_kis_supplement(
     identity = DatasetIdentity(
         kind="investor_flow_kis_supplement",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={
             "universe": dataset_reference(targets.universe_dataset_id, kind="ordinary_universe"),
             "daily_market": dataset_reference(targets.daily_market_dataset_id, kind="daily_market"),

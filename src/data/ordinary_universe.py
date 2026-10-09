@@ -17,7 +17,7 @@ from src.core.time import KRX_TZ
 from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 
-POLICY_VERSION = "krx-ordinary-equity-v1"
+REVISION = "krx-ordinary-equity-v1"
 _MARKETS = frozenset({"KOSPI", "KOSDAQ"})
 _DATED_SOURCE = re.compile(r"^KRX:historical-master:(\d{4}-\d{2}-\d{2})$")
 
@@ -140,7 +140,7 @@ def ordinary_universe_snapshot(receipt: BronzeReceipt) -> OrdinaryUniverseSnapsh
                 "exclusion_reason": reason,
                 "available_at": available_at,
                 "source_hash": receipt.content_hash,
-                "policy_version": POLICY_VERSION,
+                "policy_version": REVISION,
             }
         )
     if not rows:
@@ -214,7 +214,7 @@ def catalog_master_receipts(
 def write_ordinary_universe_silver(
     snapshots: Iterable[OrdinaryUniverseSnapshot], *, root: Path
 ) -> Path:
-    """Publish ordered ordinary-universe snapshots through the v2 contract."""
+    """Publish ordered ordinary-universe snapshots through the dataset contract."""
 
     ordered = tuple(snapshots)
     if not ordered:
@@ -241,7 +241,7 @@ def write_ordinary_universe_silver(
     identity = DatasetIdentity(
         kind="ordinary_universe",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={"bronze_master": dataset_digest(source_hashes)},
         params={
             "calendar_digest": hashlib.sha256(

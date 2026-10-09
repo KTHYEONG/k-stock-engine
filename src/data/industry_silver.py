@@ -16,7 +16,7 @@ from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, pub
 from src.data.industry_ksic_map import learn_ksic_industry_mapping
 from src.data.receipt_catalog import ReceiptCatalog
 
-POLICY_VERSION = "kis-industry-classification-v2"
+REVISION = "kis-industry-classification-v2"
 
 _SCHEMA: dict[str, Any] = {
     "ticker": pl.String,
@@ -295,7 +295,7 @@ def materialize_industry_classification_silver(
                 "attribute_basis": attribute_basis_list,
                 "source_hash": source_list,
                 "ksic_source_hash": ksic_source_list,
-                "policy_version": [POLICY_VERSION for _ in ticker_list],
+                "policy_version": [REVISION for _ in ticker_list],
             },
             schema=_SCHEMA,
         ).sort("ticker")
@@ -303,7 +303,7 @@ def materialize_industry_classification_silver(
     identity = DatasetIdentity(
         kind="industry",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={"bronze_classification": dataset_digest(considered)},
         params={
             "symbols": ",".join(sorted(symbols)) if symbols is not None else None,

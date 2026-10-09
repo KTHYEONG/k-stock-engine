@@ -14,6 +14,7 @@ from typing import Any, cast
 import polars as pl
 
 from src.core.pit import PITDataError
+from src.data.datasets import SCHEMA_VERSION as DATASETS_SCHEMA_VERSION
 from src.data.datasets import dataset_partition_paths, load_manifest
 
 _LOG = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ def _load_universe_manifest(dataset: Path) -> list[dict[str, Any]]:
         raise PITDataError("invalid ordinary-universe manifest") from exc
     if not isinstance(raw, dict) or raw.get("dataset_id") != dataset.name:
         raise PITDataError("invalid ordinary-universe manifest")
-    if raw.get("schema") == "dataset-manifest-v2":
+    if raw.get("schema") == DATASETS_SCHEMA_VERSION:
         try:
             manifest = load_manifest(dataset)
             paths = dataset_partition_paths(dataset)

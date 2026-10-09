@@ -27,7 +27,7 @@ from src.data.datasets import (
 )
 from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
-POLICY_VERSION = "ls-t1702-net-shares-v2"
+REVISION = "ls-t1702-net-shares-v2"
 
 _LOG = logging.getLogger(__name__)
 
@@ -356,7 +356,7 @@ def materialize_investor_flow_silver(
                 .dt.replace_time_zone(str(KRX_TZ))
                 .alias("available_at"),
                 "source_hash",
-                pl.lit(POLICY_VERSION).alias("policy_version"),
+                pl.lit(REVISION).alias("policy_version"),
             ).cast(pl.Schema(_SCHEMA)).sort(["session", "ticker"])
             if part.height == 0:
                 continue
@@ -374,7 +374,7 @@ def materialize_investor_flow_silver(
     identity = DatasetIdentity(
         kind="investor_flow_ls",
         layer=DatasetLayer.SILVER,
-        policy_version=POLICY_VERSION,
+        policy_version=REVISION,
         inputs={"universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"), "bronze_flow": flow_digest},
         params={
             "available_session_lag": policy.available_session_lag,
