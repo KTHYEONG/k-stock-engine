@@ -6,11 +6,14 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import lightgbm as lgb
@@ -21,7 +24,17 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.panel import FEATURE_SETS, FeaturePanel, feature_names_for
 
-__all__ = ["ScoreMatrix", "ScorerConfig", "_member_seeds", "walk_forward_scores"]
+__all__ = [
+    "FrozenScorer",
+    "ScoreMatrix",
+    "ScorerConfig",
+    "_member_seeds",
+    "load_frozen_scorer",
+    "save_frozen_scorer",
+    "score_rows",
+    "train_year_boosters",
+    "walk_forward_scores",
+]
 
 _LOG = logging.getLogger(__name__)
 
@@ -159,6 +172,311 @@ class ScoreMatrix:
     test_years: tuple[int, ...]
     config_hash: str
     last_row: int
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenScorer:
+    """Boosters of one test year keyed by (member seed, horizon)."""
+
+    config: ScorerConfig
+    year: int
+    boosters: Mapping[tuple[int, int], lgb.Booster]
+
+
+def _seed_for(member_seed: int, horizon: int, year: int) -> int:
+    return (int(member_seed) + int(horizon) * 100003 + int(year) * 101) % 2147483647
+
+
+def _resolve_year_rows(
+    panel: FeaturePanel,
+    universe: NDArray[np.bool_],
+    sessions: Sequence[date],
+    config: ScorerConfig,
+    years: Sequence[int],
+    authorization: WindowAuthorization,
+) -> tuple[list[NDArray[np.float32]], NDArray[np.bool_], list[date], dict[int, list[int]]]:
+    year_list = list(years)
+    if not year_list:
+        raise ValueError("test_years must be non-empty")
+    if any(y < config.first_test_year for y in year_list):
+        raise ValueError(f"test_years {year_list} begins before first_test_year {config.first_test_year}")
+    if list(year_list) != sorted(year_list) or len(set(year_list)) != len(year_list):
+        raise ValueError(f"test_years must be strictly ascending, got {year_list}")
+    feat_mats = [np.asarray(panel.features[name]) for name in feature_names_for(config.feature_set)]
+    shape = feat_mats[0].shape
+    if any(mat.shape != shape for mat in feat_mats):
+        raise ValueError("panel feature arrays have mismatched shapes")
+    n_rows, n_inst = shape
+    uni = np.asarray(universe, dtype=bool)
+    if uni.shape != (n_rows, n_inst):
+        raise ValueError(f"universe shape {uni.shape} != panel shape {(n_rows, n_inst)}")
+    if panel.last_row >= len(sessions):
+        raise ValueError("panel last_row is outside the sessions timeline")
+    sess = list(sessions)[:n_rows]
+    year_rows: dict[int, list[int]] = {}
+    for year in year_list:
+        members = [r for r, day in enumerate(sess) if day.year == year]
+        if not members:
+            raise ValueError(f"test year {year} has no sessions in the panel")
+        if max(sess[r] for r in members) > authorization.end:
+            raise WindowError(f"test year {year} ends after the authorization end {authorization.end}")
+        year_rows[year] = members
+    return feat_mats, uni, sess, year_rows
+
+
+def _build_train_stack(
+    feat_mats: Sequence[NDArray[np.float32]],
+    uni: NDArray[np.bool_],
+    sess: Sequence[date],
+    panel: FeaturePanel,
+    config: ScorerConfig,
+    first: int,
+) -> tuple[NDArray[np.float64], NDArray[np.int64], NDArray[np.int64], dict[int, NDArray[np.float64]]]:
+    n_rows = feat_mats[0].shape[0]
+    weekly = list(_weekly_rows(sess, lo=0, hi=first))
+    train_x, train_r, train_i = _rank_stack(feat_mats, uni, weekly, config.min_cross_section)
+    horizons = tuple(int(h) for h in config.horizons)
+    targets: dict[int, NDArray[np.float64]] = {}
+    for horizon in horizons:
+        lab = np.asarray(panel.labels[int(horizon)])
+        if lab.shape != (n_rows, uni.shape[1]):
+            raise ValueError(f"label array for horizon {horizon} has wrong shape {lab.shape}")
+        targets[horizon] = _winsor_z_by_date(
+            lab, train_r, train_i, config.winsor_low_pct, config.winsor_high_pct, config.min_cross_section
+        )
+    return train_x, train_r, train_i, targets
+
+
+def _fit_year_boosters(
+    train_x: NDArray[np.float64],
+    train_r: NDArray[np.int64],
+    targets: dict[int, NDArray[np.float64]],
+    config: ScorerConfig,
+    year: int,
+    first: int,
+) -> dict[tuple[int, int], lgb.Booster]:
+    member_seeds = _member_seeds(config)
+    horizons = tuple(int(h) for h in config.horizons)
+    if len(member_seeds) == 1:
+        train_args: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
+        for hi, horizon in enumerate(horizons):
+            target = targets[horizon]
+            mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
+            n_train = int(mask.sum())
+            _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
+            if n_train < config.min_train_rows:
+                raise ValueError(
+                    f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
+                )
+            seed = _seed_for(member_seeds[0], horizon, year)
+            train_args.append(
+                (
+                    hi,
+                    seed,
+                    np.ascontiguousarray(train_x[mask]),
+                    np.ascontiguousarray(target[mask]),
+                    _lgbm_params(config, seed),
+                    train_r[mask],
+                )
+            )
+        jobs = [(member_seeds[0], horizons[hi], tx, ty, params, rows, seed) for hi, seed, tx, ty, params, rows in train_args]
+    else:
+        fold_design: list[tuple[int, NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]] = []
+        for hi, horizon in enumerate(horizons):
+            target = targets[horizon]
+            mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
+            n_train = int(mask.sum())
+            _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
+            if n_train < config.min_train_rows:
+                raise ValueError(
+                    f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
+                )
+            fold_design.append(
+                (
+                    hi,
+                    np.ascontiguousarray(train_x[mask]),
+                    np.ascontiguousarray(target[mask]),
+                    train_r[mask],
+                )
+            )
+        jobs = []
+        for member_seed in member_seeds:
+            for hi, tx, ty, rows in fold_design:
+                horizon = horizons[hi]
+                seed = _seed_for(member_seed, horizon, year)
+                jobs.append((member_seed, horizon, tx, ty, _lgbm_params(config, seed), rows, seed))
+    workers = min(len(jobs), _fold_workers(config.num_threads))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_train_booster, tx, ty, params, config.num_boost_round, seed, rows)
+            for _, _, tx, ty, params, rows, seed in jobs
+        ]
+        trained = [future.result() for future in futures]
+    return {(ms, h): booster for (ms, h, _, _, _, _, _), booster in zip(jobs, trained, strict=True)}
+
+
+def train_year_boosters(
+    panel: FeaturePanel,
+    universe: NDArray[np.bool_],
+    sessions: Sequence[date],
+    config: ScorerConfig,
+    *,
+    year: int,
+    authorization: WindowAuthorization,
+) -> FrozenScorer:
+    """Train every (member seed, horizon) booster of one test year."""
+    feat_mats, uni, sess, year_rows = _resolve_year_rows(panel, universe, sessions, config, [year], authorization)
+    first = year_rows[int(year)][0]
+    train_x, train_r, _train_i, targets = _build_train_stack(feat_mats, uni, sess, panel, config, first)
+    boosters = _fit_year_boosters(train_x, train_r, targets, config, int(year), first)
+    return FrozenScorer(config=config, year=int(year), boosters=dict(boosters))
+
+
+def score_rows(
+    feat_mats: Sequence[NDArray[np.float32]],
+    universe: NDArray[np.bool_],
+    rows: Sequence[int],
+    scorer: FrozenScorer,
+) -> NDArray[np.float32]:
+    """Ensemble scores of the given rows from frozen boosters."""
+    config = scorer.config
+    uni = np.asarray(universe, dtype=bool)
+    wanted = [int(r) for r in rows]
+    n_inst = uni.shape[1]
+    if not wanted:
+        return np.ascontiguousarray(np.zeros((0, n_inst), dtype=np.float32))
+    horizons = tuple(int(h) for h in config.horizons)
+    member_seeds = _member_seeds(config)
+    positions = range(len(wanted))
+    local_uni = uni[wanted]
+    local_mats = [mat[wanted] for mat in feat_mats]
+    pred_x, pred_r, pred_i = _rank_stack(local_mats, local_uni, positions, config.min_cross_section)
+    uni_rows = uni[wanted]
+    if len(member_seeds) == 1:
+        per_horizon = [np.full((len(wanted), n_inst), np.nan, dtype=np.float64) for _ in horizons]
+        if pred_r.size:
+            for hi, horizon in enumerate(horizons):
+                booster = scorer.boosters[(int(member_seeds[0]), int(horizon))]
+                preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
+                per_horizon[hi][pred_r, pred_i] = preds
+        ensemble = _ensemble_average(per_horizon, config.min_cross_section)
+        ensemble = np.where(uni_rows, ensemble, np.nan)
+        return np.ascontiguousarray(ensemble, dtype=np.float32)
+    member_horizon = [
+        [np.full((len(wanted), n_inst), np.nan, dtype=np.float64) for _ in horizons]
+        for _ in member_seeds
+    ]
+    if pred_r.size:
+        for mi, member_seed in enumerate(member_seeds):
+            for hi, horizon in enumerate(horizons):
+                booster = scorer.boosters[(int(member_seed), int(horizon))]
+                preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
+                member_horizon[mi][hi][pred_r, pred_i] = preds
+    member_scores: list[NDArray[np.float32]] = []
+    for mi in range(len(member_seeds)):
+        part = _ensemble_average(member_horizon[mi], config.min_cross_section)
+        part = np.where(uni_rows, part, np.nan)
+        member_scores.append(np.ascontiguousarray(part, dtype=np.float32))
+    ensemble = _ensemble_average(
+        [np.asarray(part, dtype=np.float64) for part in member_scores],
+        config.min_cross_section,
+    )
+    ensemble = np.where(uni_rows, ensemble, np.nan)
+    return np.ascontiguousarray(ensemble, dtype=np.float32)
+
+
+def _booster_filename(seed: int, horizon: int) -> str:
+    return f"s{int(seed)}_h{int(horizon)}.txt"
+
+
+def save_frozen_scorer(scorer: FrozenScorer, directory: Path, *, provenance: Mapping[str, str]) -> Path:
+    """Write boosters and a manifest under directory; returns the manifest path."""
+    target = Path(directory)
+    if target.exists() and any(target.iterdir()):
+        raise ValueError(f"refusing to overwrite non-empty directory {target}")
+    member_seeds = [int(s) for s in _member_seeds(scorer.config)]
+    horizons = [int(h) for h in scorer.config.horizons]
+    expected = {(s, h) for s in member_seeds for h in horizons}
+    if set(scorer.boosters) != expected:
+        raise ValueError(f"scorer holds {sorted(scorer.boosters)} but the config needs {sorted(expected)}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=str(target.parent), prefix=f".{target.name}."))
+    try:
+        files: dict[str, str] = {}
+        for (seed, horizon), booster in sorted(scorer.boosters.items()):
+            name = _booster_filename(seed, horizon)
+            payload = booster.model_to_string().encode("utf-8")
+            (staging / name).write_bytes(payload)
+            files[name] = hashlib.sha256(payload).hexdigest()
+        manifest: dict[str, Any] = {
+            "config_hash": scorer.config.config_hash,
+            "config_json": scorer.config.canonical_json(),
+            "year": int(scorer.year),
+            "feature_names": list(feature_names_for(scorer.config.feature_set)),
+            "member_seeds": member_seeds,
+            "horizons": horizons,
+            "files": files,
+            "lightgbm_version": str(lgb.__version__),
+        }
+        if set(provenance) & set(manifest):
+            raise ValueError("provenance overlaps reserved manifest keys")
+        manifest.update(provenance)
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        os.rename(staging, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target / "manifest.json"
+
+
+def load_frozen_scorer(directory: Path, *, expected_config_hash: str) -> FrozenScorer:
+    """Load a saved scorer after verifying file hashes and the config hash."""
+    target = Path(directory)
+    try:
+        manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"unreadable frozen scorer manifest in {target}: {exc}") from exc
+    try:
+        stored_hash = str(manifest["config_hash"])
+        config_json = str(manifest["config_json"])
+        year = int(manifest["year"])
+        member_seeds = [int(s) for s in manifest["member_seeds"]]
+        horizons = [int(h) for h in manifest["horizons"]]
+        files = {str(k): str(v) for k, v in dict(manifest["files"]).items()}
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"malformed frozen scorer manifest in {target}: {exc}") from exc
+    if stored_hash != str(expected_config_hash):
+        raise ValueError(f"frozen scorer config hash {stored_hash} != expected {expected_config_hash}")
+    try:
+        config = ScorerConfig.model_validate_json(config_json)
+    except ValueError as exc:
+        raise ValueError(f"invalid frozen scorer config in {target}: {exc}") from exc
+    if config.config_hash != stored_hash:
+        raise ValueError("frozen scorer manifest config hash does not match its config")
+    if manifest.get("feature_names") != list(feature_names_for(config.feature_set)):
+        raise ValueError("frozen scorer manifest feature names differ from the config")
+    if [int(s) for s in _member_seeds(config)] != member_seeds or [int(h) for h in config.horizons] != horizons:
+        raise ValueError("frozen scorer manifest members differ from the config")
+    expected_names = {_booster_filename(s, h) for s in member_seeds for h in horizons}
+    if set(files) != expected_names:
+        raise ValueError("frozen scorer manifest files differ from the config members")
+    boosters: dict[tuple[int, int], lgb.Booster] = {}
+    for seed in member_seeds:
+        for horizon in horizons:
+            name = _booster_filename(seed, horizon)
+            path = target / name
+            try:
+                payload = path.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"missing frozen booster file {name}: {exc}") from exc
+            if hashlib.sha256(payload).hexdigest() != files[name]:
+                raise ValueError(f"frozen booster file {name} hash mismatch")
+            try:
+                boosters[(int(seed), int(horizon))] = lgb.Booster(model_str=payload.decode("utf-8"))
+            except (UnicodeError, lgb.basic.LightGBMError) as exc:
+                raise ValueError(f"invalid frozen booster file {name}: {exc}") from exc
+    return FrozenScorer(config=config, year=year, boosters=boosters)
 
 
 def _weekly_rows(sessions: Sequence[date], *, lo: int, hi: int) -> tuple[int, ...]:
@@ -341,155 +659,20 @@ def walk_forward_scores(
         ValueError: a fold has fewer than ``min_train_rows`` training rows, ``test_years`` is empty, is
             not ascending, or begins before ``config.first_test_year``.
     """
+    feat_mats, uni, _sess, year_rows = _resolve_year_rows(
+        panel, universe, sessions, config, list(test_years), authorization
+    )
     years = list(test_years)
-    if not years:
-        raise ValueError("test_years must be non-empty")
-    if any(y < config.first_test_year for y in years):
-        raise ValueError(f"test_years {years} begins before first_test_year {config.first_test_year}")
-    if list(years) != sorted(years) or len(set(years)) != len(years):
-        raise ValueError(f"test_years must be strictly ascending, got {years}")
-    feat_mats = [np.asarray(panel.features[name]) for name in feature_names_for(config.feature_set)]
-    shape = feat_mats[0].shape
-    if any(mat.shape != shape for mat in feat_mats):
-        raise ValueError("panel feature arrays have mismatched shapes")
-    n_rows, n_inst = shape
-    uni = np.asarray(universe, dtype=bool)
-    if uni.shape != (n_rows, n_inst):
-        raise ValueError(f"universe shape {uni.shape} != panel shape {(n_rows, n_inst)}")
-    if panel.last_row >= len(sessions):
-        raise ValueError("panel last_row is outside the sessions timeline")
-    sess = list(sessions)[:n_rows]
-    year_rows: dict[int, list[int]] = {}
-    for year in years:
-        members = [r for r, day in enumerate(sess) if day.year == year]
-        if not members:
-            raise ValueError(f"test year {year} has no sessions in the panel")
-        if max(sess[r] for r in members) > authorization.end:
-            raise WindowError(f"test year {year} ends after the authorization end {authorization.end}")
-        year_rows[year] = members
-    weekly = list(_weekly_rows(sess, lo=0, hi=n_rows))
-    train_x, train_r, train_i = _rank_stack(feat_mats, uni, weekly, config.min_cross_section)
-    horizons = tuple(int(h) for h in config.horizons)
-    targets: dict[int, NDArray[np.float64]] = {}
-    for horizon in horizons:
-        lab = np.asarray(panel.labels[int(horizon)])
-        if lab.shape != (n_rows, n_inst):
-            raise ValueError(f"label array for horizon {horizon} has wrong shape {lab.shape}")
-        targets[horizon] = _winsor_z_by_date(
-            lab, train_r, train_i, config.winsor_low_pct, config.winsor_high_pct, config.min_cross_section
-        )
     member_seeds = _member_seeds(config)
-    if len(member_seeds) == 1:
-        per_horizon: list[NDArray[np.float64]] = [
-            np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons
-        ]
-        workers = min(len(horizons), _fold_workers(config.num_threads))
-        for year in years:
-            first = year_rows[year][0]
-            end = year_rows[year][-1] + 1
-            pred_x, pred_r, pred_i = _rank_stack(
-                feat_mats, uni, range(first, end), config.min_cross_section
-            )
-            train_args: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
-            for hi, horizon in enumerate(horizons):
-                target = targets[horizon]
-                mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
-                n_train = int(mask.sum())
-                _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
-                if n_train < config.min_train_rows:
-                    raise ValueError(
-                        f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
-                    )
-                seed = (int(member_seeds[0]) + int(horizon) * 100003 + int(year) * 101) % 2147483647
-                train_args.append(
-                    (
-                        hi,
-                        seed,
-                        np.ascontiguousarray(train_x[mask]),
-                        np.ascontiguousarray(target[mask]),
-                        _lgbm_params(config, seed),
-                        train_r[mask],
-                    )
-                )
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [
-                    pool.submit(
-                        _train_booster, tx, ty, params, config.num_boost_round, seed, rows
-                    )
-                    for hi, seed, tx, ty, params, rows in train_args
-                ]
-                boosters = [future.result() for future in futures]
-            if pred_r.size:
-                for (hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_args, boosters, strict=True):
-                    preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
-                    per_horizon[hi][pred_r, pred_i] = preds
-            del pred_x, pred_r, pred_i, train_args, futures, boosters
-        ensemble = _ensemble_average(per_horizon, config.min_cross_section)
-        ensemble = np.where(uni, ensemble, np.nan)
-        _LOG.info("[ALGO] member seed=%d done", int(member_seeds[0]))
-    else:
-        n_members = len(member_seeds)
-        member_horizon: list[list[NDArray[np.float64]]] = [
-            [np.full((n_rows, n_inst), np.nan, dtype=np.float64) for _ in horizons]
-            for _ in range(n_members)
-        ]
-        workers = min(len(horizons) * n_members, _fold_workers(config.num_threads))
-        for year in years:
-            first = year_rows[year][0]
-            end = year_rows[year][-1] + 1
-            pred_x, pred_r, pred_i = _rank_stack(
-                feat_mats, uni, range(first, end), config.min_cross_section
-            )
-            fold_design: list[tuple[int, NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]] = []
-            for hi, horizon in enumerate(horizons):
-                target = targets[horizon]
-                mask = (train_r + int(horizon) + config.purge_extra_sessions < first) & np.isfinite(target)
-                n_train = int(mask.sum())
-                _LOG.info("[ALGO] fold year=%d horizon=%d rows=%d", year, int(horizon), n_train)
-                if n_train < config.min_train_rows:
-                    raise ValueError(
-                        f"fold year={year} horizon={horizon} has {n_train} rows below min_train_rows"
-                    )
-                fold_design.append(
-                    (
-                        hi,
-                        np.ascontiguousarray(train_x[mask]),
-                        np.ascontiguousarray(target[mask]),
-                        train_r[mask],
-                    )
-                )
-            train_jobs: list[tuple[int, int, int, NDArray[np.float64], NDArray[np.float64], dict[str, Any], NDArray[np.int64]]] = []
-            for mi, member_seed in enumerate(member_seeds):
-                for hi, tx, ty, rows in fold_design:
-                    horizon = horizons[hi]
-                    seed = (int(member_seed) + int(horizon) * 100003 + int(year) * 101) % 2147483647
-                    train_jobs.append((mi, hi, seed, tx, ty, _lgbm_params(config, seed), rows))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [
-                    pool.submit(
-                        _train_booster, tx, ty, params, config.num_boost_round, seed, rows
-                    )
-                    for mi, hi, seed, tx, ty, params, rows in train_jobs
-                ]
-                boosters = [future.result() for future in futures]
-            if pred_r.size:
-                for (mi, hi, _seed, _tx, _ty, _params, _rows), booster in zip(train_jobs, boosters, strict=True):
-                    preds = np.asarray(booster.predict(pred_x), dtype=np.float64)
-                    member_horizon[mi][hi][pred_r, pred_i] = preds
-            del pred_x, pred_r, pred_i, fold_design, train_jobs, futures, boosters
-        member_scores: list[NDArray[np.float32]] = []
-        for mi, member_seed in enumerate(member_seeds):
-            part = _ensemble_average(member_horizon[mi], config.min_cross_section)
-            part = np.where(uni, part, np.nan)
-            member_scores.append(np.ascontiguousarray(part, dtype=np.float32))
-            _LOG.info("[ALGO] member seed=%d done", int(member_seed))
-        del member_horizon
-        ensemble = _ensemble_average(
-            [np.asarray(part, dtype=np.float64) for part in member_scores],
-            config.min_cross_section,
+    # Empty nanmean rows carry a negative NaN in the legacy score matrix.
+    scores32 = np.ascontiguousarray(np.where(uni, -np.nan, np.nan), dtype=np.float32)
+    for year in years:
+        scorer = train_year_boosters(
+            panel, universe, sessions, config, year=year, authorization=authorization
         )
-        ensemble = np.where(uni, ensemble, np.nan)
-    scores32 = np.ascontiguousarray(ensemble, dtype=np.float32)
+        scores32[year_rows[year]] = score_rows(feat_mats, uni, year_rows[year], scorer)
+    for member_seed in member_seeds:
+        _LOG.info("[ALGO] member seed=%d done", int(member_seed))
     scores32.flags.writeable = False
     _LOG.info("[ALGO] scores years=%s horizons=%s", tuple(years), tuple(config.horizons))
     return ScoreMatrix(

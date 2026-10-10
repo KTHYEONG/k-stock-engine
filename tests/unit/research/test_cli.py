@@ -827,6 +827,37 @@ def test_promote_rebaseline_refusal_leaves_store_and_file_untouched(
     assert len(store.history()) == 1
 
 
+def test_freeze_models_command(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.research.cli import main
+
+    calls: list[int | None] = []
+
+    class _FreezePipeline:
+        def freeze_models(self, spec: object, *, year: int | None = None) -> Path:
+            calls.append(year)
+            resolved = int(year) if year is not None else 2021
+            target = tmp_path / "models" / str(resolved)
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+
+    _patch_pipeline(monkeypatch, _FreezePipeline())
+    spec = _write_spec(tmp_path / "spec.toml")
+    assert main(["freeze-models", "--spec", str(spec), "--year", "2020"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["models_dir"].endswith("2020")
+    assert payload["year"] == 2020
+    assert payload["boosters"] == 9
+    assert main(["freeze-models", "--spec", str(spec)]) == 0
+    defaulted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert defaulted["year"] == 2021
+    assert defaulted["boosters"] == 9
+    assert calls == [2020, None]
+
+
 def test_promote_rebaseline_flags_are_exclusive(tmp_path: Path) -> None:
     from src.research.cli import main
 

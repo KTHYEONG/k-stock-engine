@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -358,19 +359,21 @@ def _scores_digest(scores: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(canon).tobytes()).hexdigest()
 
 
-def test_scores_bitwise_golden() -> None:
+@pytest.mark.parametrize(("seeds", "digest"), [
+    ((), "09ac305158002f2bc78c1df638d92cae1374f0f318ecd3fdd8e35b8bf7a79bd3"),
+    ((11, 12, 13), "e2bfc5187f4aa57c9f96067ab9c02f2ebbb9cc0a7aad5c565f4288cfce48247d"),
+])
+def test_scores_bitwise_golden(seeds: tuple[int, ...], digest: str) -> None:
     sess = _sessions()
     out = walk_forward_scores(
         _synthetic_panel(),
         _universe(),
         sess,
-        _tiny_config(),
+        _tiny_config(seeds=seeds),
         test_years=(2018, 2019),
         authorization=_auth(sess),
     )
-    assert _scores_digest(np.asarray(out.scores)) == (
-        "09ac305158002f2bc78c1df638d92cae1374f0f318ecd3fdd8e35b8bf7a79bd3"
-    )
+    assert _scores_digest(np.asarray(out.scores)) == digest
 
 
 def test_no_full_float64_feature_copy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -559,14 +562,14 @@ def test_prediction_design_built_once_per_year(monkeypatch: pytest.MonkeyPatch) 
             assert previous_prediction() is None
         calls += 1
         result = orig(*args, **kwargs)  # type: ignore[arg-type]
-        if calls > 1:
+        if calls % 2 == 0:
             previous_prediction = weakref.ref(result[0])
         return result
 
     monkeypatch.setattr(model_mod, "_rank_stack", _counting)
     monkeypatch.setattr(model_mod, "_train_booster", lambda *a, **k: _StubBooster())
     walk_forward_scores(panel, _universe(), sess, cfg, test_years=(2018, 2019), authorization=_auth(sess))
-    assert calls == 1 + 2
+    assert calls == 2 * 2
 
 
 def test_booster_thread_count_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -812,7 +815,7 @@ def test_prediction_design_shared_across_members(monkeypatch: pytest.MonkeyPatch
             assert previous_prediction() is None
         calls += 1
         result = orig(*args, **kwargs)  # type: ignore[arg-type]
-        if calls > 1:
+        if calls % 2 == 0:
             previous_prediction = weakref.ref(result[0])
         return result
 
@@ -822,7 +825,7 @@ def test_prediction_design_shared_across_members(monkeypatch: pytest.MonkeyPatch
         panel, _universe(), sess, _tiny_config(seed=3, seeds=(3, 4, 5)),
         test_years=(2018, 2019), authorization=_auth(sess),
     )
-    assert calls == 1 + 2
+    assert calls == 2 * 2
 
 
 def test_member_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -862,3 +865,311 @@ def test_multi_member_fold_without_enough_data_fails_closed(monkeypatch: pytest.
             test_years=(2018,), authorization=_auth(sess),
         )
     assert not calls
+
+
+def _feat_mats(panel: FeaturePanel, cfg: ScorerConfig) -> list[np.ndarray]:
+    return [np.asarray(panel.features[name]) for name in feature_names_for(cfg.feature_set)]
+
+
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+def test_frozen_year_reproduces_walkforward_rows(seeds: tuple[int, ...]) -> None:
+    from src.research.model import score_rows, train_year_boosters
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    cfg = _tiny_config(seeds=seeds)
+    auth = _auth(sess)
+    full = walk_forward_scores(panel, uni, sess, cfg, test_years=(2018, 2019), authorization=auth)
+    mats = _feat_mats(panel, cfg)
+    for year in (2018, 2019):
+        scorer = train_year_boosters(panel, uni, sess, cfg, year=year, authorization=auth)
+        assert scorer.year == year
+        assert scorer.config == cfg
+        rows = [r for r, day in enumerate(sess) if day.year == year]
+        part = score_rows(mats, uni, rows, scorer)
+        assert part.shape == (len(rows), N_INST)
+        assert part.dtype == np.float32
+        assert np.asarray(full.scores[rows]).tobytes() == np.asarray(part).tobytes()
+
+
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+def test_score_rows_is_row_local(seeds: tuple[int, ...]) -> None:
+    from src.research.model import score_rows, train_year_boosters
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    cfg = _tiny_config(seeds=seeds)
+    auth = _auth(sess)
+    scorer = train_year_boosters(panel, uni, sess, cfg, year=2018, authorization=auth)
+    mats = _feat_mats(panel, cfg)
+    rows_2018 = [r for r, day in enumerate(sess) if day.year == 2018]
+    target = rows_2018[len(rows_2018) // 2]
+    before = score_rows(mats, uni, [target], scorer)
+    noisy_feats = dict(panel.features)
+    rng = np.random.default_rng(7)
+    for name, arr in panel.features.items():
+        blown = np.asarray(arr, dtype=np.float64).copy()
+        mask = np.ones(N_SESS, dtype=bool)
+        mask[target] = False
+        blown[mask, :] = rng.standard_normal((N_SESS - 1, N_INST)) * 999.0
+        noisy_feats[name] = np.ascontiguousarray(blown, dtype=np.float32)
+    noisy = FeaturePanel(features=noisy_feats, labels=panel.labels, last_row=panel.last_row)
+    after = score_rows(_feat_mats(noisy, cfg), uni, [target], scorer)
+    assert np.asarray(before).tobytes() == np.asarray(after).tobytes()
+
+
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+def test_train_year_ignores_future_rows(seeds: tuple[int, ...]) -> None:
+    from src.research.model import train_year_boosters
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    cfg = _tiny_config(seeds=seeds)
+    auth = _auth(sess)
+    clean = train_year_boosters(panel, uni, sess, cfg, year=2018, authorization=auth)
+    first_2018 = next(i for i, day in enumerate(sess) if day.year == 2018)
+    rng = np.random.default_rng(11)
+    noisy_feats = dict(panel.features)
+    for name, arr in panel.features.items():
+        blown = np.asarray(arr, dtype=np.float64).copy()
+        blown[first_2018:, :] = rng.standard_normal((N_SESS - first_2018, N_INST)) * 999.0
+        noisy_feats[name] = np.ascontiguousarray(blown, dtype=np.float32)
+    noisy_labels = dict(panel.labels)
+    for h, arr in panel.labels.items():
+        blown = np.asarray(arr, dtype=np.float64).copy()
+        blown[first_2018:, :] = rng.standard_normal((N_SESS - first_2018, N_INST)) * 999.0
+        noisy_labels[h] = np.ascontiguousarray(blown, dtype=np.float32)
+    noisy = FeaturePanel(features=noisy_feats, labels=noisy_labels, last_row=panel.last_row)
+    other = train_year_boosters(noisy, uni, sess, cfg, year=2018, authorization=auth)
+    assert set(clean.boosters) == set(other.boosters)
+    for key in clean.boosters:
+        assert clean.boosters[key].model_to_string() == other.boosters[key].model_to_string()
+
+
+def test_score_rows_empty_rows() -> None:
+    from src.research.model import score_rows, train_year_boosters
+
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    cfg = _tiny_config()
+    scorer = train_year_boosters(panel, uni, sess, cfg, year=2018, authorization=_auth(sess))
+    out = score_rows(_feat_mats(panel, cfg), uni, [], scorer)
+    assert out.shape == (0, N_INST)
+    assert out.dtype == np.float32
+
+
+def test_thin_year_fold_names_year_and_horizon() -> None:
+    from src.research.model import train_year_boosters
+
+    sess = _sessions()
+    with pytest.raises(ValueError, match=r"fold year=2018 horizon=5 has .* below min_train_rows"):
+        train_year_boosters(
+            _synthetic_panel(), _universe(), sess,
+            _tiny_config(min_train_rows=10**9), year=2018, authorization=_auth(sess),
+        )
+
+
+def _trained_scorer(seeds: tuple[int, ...] = ()) -> tuple[ScorerConfig, object]:
+    from src.research.model import train_year_boosters
+
+    sess = _sessions()
+    cfg = _tiny_config(seeds=seeds)
+    scorer = train_year_boosters(
+        _synthetic_panel(), _universe(), sess, cfg, year=2018, authorization=_auth(sess)
+    )
+    return cfg, scorer
+
+
+@pytest.mark.parametrize("seeds", [(), (11, 12, 13)])
+@pytest.mark.parametrize("precreate", [False, True])
+def test_save_load_roundtrip_is_exact(tmp_path: Path, seeds: tuple[int, ...], precreate: bool) -> None:
+    import hashlib
+    import json
+
+    from src.research.model import load_frozen_scorer, save_frozen_scorer, score_rows
+
+    cfg, scorer = _trained_scorer(seeds)
+    sess = _sessions()
+    panel = _synthetic_panel()
+    uni = _universe()
+    rows = [r for r, day in enumerate(sess) if day.year == 2018]
+    target = tmp_path / "scorer"
+    if precreate:
+        target.mkdir(parents=True)
+    manifest_path = save_frozen_scorer(
+        scorer, target, provenance={"cube_id": "cube_0", "note": "probe"}
+    )
+    assert manifest_path == target / "manifest.json"
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config_hash"] == cfg.config_hash
+    assert manifest["config_json"] == cfg.canonical_json()
+    assert manifest["year"] == 2018
+    assert manifest["cube_id"] == "cube_0"
+    assert manifest["note"] == "probe"
+    assert set(manifest["files"]) == {f"s{s}_h{h}.txt" for (s, h) in scorer.boosters}
+    for name, digest in manifest["files"].items():
+        assert hashlib.sha256((target / name).read_bytes()).hexdigest() == digest
+    reloaded = load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+    assert reloaded.year == 2018
+    assert reloaded.config == cfg
+    mats = _feat_mats(panel, cfg)
+    assert np.asarray(score_rows(mats, uni, rows, scorer)).tobytes() == np.asarray(
+        score_rows(mats, uni, rows, reloaded)
+    ).tobytes()
+
+
+def test_save_cleans_staging_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import lightgbm as lgb
+
+    from src.research.model import save_frozen_scorer
+
+    _, scorer = _trained_scorer()
+    target = tmp_path / "scorer"
+
+    def _boom(self: object) -> str:
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(lgb.Booster, "model_to_string", _boom)
+    with pytest.raises(RuntimeError, match="disk gone"):
+        save_frozen_scorer(scorer, target, provenance={})
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_refuses_nonempty_directory(tmp_path: Path) -> None:
+    from src.research.model import save_frozen_scorer
+
+    _, scorer = _trained_scorer()
+    target = tmp_path / "scorer"
+    target.mkdir(parents=True)
+    (target / "other.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-empty"):
+        save_frozen_scorer(scorer, target, provenance={})
+
+
+def test_save_rejects_member_mismatch(tmp_path: Path) -> None:
+    from src.research.model import FrozenScorer, save_frozen_scorer
+
+    cfg, scorer = _trained_scorer()
+    pruned = FrozenScorer(config=cfg, year=2018, boosters={})
+    with pytest.raises(ValueError, match="needs"):
+        save_frozen_scorer(pruned, tmp_path / "scorer", provenance={})
+    assert scorer.boosters
+
+
+def test_load_fails_closed(tmp_path: Path) -> None:
+    import copy
+    import json
+
+    from src.research.model import load_frozen_scorer, save_frozen_scorer
+
+    cfg, scorer = _trained_scorer()
+    target = tmp_path / "scorer"
+    save_frozen_scorer(scorer, target, provenance={"cube_id": "cube_0"})
+    manifest_path = target / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    first_file = sorted(manifest["files"])[0]
+
+    with pytest.raises(ValueError, match="unreadable"):
+        load_frozen_scorer(tmp_path / "absent", expected_config_hash=cfg.config_hash)
+
+    (target / first_file).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    save_frozen_scorer(scorer, tmp_path / "fresh", provenance={})
+    with pytest.raises(ValueError, match="expected"):
+        load_frozen_scorer(tmp_path / "fresh", expected_config_hash="0" * 64)
+
+    broken = copy.deepcopy(manifest)
+    del broken["files"]
+    manifest_path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    broken = copy.deepcopy(manifest)
+    broken["config_json"] = "{not json"
+    manifest_path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    broken = copy.deepcopy(manifest)
+    other = _tiny_config(num_boost_round=6)
+    broken["config_json"] = other.canonical_json()
+    manifest_path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    broken = copy.deepcopy(manifest)
+    broken["member_seeds"] = [999]
+    manifest_path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="members differ"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    broken = copy.deepcopy(manifest)
+    broken["files"] = {}
+    manifest_path.write_text(json.dumps(broken), encoding="utf-8")
+    with pytest.raises(ValueError, match="files differ"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (target / first_file).unlink()
+    with pytest.raises(ValueError, match="missing"):
+        load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+
+
+def test_frozen_predictions_preserve_duplicate_rows() -> None:
+    cfg, scorer = _trained_scorer()
+    panel = _synthetic_panel()
+    mats = _feat_mats(panel, cfg)
+    one = model_mod.score_rows(mats, _universe(), [740], scorer)
+    repeated = model_mod.score_rows(mats, _universe(), [740, 750, 740], scorer)
+    assert repeated[[0, 2]].tobytes() == np.repeat(one, 2, axis=0).tobytes()
+
+
+def test_frozen_save_failure_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    _, scorer = _trained_scorer()
+    target = tmp_path / "scorer"
+    target.mkdir()
+
+    def fail_rename(*args: object) -> None:
+        raise OSError("rename failed")
+
+    monkeypatch.setattr(os, "rename", fail_rename)
+    with pytest.raises(OSError, match="rename failed"):
+        model_mod.save_frozen_scorer(scorer, target, provenance={})
+    assert list(target.iterdir()) == []
+    assert list(tmp_path.iterdir()) == [target]
+    with pytest.raises(ValueError, match="reserved"):
+        model_mod.save_frozen_scorer(scorer, target, provenance={"config_hash": "wrong"})
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_frozen_manifest_invalid_structures(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    cfg, scorer = _trained_scorer()
+    target = tmp_path / "scorer"
+    path = model_mod.save_frozen_scorer(scorer, target, provenance={})
+    manifest = json.loads(path.read_text())
+    path.write_text("[]")
+    with pytest.raises(ValueError, match="malformed"):
+        model_mod.load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+    manifest["feature_names"] = []
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="feature names"):
+        model_mod.load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
+    manifest["feature_names"] = list(feature_names_for(cfg.feature_set))
+    name = next(iter(manifest["files"]))
+    (target / name).write_bytes(b"\xff")
+    manifest["files"][name] = hashlib.sha256(b"\xff").hexdigest()
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="invalid frozen booster"):
+        model_mod.load_frozen_scorer(target, expected_config_hash=cfg.config_hash)
