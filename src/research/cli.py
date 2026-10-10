@@ -43,6 +43,11 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--spec", type=Path, required=True)
     evaluate.add_argument("--capital", type=int, required=False, default=None)
 
+    freeze_models = sub.add_parser("freeze-models")
+    _common_args(freeze_models)
+    freeze_models.add_argument("--spec", type=Path, required=True)
+    freeze_models.add_argument("--year", type=int, required=False, default=None)
+
     champion = sub.add_parser("champion")
     _common_args(champion)
     champion.add_argument("--sync-file", action="store_true")
@@ -193,6 +198,21 @@ def _run_build_cube(args: argparse.Namespace) -> Mapping[str, object]:  # pragma
     present = cube.arrays.get("present")
     coverage = float(present.mean()) if present is not None else 0.0
     return {"cube_id": cube.cube_id, "sessions": shape[0], "instruments": shape[1], "coverage": coverage}
+
+
+def _run_freeze_models(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.research.model import _member_seeds
+
+    pipeline = _pipeline_for(args)
+    spec = _load_spec(args.spec)
+    target_year = int(args.year) if getattr(args, "year", None) is not None else None
+    models_dir = pipeline.freeze_models(spec, year=target_year)
+    resolved_year = int(target_year) if target_year is not None else int(Path(models_dir).name)
+    return {
+        "models_dir": str(models_dir),
+        "year": resolved_year,
+        "boosters": len(_member_seeds(spec.scorer)) * len(spec.scorer.horizons),
+    }
 
 
 def _run_evaluate(args: argparse.Namespace) -> Mapping[str, object]:
@@ -474,6 +494,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(_run_build_cube(args))
         elif args.command == "evaluate":
             _emit(_run_evaluate(args))
+        elif args.command == "freeze-models":
+            _emit(_run_freeze_models(args))
         elif args.command == "champion":
             _emit(_run_champion(args))
         elif args.command == "challenge":
