@@ -6,7 +6,7 @@ import hashlib
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -161,6 +161,51 @@ def _build_daily_market(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
         catalog=ctx.catalog,
         universe_root=ctx.runtime.workspace.silver_root,
         silver_root=ctx.runtime.workspace.silver_root,
+        universe_dataset_id=inputs["ordinary_universe"],
+    )
+    return _published(result.dataset_path)
+
+
+def _build_hedge_series(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+    """Build the KOSDAQ-150 hedge series Silver from the registered universe; returns the published dataset."""
+    from src.config import load_runtime_config
+    from src.data.hedge_series_silver import load_hedge_series_config, materialize_hedge_series_silver
+
+    result = materialize_hedge_series_silver(
+        catalog=ctx.catalog,
+        universe_root=ctx.runtime.workspace.silver_root,
+        silver_root=ctx.runtime.workspace.silver_root,
+        config=load_hedge_series_config(load_runtime_config().hedge_series),
+        universe_dataset_id=inputs["ordinary_universe"],
+    )
+    return _published(result.dataset_path)
+
+
+def _build_trend_series(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+    """Build the KOSPI-200 trend series Silver from the registered universe; returns the published dataset."""
+    from src.config import load_runtime_config
+    from src.data.hedge_series_silver import load_hedge_series_config, materialize_hedge_series_silver
+
+    result = materialize_hedge_series_silver(
+        catalog=ctx.catalog,
+        universe_root=ctx.runtime.workspace.silver_root,
+        silver_root=ctx.runtime.workspace.silver_root,
+        config=load_hedge_series_config(load_runtime_config().trend_series),
+        universe_dataset_id=inputs["ordinary_universe"],
+    )
+    return _published(result.dataset_path)
+
+
+def _build_cash_series(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+    """Build the cash-proxy series Silver from the registered universe; returns the published dataset."""
+    from src.config import load_runtime_config
+    from src.data.cash_series_silver import load_cash_series_config, materialize_cash_series_silver
+
+    result = materialize_cash_series_silver(
+        catalog=ctx.catalog,
+        universe_root=ctx.runtime.workspace.silver_root,
+        silver_root=ctx.runtime.workspace.silver_root,
+        config=load_cash_series_config(load_runtime_config().cash_series),
         universe_dataset_id=inputs["ordinary_universe"],
     )
     return _published(result.dataset_path)
@@ -410,6 +455,103 @@ def _preview_daily_market(ctx: RefreshContext) -> DatasetIdentity:
     )
 
 
+def _index_series_source_hashes(
+    ctx: RefreshContext, *, source: str, sessions: tuple[date, ...]
+) -> list[str]:
+    """Content hashes of the certified index-series pages, failing closed on gaps."""
+    from src.data.receipt_catalog import EvidenceStatus
+
+    entries = ctx.catalog.latest(source=source, natural_keys={session.isoformat() for session in sessions})
+    hashes: list[str] = []
+    for session in sessions:
+        entry = entries.get(session.isoformat())
+        if entry is None or entry.status is not EvidenceStatus.SUCCESS:
+            raise PITDataError(f"KRX index series page is missing for {session}")
+        if entry.as_of != session:
+            raise PITDataError(f"KRX index series catalog date conflicts for {session}")
+        hashes.append(entry.content_hash)
+    return hashes
+
+
+def _preview_index_series(ctx: RefreshContext, *, config_path_kind: str) -> DatasetIdentity:
+    """Identity the hedge/trend materializer publishes for the current catalog state."""
+    from src.config import load_runtime_config
+    from src.data.datasets import DatasetLayer as _Layer
+    from src.data.datasets import dataset_digest, dataset_reference, universe_sessions
+    from src.data.evidence_sources import KRX_HEDGE_SERIES_SOURCE, KRX_TREND_SERIES_SOURCE
+    from src.data.hedge_series_silver import REVISION as HEDGE_SERIES_REVISION
+    from src.data.hedge_series_silver import load_hedge_series_config
+
+    runtime_config = load_runtime_config()
+    config = load_hedge_series_config(
+        runtime_config.hedge_series if config_path_kind == "hedge" else runtime_config.trend_series
+    )
+    universe_id = ctx.registry.require("ordinary_universe")
+    _, calendar = universe_sessions(ctx.runtime.workspace.silver_root, universe_id, allow_legacy=False)
+    sessions = tuple(day for day in calendar if day >= config.collection_start)
+    source_hashes = _index_series_source_hashes(ctx, source=config.source, sessions=sessions)
+    params: dict[str, str] = {
+        "collection_start": config.collection_start.isoformat(),
+        "index_name": config.index_name,
+        "inverse_ticker": config.inverse_ticker,
+        "available_time": config.available_time.isoformat(),
+    }
+    if config.index_class != "KOSDAQ":
+        params["index_class"] = config.index_class
+    if config.source != KRX_HEDGE_SERIES_SOURCE:
+        params["source"] = config.source
+    return DatasetIdentity(
+        kind="trend_series" if config.source == KRX_TREND_SERIES_SOURCE else "hedge_series",
+        layer=_Layer.SILVER,
+        policy_version=HEDGE_SERIES_REVISION,
+        inputs={
+            "universe": dataset_reference(universe_id, kind="ordinary_universe"),
+            "bronze_hedge": dataset_digest(source_hashes),
+        },
+        params=params,
+    )
+
+
+def _preview_hedge_series(ctx: RefreshContext) -> DatasetIdentity:
+    """Identity the hedge series build would publish for the current catalog and registry state."""
+    return _preview_index_series(ctx, config_path_kind="hedge")
+
+
+def _preview_trend_series(ctx: RefreshContext) -> DatasetIdentity:
+    """Identity the trend series build would publish for the current catalog and registry state."""
+    return _preview_index_series(ctx, config_path_kind="trend")
+
+
+def _preview_cash_series(ctx: RefreshContext) -> DatasetIdentity:
+    """Identity the cash series build would publish for the current catalog and registry state."""
+    from src.config import load_runtime_config
+    from src.data.cash_series_silver import REVISION as CASH_SERIES_REVISION
+    from src.data.cash_series_silver import load_cash_series_config
+    from src.data.datasets import DatasetLayer as _Layer
+    from src.data.datasets import dataset_digest, dataset_reference, universe_sessions
+    from src.data.evidence_sources import KRX_CASH_SERIES_SOURCE
+
+    config = load_cash_series_config(load_runtime_config().cash_series)
+    universe_id = ctx.registry.require("ordinary_universe")
+    _, calendar = universe_sessions(ctx.runtime.workspace.silver_root, universe_id, allow_legacy=False)
+    sessions = tuple(day for day in calendar if day >= config.collection_start)
+    source_hashes = _index_series_source_hashes(ctx, source=KRX_CASH_SERIES_SOURCE, sessions=sessions)
+    return DatasetIdentity(
+        kind="cash_series",
+        layer=_Layer.SILVER,
+        policy_version=CASH_SERIES_REVISION,
+        inputs={
+            "universe": dataset_reference(universe_id, kind="ordinary_universe"),
+            "bronze_cash": dataset_digest(source_hashes),
+        },
+        params={
+            "collection_start": config.collection_start.isoformat(),
+            "ticker": config.ticker,
+            "available_time": config.available_time.isoformat(),
+        },
+    )
+
+
 def _preview_investor_flow_ls(ctx: RefreshContext) -> DatasetIdentity:
     """Compute the would-be LS flow identity from the catalog blob digest."""
     from src.data.datasets import DatasetLayer as _Layer
@@ -588,21 +730,27 @@ def _preview_financial_facts(ctx: RefreshContext) -> DatasetIdentity:
     receipt_hashes = [
         str(item["content_hash"]) for item in receipts if str(item["content_hash"]) not in ctx.superseded_receipts
     ]
+    from src.data.datasets import read_dataset as _read_dataset
+
     disclosure_digest = dataset_digest([])
-    for candidate in sorted(runtime.workspace.silver_root.glob("disclosures_*"), reverse=True):
+    candidates = sorted(
+        (path for path in runtime.workspace.silver_root.glob("disclosures_*")
+         if path.is_dir() and not path.is_symlink()),
+        reverse=True,
+    )
+    for candidate in candidates:
         try:
             _load(candidate)
+            _read_dataset(candidate).collect()
         except PITDataError:
             continue
         disclosure_digest = _reference(candidate.name, kind="disclosures")
         break
     bridge_receipt_hash: str | None = None
-    try:
+    if (runtime.workspace.bronze_root / "dart_corp_codes").exists():
         _, bridge_receipt_hash = load_frozen_dart_ticker_bridge(
             bronze_root=runtime.workspace.bronze_root, decision_time=ctx.decision_time
         )
-    except PITDataError:  # pragma: no cover - missing bridge preview fallback
-        bridge_receipt_hash = None
     calendar = _build_calendar(ctx)
     calendar_digest = hashlib.sha256(
         "\n".join(session.astimezone(UTC).isoformat() for session in calendar.sessions).encode("utf-8")
@@ -801,6 +949,9 @@ def _preview_reference_benchmarks(ctx: RefreshContext) -> DatasetIdentity:
 _PREVIEW_FNS: Final[dict[str, Callable[[RefreshContext], DatasetIdentity]]] = {
     "ordinary_universe": _preview_ordinary_universe,
     "daily_market": _preview_daily_market,
+    "hedge_series": _preview_hedge_series,
+    "trend_series": _preview_trend_series,
+    "cash_series": _preview_cash_series,
     "investor_flow_ls": _preview_investor_flow_ls,
     "market_actions": _preview_market_actions,
     "market_panel": _preview_market_panel,
@@ -823,6 +974,24 @@ SCOPE_GRAPH: Final[tuple[BuildNode, ...]] = (
         inputs=("ordinary_universe",),
         bronze_sources=("krx_daily_market",),
         build=_build_daily_market,
+    ),
+    BuildNode(
+        kind="hedge_series",
+        inputs=("ordinary_universe",),
+        bronze_sources=("krx_hedge_series",),
+        build=_build_hedge_series,
+    ),
+    BuildNode(
+        kind="trend_series",
+        inputs=("ordinary_universe",),
+        bronze_sources=("krx_trend_series",),
+        build=_build_trend_series,
+    ),
+    BuildNode(
+        kind="cash_series",
+        inputs=("ordinary_universe",),
+        bronze_sources=("krx_cash_series",),
+        build=_build_cash_series,
     ),
     BuildNode(
         kind="dividend_events",
@@ -1282,6 +1451,24 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
             ),
         ),
         (
+            "krx_hedge_series",
+            lambda ctx, *, dry_run, emit: _run_krx_collection_step(
+                ctx, "krx_hedge_series", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "krx_trend_series",
+            lambda ctx, *, dry_run, emit: _run_krx_collection_step(
+                ctx, "krx_trend_series", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "krx_cash_series",
+            lambda ctx, *, dry_run, emit: _run_krx_collection_step(
+                ctx, "krx_cash_series", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
             "kind_notice_search",
             lambda ctx, *, dry_run, emit: _run_kind_collection_step(
                 ctx, "kind_notice_search", dry_run=dry_run, emit=emit
@@ -1408,6 +1595,7 @@ def refresh_scope(
     dry_run: bool,
     emit: Callable[[Mapping[str, object]], None],
     steps: tuple[CollectionStep, ...] | None = None,
+    collect_steps: frozenset[str] | None = None,
 ) -> RefreshReport:
     """Run one scope refresh with KIS collection after the LS build.
 
@@ -1415,14 +1603,22 @@ def refresh_scope(
     the graph up to ``investor_flow_ls``, the ``kis_investor_flow`` collection
     step, then the remaining builds. KIS collection needs a current LS Silver
     dataset, so it cannot run before the LS build. ``dry_run`` reports all
-    steps in the same order without requests or writes.
+    steps in the same order without requests or writes. ``collect_steps`` runs
+    only the named collection steps, in the default order; an unknown name
+    fails before any collection, and the build phase is unchanged.
     """
     resolved_steps = steps if steps is not None else _default_collection_steps()
+    if collect_steps is not None:
+        known_steps = {name for name, _ in resolved_steps}
+        unknown_steps = sorted(set(collect_steps) - known_steps)
+        if unknown_steps:
+            raise ValueError(f"unknown collection steps: {unknown_steps}")
+        resolved_steps = tuple(item for item in resolved_steps if item[0] in collect_steps)
     has_kis = any(name == "kis_investor_flow" for name, _ in resolved_steps)
     if not collect or not has_kis:
         summaries: tuple[Mapping[str, object], ...] = ()
         if collect:
-            collection = run_collection_jobs(ctx, dry_run=dry_run, emit=emit, steps=steps)
+            collection = run_collection_jobs(ctx, dry_run=dry_run, emit=emit, steps=resolved_steps)
             summaries = tuple(
                 MappingProxyType(
                     {
@@ -1435,7 +1631,7 @@ def refresh_scope(
                 )
                 for step in collection.steps
             )
-            if not dry_run and not collection.complete:
+            if not dry_run and collection.blocking_job is not None:
                 return RefreshReport(
                     decision_time=ctx.decision_time,
                     status="blocked",
@@ -1494,7 +1690,7 @@ def refresh_scope(
         )
         for step in pre_collection.steps
     ]
-    if not pre_collection.complete:
+    if pre_collection.blocking_job is not None:
         return RefreshReport(
             decision_time=ctx.decision_time,
             status="blocked",
