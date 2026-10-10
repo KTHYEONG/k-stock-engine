@@ -22,7 +22,13 @@ import numpy as np
 import polars as pl
 from numpy.typing import NDArray
 
-from src.backtest.market import load_market_arrays
+from src.backtest.market import (
+    FLOAT_FIELD_NAMES,
+    INT_FIELD_NAMES,
+    PANEL_BOOL_FIELD_NAMES,
+    MarketArrays,
+    load_market_arrays,
+)
 from src.core.market_rules import KrxMarket, KrxMarketRules
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
@@ -156,8 +162,8 @@ def _rules_fingerprint(rules: KrxMarketRules) -> str:
     return hashlib.sha256(repr(rules).encode("utf-8")).hexdigest()[:16]
 
 
-def research_cube_id(inputs: CubeInputs) -> str:
-    """Return ``research_cube_<hash16>`` for the given inputs."""
+def research_cube_id(inputs: CubeInputs, *, first_session: date | None = None) -> str:
+    """Cube id; unchanged when first_session is None, distinct for each tail start otherwise."""
     payload = "|".join(
         [
             REVISION,
@@ -170,6 +176,8 @@ def research_cube_id(inputs: CubeInputs) -> str:
             str(inputs.dividend_withholding_rate),
         ]
     )
+    if first_session is not None:
+        payload = f"{payload}|{first_session.isoformat()}"
     return f"research_cube_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
 
 
@@ -254,7 +262,8 @@ def _log_phase(name: str, arrays: Mapping[str, NDArray[Any]], shape: tuple[int, 
 
 
 def _quarter_fact_map(
-    facts: pl.DataFrame, sessions: Sequence[date], instrument_ids: Sequence[str]
+    facts: pl.DataFrame, sessions: Sequence[date], instrument_ids: Sequence[str],
+    availability_sessions: Sequence[date] | None = None,
 ) -> tuple[
     dict[tuple[int, int], dict[str, tuple[float, int]]],
     dict[tuple[int, int], int],
@@ -263,7 +272,9 @@ def _quarter_fact_map(
     index_of = {inst: idx for idx, inst in enumerate(instrument_ids)}
     grouped: dict[tuple[int, int, str], list[tuple[int, int, float, bool]]] = {}
     order = 0
-    times = _decision_times(sessions)
+    timeline = sessions if availability_sessions is None else availability_sessions
+    offset = list(timeline).index(sessions[0]) if sessions else 0
+    times = _decision_times(timeline)
     try:
         rows = facts.to_dicts()
     except (ValueError, pl.exceptions.PolarsError) as exc:  # pragma: no cover
@@ -292,6 +303,7 @@ def _quarter_fact_map(
         avail = _avail_index_in(row.get("available_at"), times)
         if avail is None:
             continue
+        avail -= offset
         consolidated = row.get("consolidated")
         is_consolidated = bool(consolidated) if consolidated is not None else True
         grouped.setdefault((index_of[inst], qk, fact), []).append((avail, order, amount, is_consolidated))
@@ -308,14 +320,15 @@ def _quarter_fact_map(
 
 
 def assemble_fundamentals(
-    facts: pl.DataFrame, *, sessions: Sequence[date], instrument_ids: Sequence[str]
+    facts: pl.DataFrame, *, sessions: Sequence[date], instrument_ids: Sequence[str],
+    availability_sessions: Sequence[date] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Build as-of fundamental arrays with Q4 derivation and largest-quarter-wins display."""
     sess = list(sessions)
     insts = list(instrument_ids)
     n_s, n_n = len(sess), len(insts)
     shape = (n_s, n_n)
-    quarter_fact, quarter_avail = _quarter_fact_map(facts, sess, insts)
+    quarter_fact, quarter_avail = _quarter_fact_map(facts, sess, insts, availability_sessions)
     sess_qk = np.asarray([_session_qk(day) for day in sess], dtype=np.int64)
 
     def _three_month(nidx: int, qk: int, fact: str) -> tuple[float, int | None]:
@@ -437,6 +450,7 @@ def _release_tables(
     quarter_fact: dict[tuple[int, int], dict[str, tuple[float, int]]],
     sessions: Sequence[date],
     instrument_ids: Sequence[str],
+    availability_sessions: Sequence[date] | None = None,
 ) -> tuple[
     dict[tuple[int, int], list[tuple[int, int, dict[str, tuple[float | None, float | None]]]]],
     dict[tuple[int, int], int],
@@ -448,7 +462,9 @@ def _release_tables(
         raise PITDataError(f"invalid earnings releases frame: {exc}") from exc
     per_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
     order = 0
-    times = _decision_times(sessions)
+    timeline = sessions if availability_sessions is None else availability_sessions
+    offset = list(timeline).index(sessions[0]) if sessions else 0
+    times = _decision_times(timeline)
     for row in rows:
         order += 1
         inst = _instrument_of(row)
@@ -461,6 +477,7 @@ def _release_tables(
         avail = _avail_index_in(row.get("available_at"), times)
         if avail is None:
             continue
+        avail -= offset
         basis = str(row.get("basis") or "consolidated").strip().lower()
         if basis not in ("consolidated", "separate"):
             basis = "consolidated"
@@ -550,6 +567,7 @@ def assemble_releases(
     *,
     sessions: Sequence[date],
     instrument_ids: Sequence[str],
+    availability_sessions: Sequence[date] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Build early-release and merged best-available quarterly arrays."""
     sess = list(sessions)
@@ -567,8 +585,8 @@ def assemble_releases(
         out[f"earn_{metric}_q_ly"] = np.full(shape, np.nan, dtype=np.float64)
     out["earn_qk"] = np.full(shape, np.nan, dtype=np.float64)
     out["earn_avail_t"] = np.full(shape, np.nan, dtype=np.float64)
-    quarter_fact, _ = _quarter_fact_map(facts, sess, insts)
-    versions, _first_avail = _release_tables(releases, quarter_fact, sess, insts)
+    quarter_fact, _ = _quarter_fact_map(facts, sess, insts, availability_sessions)
+    versions, _first_avail = _release_tables(releases, quarter_fact, sess, insts, availability_sessions)
     _ = fundamentals
     by_inst: dict[int, list[tuple[int, int, int]]] = {}
     for (nidx, qk), ver_list in versions.items():
@@ -856,15 +874,56 @@ def _fact_instruments_outside_panel(facts: pl.DataFrame, panel_ids: set[str]) ->
     return {inst for inst in found if inst is not None and inst not in panel_ids}
 
 
+def _panel_scan(panel_dir: Path) -> pl.LazyFrame:
+    from src.data.datasets import dataset_partition_paths
+
+    paths = [str(path) for path in dataset_partition_paths(panel_dir)
+             if path.suffix == ".parquet" and path.name not in {"instrument_exits.parquet", "exits.parquet"}]
+    return pl.scan_parquet(paths)
+
+
+def panel_axes(panel_dir: Path) -> tuple[tuple[date, ...], tuple[str, ...]]:
+    """Read the panel timeline and instrument ids without allocating dense history."""
+    scan = _panel_scan(panel_dir)
+    sessions = tuple(sorted(scan.select(pl.col("session").unique()).collect()["session"].to_list()))
+    instruments = tuple(sorted(scan.select(pl.col("instrument_id").unique()).collect()["instrument_id"].to_list()))
+    return sessions, instruments
+
+
+def _load_tail_market(panel_dir: Path, first_session: date) -> MarketArrays:
+    frame = _panel_scan(panel_dir).filter(pl.col("session") >= first_session).collect()
+    if frame.select("session", "instrument_id").is_duplicated().any():
+        raise PITDataError("duplicate market panel key in tail")
+    sessions = tuple(sorted(frame["session"].unique().to_list()))
+    instruments = tuple(sorted(frame["instrument_id"].unique().to_list()))
+    rows = frame["session"].replace_strict({day: idx for idx, day in enumerate(sessions)}, return_dtype=pl.Int64).to_numpy()
+    cols = frame["instrument_id"].replace_strict({inst: idx for idx, inst in enumerate(instruments)}, return_dtype=pl.Int64).to_numpy()
+    shape = (len(sessions), len(instruments))
+    ints = {name: np.zeros(shape, dtype=np.int64) for name in INT_FIELD_NAMES}
+    floats = {name: np.full(shape, np.nan, dtype=np.float64) for name in FLOAT_FIELD_NAMES}
+    bools = {name: np.zeros(shape, dtype=np.bool_) for name in ("present", *PANEL_BOOL_FIELD_NAMES)}
+    bools["present"][rows, cols] = True
+    for name, block in ints.items():
+        block[rows, cols] = frame[name].cast(pl.Int64).fill_null(0).to_numpy()
+    for name, float_block in floats.items():
+        float_block[rows, cols] = frame[name].cast(pl.Float64).fill_null(float("nan")).to_numpy()
+    for name in PANEL_BOOL_FIELD_NAMES:
+        if name in frame.columns:
+            bools[name][rows, cols] = frame[name].cast(pl.Boolean).fill_null(False).to_numpy()
+    market = np.zeros(shape, dtype=np.int8)
+    market[rows, cols] = frame["market"].replace_strict({"KOSPI": 1, "KOSDAQ": 2}, default=0, return_dtype=pl.Int8).to_numpy()
+    return MarketArrays(Path(panel_dir).name, sessions, instruments, ints, floats, bools, market)
+
+
 def _panel_float_columns(
     panel_dir: Path, names: Sequence[str], sessions: Sequence[date], instrument_ids: Sequence[str]
 ) -> dict[str, NDArray[np.float64]]:
     """Dense arrays of panel columns that ``load_market_arrays`` does not carry."""
-    from src.data.datasets import dataset_partition_paths
-
-    paths = [str(path) for path in dataset_partition_paths(panel_dir) if path.suffix == ".parquet"
-             and path.name != "instrument_exits.parquet"]
-    frame = pl.scan_parquet(paths).select(["session", "instrument_id", *names]).collect()
+    frame = (
+        _panel_scan(panel_dir).select(["session", "instrument_id", *names])
+        .filter(pl.col("session").is_in(list(sessions)) & pl.col("instrument_id").is_in(list(instrument_ids)))
+        .collect()
+    )
     session_index = {day: idx for idx, day in enumerate(sessions)}
     instrument_index = {inst: idx for idx, inst in enumerate(instrument_ids)}
     rows = frame["session"].replace_strict(session_index, return_dtype=pl.Int64).to_numpy()
@@ -878,29 +937,45 @@ def _panel_float_columns(
 
 
 def _build_market_arrays(
-    inputs: CubeInputs, sessions: tuple[date, ...], instrument_ids: tuple[str, ...]
+    inputs: CubeInputs,
+    sessions: tuple[date, ...],
+    instrument_ids: tuple[str, ...],
+    *,
+    market_cache_root: Path | None = None,
+    source: MarketArrays | None = None,
 ) -> dict[str, NDArray[Any]]:
-    arrays = load_market_arrays(panel_dir=Path(inputs.market_panel), cache_root=Path(tempfile.gettempdir()))
+    cache_root = Path(market_cache_root) if market_cache_root is not None else Path(tempfile.gettempdir())
+    arrays = source if source is not None else load_market_arrays(panel_dir=Path(inputs.market_panel), cache_root=cache_root)
     panel_sessions = list(arrays.sessions)
     panel_insts = list(arrays.instrument_ids)
-    if tuple(panel_sessions) != tuple(sessions) or tuple(panel_insts) != tuple(instrument_ids):
-        raise PITDataError("market panel sessions or instruments changed during cube build")  # pragma: no cover
+    if tuple(panel_sessions) == tuple(sessions) and tuple(panel_insts) == tuple(instrument_ids):
+        row_idx: NDArray[np.int64] | None = None
+        col_idx: NDArray[np.int64] | None = None
+    else:
+        sess_pos = {day: idx for idx, day in enumerate(panel_sessions)}
+        inst_pos = {inst: idx for idx, inst in enumerate(panel_insts)}
+        if any(day not in sess_pos for day in sessions) or any(inst not in inst_pos for inst in instrument_ids):
+            raise PITDataError("market panel sessions or instruments changed during cube build")
+        row_idx = np.asarray([sess_pos[day] for day in sessions], dtype=np.int64)
+        col_idx = np.asarray([inst_pos[inst] for inst in instrument_ids], dtype=np.int64)
     n_s, n_n = len(sessions), len(instrument_ids)
     shape = (n_s, n_n)
     get_int = arrays.int_fields.get
-    get_float = arrays.float_fields.get
     get_bool = arrays.bool_fields.get
 
-    def _f(name: str, default: float = float("nan")) -> NDArray[np.float64]:
+    def _take(block: Any) -> NDArray[Any]:
+        if row_idx is None:
+            return np.asarray(block)
+        return np.ascontiguousarray(np.asarray(block)[row_idx][:, col_idx])
+
+    def _f(name: str) -> NDArray[np.float64]:
         if name in arrays.int_fields:
-            return np.asarray(get_int(name), dtype=np.float64)
-        if name in arrays.float_fields:
-            return np.asarray(get_float(name), dtype=np.float64)
-        return np.full(shape, default, dtype=np.float64)
+            return np.asarray(_take(get_int(name)), dtype=np.float64)
+        return np.asarray(_take(arrays.float_fields[name]), dtype=np.float64)
 
     def _b(name: str) -> NDArray[np.bool_]:
         if name in arrays.bool_fields:
-            return np.asarray(get_bool(name), dtype=bool)
+            return np.asarray(_take(get_bool(name)), dtype=np.bool_)
         return np.zeros(shape, dtype=bool)
 
     open_px = _f("open")
@@ -923,7 +998,7 @@ def _build_market_arrays(
     entry_blocked = _b("entry_blocked")
     open_at_upper = _b("open_at_upper")
     open_at_lower = _b("open_at_lower")
-    market = np.asarray(arrays.market, dtype=np.int8)
+    market = np.asarray(_take(arrays.market), dtype=np.int8)
     tick_at_open = np.zeros(shape, dtype=np.float64)
     for t, day in enumerate(sessions):
         try:
@@ -1016,13 +1091,16 @@ def _exit_arrays(panel_dir: Path, sessions: Sequence[date], instrument_ids: Sequ
     return exit_at, halted
 
 
-def build_research_cube(inputs: CubeInputs) -> ResearchCube:
-    """Load verified datasets and assemble the cube.
+def build_research_cube(
+    inputs: CubeInputs, *, first_session: date | None = None, market_cache_root: Path | None = None
+) -> ResearchCube:
+    """Build the cube over all panel sessions, or only sessions on or after first_session.
 
     Raises:
         PITDataError: any input manifest or partition hash fails verification, an input dataset
-            kind mismatches its role, fact keys (company, fiscal period, fact) are duplicated, or an
-            event references an instrument absent from the panel.
+            kind mismatches its role, fact keys (company, fiscal period, fact) are duplicated, an
+            event references an instrument absent from the panel, or ``first_session`` is not a
+            panel session.
     """
     for role, expected in (
         (inputs.market_panel, "market_panel"),
@@ -1032,14 +1110,34 @@ def build_research_cube(inputs: CubeInputs) -> ResearchCube:
         (inputs.earnings_releases, "earnings_releases"),
     ):
         _require_kind(Path(role), expected)
-    arrays = load_market_arrays(panel_dir=Path(inputs.market_panel), cache_root=Path(tempfile.gettempdir()))
-    sessions = tuple(arrays.sessions)
-    instrument_ids = tuple(arrays.instrument_ids)
-    panel_ids = set(instrument_ids)
+    cache_root = Path(market_cache_root) if market_cache_root is not None else Path(tempfile.gettempdir())
+    if first_session is None:
+        arrays = load_market_arrays(panel_dir=Path(inputs.market_panel), cache_root=cache_root)
+        full_sessions = tuple(arrays.sessions)
+        full_ids = set(arrays.instrument_ids)
+        sessions = full_sessions
+        instrument_ids = tuple(arrays.instrument_ids)
+    else:
+        full_sessions, full_instruments = panel_axes(Path(inputs.market_panel))
+        full_ids = set(full_instruments)
+        if first_session not in set(full_sessions):
+            raise PITDataError(f"first_session {first_session.isoformat()} is not a panel session")
+        arrays = _load_tail_market(Path(inputs.market_panel), first_session)
+        cut = arrays.sessions.index(first_session)
+        sessions = tuple(arrays.sessions[cut:])
+        present = np.asarray(arrays.bool_fields["present"], dtype=bool)
+        kept_cols = np.flatnonzero(np.any(present[cut:, :], axis=0))
+        full_insts = list(arrays.instrument_ids)
+        instrument_ids = tuple(full_insts[int(i)] for i in kept_cols.tolist())
+        if not instrument_ids:
+            raise PITDataError("tail market has no present instruments")
     facts = _read_frame(Path(inputs.financial_facts))
     dividends = _read_frame(Path(inputs.dividend_events))
     flows = _read_frame(Path(inputs.investor_flow))
     releases = _read_frame(Path(inputs.earnings_releases))
+    if first_session is not None:
+        flows = flows.filter(pl.col("session").cast(pl.Date).is_in(list(sessions)))
+        dividends = dividends.filter(pl.col("ex_session").cast(pl.Date).is_in(list(sessions)))
     if "company_id" in facts.columns and "fiscal_period" in facts.columns and "fact" in facts.columns:
         try:
             keys = facts.select(["company_id", "fiscal_period", "fact"]).to_dicts()
@@ -1056,18 +1154,21 @@ def build_research_cube(inputs: CubeInputs) -> ResearchCube:
         (flows, "investor flow"),
         (releases, "earnings releases"),
     ):
-        _check_references(frame, panel_ids, label)
-    outside = _fact_instruments_outside_panel(facts, panel_ids)
+        _check_references(frame, full_ids, label)
+    outside = _fact_instruments_outside_panel(facts, full_ids)
     if outside:
         # 시세가 없는 비유니버스 종목의 공시라 매매 대상이 될 수 없다. 조용히 버리지 않고 규모를 남긴다.
         _LOG.info("[DATA] stage=facts_outside_panel instruments=%d skipped", len(outside))
-    market_part = _build_market_arrays(inputs, sessions, instrument_ids)
+    market_part = _build_market_arrays(inputs, sessions, instrument_ids, market_cache_root=cache_root, source=arrays)
     shape = (len(sessions), len(instrument_ids))
     base = np.asarray(market_part["base_price"], dtype=np.float64)
     close = np.asarray(market_part["close"], dtype=np.float64)
-    fundamentals = assemble_fundamentals(facts, sessions=sessions, instrument_ids=instrument_ids)
+    fundamentals = assemble_fundamentals(
+        facts, sessions=sessions, instrument_ids=instrument_ids, availability_sessions=full_sessions
+    )
     releases_out = assemble_releases(
-        releases, fundamentals, facts, sessions=sessions, instrument_ids=instrument_ids
+        releases, fundamentals, facts, sessions=sessions, instrument_ids=instrument_ids,
+        availability_sessions=full_sessions,
     )
     flows_out = assemble_flows(flows, close, sessions=sessions, instrument_ids=instrument_ids)
     dividends_out = assemble_dividends(
@@ -1116,7 +1217,7 @@ def build_research_cube(inputs: CubeInputs) -> ResearchCube:
         "adj_tr": adj_tr,
     }
     exit_at, exit_halted = _exit_arrays(Path(inputs.market_panel), sessions, instrument_ids)
-    cube_id = research_cube_id(inputs)
+    cube_id = research_cube_id(inputs, first_session=first_session)
     return ResearchCube.from_arrays(
         cube_id=cube_id,
         sessions=sessions,
