@@ -429,3 +429,118 @@ def test_trend_fail_fraction_is_inert_when_all_pass_and_validated() -> None:
     assert _policy().spec_hash != _policy(trend_fail_weight_fraction=0.5).spec_hash
     assert json.loads(_policy().canonical_json())["trend_fail_weight_fraction"] is None
     assert _policy(trend_fail_weight_fraction=None).trend_fail_weight_fraction is None
+
+
+def test_select_row_loop_equals_build_targets() -> None:
+    from src.research.policy import select_row
+
+    rng = np.random.default_rng(11)
+    mat = rng.standard_normal((S, N))
+    panel = _panel()
+    panel.features["dev_ma20"] = np.ascontiguousarray(rng.standard_normal((S, N)), dtype=np.float32)
+    panel.features["ret_21"] = np.ascontiguousarray(rng.standard_normal((S, N)), dtype=np.float32)
+    uni = np.ones((S, N), dtype=bool)
+    uni[3, 0] = False
+    policy = _policy()
+    rows = list(range(12))
+    slot = float(CAP) / float(policy.n)
+    dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
+    ret = np.asarray(panel.features["ret_21"], dtype=np.float64)
+    close = np.full((S, N), 5000.0)
+    expected = build_targets(policy, _cube(), panel, _scores(mat), uni, rows=rows, capital_krw=CAP, cash_buffer=0.0)
+    carried: frozenset[int] = frozenset()
+    for row in rows:
+        weights, carried = select_row(
+            policy,
+            score_row=np.asarray(mat[row]),
+            universe_row=uni[row],
+            close_row=close[row],
+            dev_row=dev[row],
+            ret_row=ret[row],
+            incumbents=carried,
+            slot_krw=slot,
+        )
+        assert np.array_equal(np.asarray(weights), np.asarray(expected[row]))
+
+
+def test_select_row_empty_candidates_reset_incumbency() -> None:
+    from src.research.policy import select_row
+
+    policy = _policy()
+    slot = float(CAP) / float(policy.n)
+    uni = np.zeros(N, dtype=bool)
+    weights, nxt = select_row(
+        policy,
+        score_row=np.full(N, 0.5),
+        universe_row=uni,
+        close_row=np.full(N, 5000.0),
+        dev_row=np.full(N, 0.05),
+        ret_row=np.full(N, 0.05),
+        incumbents=frozenset({0, 1}),
+        slot_krw=slot,
+    )
+    assert bool(np.all(np.asarray(weights) == 0.0))
+    assert nxt == frozenset()
+    with pytest.raises(ValueError, match="dev_row"):
+        select_row(
+            policy,
+            score_row=np.full(N, 0.5),
+            universe_row=np.ones(N, dtype=bool),
+            close_row=np.full(N, 5000.0),
+            dev_row=None,
+            ret_row=np.full(N, 0.05),
+            incumbents=frozenset(),
+            slot_krw=slot,
+        )
+
+
+def test_select_row_ret_only_leg() -> None:
+    from src.research.policy import select_row
+
+    rng = np.random.default_rng(23)
+    mat = rng.standard_normal((S, N))
+    uni = np.ones((S, N), dtype=bool)
+    policy = _policy(trend_min_dev_ma20=None, trend_min_ret21=0.0)
+    rows = list(range(12))
+    slot = float(CAP) / float(policy.n)
+    ret = np.asarray(_panel().features["ret_21"], dtype=np.float64)
+    close = np.full((S, N), 5000.0)
+    expected = build_targets(policy, _cube(), _panel(), _scores(mat), uni, rows=rows, capital_krw=CAP, cash_buffer=0.0)
+    carried: frozenset[int] = frozenset()
+    for row in rows:
+        weights, carried = select_row(
+            policy,
+            score_row=np.asarray(mat[row]),
+            universe_row=uni[row],
+            close_row=close[row],
+            dev_row=None,
+            ret_row=ret[row],
+            incumbents=carried,
+            slot_krw=slot,
+        )
+        assert np.array_equal(np.asarray(weights), np.asarray(expected[row]))
+    with pytest.raises(ValueError, match="ret_row"):
+        select_row(
+            policy,
+            score_row=np.full(N, 0.5),
+            universe_row=np.ones(N, dtype=bool),
+            close_row=np.full(N, 5000.0),
+            dev_row=None,
+            ret_row=None,
+            incumbents=frozenset(),
+            slot_krw=slot,
+        )
+
+
+def test_build_targets_feature_shape_guards() -> None:
+    mat = _full_scores()
+    uni = np.ones((S, N), dtype=bool)
+    policy = _policy()
+    bad_dev = _panel()
+    bad_dev.features["dev_ma20"] = np.ascontiguousarray(np.zeros((S - 1, N)), dtype=np.float32)
+    with pytest.raises(ValueError, match="match the scores shape"):
+        build_targets(policy, _cube(), bad_dev, _scores(mat), uni, rows=[5], capital_krw=CAP, cash_buffer=0.0)
+    bad_ret = _panel()
+    bad_ret.features["ret_21"] = np.ascontiguousarray(np.zeros((S - 1, N)), dtype=np.float32)
+    with pytest.raises(ValueError, match="match the scores shape"):
+        build_targets(policy, _cube(), bad_ret, _scores(mat), uni, rows=[5], capital_krw=CAP, cash_buffer=0.0)
