@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import requests
 
@@ -14,6 +14,7 @@ from src.config.runtime import load_runtime_config
 from src.config.secrets import read_secret
 from src.core.market_rules import KrxMarket, KrxMarketRules
 from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
+from src.integrations.kis.admission import HostPacedLimiter, SharedTokenStore
 from src.integrations.transport import HttpTransport, RetryPolicy, TokenCache
 
 
@@ -25,6 +26,18 @@ class KisCredentials:
     account_product_code: str
     env: str = "real"
     base_url: str | None = None
+
+    @classmethod
+    def from_pool_slot(cls, slot: int, *, account_no: str = "", account_product_code: str = "01") -> KisCredentials:
+        """Credentials of shared data slot `slot` from KIS_DATA_<slot>_APP_KEY / _APP_SECRET; raises ConfigError when unset."""
+        app_key = read_secret(f"KIS_DATA_{int(slot)}_APP_KEY").strip()
+        app_secret = read_secret(f"KIS_DATA_{int(slot)}_APP_SECRET").strip()
+        return cls(
+            app_key=app_key,
+            app_secret=app_secret,
+            account_no=account_no,
+            account_product_code=account_product_code,
+        )
 
     @classmethod
     def from_env(cls, policy: KisPolicy | None = None, *, env: str | None = None) -> KisCredentials:
@@ -66,6 +79,24 @@ def _default_kis_policy() -> KisPolicy | None:
         return None
 
 
+_RATE_LIMIT_CODE: Final = "EGW00201"
+_TOKEN_REJECTED_CODES: Final = frozenset({"EGW00121", "EGW00123"})
+
+
+def _is_token_rejection(payload: dict[str, Any]) -> bool:
+    return payload.get("rt_cd") not in (None, "0") and str(payload.get("msg_cd", "")) in _TOKEN_REJECTED_CODES
+
+
+class _LimiterPacer:
+    """Adapt HostPacedLimiter to the transport host-pacer hook."""
+
+    def __init__(self, limiter: HostPacedLimiter) -> None:
+        self._limiter = limiter
+
+    def wait_turn(self) -> None:
+        self._limiter.acquire()
+
+
 class KisClient:
     """Korea Investment OpenAPI client (domestic stock)."""
 
@@ -81,6 +112,8 @@ class KisClient:
         token_cache_dir: Path | None = None,
         policy: KisPolicy | None = None,
         min_interval_seconds: float | None = None,
+        limiter: HostPacedLimiter | None = None,
+        token_store: SharedTokenStore | None = None,
     ) -> None:
         self.creds = credentials
         self.timeout = timeout
@@ -91,6 +124,8 @@ class KisClient:
         )
         self._access_token: str | None = None
         self._token_expire_at: datetime | None = None
+        self._limiter = limiter
+        self._token_store = token_store
         resolved_policy = policy if policy is not None else _default_kis_policy()
         if min_interval_seconds is not None:
             pace = float(min_interval_seconds)
@@ -115,12 +150,15 @@ class KisClient:
             session=self.session,
             sleep=lambda seconds: time.sleep(seconds),
             monotonic=lambda: time.monotonic(),
+            host_pacer=_LimiterPacer(limiter) if limiter is not None else None,  # type: ignore[arg-type]
         )
 
     def _sync_session(self) -> None:
         self._transport._session = self.session
 
     def _load_cached_token(self) -> None:
+        if self._token_store is not None:
+            return
         try:
             if not self._token_cache_path.exists():
                 return
@@ -143,6 +181,8 @@ class KisClient:
             return
 
     def _save_cached_token(self, token: str, expire_at: datetime) -> None:
+        if self._token_store is not None:
+            return
         import contextlib
         import json
         import os
@@ -161,7 +201,10 @@ class KisClient:
             with contextlib.suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
 
-    def _request_new_token(self) -> str:
+    def _post_token(self) -> tuple[str, int]:
+        """Issue one token via POST /oauth2/tokenP; returns (access_token, expires_in_seconds)."""
+        if self._limiter is not None:
+            self._limiter.acquire()
         url = f"{self.base_url}/oauth2/tokenP"
         body = {"grant_type": "client_credentials", "appkey": self.creds.app_key, "appsecret": self.creds.app_secret}
         resp = self.session.post(url, json=body, timeout=self.timeout)
@@ -170,15 +213,19 @@ class KisClient:
         raw_token = payload.get("access_token")
         if not raw_token:
             raise ProviderTerminalError(f"Failed to issue token: {payload}", provider="KIS", endpoint="oauth2/tokenP")
-        token = str(raw_token)
-        expires_in = int(payload.get("expires_in", 86400))
+        return str(raw_token), int(payload.get("expires_in", 86400))
+
+    def _request_new_token(self) -> str:
+        token, expires_in = self._post_token()
         expire_at = datetime.now() + timedelta(seconds=max(expires_in - 120, 60))
         self._access_token = token
         self._token_expire_at = expire_at
         self._save_cached_token(token, expire_at)
-        return str(token)
+        return token
 
     def ensure_token(self) -> str:
+        if self._token_store is not None:
+            return self._token_store.ensure(self._post_token)
         if self._access_token and self._token_expire_at and self._token_expire_at > datetime.now() + timedelta(minutes=1):
             return self._access_token
         self._load_cached_token()
@@ -216,6 +263,8 @@ class KisClient:
             return
         msg = str(payload.get("msg1", "Unknown KIS API error"))
         code = str(payload.get("msg_cd", ""))
+        if code == _RATE_LIMIT_CODE:
+            raise ProviderRetryableError(f"KIS API error ({rt_cd}): {msg}", provider="KIS", endpoint=endpoint)
         for retryable in self._retryable_codes:
             if (code and (code == retryable or code.startswith(retryable))) or (msg and msg.startswith(retryable)):
                 raise ProviderRetryableError(f"KIS API error ({rt_cd}): {msg}", provider="KIS", endpoint=endpoint)
@@ -236,28 +285,43 @@ class KisClient:
         if use_hashkey and request_body:
             hashkey = self.get_hashkey(request_body)
         headers = self._headers(tr_id=tr_id, include_auth=include_auth, hashkey=hashkey)
-        parsed: list[dict[str, Any]] = []
         endpoint = path
+        store = self._token_store if include_auth else None
 
-        def _classify(response: requests.Response) -> None:
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise ProviderRetryableError(
-                    f"KIS transient invalid JSON for {endpoint}", provider="KIS", endpoint=endpoint
-                ) from exc
-            if not isinstance(payload, dict):
-                raise ProviderTerminalError(f"KIS response must be an object: {payload}", provider="KIS", endpoint=endpoint)
-            self._classify_business(payload, endpoint=endpoint)
-            parsed.append(payload)
+        def _send(current_headers: dict[str, str], *, defer_token_rejection: bool) -> dict[str, Any]:
+            parsed: list[dict[str, Any]] = []
 
-        self._sync_session()
-        str_params = {str(k): str(v) for k, v in (params or {}).items()}
-        if method.upper() == "GET":
-            self._transport.get(endpoint, str_params, headers=headers, classify=_classify)
-        else:
-            self._transport.post(endpoint, {str(k): v for k, v in request_body.items()}, headers=headers, classify=_classify)
-        return parsed[0]
+            def _classify(response: requests.Response) -> None:
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise ProviderRetryableError(
+                        f"KIS transient invalid JSON for {endpoint}", provider="KIS", endpoint=endpoint
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise ProviderTerminalError(
+                        f"KIS response must be an object: {payload}", provider="KIS", endpoint=endpoint
+                    )
+                if not (defer_token_rejection and _is_token_rejection(payload)):
+                    self._classify_business(payload, endpoint=endpoint)
+                parsed.append(payload)
+
+            self._sync_session()
+            str_params = {str(k): str(v) for k, v in (params or {}).items()}
+            if method.upper() == "GET":
+                self._transport.get(endpoint, str_params, headers=current_headers, classify=_classify)
+            else:
+                self._transport.post(
+                    endpoint, {str(k): v for k, v in request_body.items()}, headers=current_headers, classify=_classify
+                )
+            return parsed[0]
+
+        payload = _send(headers, defer_token_rejection=store is not None)
+        if store is not None and _is_token_rejection(payload):
+            sent_token = headers["authorization"].removeprefix("Bearer ")
+            refreshed = store.ensure(self._post_token, rejected=sent_token)
+            return _send({**headers, "authorization": f"Bearer {refreshed}"}, defer_token_rejection=False)
+        return payload
 
     def get_hashkey(self, data: dict[str, Any]) -> str:
         payload = self._call(method="POST", path="/uapi/hashkey", body=data, include_auth=False)
@@ -279,6 +343,17 @@ class KisClient:
         if not isinstance(out, dict):
             raise ProviderTerminalError(f"KIS inquire_price malformed output: {payload}", provider="KIS", endpoint="inquire-price")
         return out
+
+    def inquire_asking_price_exp_ccn(self, symbol: str) -> dict[str, Any]:
+        """Order book and expected auction price (TR FHKST01010200); returns the raw response."""
+        if not symbol or not symbol.strip():
+            raise ValueError("symbol is required")
+        return self._call(
+            method="GET",
+            path="/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            tr_id="FHKST01010200",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol.strip()},
+        )
 
     def search_stock_info(self, symbol: str) -> dict[str, Any]:
         """Return KIS's stock-basic-information output (``CTPF1002R``) for one ticker."""

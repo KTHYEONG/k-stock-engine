@@ -69,6 +69,9 @@ min_interval_seconds = 1.0
 max_attempts = 3
 # KIS business-level "try later" message codes (msg1 prefix match); anything else is terminal.
 retryable_msg_codes = []
+# Shared-pool data slot (or-vps KIS_DATA_<n> keys); unset disables pool admission.
+pool_slot = 5
+admission_class = "bulk"
 
 [krx]
 api_key_env = "KRX_OPENAPI_KEY"

@@ -462,3 +462,32 @@ def test_document_parser_rejects_bad_sample() -> None:
 
     with pytest.raises(pydantic.ValidationError):
         DocumentParserPolicy(trusted=False, min_precision=0.995, benchmark_sample=0)
+
+
+def test_kis_pool_admission_policy_loads() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import KisPolicy
+
+    provider = _policy()
+    assert provider.kis.pool_slot == 5
+    assert provider.kis.admission_class == "bulk"
+    assert provider.kis.admission_dir_env == "KIS_TOKEN_CACHE_DIR"
+    assert provider.kis.require_shared_admission is False
+
+    with pytest.raises(pydantic.ValidationError):
+        KisPolicy(
+            app_key_env="K",
+            app_secret_env="S",
+            account_no_env="A",
+            account_product_code_env="P",
+            env_env="E",
+            circuit_threshold=3,
+            daily_limit=20000,
+            investor_flow_rows_per_page=30,
+            min_interval_seconds=1.0,
+            max_attempts=3,
+            pool_slot=5,
+            admission_class="ultra",  # type: ignore[arg-type]
+        )
