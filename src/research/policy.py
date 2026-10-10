@@ -16,7 +16,7 @@ from src.research.cube import ResearchCube
 from src.research.model import ScoreMatrix
 from src.research.panel import FeaturePanel
 
-__all__ = ["TrendCashPolicy", "UniverseRule", "build_targets", "decision_rows", "universe_mask"]
+__all__ = ["TrendCashPolicy", "UniverseRule", "build_targets", "decision_rows", "select_row", "universe_mask"]
 
 
 class UniverseRule(BaseModel):
@@ -196,6 +196,86 @@ def decision_rows(
     return tuple(out)
 
 
+def select_row(
+    policy: TrendCashPolicy,
+    *,
+    score_row: NDArray[np.float64],
+    universe_row: NDArray[np.bool_],
+    close_row: NDArray[np.float64],
+    dev_row: NDArray[np.float64] | None,
+    ret_row: NDArray[np.float64] | None,
+    incumbents: frozenset[int],
+    slot_krw: float,
+) -> tuple[NDArray[np.float64], frozenset[int]]:
+    """Target weights of one decision row and the incumbent set to carry to the sleeve's next decision."""
+    n_names = int(np.asarray(score_row).shape[0])
+    uni_row = np.asarray(universe_row, dtype=bool)
+    scores = np.asarray(score_row, dtype=np.float64)
+    units = int(policy.min_units_per_slot)
+    keep_limit = int(float(policy.n) * float(policy.keep_rank_multiple))
+    weight = 1.0 / float(policy.n)
+    dev_enabled = policy.trend_min_dev_ma20 is not None
+    ret_enabled = policy.trend_min_ret21 is not None
+    if dev_enabled and dev_row is None:
+        raise ValueError("dev_row is required when trend_min_dev_ma20 is set")
+    if ret_enabled and ret_row is None:
+        raise ValueError("ret_row is required when trend_min_ret21 is set")
+    dev = None if dev_row is None else np.asarray(dev_row, dtype=np.float64)
+    ret = None if ret_row is None else np.asarray(ret_row, dtype=np.float64)
+    if units > 0:
+        closes = np.asarray(close_row, dtype=np.float64)
+        affordable = (
+            np.isfinite(closes) & (closes > 0.0) & (closes * float(units) <= float(slot_krw))
+        )
+    else:
+        affordable = np.ones(n_names, dtype=bool)
+    idx = np.flatnonzero(uni_row & np.isfinite(scores) & affordable)
+    weights = np.zeros(n_names, dtype=np.float64)
+    if idx.size >= policy.n:
+        ranked = idx[np.argsort(-scores[idx], kind="stable")]
+        position = {int(k): p for p, k in enumerate(ranked)}
+        kept = [
+            int(k) for k in ranked if int(k) in incumbents and position[int(k)] < keep_limit
+        ][: policy.n]
+        kept_set = set(kept)
+        for k in ranked:
+            if len(kept) >= policy.n:
+                break
+            if int(k) not in kept_set:
+                kept_set.add(int(k))
+                kept.append(int(k))
+        kept_arr = np.asarray(kept, dtype=np.int64)
+        if dev_enabled and ret_enabled:
+            assert dev is not None
+            assert ret is not None
+            passing = (
+                np.isfinite(dev[kept_arr])
+                & np.isfinite(ret[kept_arr])
+                & (dev[kept_arr] > float(policy.trend_min_dev_ma20))  # type: ignore[arg-type]
+                & (ret[kept_arr] > float(policy.trend_min_ret21))  # type: ignore[arg-type]
+            )
+        elif dev_enabled:
+            assert dev is not None
+            passing = np.isfinite(dev[kept_arr]) & (
+                dev[kept_arr] > float(policy.trend_min_dev_ma20)  # type: ignore[arg-type]
+            )
+        elif ret_enabled:
+            assert ret is not None
+            passing = np.isfinite(ret[kept_arr]) & (
+                ret[kept_arr] > float(policy.trend_min_ret21)  # type: ignore[arg-type]
+            )
+        else:
+            passing = np.ones(len(kept), dtype=bool)
+        n_pass = int(np.count_nonzero(passing))
+        cap = policy.redistribute_cap_multiple
+        unit = min(1.0 / float(n_pass), float(cap) / float(policy.n)) if cap is not None and n_pass > 0 else weight
+        fail_unit = weight * float(policy.trend_fail_weight_fraction or 0.0)
+        for pos_k, k in enumerate(kept):
+            weights[int(k)] = unit if bool(passing[pos_k]) else fail_unit
+        return np.ascontiguousarray(weights), frozenset(int(k) for k in kept)
+    return np.ascontiguousarray(weights), frozenset()
+
+
 def build_targets(
     policy: TrendCashPolicy,
     cube: ResearchCube,
@@ -252,67 +332,19 @@ def build_targets(
     if not math.isfinite(buffer) or not 0.0 <= buffer < 1.0:
         raise ValueError(f"cash_buffer must satisfy 0 <= cash_buffer < 1, got {cash_buffer!r}")
     slot_krw = float(capital_krw) * (1.0 - buffer) / float(policy.n)
-    units = int(policy.min_units_per_slot)
-    keep_limit = int(float(policy.n) * float(policy.keep_rank_multiple))
-    weight = 1.0 / float(policy.n)
     out: dict[int, NDArray[np.float64]] = {}
-    incumbents: set[int] = set()
+    incumbents: frozenset[int] = frozenset()
     for t in rows:
         row = int(t)
-        uni_row = uni[row]
-        score_row = score_mat[row]
-        if units > 0:
-            close_row = close[row]
-            affordable = (
-                np.isfinite(close_row) & (close_row > 0.0) & (close_row * float(units) <= slot_krw)
-            )
-        else:
-            affordable = np.ones(n_names, dtype=bool)
-        idx = np.flatnonzero(uni_row & np.isfinite(score_row) & affordable)
-        weights = np.zeros(n_names, dtype=np.float64)
-        if idx.size >= policy.n:
-            ranked = idx[np.argsort(-score_row[idx], kind="stable")]
-            position = {int(k): p for p, k in enumerate(ranked)}
-            kept = [
-                int(k) for k in ranked if int(k) in incumbents and position[int(k)] < keep_limit
-            ][: policy.n]
-            kept_set = set(kept)
-            for k in ranked:
-                if len(kept) >= policy.n:
-                    break
-                if int(k) not in kept_set:
-                    kept_set.add(int(k))
-                    kept.append(int(k))
-            kept_arr = np.asarray(kept, dtype=np.int64)
-            if dev_enabled and ret_enabled:
-                assert dev is not None
-                assert ret is not None
-                passing = (
-                    np.isfinite(dev[row, kept_arr])
-                    & np.isfinite(ret[row, kept_arr])
-                    & (dev[row, kept_arr] > float(policy.trend_min_dev_ma20))  # type: ignore[arg-type]
-                    & (ret[row, kept_arr] > float(policy.trend_min_ret21))  # type: ignore[arg-type]
-                )
-            elif dev_enabled:
-                assert dev is not None
-                passing = np.isfinite(dev[row, kept_arr]) & (
-                    dev[row, kept_arr] > float(policy.trend_min_dev_ma20)  # type: ignore[arg-type]
-                )
-            elif ret_enabled:
-                assert ret is not None
-                passing = np.isfinite(ret[row, kept_arr]) & (
-                    ret[row, kept_arr] > float(policy.trend_min_ret21)  # type: ignore[arg-type]
-                )
-            else:
-                passing = np.ones(len(kept), dtype=bool)
-            n_pass = int(np.count_nonzero(passing))
-            cap = policy.redistribute_cap_multiple
-            unit = min(1.0 / float(n_pass), float(cap) / float(policy.n)) if cap is not None and n_pass > 0 else weight
-            fail_unit = weight * float(policy.trend_fail_weight_fraction or 0.0)
-            for pos_k, k in enumerate(kept):
-                weights[int(k)] = unit if bool(passing[pos_k]) else fail_unit
-            incumbents = set(kept)
-        else:
-            incumbents = set()
-        out[row] = np.ascontiguousarray(weights)
+        weights, incumbents = select_row(
+            policy,
+            score_row=score_mat[row],
+            universe_row=uni[row],
+            close_row=close[row],
+            dev_row=None if dev is None else dev[row],
+            ret_row=None if ret is None else ret[row],
+            incumbents=incumbents,
+            slot_krw=slot_krw,
+        )
+        out[row] = weights
     return out
