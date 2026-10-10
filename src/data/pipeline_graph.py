@@ -1381,13 +1381,18 @@ def _run_kis_flow_collection_step(
     provider = load_provider_policy(runtime_config)
     collector = None
     if not dry_run:  # pragma: no cover - live provider path
-        collector = KisInvestorFlowCollector(
-            client=KisClient(
-                KisCredentials.from_env(provider.kis),
-                token_cache_dir=Path(runtime_config.logs_root),
-                policy=provider.kis,
+        if provider.kis.pool_slot is not None:
+            from src.integrations.kis import build_pool_client
+
+            collector = KisInvestorFlowCollector(client=build_pool_client(provider.kis))
+        else:
+            collector = KisInvestorFlowCollector(
+                client=KisClient(
+                    KisCredentials.from_env(provider.kis),
+                    token_cache_dir=Path(runtime_config.logs_root),
+                    policy=provider.kis,
+                )
             )
-        )
     job_ctx = build_kis_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
     try:
         report = run_job(
