@@ -31,6 +31,9 @@ EXPECTED_KINDS = (
     "industry",
     "financial_facts",
     "daily_market",
+    "hedge_series",
+    "trend_series",
+    "cash_series",
     "dividend_events",
     "earnings_releases",
     "investor_flow_ls",
@@ -134,6 +137,39 @@ def _daily_payload(session: date, *, close: int = 70000, change: int = 700) -> d
     }
 
 
+def _index_series_payload(session: date, *, index_level: float = 1000.5, inverse_close: int = 5000) -> dict[str, object]:
+    stamp = session.strftime("%Y%m%d")
+    return {
+        "session": session.isoformat(),
+        "records": [
+            {"_endpoint": "index", "BAS_DD": stamp, "CLSPRC_IDX": repr(index_level)},
+            {"_endpoint": "etf", "BAS_DD": stamp, "TDD_CLSPRC": str(inverse_close)},
+        ],
+    }
+
+
+def _cash_series_payload(session: date, *, cash_close: int = 55000) -> dict[str, object]:
+    return {
+        "session": session.isoformat(),
+        "records": [
+            {"_endpoint": "etf", "ISU_CD": "153130", "BAS_DD": session.strftime("%Y%m%d"),
+             "TDD_CLSPRC": str(cash_close)},
+        ],
+    }
+
+
+def _seed_series_receipt(
+    catalog: ReceiptCatalog, bronze_root: Path, *, source: str, prefix: str,
+    payload: dict[str, object], session: date, retrieved_at: datetime,
+) -> None:
+    path = bronze_root / "catalog-payloads" / f"{prefix}-{session.isoformat()}.json"
+    path.write_text(json.dumps(payload, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    _publish_catalog_entry(
+        catalog, source=source, key=session.isoformat(), as_of=session,
+        payload_path=path, retrieved_at=retrieved_at,
+    )
+
+
 def _fixture_context(tmp_path: Path) -> RefreshContext:
     runtime = _scope_runtime(tmp_path)
     bronze_root = runtime.workspace.bronze_root
@@ -152,6 +188,19 @@ def _fixture_context(tmp_path: Path) -> RefreshContext:
         _publish_catalog_entry(
             catalog, source="krx_daily_market", key=session.isoformat(), as_of=session,
             payload_path=daily_path, retrieved_at=retrieved,
+        )
+        _seed_series_receipt(
+            catalog, bronze_root, source="krx_hedge_series", prefix="hedge",
+            payload=_index_series_payload(session), session=session, retrieved_at=retrieved,
+        )
+        _seed_series_receipt(
+            catalog, bronze_root, source="krx_trend_series", prefix="trend",
+            payload=_index_series_payload(session, index_level=2500.25, inverse_close=12000),
+            session=session, retrieved_at=retrieved,
+        )
+        _seed_series_receipt(
+            catalog, bronze_root, source="krx_cash_series", prefix="cash",
+            payload=_cash_series_payload(session), session=session, retrieved_at=retrieved,
         )
         _ = position
     _write_bronze_receipt(
@@ -530,11 +579,13 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 11
+    assert len(report.collection) == 14
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
         "earnings_releases",
-        "krx_daily_market", "krx_security_master", "kind_notice_search", "kind_notice_documents",
+        "krx_daily_market", "krx_security_master",
+        "krx_hedge_series", "krx_trend_series", "krx_cash_series",
+        "kind_notice_search", "kind_notice_documents",
         "ls_investor_flow", "kis_investor_flow",
     }
 
@@ -806,10 +857,12 @@ def test_refresh_scope_command_collect_dry_run_and_blocked(
     real_refresh_scope = pipeline_graph.refresh_scope
 
     def _blocked(
-        ctx: RefreshContext, *, collect: bool, dry_run: bool, emit: object, steps: object = None
+        ctx: RefreshContext, *, collect: bool, dry_run: bool, emit: object, steps: object = None,
+        collect_steps: object = None,
     ) -> object:
         assert collect
         assert not dry_run
+        assert collect_steps is None
         return real_refresh_scope(
             ctx, collect=False, dry_run=True, emit=emit,
         ).__class__(
@@ -1153,3 +1206,209 @@ def test_earnings_preview_equals_built_identity(tmp_path: Path) -> None:
     built = graph_module._build_earnings_releases(ctx, {})
 
     assert built.dataset_id == dataset_id_for(expected)
+
+
+def test_series_preview_equals_built_identity(tmp_path: Path) -> None:
+    """Each series preview is exactly the identity its build publishes."""
+    import src.data.pipeline_graph as graph_module
+    from src.data.datasets import dataset_id_for
+
+    ctx = _fixture_context(tmp_path)
+    universe_id = graph_module._build_ordinary_universe(ctx, {}).dataset_id
+    ctx.registry.register("ordinary_universe", universe_id)
+    for preview_fn, build_fn in (
+        (graph_module._preview_hedge_series, graph_module._build_hedge_series),
+        (graph_module._preview_trend_series, graph_module._build_trend_series),
+        (graph_module._preview_cash_series, graph_module._build_cash_series),
+    ):
+        built = build_fn(ctx, {"ordinary_universe": universe_id})
+        assert built.dataset_id == dataset_id_for(preview_fn(ctx))
+
+
+def test_series_preview_gap_replans_series(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing series page fails the preview closed, so the series is rebuilt."""
+    ctx = _built_fixture(tmp_path)
+    real_latest = ctx.catalog.latest
+
+    def _gapped(*, source: str, natural_keys: object) -> object:
+        result = real_latest(source=source, natural_keys=natural_keys)  # type: ignore[arg-type]
+        if source == "krx_hedge_series":
+            result = {key: entry for key, entry in result.items() if key != SESSIONS[0].isoformat()}
+        return result
+
+    monkeypatch.setattr(ctx.catalog, "latest", _gapped)
+    assert [node.kind for node in plan_refresh(ctx)] == ["hedge_series"]
+
+
+def test_series_preview_conflict_replans_series(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A series receipt filed under the wrong session fails the preview closed."""
+    from dataclasses import replace
+
+    ctx = _built_fixture(tmp_path)
+    real_latest = ctx.catalog.latest
+
+    def _conflicted(*, source: str, natural_keys: object) -> object:
+        result = dict(real_latest(source=source, natural_keys=natural_keys))  # type: ignore[arg-type]
+        if source == "krx_cash_series":
+            key = SESSIONS[0].isoformat()
+            result[key] = replace(result[key], as_of=SESSIONS[1])
+        return result
+
+    monkeypatch.setattr(ctx.catalog, "latest", _conflicted)
+    assert [node.kind for node in plan_refresh(ctx)] == ["cash_series"]
+
+
+def test_refresh_scope_collect_steps_runs_only_named(
+    tmp_path: Path,
+) -> None:
+    """A step filter runs only the named steps, in default order, and still plans."""
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+
+    def _stub(name: str) -> object:
+        def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+            calls.append(name)
+            return CollectionStepReport(job=name, status="complete", done=1, pending_left=0, requests_used=0)
+
+        return (name, _step)
+
+    import src.data.pipeline_graph as pipeline_graph
+
+    steps = tuple(_stub(name) for name, _ in pipeline_graph._default_collection_steps())  # type: ignore[misc]
+    report = refresh_scope(
+        ctx, collect=True, dry_run=True, emit=lambda payload: None,
+        steps=steps,  # type: ignore[arg-type]
+        collect_steps=frozenset({"krx_daily_market", "krx_security_master"}),
+    )
+    assert calls == ["krx_daily_market", "krx_security_master"]
+    assert report.status == "dry_run"
+    assert report.planned == EXPECTED_KINDS
+
+
+def test_refresh_scope_collect_steps_rejects_unknown(tmp_path: Path) -> None:
+    """An unknown step name fails before any collection runs."""
+    import src.data.pipeline_graph as pipeline_graph
+
+    ctx = _built_fixture(tmp_path)
+    calls: list[str] = []
+
+    def _stub(name: str) -> object:
+        def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+            calls.append(name)
+            return CollectionStepReport(job=name, status="complete", done=1, pending_left=0, requests_used=0)
+
+        return (name, _step)
+
+    steps = tuple(_stub(name) for name, _ in pipeline_graph._default_collection_steps())  # type: ignore[misc]
+    with pytest.raises(ValueError, match="unknown collection steps"):
+        refresh_scope(
+            ctx, collect=True, dry_run=True, emit=lambda payload: None,
+            steps=steps,  # type: ignore[arg-type]
+            collect_steps=frozenset({"nope"}),
+        )
+    assert calls == []
+
+
+def test_refresh_scope_command_collect_steps_requires_collect(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from src.data.cli import main
+
+    _fixture_context(tmp_path)
+    assert main([
+        "refresh-scope",
+        "--scope-config", "config/research/kr_swing_2019_v1.toml",
+        "--data-root", str(tmp_path / "data"),
+        "--collect-steps", "krx_daily_market",
+    ]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]
+
+
+def test_refresh_scope_command_collect_steps_filters(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from src.data.cli import main
+
+    _built_fixture(tmp_path)
+    assert main([
+        "refresh-scope",
+        "--scope-config", "config/research/kr_swing_2019_v1.toml",
+        "--data-root", str(tmp_path / "data"),
+        "--collect", "--dry-run",
+        "--collect-steps", "krx_daily_market,krx_security_master",
+    ]) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    summary = lines[-1]
+    assert summary["type"] == "summary"
+    assert {step["job"] for step in summary["collection"]} == {"krx_daily_market", "krx_security_master"}
+
+
+@pytest.mark.parametrize("selected", [frozenset(), frozenset({"kis_investor_flow"})])
+def test_filtered_empty_collection_phase_does_not_block(
+    tmp_path: Path, selected: frozenset[str],
+) -> None:
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+
+    def _kis(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        calls.append("kis_investor_flow")
+        assert inner_ctx.registry.require("investor_flow_ls")
+        return CollectionStepReport("kis_investor_flow", "complete", 0, 0, 0)
+
+    report = refresh_scope(
+        ctx, collect=True, dry_run=False, emit=lambda payload: None,
+        steps=(("kis_investor_flow", _kis),), collect_steps=selected,
+    )
+    assert report.status == "complete"
+    assert report.blocking_job is None
+    assert report.built == EXPECTED_KINDS
+    assert calls == (["kis_investor_flow"] if selected else [])
+
+
+@pytest.mark.parametrize("bridge_present", [False, True])
+def test_facts_preview_matches_build_with_optional_bridge(
+    tmp_path: Path, bridge_present: bool,
+) -> None:
+    from dataclasses import replace
+
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    if not bridge_present:
+        root = ctx.runtime.workspace.bronze_root
+        (root / "dart_corp_codes").rename(root / "unused_bridge")
+    built = graph._build_financial_facts(ctx, {})
+    later = replace(ctx, decision_time=ctx.decision_time + timedelta(days=1))
+    assert graph._expected_matches_registered(graph._preview_financial_facts(later), built.path)
+
+
+def test_facts_preview_skips_symlinked_disclosures(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+    from src.data.datasets import dataset_digest, load_manifest
+
+    ctx = _fixture_context(tmp_path)
+    silver = ctx.runtime.workspace.silver_root
+    candidate = next(path for path in silver.glob("disclosures_*") if "invalid" not in path.name)
+    target = tmp_path / candidate.name
+    candidate.rename(target)
+    candidate.symlink_to(target, target_is_directory=True)
+    built = graph._build_financial_facts(ctx, {})
+    preview = graph._preview_financial_facts(ctx)
+    assert preview.inputs["disclosures"] == dataset_digest([])
+    assert preview.inputs == load_manifest(built.path).inputs
+
+
+def test_facts_preview_rejects_unreadable_present_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.data import incremental_normalization as inc
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+
+    def _unreadable(**kwargs: object) -> object:
+        raise PITDataError("bridge unreadable")
+
+    monkeypatch.setattr(inc, "load_frozen_dart_ticker_bridge", _unreadable)
+    with pytest.raises(PITDataError, match="bridge unreadable"):
+        graph._preview_financial_facts(ctx)

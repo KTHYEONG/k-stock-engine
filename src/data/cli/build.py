@@ -84,6 +84,10 @@ def _add_refresh(parser: argparse.ArgumentParser) -> None:
     add_scoped_args(parser)
     parser.add_argument("--collect", action="store_true", help="Run collection jobs before building")
     parser.add_argument("--dry-run", action="store_true", help="Report stale nodes and pending counts only")
+    parser.add_argument(
+        "--collect-steps", type=str, required=False, default=None,
+        help="Comma-separated collection step names to run (requires --collect)",
+    )
 
 
 def _add_kis_supplement(parser: argparse.ArgumentParser) -> None:
@@ -266,9 +270,15 @@ def _run_refresh(args: argparse.Namespace) -> Mapping[str, object]:
 
     runtime = scoped_runtime(args)
     ctx = build_refresh_context(runtime)
+    raw_steps = getattr(args, "collect_steps", None)
+    selected: frozenset[str] | None = None
+    if raw_steps is not None:
+        if not bool(getattr(args, "collect", False)):
+            raise ValueError("refresh-scope --collect-steps requires --collect")
+        selected = frozenset(part.strip() for part in str(raw_steps).split(",") if part.strip())
     report = refresh_scope(
         ctx, collect=bool(getattr(args, "collect", False)), dry_run=bool(getattr(args, "dry_run", False)),
-        emit=lambda payload: emit(dict(payload)),
+        emit=lambda payload: emit(dict(payload)), collect_steps=selected,
     )
     summary = {
         "type": "summary", "status": report.status, "planned": list(report.planned), "built": list(report.built),
