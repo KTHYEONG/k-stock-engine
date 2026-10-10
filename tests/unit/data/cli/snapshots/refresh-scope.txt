@@ -1,5 +1,6 @@
 usage: cli.py refresh-scope [-h] [--scope-config SCOPE_CONFIG]
                             [--data-root DATA_ROOT] [--collect] [--dry-run]
+                            [--collect-steps COLLECT_STEPS]
 
 options:
   -h, --help            show this help message and exit
@@ -7,3 +8,6 @@ options:
   --data-root DATA_ROOT
   --collect             Run collection jobs before building
   --dry-run             Report stale nodes and pending counts only
+  --collect-steps COLLECT_STEPS
+                        Comma-separated collection step names to run (requires
+                        --collect)

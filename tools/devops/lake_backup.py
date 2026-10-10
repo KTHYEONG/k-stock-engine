@@ -14,7 +14,6 @@ import argparse
 import fcntl
 import json
 import logging
-import os
 import shutil
 import sys
 import tempfile
@@ -27,6 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from src.config.secrets import read_secret  # noqa: E402
 from src.data.lake_backup import BackupSource, LocalDirStore, RcloneStore, push, restore, verify  # noqa: E402
 
 DEFAULT_CONFIG = REPO / "config" / "data" / "lake_backup.toml"
@@ -83,7 +83,7 @@ def main() -> int:
     if args.command == "restore" and (args.dest is None or len(sources) != 1):
         raise SystemExit("restore needs exactly one --source (or --root) and --dest")
 
-    lock_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    lock_dir = Path(read_secret("XDG_RUNTIME_DIR", default=tempfile.gettempdir()))
     rc = 0
     results: dict[str, object] = {}
     with open(lock_dir / "quant-gdrive.lock", "w") as lock:
