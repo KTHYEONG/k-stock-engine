@@ -359,3 +359,32 @@ def test_fail_closed_on_malformed_blobs(tmp_path: Path) -> None:
             materialize_investor_flow_silver(
                 catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
             )
+
+
+def test_packed_bronze_builds_identical_flow(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.payload_store import pack_loose
+
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload(
+            "005930", [_row("20260304"), _row("20260305"), _row("20260306")],
+            start="2026-03-04", end="2026-03-05",
+        ),
+    )
+    first = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    pack_loose(bronze_root, kinds=["investor_flow"], offsite_paths=None, remove=True)
+    silver2 = tmp_path / "silver2"
+    _write_universe(silver2)
+    second = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=silver2, silver_root=silver2, workers=1
+    )
+    assert first.dataset_id == second.dataset_id
+    assert [
+        (partition.path, partition.sha256) for partition in load_manifest(first.dataset_path).partitions
+    ] == [
+        (partition.path, partition.sha256) for partition in load_manifest(second.dataset_path).partitions
+    ]

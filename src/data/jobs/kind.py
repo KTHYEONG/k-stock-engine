@@ -21,6 +21,7 @@ from src.core.pit import EvidenceKind, PITDataError
 from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE, KIND_NOTICE_SEARCH_SOURCE
 from src.data.jobs.dart import disclosure_windows
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from src.data.runtime import DataRuntime
 from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRawPayload
@@ -72,8 +73,8 @@ def normalize_kind_title(title: str) -> str:
 
 def _read_search_document(entry_content_hash: str, payload_path: Path) -> dict[str, object]:
     try:
-        raw = Path(payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"retained KIND search payload is missing for {entry_content_hash[:12]}") from exc
     if hashlib.sha256(raw).hexdigest() != entry_content_hash:
         raise PITDataError(f"retained KIND search payload hash mismatch for {entry_content_hash[:12]}")

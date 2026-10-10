@@ -14,7 +14,15 @@ import polars as pl
 
 from src.core.pit import BronzeReceipt, EvidenceKind, PITDataError
 from src.core.time import KRX_TZ
-from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
+from src.data.datasets import (
+    DatasetIdentity,
+    DatasetLayer,
+    dataset_digest,
+    file_sha256,
+    load_manifest,
+    publish_dataset,
+)
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 
 REVISION = "krx-ordinary-equity-v1"
@@ -79,8 +87,8 @@ def ordinary_universe_snapshot(receipt: BronzeReceipt) -> OrdinaryUniverseSnapsh
     if receipt.kind is not EvidenceKind.SECURITY_MASTER:
         raise PITDataError("expected security_master Bronze receipt")
     try:
-        raw = receipt.payload_path.read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(receipt.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError("security_master Bronze payload is unreadable") from exc
     if hashlib.sha256(raw).hexdigest() != receipt.content_hash:
         raise PITDataError("security_master Bronze hash mismatch")
@@ -190,13 +198,6 @@ def catalog_master_receipts(
         if entry.as_of != session:
             raise PITDataError(f"security_master catalog date conflicts for {session}")
         payload_path = Path(entry.payload_path)
-        if not payload_path.is_file():
-            raise PITDataError(f"security_master catalog payload is missing for {session}")
-        try:
-            if hashlib.sha256(payload_path.read_bytes()).hexdigest() != entry.content_hash:
-                raise PITDataError(f"security_master catalog hash mismatch for {session}")
-        except OSError as exc:
-            raise PITDataError(f"security_master catalog payload is missing for {session}") from exc
         receipts.append(
             BronzeReceipt(
                 kind=EvidenceKind.SECURITY_MASTER,
@@ -283,11 +284,55 @@ def catalog_master_sessions(catalog: ReceiptCatalog) -> tuple[date, ...]:
 
 
 def materialize_ordinary_universe_from_catalog(
-    *, catalog: ReceiptCatalog, sessions: Iterable[date], silver_root: Path
+    *, catalog: ReceiptCatalog, sessions: Iterable[date], silver_root: Path, reuse_from: Path | None = None
 ) -> Path:
-    """Materialize the ordinary-share Silver dataset from scope receipt state."""
+    """Publish the ordinary-universe Silver; unchanged sessions may be copied from the dataset at reuse_from."""
+    requested = tuple(sessions)
+    receipts = catalog_master_receipts(catalog, sessions=requested)
+    by_session = dict(zip(sorted(set(requested)), receipts, strict=True))
+    current = {session: receipt.content_hash for session, receipt in by_session.items()}
+    reused = _reusable_session_frames(reuse_from, current)
+    ordered: list[OrdinaryUniverseSnapshot] = []
+    for session in sorted(by_session):
+        frame = reused.get(session)
+        if frame is not None:
+            ordered.append(OrdinaryUniverseSnapshot(session, current[session], frame))
+        else:
+            ordered.append(ordinary_universe_snapshot(by_session[session]))
+    return write_ordinary_universe_silver(ordered, root=silver_root)
 
-    receipts = catalog_master_receipts(catalog, sessions=sessions)
-    return write_ordinary_universe_silver(
-        (ordinary_universe_snapshot(receipt) for receipt in receipts), root=silver_root
-    )
+
+def _reusable_session_frames(reuse_from: Path | None, current: dict[date, str]) -> dict[date, pl.DataFrame]:
+    """Prior-session frames whose manifest entry verifies and whose source is unchanged."""
+    if reuse_from is None:
+        return {}
+    try:
+        manifest = load_manifest(Path(reuse_from))
+    except PITDataError:
+        return {}
+    if manifest.kind != "ordinary_universe" or manifest.policy_version != REVISION:
+        return {}
+    raw_partitions = manifest.details.get("partitions")
+    if not isinstance(raw_partitions, list):
+        return {}
+    recorded: dict[str, str] = {}
+    for item in raw_partitions:
+        if not isinstance(item, dict) or not isinstance(item.get("session"), str) or not isinstance(item.get("source_hash"), str):
+            return {}
+        recorded[str(item["session"])] = str(item["source_hash"])
+    expected_sha = {partition.path: partition.sha256 for partition in manifest.partitions}
+    reused: dict[date, pl.DataFrame] = {}
+    for session, source_hash in current.items():
+        if recorded.get(session.isoformat()) != source_hash:
+            continue
+        relative_path = f"session={session.isoformat()}/part.parquet"
+        if expected_sha.get(relative_path) is None:
+            continue
+        path = Path(reuse_from) / relative_path
+        try:
+            if file_sha256(path) != expected_sha[relative_path]:
+                continue
+            reused[session] = pl.read_parquet(path)
+        except Exception:  # noqa: S112 - an unverifiable prior partition is rebuilt from payloads
+            continue
+    return reused

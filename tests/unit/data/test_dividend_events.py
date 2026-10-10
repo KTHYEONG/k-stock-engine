@@ -796,3 +796,25 @@ def test_decision_from_envelope_passes_report_title(tmp_path: Path) -> None:
 
     assert decision.is_correction is True
     assert decision.dps_common_krw == 100
+
+
+def test_packed_bronze_builds_identical_dividend_events(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.payload_store import pack_loose
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    first = materialize_dividend_events(
+        catalog=catalog, silver_root=tmp_path / "silver", calendar=_calendar()
+    )
+    pack_loose(bronze, kinds=["dart_corp_codes", "corporate_actions"], offsite_paths=None, remove=True)
+    second = materialize_dividend_events(
+        catalog=_catalog_for(bronze), silver_root=tmp_path / "silver2", calendar=_calendar()
+    )
+    assert load_manifest(first).dataset_id == load_manifest(second).dataset_id
+    assert [
+        (partition.path, partition.sha256) for partition in load_manifest(first).partitions
+    ] == [
+        (partition.path, partition.sha256) for partition in load_manifest(second).partitions
+    ]

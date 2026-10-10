@@ -27,6 +27,7 @@ from src.data.datasets import (
     universe_sessions,
 )
 from src.data.evidence_sources import KRX_HEDGE_SERIES_SOURCE, KRX_TREND_SERIES_SOURCE
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
 REVISION: Final = "krx-hedge-series-v1"
@@ -118,8 +119,8 @@ def _resolve_universe(universe_root: Path, dataset_id: str | None) -> tuple[str,
 
 def _load_session_payload(entry: ReceiptIndexEntry, session: date) -> list[Any]:
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"KRX hedge series payload is unreadable for {session}") from exc
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError(f"KRX hedge series hash mismatch for {session}")

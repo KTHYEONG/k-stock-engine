@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
@@ -29,6 +32,7 @@ from src.data.kind_notices import (
     read_kind_document,
     require_kind_coverage,
 )
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
 
 __all__ = [
@@ -207,25 +211,37 @@ def _resolve_available_at(announced_on: date, *, calendar: SessionCalendar) -> d
 
 
 def _load_daily_flag_rows(
-    catalog: ReceiptCatalog, calendar: SessionCalendar
+    catalog: ReceiptCatalog, calendar: SessionCalendar, *, flag_cache: Path | None = None
 ) -> dict[date, dict[str, bool]]:
     """Map each covered session to ``{ticker: flagged}`` from raw daily pages.
 
     Only the ``SECT_TP_NM`` administrative flag values are interpreted; prices,
-    volumes and limits are never read here.
+    volumes and limits are never read here. When ``flag_cache`` is given,
+    sessions whose cached ``source_hash`` matches the catalog are served from
+    the cache without reading any payload; missing or mismatching sessions are
+    parsed and the cache is atomically rewritten.
     """
     sessions = [session.astimezone(KRX_TZ).date() for session in calendar.sessions]
     entries = catalog.latest(
         source=KRX_DAILY_MARKET_SOURCE, natural_keys={day.isoformat() for day in sessions}
     )
+    cached: dict[date, tuple[str, dict[str, bool]]] = {}
+    if flag_cache is not None:
+        cached = _read_flag_cache(flag_cache)
     by_session: dict[date, dict[str, bool]] = {}
+    dirty = False
     for day in sessions:
         entry = entries.get(day.isoformat())
         if entry is None:
             continue
+        hit = cached.get(day)
+        if hit is not None and hit[0] == entry.content_hash:
+            by_session[day] = dict(hit[1])
+            continue
+        dirty = True
         try:
-            raw = Path(entry.payload_path).read_bytes()
-        except OSError as exc:
+            raw = read_payload(Path(entry.payload_path))
+        except (OSError, PITDataError) as exc:
             raise PITDataError(f"KRX daily market payload is unreadable for {day}") from exc
         if hashlib.sha256(raw).hexdigest() != entry.content_hash:
             raise PITDataError(f"KRX daily market hash mismatch for {day}")
@@ -249,7 +265,81 @@ def _load_daily_flag_rows(
             flagged = str(record.get("SECT_TP_NM") or "").strip() in _ADMIN_FLAG_VALUES
             flags[ticker] = flags.get(ticker, False) or flagged
         by_session[day] = flags
+    if flag_cache is not None and (dirty or not Path(flag_cache).is_file()):
+        _write_flag_cache(
+            flag_cache,
+            {
+                day: (entries[day.isoformat()].content_hash, flags)
+                for day, flags in by_session.items()
+            },
+        )
     return by_session
+
+
+def _read_flag_cache(path: Path) -> dict[date, tuple[str, dict[str, bool]]]:
+    """Cached per-session flags, or empty when the cache is missing or unreadable."""
+    try:
+        frame = pl.read_parquet(path)
+    except Exception:
+        return {}
+    if not {"session", "source_hash", "ticker", "flagged"}.issubset(set(frame.columns)):
+        return {}
+    cached: dict[date, tuple[str, dict[str, bool]]] = {}
+    covered: set[date] = set()
+    for row in frame.iter_rows(named=True):
+        session = row.get("session")
+        source = row.get("source_hash")
+        if not isinstance(session, date) or not isinstance(source, str) or not source:
+            return {}
+        if session not in cached:
+            cached[session] = (source, {})
+        elif cached[session][0] != source:
+            return {}
+        ticker = row.get("ticker")
+        if ticker is None:
+            covered.add(session)
+            continue
+        flags = cached[session][1]
+        flags[str(ticker)] = flags.get(str(ticker), False) or bool(row.get("flagged"))
+    return {session: value for session, value in cached.items() if session in covered}
+
+
+def _write_flag_cache(path: Path, flags: dict[date, tuple[str, dict[str, bool]]]) -> None:
+    """Atomically rewrite the per-session flag cache."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    for session in sorted(flags):
+        source_hash, tickers = flags[session]
+        rows.append({"session": session, "source_hash": source_hash, "ticker": None, "flagged": False})
+        rows.extend(
+            {"session": session, "source_hash": source_hash, "ticker": ticker, "flagged": bool(tickers[ticker])}
+            for ticker in sorted(tickers)
+        )
+    frame = (
+        pl.DataFrame(
+            rows,
+            schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+        )
+        if rows
+        else pl.DataFrame(
+            [],
+            schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+        )
+    )
+    fd = -1
+    tmp_name = ""
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+        os.close(fd)
+        frame.write_parquet(tmp_name)
+        os.rename(tmp_name, target)
+    except (OSError, ValueError) as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise PITDataError(f"daily flag cache cannot be written: {target}") from exc
 
 
 def _resolve_kind_available_at(disclosed_at: datetime, *, calendar: SessionCalendar) -> datetime:
@@ -298,10 +388,12 @@ def materialize_market_actions(
     bridge: Mapping[str, str],
     kind_keywords: Sequence[str],
     kind_coverage_start: date,
+    flag_cache: Path | None = None,
 ) -> Path:
     """Publish ``market_actions_<hash16>`` from three point-in-time channels: DART exchange
     notices (date precision), KIND exchange notices and forms (minute precision), and KOSDAQ
-    daily administrative flags. KIND fills KOSPI notices DART does not carry.
+    daily administrative flags. KIND fills KOSPI notices DART does not carry. Per-session
+    admin flags may be served from the cache file at flag_cache.
 
     Columns: ``instrument_id``, ``ticker``, ``kind``, ``source`` (``"dart"``, ``"kind"``,
     ``"krx_flag"``), ``rcept_no``, ``announced_on`` (KST date), ``available_at`` (open of the
@@ -318,6 +410,8 @@ def materialize_market_actions(
         kind_coverage_start: First day of the KIND collection windows (the scope's evidence
             start). Window keys are anchored here exactly as the collector anchors them, so the
             coverage check addresses the same receipts the collector wrote.
+        flag_cache: Optional Parquet cache of per-session admin flags; sessions whose cached
+            source matches the catalog are served without reading payloads.
 
     Returns:
         The published dataset directory.
@@ -328,7 +422,7 @@ def materialize_market_actions(
     """
     if len(calendar.sessions) < 2:
         raise PITDataError("market actions require at least two certified sessions")
-    flag_pages = _load_daily_flag_rows(catalog, calendar)
+    flag_pages = _load_daily_flag_rows(catalog, calendar, flag_cache=flag_cache)
     covered_days = sorted(flag_pages)
     # 달력은 다음 해 말까지 이어지므로 커버리지 기준일은 달력 끝이 아니라 실제 관측한 마지막 거래일이다.
     if kind_keywords and not covered_days:

@@ -27,6 +27,7 @@ from src.data.datasets import (
     read_dataset,
 )
 from src.data.evidence_sources import EARNINGS_RELEASE_SOURCE
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
 from src.integrations.dart.earnings_release import (
     EarningsRelease,
@@ -86,8 +87,8 @@ def _iter_release_envelopes(catalog: ReceiptCatalog) -> list[dict[str, Any]]:
     for blob in catalog.blobs(source=EARNINGS_RELEASE_SOURCE, usable=True):
         path = Path(blob.payload_path)
         try:
-            raw = path.read_bytes()
-        except OSError as exc:
+            raw = read_payload(path)
+        except (OSError, PITDataError) as exc:
             raise PITDataError(f"earnings-release Bronze payload is unreadable: {path}") from exc
         if hashlib.sha256(raw).hexdigest() != blob.content_hash:
             raise PITDataError(f"earnings-release Bronze hash mismatch: {path}")

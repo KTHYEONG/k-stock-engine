@@ -20,10 +20,13 @@ from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
     dataset_reference,
+    file_sha256,
+    load_manifest,
     publish_dataset,
     resolve_bronze_digest,
     universe_sessions,
 )
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 
 REVISION = "krx-daily-market-v1"
@@ -167,8 +170,8 @@ def _resolve_universe(universe_root: Path, dataset_id: str | None) -> tuple[str,
 
 def _load_session_payload(entry: ReceiptIndexEntry, session: date) -> list[Any]:
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"KRX daily market payload is unreadable for {session}") from exc
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError(f"KRX daily market hash mismatch for {session}")
@@ -184,6 +187,67 @@ def _load_session_payload(entry: ReceiptIndexEntry, session: date) -> list[Any]:
     return records
 
 
+def _universe_partition_shas(universe_root: Path, universe_dataset_id: str) -> dict[str, str]:
+    """Manifest partition digests of the resolved universe keyed by session isoformat."""
+    manifest = load_manifest(Path(universe_root) / universe_dataset_id)
+    shas: dict[str, str] = {}
+    for partition in manifest.partitions:
+        marker = "session="
+        if marker not in partition.path:
+            continue
+        shas[partition.path.split(marker, 1)[1].split("/", 1)[0]] = partition.sha256
+    return shas
+
+
+def _reusable_daily_frames(
+    reuse_from: Path | None,
+    current: dict[str, str],
+    universe_shas: dict[str, str],
+    expected_params: dict[str, object],
+) -> dict[date, pl.DataFrame]:
+    """Prior-session frames whose manifest entry verifies and whose inputs are unchanged."""
+    if reuse_from is None:
+        return {}
+    try:
+        manifest = load_manifest(Path(reuse_from))
+    except PITDataError:
+        return {}
+    if manifest.kind != "daily_market" or manifest.policy_version != REVISION:
+        return {}
+    if dict(manifest.params) != dict(expected_params):
+        return {}
+    raw_partitions = manifest.details.get("partitions")
+    if not isinstance(raw_partitions, list):
+        return {}
+    recorded: dict[str, tuple[str, str | None]] = {}
+    for item in raw_partitions:
+        if not isinstance(item, dict) or not isinstance(item.get("session"), str) or not isinstance(item.get("source_hash"), str):
+            return {}
+        universe_sha = item.get("universe_sha")
+        if universe_sha is not None and not isinstance(universe_sha, str):
+            return {}
+        recorded[str(item["session"])] = (str(item["source_hash"]), str(universe_sha) if universe_sha is not None else None)
+    expected_sha = {partition.path: partition.sha256 for partition in manifest.partitions}
+    reused: dict[date, pl.DataFrame] = {}
+    for session_iso, source_hash in current.items():
+        entry = recorded.get(session_iso)
+        if entry is None or entry[0] != source_hash:
+            continue
+        if entry[1] is None or entry[1] != universe_shas.get(session_iso):
+            continue
+        relative_path = f"session={session_iso}/part.parquet"
+        if expected_sha.get(relative_path) is None:
+            continue
+        path = Path(reuse_from) / relative_path
+        try:
+            if file_sha256(path) != expected_sha[relative_path]:
+                continue
+            reused[date.fromisoformat(session_iso)] = pl.read_parquet(path)
+        except Exception:  # noqa: S112 - an unverifiable prior partition is rebuilt from payloads
+            continue
+    return reused
+
+
 def materialize_daily_market_silver(
     *,
     catalog: ReceiptCatalog,
@@ -192,8 +256,9 @@ def materialize_daily_market_silver(
     policy: DailyMarketSilverPolicy = DailyMarketSilverPolicy(),  # noqa: B008
     universe_dataset_id: str | None = None,
     bronze_daily_digest: str | None = None,
+    reuse_from: Path | None = None,
 ) -> DailyMarketSilverResult:
-    """Normalize one hash-verified KRX page per certified session and publish."""
+    """Publish the daily-market Silver; unchanged sessions may be copied from the dataset at reuse_from."""
 
     if not isinstance(policy.available_time, time):
         raise PITDataError("daily market available_time must be a time")
@@ -240,104 +305,116 @@ def materialize_daily_market_silver(
     zero_volume_rows = 0
     invalid_rows = 0
     base_adjusted_rows = 0
+    universe_shas = _universe_partition_shas(Path(universe_root), universe_dataset_id)
+    current_hashes = {session.isoformat(): entries[session.isoformat()].content_hash for session in calendar}
+    reusable = _reusable_daily_frames(
+        reuse_from, current_hashes, universe_shas, dict(identity.params)
+    )
     previous_closes: dict[str, int] = {}
     for position, session in enumerate(calendar, start=1):
         entry = entries[session.isoformat()]
-        records = _load_session_payload(entry, session)
-        rows: list[dict[str, Any]] = []
-        current_closes: dict[str, int] = {}
-        seen: set[str] = set()
-        seen_tickers: set[str] = set()
-        available_at = datetime.combine(session, policy.available_time, tzinfo=KRX_TZ)
-        for record in records:
-            if not isinstance(record, dict):
-                raise PITDataError(f"KRX daily market record must be an object for {session}")
-            market = str(record.get("MKT_NM") or "").strip()
-            if market not in _MARKETS:
-                continue
-            if _parse_bas_dd(record.get("BAS_DD")) != session:
-                raise PITDataError(f"KRX daily market page date conflicts for {session}")
-            isu = str(record.get("ISU_CD") or "").strip()
-            if not isu:
-                raise PITDataError(f"KRX daily market record is missing instrument identity for {session}")
-            if isu in seen:
-                raise PITDataError(f"KRX daily market has duplicate rows for {session}")
-            seen.add(isu)
-            open_price = _parse_int(record, "TDD_OPNPRC")
-            high_price = _parse_int(record, "TDD_HGPRC")
-            low_price = _parse_int(record, "TDD_LWPRC")
-            close = _parse_int(record, "TDD_CLSPRC")
-            change = _parse_int(record, "CMPPREVDD_PRC")
-            volume = _parse_int(record, "ACC_TRDVOL")
-            trading_value = _parse_int(record, "ACC_TRDVAL")
-            market_cap = _parse_int(record, "MKTCAP")
-            listed_shares = _parse_int(record, "LIST_SHRS")
-            fluc_rate = _parse_fluc(record)
-            base_price = close - change
-            state, reason = _classify(
-                open_price=open_price,
-                high_price=high_price,
-                low_price=low_price,
-                close=close,
-                change=change,
-                base_price=base_price,
-                volume=volume,
-                fluc_rate=fluc_rate,
-                tolerance=policy.fluc_tolerance_pct,
+        cached = reusable.get(session)
+        if cached is not None:
+            frame = cached
+        else:
+            records = _load_session_payload(entry, session)
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            seen_tickers: set[str] = set()
+            available_at = datetime.combine(session, policy.available_time, tzinfo=KRX_TZ)
+            for record in records:
+                if not isinstance(record, dict):
+                    raise PITDataError(f"KRX daily market record must be an object for {session}")
+                market = str(record.get("MKT_NM") or "").strip()
+                if market not in _MARKETS:
+                    continue
+                if _parse_bas_dd(record.get("BAS_DD")) != session:
+                    raise PITDataError(f"KRX daily market page date conflicts for {session}")
+                isu = str(record.get("ISU_CD") or "").strip()
+                if not isu:
+                    raise PITDataError(f"KRX daily market record is missing instrument identity for {session}")
+                if isu in seen:
+                    raise PITDataError(f"KRX daily market has duplicate rows for {session}")
+                seen.add(isu)
+                open_price = _parse_int(record, "TDD_OPNPRC")
+                high_price = _parse_int(record, "TDD_HGPRC")
+                low_price = _parse_int(record, "TDD_LWPRC")
+                close = _parse_int(record, "TDD_CLSPRC")
+                change = _parse_int(record, "CMPPREVDD_PRC")
+                volume = _parse_int(record, "ACC_TRDVOL")
+                trading_value = _parse_int(record, "ACC_TRDVAL")
+                market_cap = _parse_int(record, "MKTCAP")
+                listed_shares = _parse_int(record, "LIST_SHRS")
+                fluc_rate = _parse_fluc(record)
+                base_price = close - change
+                state, reason = _classify(
+                    open_price=open_price,
+                    high_price=high_price,
+                    low_price=low_price,
+                    close=close,
+                    change=change,
+                    base_price=base_price,
+                    volume=volume,
+                    fluc_rate=fluc_rate,
+                    tolerance=policy.fluc_tolerance_pct,
+                )
+                ticker = str(record.get("ISU_SRT_CD") or isu).strip()
+                if ticker in seen_tickers:
+                    raise PITDataError(f"KRX daily market has duplicate ticker for {session}: {ticker}")
+                seen_tickers.add(ticker)
+                rows.append(
+                    {
+                        "session": session,
+                        # The universe and all downstream Silver/Gold tables use the
+                        # exchange ticker as their stable instrument key.  ISU_CD is
+                        # retained as the source-page identity only; using it here
+                        # would silently turn every universe join into an absent row.
+                        "instrument_id": f"KRX:{ticker}",
+                        "ticker": ticker,
+                        "market": market,
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close,
+                        "change": change,
+                        "base_price": base_price,
+                        "volume": volume,
+                        "trading_value": trading_value,
+                        "market_cap": market_cap,
+                        "listed_shares": listed_shares,
+                        "fluc_rate": fluc_rate,
+                        "price_state": state.value,
+                        "invalid_reason": reason,
+                        "available_at": available_at,
+                        "source_hash": entry.content_hash,
+                        "policy_version": REVISION,
+                    }
+                )
+            frame = (
+                pl.DataFrame(rows, schema=_SCHEMA).sort(["session", "ticker"])
+                if rows
+                else pl.DataFrame([], schema=_SCHEMA)
             )
-            ticker = str(record.get("ISU_SRT_CD") or isu).strip()
-            if ticker in seen_tickers:
-                raise PITDataError(f"KRX daily market has duplicate ticker for {session}: {ticker}")
-            seen_tickers.add(ticker)
-            current_closes[ticker] = close
-            if ticker in previous_closes and base_price != previous_closes[ticker]:
-                base_adjusted_rows += 1
-            if state is PriceState.TRADABLE:
-                tradable_rows += 1
-            elif state is PriceState.ZERO_VOLUME:
-                zero_volume_rows += 1
-            else:
-                invalid_rows += 1
-            rows.append(
-                {
-                    "session": session,
-                    # The universe and all downstream Silver/Gold tables use the
-                    # exchange ticker as their stable instrument key.  ISU_CD is
-                    # retained as the source-page identity only; using it here
-                    # would silently turn every universe join into an absent row.
-                    "instrument_id": f"KRX:{ticker}",
-                    "ticker": ticker,
-                    "market": market,
-                    "open": open_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "close": close,
-                    "change": change,
-                    "base_price": base_price,
-                    "volume": volume,
-                    "trading_value": trading_value,
-                    "market_cap": market_cap,
-                    "listed_shares": listed_shares,
-                    "fluc_rate": fluc_rate,
-                    "price_state": state.value,
-                    "invalid_reason": reason,
-                    "available_at": available_at,
-                    "source_hash": entry.content_hash,
-                    "policy_version": REVISION,
-                }
-            )
-        previous_closes = current_closes
-        frame = (
-            pl.DataFrame(rows, schema=_SCHEMA).sort(["session", "ticker"])
-            if rows
-            else pl.DataFrame([], schema=_SCHEMA)
-        )
+        if frame.height:
+            tickers = frame.get_column("ticker").to_list()
+            closes = frame.get_column("close").to_list()
+            bases = frame.get_column("base_price").to_list()
+            for ticker, base_price in zip(tickers, bases, strict=True):
+                if ticker in previous_closes and base_price != previous_closes[ticker]:
+                    base_adjusted_rows += 1
+            previous_closes = dict(zip(tickers, closes, strict=True))
+            tradable_rows += int(frame.filter(pl.col("price_state") == "tradable").height)
+            zero_volume_rows += int(frame.filter(pl.col("price_state") == "zero_volume").height)
+            invalid_rows += int(frame.filter(pl.col("price_state") == "invalid").height)
+        else:
+            previous_closes = {}
         relative_path = f"session={session.isoformat()}/part.parquet"
         partitions[relative_path] = frame
         partition_details.append(
             {
                 "session": session.isoformat(),
                 "source_hash": entry.content_hash,
+                "universe_sha": universe_shas.get(session.isoformat()),
                 "rows": frame.height,
                 "tradable_rows": int(frame.filter(pl.col("price_state") == "tradable").height) if frame.height else 0,
                 "zero_volume_rows": int(frame.filter(pl.col("price_state") == "zero_volume").height) if frame.height else 0,

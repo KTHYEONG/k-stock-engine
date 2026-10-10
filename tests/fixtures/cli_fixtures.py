@@ -523,6 +523,7 @@ _LIVE_SUBCOMMANDS = frozenset(
         "build-reference-benchmarks",
         "verify-datasets",
         "prune-datasets",
+        "pack-bronze",
         "refresh-scope",
         "audit-ordinary-universe-prices",
     }
