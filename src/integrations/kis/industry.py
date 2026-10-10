@@ -8,7 +8,7 @@ from typing import Any
 
 from src.core.pit import PITDataError
 from src.integrations.errors import ProviderError
-from src.integrations.kis.client import KisClient, KisCredentials
+from src.integrations.kis import default_client
 
 
 class KisIndustryCollector:
@@ -25,7 +25,7 @@ class KisIndustryCollector:
         if not cleaned:
             raise ValueError("KIS industry classification requires at least one symbol")
         self._symbols = cleaned
-        self._client = client or KisClient(KisCredentials.from_env())
+        self._client = client if client is not None else default_client()
 
     @staticmethod
     def _map_output(symbol: str, output: dict[str, Any]) -> dict[str, object]:
@@ -74,7 +74,7 @@ class KisStockClassificationCollector:
         if not cleaned:
             raise ValueError("KIS industry classification requires at least one symbol")
         self._symbols = cleaned
-        self._client = client or KisClient(KisCredentials.from_env())
+        self._client = client if client is not None else default_client()
 
     @staticmethod
     def _map_output(symbol: str, output: dict[str, Any]) -> dict[str, object]:

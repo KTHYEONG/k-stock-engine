@@ -6,7 +6,7 @@ from datetime import date
 from typing import Any
 
 from src.integrations.errors import ProviderError
-from src.integrations.kis.client import KisClient, KisCredentials
+from src.integrations.kis import default_client
 from src.integrations.responses import RawResponse
 
 __all__ = ["KisInvestorFlowCollector"]
@@ -23,7 +23,7 @@ class KisInvestorFlowCollector:
             self._symbols: tuple[str, ...] | None = cleaned
         else:
             self._symbols = None
-        self._client = client or KisClient(KisCredentials.from_env())
+        self._client = client if client is not None else default_client()
 
     def health_check(self) -> None:
         """Confirm collection credentials are live without touching Bronze."""
