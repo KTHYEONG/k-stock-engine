@@ -2084,3 +2084,74 @@ def test_big3_strategy_loads_with_full62_and_three_seeds() -> None:
     assert restored.hedge == champion.hedge
     assert restored.trend_overlay == champion.trend_overlay
     assert restored.regime_hedge == champion.regime_hedge
+
+
+def test_freeze_is_idempotent_per_cube(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.model as model_mod
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions)
+    calls = {"n": 0}
+    real = model_mod._train_booster
+
+    def _counting(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(model_mod, "_train_booster", _counting)
+    spec = _spec()
+    first = pipe.freeze_models(spec)
+    assert (first / "manifest.json").is_file()
+    trained = calls["n"]
+    assert trained > 0
+    second = pipe.freeze_models(spec)
+    assert second == first
+    assert calls["n"] == trained
+
+
+def test_freeze_refuses_a_different_cube(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dataclasses
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions)
+    spec = _spec()
+    frozen = pipe.freeze_models(spec)
+    assert (frozen / "manifest.json").is_file()
+    other_cube = dataclasses.replace(pipe._ctx.cube, cube_id="research_cube_ffffffffffffffff")
+    object.__setattr__(pipe._ctx, "cube", other_cube)
+    with pytest.raises(ValueError, match="cube"):
+        pipe.freeze_models(spec)
+
+
+def test_freeze_refuses_an_unreadable_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions)
+    spec = _spec()
+    frozen = pipe.freeze_models(spec)
+    (frozen / "manifest.json").write_text("[[[", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable"):
+        pipe.freeze_models(spec)
+    (frozen / "manifest.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable"):
+        pipe.freeze_models(spec)
+    with pytest.raises(ValueError, match="no sessions"):
+        pipe.freeze_models(spec, year=2099)
+
+
+def test_freeze_provenance_and_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    sessions = _multi_year_sessions()
+    pipe = _context(tmp_path, sessions)
+    spec = _spec()
+    target_year = sessions[-1].year
+    frozen = pipe.freeze_models(spec, year=target_year)
+    assert frozen.name == str(target_year)
+    manifest = json.loads((frozen / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cube_id"] == pipe._ctx.cube.cube_id
+    assert manifest["spec_hash"] == spec.spec_hash
+    assert manifest["config_hash"] == spec.scorer.config_hash
+    first_idx = next(i for i, day in enumerate(sessions) if day.year == target_year)
+    assert manifest["last_train_session"] == sessions[first_idx - 1].isoformat()
+    assert manifest["created_at"] == _NOW.isoformat()
+    assert len(manifest["files"]) == len(spec.scorer.horizons)
