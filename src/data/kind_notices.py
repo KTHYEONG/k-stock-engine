@@ -21,6 +21,7 @@ from src.core.digest import dataset_digest
 from src.core.pit import PITDataError
 from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE, KIND_NOTICE_SEARCH_SOURCE
 from src.data.jobs.dart import disclosure_windows
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from src.integrations.krx.kind import KindNoticeRow, parse_kind_search_page
 
@@ -225,8 +226,8 @@ def parse_kind_administrative_form(html: str) -> KindAdministrativeForm:
 
 def _read_search_document(content_hash: str, payload_path: Path, *, label: str) -> dict[str, object]:
     try:
-        raw = Path(payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"retained KIND search payload is missing for {label}") from exc
     if hashlib.sha256(raw).hexdigest() != content_hash:
         raise PITDataError(f"retained KIND search payload hash mismatch for {label}")
@@ -284,8 +285,8 @@ def read_kind_document(catalog: ReceiptCatalog, acptno: str) -> str | None:
     if entry is None or entry.status not in _ANSWERED:
         return None
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"retained KIND document payload is unreadable for {acptno}") from exc
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError(f"retained KIND document payload hash mismatch for {acptno}")

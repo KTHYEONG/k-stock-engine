@@ -291,3 +291,29 @@ def test_rejects_empty_daily_calendar(tmp_path: Path) -> None:
     empty = _write_dataset(tmp_path / "gold" / "empty", pl.DataFrame({"value": [1]}), kind="market_panel")
     with pytest.raises(PITDataError, match="no session"):
         _load_daily_calendar(empty)
+
+
+def test_packed_bronze_builds_identical_supplement(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.payload_store import pack_loose
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000002")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    targets = _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    first = _materialize(tmp_path, catalog, targets, ls_path)
+    pack_loose(bronze, kinds=["investor_flow"], offsite_paths=None, remove=True)
+    root2 = tmp_path / "round2"
+    uni2, daily2 = _write_universe_daily(root2, [(S1, "000001"), (S2, "000001"), (S3, "000002")])
+    ls2 = _write_ls(root2, [(S1, "000001")])
+    second = _materialize(
+        root2, catalog, _targets(uni2, daily2, [(S1, "000001"), (S2, "000001"), (S3, "000001")]), ls2
+    )
+    assert first.dataset_id == second.dataset_id
+    assert [
+        (partition.path, partition.sha256) for partition in load_manifest(first.dataset_path).partitions
+    ] == [
+        (partition.path, partition.sha256) for partition in load_manifest(second.dataset_path).partitions
+    ]

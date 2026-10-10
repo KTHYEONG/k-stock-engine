@@ -1,0 +1,42 @@
+# Raw-data backup to the shared Drive lake (content-addressed archives, deduplicated by sha256).
+remote = "gdrive:quant-lake/live/k-stock-engine/lake"
+
+# Bronze payloads are append-only: a path already in the remote index is never re-hashed.
+[[source]]
+name = "bronze"
+root = "data/bronze/kr_swing_2019_v1"
+immutable = true
+exclude = ["catalog/*", "_packs/*"]
+segment_mib = 512
+
+# SQLite catalogs change on every collection; they are snapshotted through the SQLite backup API.
+[[source]]
+name = "bronze_catalog"
+root = "data/bronze/kr_swing_2019_v1/catalog"
+exclude = ["*-wal", "*-shm"]
+
+# Registry, champion history, quota ledgers and fact quarantine; rebuildable caches are left out.
+[[source]]
+name = "state"
+root = "data/state/kr_swing_2019_v1"
+exclude = ["research/cube/*", "research/market_cache/*", "research/scores/*", "dart_fact_staging/*", "*.lock"]
+
+# Legacy pre-scope Bronze. security_master is excluded: every one of its 2,621 sessions equals the scoped page byte-for-byte
+# (checked 2026-10-10). daily_market stays: 83 sessions of 2015 exist only here.
+[[source]]
+name = "legacy_stocks"
+root = "data/bronze/stocks"
+immutable = true
+exclude = ["security_master/*"]
+segment_mib = 512
+
+# Silver root bound by the 2026-09-11 run manifests (reproduction anchor) and the run manifests themselves.
+[[source]]
+name = "silver_provenance"
+root = "data/silver/stocks_provenance_20260911"
+immutable = true
+
+[[source]]
+name = "artifacts"
+root = "data/artifacts"
+exclude = ["*.tmp"]

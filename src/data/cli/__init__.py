@@ -68,6 +68,7 @@ def _ensure_registered() -> None:
         "build-reference-benchmarks",
         "verify-datasets",
         "prune-datasets",
+        "pack-bronze",
         "refresh-scope",
         "build-investor-flow-kis-supplement",
         "build-investor-flow-union",

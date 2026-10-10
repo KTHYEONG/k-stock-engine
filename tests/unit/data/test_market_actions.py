@@ -1035,3 +1035,169 @@ def test_kosdaq_release_ignored_on_both_kind_title_paths(tmp_path: Path) -> None
         path, frame = _admin_kind_run(tmp_path / str(index), desk="코스닥시장본부", title=title)
         assert frame.height == 0, title
         assert load_manifest(path).details["kind_kosdaq_release_ignored"] == 1, title
+
+
+def _actions_fingerprint(path: Path) -> object:
+    import json
+
+    manifest = load_manifest(path)
+    return (
+        manifest.dataset_id,
+        tuple((partition.path, partition.sha256) for partition in manifest.partitions),
+        json.dumps(manifest.details, sort_keys=True, default=str),
+    )
+
+
+def test_flag_cache_hit_and_miss(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.market_actions as actions_module
+
+    runtime = _runtime(tmp_path)
+    plain = {"ISU_SRT_CD": "000660", "SECT_TP_NM": ""}
+    flagged = {"ISU_SRT_CD": "000660", "SECT_TP_NM": "관리종목(소속부없음)"}
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[plain])
+    _publish_daily(runtime, session=date(2024, 1, 3), records=[flagged])
+    cache = tmp_path / "flags.parquet"
+
+    def _kwargs():  # type: ignore[no-untyped-def]
+        return {
+            "catalog": _catalog(runtime),
+            "silver_root": runtime.workspace.silver_root,
+            "calendar": _calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
+            "bridge": _bridge(),
+            "kind_keywords": (),
+            "kind_coverage_start": date(2024, 1, 2),
+        }
+
+    materialize_market_actions(**_kwargs(), flag_cache=cache)
+    assert cache.is_file()
+    cached_sessions = set(pl.read_parquet(cache).get_column("session").to_list())
+    assert cached_sessions == {date(2024, 1, 2), date(2024, 1, 3)}
+    _publish_daily(runtime, session=date(2024, 1, 4), records=[flagged])
+    calls = 0
+    real_read = actions_module.read_payload
+
+    def _counted(path):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return real_read(path)
+
+    monkeypatch.setattr(actions_module, "read_payload", _counted)
+    kwargs = _kwargs()
+    kwargs["calendar"] = _calendar(
+        date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)
+    )
+    kwargs["silver_root"] = tmp_path / "silver-cached"
+    cached_path = materialize_market_actions(**kwargs, flag_cache=cache)
+    assert calls == 1
+    uncached_path = materialize_market_actions(
+        **{**kwargs, "silver_root": tmp_path / "silver-full", "flag_cache": None}
+    )
+    assert _actions_fingerprint(cached_path) == _actions_fingerprint(uncached_path)
+    assert set(pl.read_parquet(cache).get_column("session").to_list()) == {
+        date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4),
+    }
+
+
+def test_packed_bronze_builds_identical_market_actions(tmp_path: Path) -> None:
+    from src.data.payload_store import pack_loose
+
+    runtime = _runtime(tmp_path)
+    _publish_window(
+        runtime, key="I003:2024-01-01..2024-01-31",
+        records=[_record("20240102000001", rcept_dt="20240102", report_nm="상장폐지결정")],
+    )
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[{"ISU_CD": "000660", "SECT_TP_NM": ""}])
+    kwargs = {
+        "catalog": _catalog(runtime),
+        "silver_root": runtime.workspace.silver_root,
+        "calendar": _calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
+        "bridge": _bridge(),
+        "kind_keywords": (),
+        "kind_coverage_start": date(2024, 1, 2),
+    }
+    first = materialize_market_actions(**kwargs)
+    pack_loose(
+        runtime.workspace.bronze_root, kinds=["daily_market", "disclosures"],
+        offsite_paths=None, remove=True,
+    )
+    kwargs["catalog"] = _catalog(runtime)
+    kwargs["silver_root"] = tmp_path / "silver-packed"
+    second = materialize_market_actions(**kwargs)
+    assert _actions_fingerprint(first) == _actions_fingerprint(second)
+
+
+def test_unreadable_or_inconsistent_flag_cache_is_ignored(tmp_path: Path) -> None:
+    from src.data.market_actions import _load_daily_flag_rows
+
+    runtime = _runtime(tmp_path)
+    plain = {"ISU_SRT_CD": "000660", "SECT_TP_NM": ""}
+    _publish_daily(runtime, session=date(2024, 1, 2), records=[plain])
+    calendar = _calendar(date(2024, 1, 2), date(2024, 1, 3))
+    catalog = _catalog(runtime)
+    missing = tmp_path / "no-cache.parquet"
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=missing) == {
+        date(2024, 1, 2): {"000660": False}
+    }
+    assert missing.is_file()
+    garbage = tmp_path / "garbage.parquet"
+    garbage.write_bytes(b"not parquet")
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=garbage) == {
+        date(2024, 1, 2): {"000660": False}
+    }
+    wrong_schema = tmp_path / "wrong.parquet"
+    pl.DataFrame({"a": [1]}).write_parquet(wrong_schema)
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=wrong_schema) == {
+        date(2024, 1, 2): {"000660": False}
+    }
+    bad_row = tmp_path / "bad-row.parquet"
+    pl.DataFrame(
+        [{"session": "yesterday", "source_hash": "s", "ticker": None, "flagged": False}],
+        schema={"session": pl.String, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+    ).write_parquet(bad_row)
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=bad_row) == {
+        date(2024, 1, 2): {"000660": False}
+    }
+    conflicted = tmp_path / "conflict.parquet"
+    pl.DataFrame(
+        [
+            {"session": date(2024, 1, 2), "source_hash": "s1", "ticker": None, "flagged": False},
+            {"session": date(2024, 1, 2), "source_hash": "s2", "ticker": None, "flagged": False},
+        ],
+        schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+    ).write_parquet(conflicted)
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=conflicted) == {
+        date(2024, 1, 2): {"000660": False}
+    }
+
+
+def test_unwritable_flag_cache_fails_closed(tmp_path: Path) -> None:
+    from src.core.pit import PITDataError
+    from src.data.market_actions import _write_flag_cache
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        with pytest.raises(PITDataError, match="cannot be written"):
+            _write_flag_cache(locked / "flags.parquet", {date(2024, 1, 2): ("s" * 64, {"000660": False})})
+    finally:
+        locked.chmod(0o755)
+
+
+def test_flag_cache_without_session_sentinel_is_rebuilt(tmp_path: Path) -> None:
+    from src.data.market_actions import _load_daily_flag_rows
+
+    runtime = _runtime(tmp_path)
+    day = date(2024, 1, 2)
+    _publish_daily(runtime, session=day, records=[{"ISU_CD": "000660", "SECT_TP_NM": ""}])
+    catalog = _catalog(runtime)
+    entry = catalog.latest(source="krx_daily_market", natural_keys={day.isoformat()})[day.isoformat()]
+    cache = tmp_path / "partial.parquet"
+    pl.DataFrame(
+        {"session": [day], "source_hash": [entry.content_hash], "ticker": ["000660"], "flagged": [True]},
+        schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+    ).write_parquet(cache)
+    assert _load_daily_flag_rows(catalog, _calendar(day, date(2024, 1, 3)), flag_cache=cache) == {
+        day: {"000660": False}
+    }
+    assert pl.read_parquet(cache).filter(pl.col("ticker").is_null()).height == 1

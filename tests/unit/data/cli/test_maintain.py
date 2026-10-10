@@ -674,3 +674,55 @@ def test_earnings_releases_cli_build_and_benchmark_dispatch(tmp_path, monkeypatc
     assert payload["releases"] == releases.dataset_id
     assert payload["facts"] == facts.dataset_id
     assert payload["benchmarks"][0]["matched"] == 2
+
+
+def test_pack_bronze_packs_and_optionally_removes(tmp_path, capsys) -> None:
+    from src.data.cli import main
+    from src.data.payload_store import payload_exists, read_payload
+
+    runtime = _dataset_runtime(tmp_path)
+    (runtime.workspace.bronze_root / "catalog").mkdir(parents=True, exist_ok=True)
+    kind_dir = runtime.workspace.bronze_root / "daily_market" / ("a" * 64)
+    kind_dir.mkdir(parents=True)
+    body = b'{"session": "2024-01-02", "records": []}' * 50
+    loose = kind_dir / "payload.json"
+    loose.write_bytes(body)
+    assert main(_dataset_cli_args("pack-bronze", runtime, "--kind", "daily_market")) == 0
+    assert loose.exists()
+    assert read_payload(loose) == body
+    index = tmp_path / "offsite.txt"
+    index.write_text(loose.relative_to(runtime.workspace.bronze_root).as_posix() + "\n", encoding="utf-8")
+    assert (
+        main(
+            _dataset_cli_args(
+                "pack-bronze", runtime, "--kind", "daily_market", "--remove",
+                "--offsite-index", str(index),
+            )
+        )
+        == 0
+    )
+    assert not loose.exists()
+    assert payload_exists(loose)
+    assert read_payload(loose) == body
+    assert '"packed"' in capsys.readouterr().out
+
+
+def test_pack_bronze_defaults_to_every_kind(tmp_path, capsys) -> None:
+    from src.data.cli import main
+    from src.data.payload_store import read_payload
+
+    runtime = _dataset_runtime(tmp_path)
+    (runtime.workspace.bronze_root / "catalog").mkdir(parents=True, exist_ok=True)
+    bodies = {}
+    for kind in ("daily_market", "security_master"):
+        kind_dir = runtime.workspace.bronze_root / kind / ("b" * 64)
+        kind_dir.mkdir(parents=True)
+        body = f'{{"kind": "{kind}"}}'.encode() * 40
+        bodies[kind] = (kind_dir / "payload.json", body)
+        bodies[kind][0].write_bytes(body)
+    assert main(_dataset_cli_args("pack-bronze", runtime)) == 0
+    for loose, body in bodies.values():
+        assert loose.exists()
+        assert read_payload(loose) == body
+    out = capsys.readouterr().out
+    assert '"packed": 2' in out
