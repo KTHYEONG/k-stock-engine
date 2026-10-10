@@ -69,6 +69,46 @@ def _run_migrate_snapshot(args: argparse.Namespace) -> Mapping[str, object]:
     return {"type": "summary", "reports": [asdict(report) for report in reports]}
 
 
+def _add_pack_bronze(parser: argparse.ArgumentParser) -> None:
+    add_scoped_args(parser)
+    parser.add_argument("--kind", dest="kinds", action="append", default=[], help="Bronze kind directory to pack (repeatable; defaults to every kind)")
+    parser.add_argument("--remove", action="store_true", help="Unlink loose files after they are packed and confirmed")
+    parser.add_argument("--offsite-index", type=Path, default=None, help="File of offsite-confirmed relative paths, one per line")
+
+
+def _run_pack_bronze(args: argparse.Namespace) -> Mapping[str, object]:
+    from dataclasses import asdict
+
+    from src.data.payload_store import PACK_DIR_NAME, pack_loose
+
+    runtime = scoped_runtime(args)
+    offsite_index = args.offsite_index
+    offsite_paths = None
+    if offsite_index is not None:
+        offsite_paths = {
+            line.strip()
+            for line in Path(offsite_index).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    kinds = tuple(args.kinds or [])
+    if not kinds:
+        bronze_root = runtime.workspace.bronze_root
+        kinds = tuple(
+            sorted(
+                path.name
+                for path in bronze_root.iterdir()
+                if path.is_dir() and path.name not in ("catalog", PACK_DIR_NAME) and not path.name.startswith(".")
+            )
+        ) if bronze_root.is_dir() else ()
+    report = pack_loose(
+        runtime.workspace.bronze_root,
+        kinds=kinds,
+        offsite_paths=offsite_paths,
+        remove=bool(args.remove),
+    )
+    return {"type": "summary", **asdict(report)}
+
+
 def _run_audit(args: argparse.Namespace) -> Mapping[str, object]:
     from dataclasses import asdict
 
@@ -167,5 +207,6 @@ MAINTAIN_COMMANDS: tuple[Command, ...] = (
         _add_migrate_snapshot, _run_migrate_snapshot,
     ),
     Command("verify-datasets", "Verify current or all scoped datasets", _add_verify, _run_verify),
+    Command("pack-bronze", "Pack loose Bronze payloads into compressed packs", _add_pack_bronze, _run_pack_bronze),
     Command("prune-datasets", "Plan or apply removal of unreferenced datasets", _add_prune, _run_prune),
 )

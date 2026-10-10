@@ -25,6 +25,7 @@ from src.data.datasets import (
     resolve_bronze_digest,
     universe_sessions,
 )
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
 REVISION = "ls-t1702-net-shares-v2"
@@ -152,8 +153,8 @@ def _check_identities(groups: dict[str, int]) -> None:
 
 def _parse_blob(entry: BlobEntry, sessions: frozenset[date]) -> tuple[str, str, Any]:
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"investor-flow Bronze payload is unreadable: {entry.payload_path}") from exc
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError(f"investor-flow Bronze hash mismatch: {entry.payload_path}")

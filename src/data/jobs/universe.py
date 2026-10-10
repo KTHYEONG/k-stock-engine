@@ -14,6 +14,7 @@ from pathlib import Path
 from src.core.pit import PITDataError
 from src.data.dataset_registry import DatasetRegistry
 from src.data.jobs.runner import JobContext
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
 from src.integrations.dart.client import DartCorpCodeRecord
 
@@ -89,8 +90,8 @@ def read_corp_code_bridge_rows(
     if entry is None:
         raise PITDataError("ticker bridge missing: no retained dart_corp_codes receipt")
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError("ticker bridge payload is unreadable") from exc
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         raise PITDataError("ticker bridge payload hash mismatch")

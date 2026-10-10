@@ -1370,3 +1370,52 @@ def test_refresh_rejects_payload_removed_after_discovery(tmp_path, monkeypatch) 
             calendar=_covering_calendar(),
         )
     assert not list((tmp_path / "silver").glob("financial_facts_*"))
+
+
+def test_packed_bronze_refreshes_identical_facts(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.datasets import load_manifest
+    from src.data.incremental_normalization import refresh_dart_financial_facts
+    from src.data.payload_store import pack_loose
+
+    decision_time = datetime(2016, 12, 30, tzinfo=UTC)
+    _write_fact_receipt(tmp_path / "bronze", "ok", _FACT_PAGE)
+    _write_reference_silver(tmp_path / "silver", decision_time)
+
+    def _refresh(silver: Path, artifacts: Path):  # type: ignore[no-untyped-def]
+        return refresh_dart_financial_facts(
+            bronze_root=tmp_path / "bronze",
+            silver_root=silver,
+            artifact_root=artifacts,
+            decision_time=decision_time,
+            calendar=_covering_calendar(),
+            batch_size=500,
+        )
+
+    import pathlib
+
+    first = _refresh(tmp_path / "silver", tmp_path / "artifacts")
+    pack_loose(tmp_path / "bronze", kinds=["financial_facts"], offsite_paths=None, remove=True)
+    second = _refresh(tmp_path / "silver2", tmp_path / "artifacts2")
+    assert (first.output_hash, first.report_hash, first.row_count) == (
+        second.output_hash, second.report_hash, second.row_count,
+    )
+    assert [
+        (partition.path, partition.sha256)
+        for partition in load_manifest(pathlib.Path(first.dataset_path)).partitions
+    ] == [
+        (partition.path, partition.sha256)
+        for partition in load_manifest(pathlib.Path(second.dataset_path)).partitions
+    ]
+
+
+def test_sha256_file_rejects_files_outside_bronze_roots(tmp_path) -> None:
+    from src.data.incremental_normalization import _sha256_file
+    from src.data.payload_store import PayloadMissingError
+    import pytest
+
+    target = tmp_path / "plain.bin"
+    target.write_bytes(b"plain-bytes")
+    with pytest.raises(PayloadMissingError):
+        _sha256_file(target)

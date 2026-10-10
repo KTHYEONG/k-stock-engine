@@ -145,10 +145,12 @@ def _build_ordinary_universe(ctx: RefreshContext, inputs: Mapping[str, str]) -> 
 
     _ = inputs
     sessions = catalog_master_sessions(ctx.catalog)
+    current = ctx.registry.snapshot().get("ordinary_universe")
     path = materialize_ordinary_universe_from_catalog(
         catalog=ctx.catalog,
         sessions=sessions,
         silver_root=ctx.runtime.workspace.silver_root,
+        reuse_from=_registered_dataset_dir(ctx, current) if current is not None else None,
     )
     return _published(path)
 
@@ -157,11 +159,13 @@ def _build_daily_market(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
     """Build Silver daily-market bars for the resolved universe sessions."""
     from src.data.daily_market_silver import materialize_daily_market_silver
 
+    current = ctx.registry.snapshot().get("daily_market")
     result = materialize_daily_market_silver(
         catalog=ctx.catalog,
         universe_root=ctx.runtime.workspace.silver_root,
         silver_root=ctx.runtime.workspace.silver_root,
         universe_dataset_id=inputs["ordinary_universe"],
+        reuse_from=_registered_dataset_dir(ctx, current) if current is not None else None,
     )
     return _published(result.dataset_path)
 
@@ -261,6 +265,7 @@ def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pub
         bridge=dict(mapping),
         kind_keywords=tuple(provider.kind.search_keywords),
         kind_coverage_start=ctx.runtime.scope.evidence_start,
+        flag_cache=ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet",
     )
     return _published(path)
 
