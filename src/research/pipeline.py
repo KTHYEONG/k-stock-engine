@@ -49,7 +49,13 @@ from src.research.ledger_bridge import (
     overlay_market_from_inputs,
     overlay_market_with_legs,
 )
-from src.research.model import ScoreMatrix, ScorerConfig, walk_forward_scores
+from src.research.model import (
+    ScoreMatrix,
+    ScorerConfig,
+    save_frozen_scorer,
+    train_year_boosters,
+    walk_forward_scores,
+)
 from src.research.panel import FEATURE_NAMES, HORIZONS, FeaturePanel, build_panel
 from src.research.policy import TrendCashPolicy, universe_mask
 from src.research.regime_hedge import (
@@ -744,6 +750,53 @@ class Pipeline:
         )
         self._save_scores_cache(result, identity=identity, test_years=tuple(test_years))
         return result
+
+    def freeze_models(self, spec: StrategySpec, *, year: int | None = None) -> Path:
+        """Train and persist the boosters of one test year; returns the directory."""
+        ctx = self._ctx
+        sessions = _sessions_of(ctx.cube)
+        hi = len(sessions) - 1
+        target = int(year) if year is not None else sessions[hi].year
+        identity = _scores_identity(spec)
+        models_dir = Path(ctx.scores_root).parent / "models" / identity[:16] / str(target)
+        manifest_path = models_dir / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    raise ValueError("manifest must be an object")
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"unreadable frozen models manifest in {models_dir}: {exc}") from exc
+            if existing.get("cube_id") != ctx.cube.cube_id:
+                raise ValueError(
+                    f"frozen models in {models_dir} belong to cube {existing.get('cube_id')!r}, "
+                    f"not {ctx.cube.cube_id!r}"
+                )
+            return models_dir
+        year_sessions = [day for day in sessions if day.year == target]
+        if not year_sessions:
+            raise ValueError(f"test year {target} has no sessions in the cube")
+        auth = ctx.guard.authorize(start=year_sessions[0], end=year_sessions[-1])
+        panel = self.panel_for(hi)
+        uni_full = np.asarray(universe_mask(ctx.cube, spec.policy.universe), dtype=bool)
+        universe = np.ascontiguousarray(uni_full[: hi + 1])
+        scorer = train_year_boosters(
+            panel, universe, sessions, spec.scorer, year=target, authorization=auth
+        )
+        first_idx = next(i for i, day in enumerate(sessions) if day.year == target)
+        last_train = sessions[first_idx - 1]
+        save_frozen_scorer(
+            scorer,
+            models_dir,
+            provenance={
+                "cube_id": ctx.cube.cube_id,
+                "spec_hash": spec.spec_hash,
+                "scores_identity": identity,
+                "last_train_session": last_train.isoformat(),
+                "created_at": ctx.now().isoformat(),
+            },
+        )
+        return models_dir
 
     def _stock_targets(
         self,
