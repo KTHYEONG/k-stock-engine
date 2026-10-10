@@ -1,0 +1,13 @@
+usage: cli.py pack-bronze [-h] [--scope-config SCOPE_CONFIG]
+                          [--data-root DATA_ROOT] [--kind KINDS] [--remove]
+                          [--offsite-index OFFSITE_INDEX]
+
+options:
+  -h, --help            show this help message and exit
+  --scope-config SCOPE_CONFIG
+  --data-root DATA_ROOT
+  --kind KINDS          Bronze kind directory to pack (repeatable; defaults to
+                        every kind)
+  --remove              Unlink loose files after they are packed and confirmed
+  --offsite-index OFFSITE_INDEX
+                        File of offsite-confirmed relative paths, one per line
