@@ -30,6 +30,7 @@ from src.data.evidence_sources import (
 )
 from src.data.jobs.runner import JobContext, JobSpec, JobUnit
 from src.data.jobs.universe import corp_code_bridge, eligible_tickers
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptIndexEntry
 from src.data.scoped_ingestion import FACT_SOURCE, ScopedRawPayload, dart_fact_natural_key
 from src.integrations.dart.dividend_decision import is_dividend_decision_title
@@ -149,8 +150,8 @@ def _window_payload(
 def _window_receipt_complete(entry: ReceiptIndexEntry) -> bool:
     """True only when the stored window payload is complete against DART's declared total."""
     try:
-        raw = Path(entry.payload_path).read_bytes()
-    except OSError:
+        raw = read_payload(Path(entry.payload_path))
+    except (OSError, PITDataError):
         return False
     if hashlib.sha256(raw).hexdigest() != entry.content_hash:
         return False

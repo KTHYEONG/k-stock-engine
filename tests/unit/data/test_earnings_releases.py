@@ -619,3 +619,22 @@ def test_benchmark_rejects_malformed_releases(tmp_path: Path) -> None:
 
     with pytest.raises(PITDataError, match="invalid earnings releases for benchmark"):
         benchmark_earnings_releases(releases_path=releases_path, facts_path=facts_path)
+
+
+def test_packed_bronze_builds_identical_earnings_releases(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.payload_store import pack_loose
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    _seed_bridge(bronze)
+    _seed_release(bronze, rcept_no="20190131000001", received_on="2019-01-31")
+    calendar = _calendar(date(2019, 2, 1), date(2019, 3, 4), date(2019, 3, 5))
+    first = _materialize(bronze, silver, calendar)
+    pack_loose(bronze, kinds=["disclosures", "dart_corp_codes"], offsite_paths=None, remove=True)
+    second = _materialize(bronze, tmp_path / "silver2", calendar)
+    assert load_manifest(first).dataset_id == load_manifest(second).dataset_id
+    assert [
+        (partition.path, partition.sha256) for partition in load_manifest(first).partitions
+    ] == [
+        (partition.path, partition.sha256) for partition in load_manifest(second).partitions
+    ]

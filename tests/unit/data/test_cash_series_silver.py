@@ -688,3 +688,35 @@ def test_build_cash_series_silver_command(tmp_path: Path, capsys: pytest.Capture
     emitted = _json.loads(capsys.readouterr().out)
     assert emitted["dataset_id"].startswith("cash_series_")
     assert emitted["sessions"] == 1
+
+
+def test_packed_bronze_builds_identical_cash_series(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.payload_store import pack_loose
+
+    catalog_root, silver_root = _setup(tmp_path, (DAY1, DAY2, DAY3))
+    pages = _pages(tmp_path)
+    _publish(catalog_root, pages, DAY1, [_etf_record(DAY1)])
+    _publish(catalog_root, pages, DAY2, [_etf_record(DAY2)])
+    _publish(catalog_root, pages, DAY3, [_etf_record(DAY3)])
+    first = materialize_cash_series_silver(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver_root,
+        silver_root=silver_root,
+        config=_config(),
+    )
+    pack_loose(tmp_path, kinds=["pages"], offsite_paths=None, remove=True)
+    silver2 = tmp_path / "silver2"
+    _universe(silver2, (DAY1, DAY2, DAY3))
+    second = materialize_cash_series_silver(
+        catalog=ReceiptCatalog(catalog_root),
+        universe_root=silver2,
+        silver_root=silver2,
+        config=_config(),
+    )
+    assert first.dataset_id == second.dataset_id
+    assert [
+        (partition.path, partition.sha256) for partition in load_manifest(first.dataset_path).partitions
+    ] == [
+        (partition.path, partition.sha256) for partition in load_manifest(second.dataset_path).partitions
+    ]

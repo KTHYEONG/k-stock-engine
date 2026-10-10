@@ -295,6 +295,7 @@ def test_resolve_kind_job_registry() -> None:
 
 
 def test_search_receipt_helpers_cover_corrupt_branches(tmp_path: Path) -> None:
+    (tmp_path / "catalog").mkdir()
     import hashlib
     from types import SimpleNamespace
 

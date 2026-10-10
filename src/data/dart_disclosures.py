@@ -15,6 +15,7 @@ from src.data.evidence_sources import (
     DART_CORP_DISCLOSURES_SOURCE,
     DART_DISCLOSURE_WINDOWS_SOURCE,
 )
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
 
 __all__ = [
@@ -60,8 +61,8 @@ def _parse_receipt_day(value: object) -> date | None:
 
 def _read_records_payload(entry_content_hash: str, payload_path: Path) -> list[object]:
     try:
-        raw = Path(payload_path).read_bytes()
-    except OSError as exc:
+        raw = read_payload(Path(payload_path))
+    except (OSError, PITDataError) as exc:
         raise PITDataError(f"retained disclosure payload is missing for {entry_content_hash[:12]}") from exc
     if hashlib.sha256(raw).hexdigest() != entry_content_hash:
         raise PITDataError(f"retained disclosure payload hash mismatch for {entry_content_hash[:12]}")

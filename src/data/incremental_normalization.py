@@ -28,6 +28,7 @@ from src.data.normalization import (
     SessionIndex,
     normalize_dart_financial_facts_with_quarantine,
 )
+from src.data.payload_store import read_payload
 
 AVAILABILITY_POLICY: Final = "next-session-after-effective-receipt-v2"
 REVISION: Final = "dart-incremental-v1"
@@ -48,11 +49,7 @@ class DartFactRefreshArtifact:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(read_payload(Path(path))).hexdigest()
 
 
 def _discover_fact_receipts(bronze_root: Path, *, verify_payload: bool = True) -> list[dict[str, object]]:
@@ -87,8 +84,8 @@ def _discover_fact_receipts(bronze_root: Path, *, verify_payload: bool = True) -
     verified: list[dict[str, object]] = []
     for receipt_path in receipt_paths:
         try:
-            raw_text = receipt_path.read_text(encoding="utf-8")
-        except OSError as exc:
+            raw_text = read_payload(Path(receipt_path)).decode("utf-8")
+        except (OSError, PITDataError, UnicodeDecodeError) as exc:
             raise PITDataError(f"malformed Bronze receipt {receipt_path}: {exc}") from exc
         try:
             meta = json.loads(raw_text)
@@ -124,12 +121,10 @@ def _discover_fact_receipts(bronze_root: Path, *, verify_payload: bool = True) -
         if verify_payload:
             try:
                 computed = _sha256_file(payload_path)
-            except OSError as exc:
+            except (OSError, PITDataError) as exc:
                 raise PITDataError(f"missing Bronze payload for {receipt_path}") from exc
             if computed != content_hash:
                 raise PITDataError(f"hash mismatch for Bronze payload {payload_path}")
-        elif not payload_path.is_file():
-            raise PITDataError(f"missing Bronze payload for {receipt_path}")
         verified.append(
             {
                 "content_hash": content_hash,
@@ -419,9 +414,9 @@ def refresh_dart_financial_facts(
         batch_frames: list[pl.DataFrame] = []
         for item in batch:
             try:
-                raw_bytes = Path(str(item["payload_path"])).read_bytes()
-            except OSError as exc:
-                raise PITDataError(f"invalid Bronze payload for financial_facts: {exc}") from exc
+                raw_bytes = read_payload(Path(str(item["payload_path"])))
+            except (OSError, PITDataError) as exc:
+                raise PITDataError(f"invalid Bronze payload for financial_facts: missing Bronze payload or unreadable bytes: {exc}") from exc
             if hashlib.sha256(raw_bytes).hexdigest() != str(item["content_hash"]):
                 raise PITDataError(f"hash mismatch for Bronze payload {item['payload_path']}")
             try:
