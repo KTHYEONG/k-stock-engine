@@ -447,3 +447,346 @@ def test_search_stock_info_rejects_malformed_output() -> None:
     client, _ = _search_client(response=['not-a-dict'])
     with pytest.raises(RuntimeError, match='search-stock-info'):
         client.search_stock_info('005930')
+
+
+def test_every_http_attempt_is_paced(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    class _CountingLimiter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire(self) -> float:
+            self.calls += 1
+            return 0.0
+
+    limiter = _CountingLimiter()
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(max_attempts=3, retryable_msg_codes=("900",)),
+        limiter=limiter,
+    )
+    client.ensure_token = lambda: "token"  # type: ignore[method-assign]
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "1", "msg_cd": "900", "msg1": "900 later"})
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "0", "output": {"a": 1}})
+
+    client.session = SimpleNamespace(get=fake_get, post=lambda *a, **k: None)  # type: ignore[assignment]
+    client._sync_session()
+    client._transport._sleep = lambda _s: None
+
+    assert client.inquire_price("005930") == {"a": 1}
+    assert calls["n"] == 3
+    assert limiter.calls == 3
+
+
+def test_rejected_token_triggers_one_refresh_and_one_retry(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    seen_tokens: list[str] = []
+    ensure_calls: list[dict] = []
+
+    class _Store:
+        def ensure(self, issue, *, rejected=None):
+            ensure_calls.append({"rejected": rejected})
+            if rejected is None:
+                return "T1"
+            assert rejected == "T1"
+            return "T2"
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+        token_store=_Store(),
+    )
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        headers = _kw.get("headers", {})
+        seen_tokens.append(headers.get("authorization", ""))
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "expired"})
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "0", "output": {"a": 2}})
+
+    client.session = SimpleNamespace(get=fake_get, post=lambda *a, **k: None)  # type: ignore[assignment]
+    client._sync_session()
+
+    assert client.inquire_price("005930") == {"a": 2}
+    assert calls["n"] == 2
+    assert [c["rejected"] for c in ensure_calls] == [None, "T1"]
+    assert seen_tokens == ["Bearer T1", "Bearer T2"]
+
+
+def test_rate_limit_code_is_retried_then_surfaced(tmp_path) -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(max_attempts=3),
+    )
+    client.ensure_token = lambda: "token"  # type: ignore[method-assign]
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "limit"})
+
+    client.session = SimpleNamespace(get=fake_get, post=lambda *a, **k: None)  # type: ignore[assignment]
+    client._sync_session()
+    client._transport._sleep = lambda _s: None
+
+    with pytest.raises(ProviderRetryableError):
+        client.inquire_price("005930")
+    assert calls["n"] == 3
+
+
+def test_pool_slot_credentials(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.config import ConfigError
+    from src.integrations.kis.client import KisCredentials
+
+    monkeypatch.setenv("KIS_DATA_5_APP_KEY", "pool-key")
+    monkeypatch.setenv("KIS_DATA_5_APP_SECRET", "pool-secret")
+    creds = KisCredentials.from_pool_slot(5)
+    assert (creds.app_key, creds.app_secret) == ("pool-key", "pool-secret")
+
+    monkeypatch.delenv("KIS_DATA_9_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_DATA_9_APP_SECRET", raising=False)
+    with pytest.raises(ConfigError) as exc_info:
+        KisCredentials.from_pool_slot(9)
+    assert "KIS_DATA_9_APP_KEY" in str(exc_info.value)
+    assert "pool-key" not in str(exc_info.value)
+
+
+def test_asking_price_exp_ccn_sends_documented_request(tmp_path) -> None:
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+    )
+    calls: list[dict] = []
+
+    def fake_call(*, method, path, tr_id=None, params=None, body=None, include_auth=True, use_hashkey=False):
+        calls.append({"method": method, "path": path, "tr_id": tr_id, "params": dict(params or {})})
+        return {"rt_cd": "0", "output": {}}
+
+    client._call = fake_call  # type: ignore[method-assign]
+    out = client.inquire_asking_price_exp_ccn("005930")
+    assert out == {"rt_cd": "0", "output": {}}
+    assert calls[0]["path"] == "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+    assert calls[0]["tr_id"] == "FHKST01010200"
+    assert calls[0]["params"] == {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": "005930"}
+
+
+def test_pool_token_issue_paces_and_skips_legacy_cache(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.kis.admission import SharedTokenStore
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    class _CountingLimiter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire(self) -> float:
+            self.calls += 1
+            return 0.0
+
+    limiter = _CountingLimiter()
+    store = SharedTokenStore(tmp_path / "pool", "pool-key")
+    client = KisClient(
+        KisCredentials(app_key="pool-key", app_secret="s", account_no="", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+        limiter=limiter,
+        token_store=store,
+    )
+    client.session = SimpleNamespace(
+        post=lambda *a, **k: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: {"access_token": "P1", "expires_in": 86400}
+        )
+    )  # type: ignore[assignment]
+
+    assert client.ensure_token() == "P1"
+    assert limiter.calls == 1
+    assert list(tmp_path.glob("kis_token_*.json")) == []
+
+    client._load_cached_token()
+    client._save_cached_token("x", __import__("datetime").datetime.now())
+    assert list(tmp_path.glob("kis_token_*.json")) == []
+    assert client.ensure_token() == "P1"
+    assert limiter.calls == 1
+
+
+def test_legacy_token_request_is_paced(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    class _CountingLimiter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire(self) -> float:
+            self.calls += 1
+            return 0.0
+
+    limiter = _CountingLimiter()
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+        limiter=limiter,
+    )
+    client.session = SimpleNamespace(
+        post=lambda *a, **k: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: {"access_token": "L1", "expires_in": 3600}
+        )
+    )  # type: ignore[assignment]
+    assert client._request_new_token() == "L1"
+    assert limiter.calls == 1
+
+
+def test_rejected_token_twice_is_terminal_after_one_retry(tmp_path) -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderTerminalError
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    ensure_calls: list[str | None] = []
+
+    class _Store:
+        def ensure(self, issue, *, rejected=None):
+            ensure_calls.append(rejected)
+            return "T1" if rejected is None else "T2"
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+        token_store=_Store(),
+    )
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "expired"})
+
+    client.session = SimpleNamespace(get=fake_get, post=lambda *a, **k: None)  # type: ignore[assignment]
+    client._sync_session()
+
+    with pytest.raises(ProviderTerminalError):
+        client.inquire_price("005930")
+    assert calls["n"] == 2
+    assert ensure_calls == [None, "T1"]
+
+
+def test_token_issue_without_access_token_is_terminal(tmp_path) -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderTerminalError
+    from src.integrations.kis.admission import SharedTokenStore
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="pool-key", app_secret="s", account_no="", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+        token_store=SharedTokenStore(tmp_path / "pool", "pool-key"),
+    )
+    client.session = SimpleNamespace(
+        post=lambda *a, **k: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: {"error_code": "EGW00133"}
+        )
+    )  # type: ignore[assignment]
+
+    with pytest.raises(ProviderTerminalError, match="Failed to issue token"):
+        client.ensure_token()
+    assert list((tmp_path / "pool").glob("token_*.json")) == []
+
+
+def test_asking_price_exp_ccn_requires_symbol(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+    )
+    with pytest.raises(ValueError, match="symbol is required"):
+        client.inquire_asking_price_exp_ccn("  ")
+
+
+def test_build_pool_client_binds_shared_limiter_and_store(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src.integrations.kis import build_pool_client
+    from src.integrations.kis.admission import AdmissionClass, AdmissionDirNotSharedError, kis_key_id
+
+    monkeypatch.setenv("KIS_DATA_5_APP_KEY", "pool-key")
+    monkeypatch.setenv("KIS_DATA_5_APP_SECRET", "pool-secret")
+    monkeypatch.setenv("KIS_TOKEN_CACHE_DIR", str(tmp_path))
+    key_id = kis_key_id("pool-key")
+
+    client = build_pool_client(_policy(pool_slot=5))
+    assert client.creds.app_key == "pool-key"
+    assert client._limiter._state_path == tmp_path / f"tps_{key_id}.state"
+    assert client._limiter._max_lead == 0.25
+    assert client._token_store._token_path == tmp_path / f"token_{key_id}.json"
+
+    critical = build_pool_client(_policy(pool_slot=5), admission_class=AdmissionClass.CRITICAL)
+    assert critical._limiter._max_lead is None
+
+    with pytest.raises(AdmissionDirNotSharedError):
+        build_pool_client(_policy(pool_slot=5, require_shared_admission=True))
+
+
+def test_default_client_follows_loaded_policy(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    import src.integrations.kis as kis
+
+    monkeypatch.setenv("KIS_DATA_5_APP_KEY", "pool-key")
+    monkeypatch.setenv("KIS_DATA_5_APP_SECRET", "pool-secret")
+    monkeypatch.setenv("KIS_TOKEN_CACHE_DIR", str(tmp_path / "pool"))
+    monkeypatch.setenv("KIS_APP_KEY", "primary-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "primary-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
+    monkeypatch.delenv("KIS_ACCOUNT_PRODUCT_CODE", raising=False)
+    monkeypatch.setenv("KIS_ENV", "demo")
+    monkeypatch.setattr(kis, "load_runtime_config", lambda: SimpleNamespace(logs_root=tmp_path))
+    monkeypatch.setattr("src.integrations.kis.client.load_runtime_config", lambda: SimpleNamespace(logs_root=tmp_path))
+
+    monkeypatch.setattr(kis, "load_provider_policy", lambda _cfg: SimpleNamespace(kis=_policy(pool_slot=5)))
+    pooled = kis.default_client()
+    assert pooled.creds.app_key == "pool-key"
+    assert pooled._token_store is not None
+
+    monkeypatch.setattr(kis, "load_provider_policy", lambda _cfg: SimpleNamespace(kis=_policy()))
+    primary = kis.default_client()
+    assert primary.creds.app_key == "primary-key"
+    assert primary._limiter is None
+    assert primary._token_store is None

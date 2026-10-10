@@ -260,6 +260,10 @@ class KisPolicy(BaseModel):
     min_interval_seconds: PositiveFloat
     max_attempts: PositiveInt
     retryable_msg_codes: tuple[str, ...] = ()
+    pool_slot: PositiveInt | None = None
+    admission_class: Literal["critical", "standard", "bulk"] = "bulk"
+    admission_dir_env: str = "KIS_TOKEN_CACHE_DIR"
+    require_shared_admission: bool = False
 
     @field_validator(
         "app_key_env",

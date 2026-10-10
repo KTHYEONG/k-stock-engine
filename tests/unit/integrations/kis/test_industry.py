@@ -246,3 +246,10 @@ def test_fetch_stock_propagates_provider_error_unwrapped(tmp_path) -> None:
                 ("005930",), client=_StockStubClient({"005930": ProviderTerminalError("bad")})
             ).fetch_stock_classification(bronze_root=tmp_path / "bronze")
         )
+
+
+def test_collectors_default_to_policy_client(monkeypatch) -> None:
+    sentinel = _StubClient({})
+    monkeypatch.setattr("src.integrations.kis.industry.default_client", lambda: sentinel)
+    assert KisIndustryCollector(("005930",))._client is sentinel
+    assert KisStockClassificationCollector(("005930",))._client is sentinel

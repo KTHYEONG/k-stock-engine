@@ -103,3 +103,11 @@ def test_health_check_delegates_to_client() -> None:
     KisInvestorFlowCollector(client=object()).health_check()
 
     assert checks == ["ok"]
+
+
+def test_collector_defaults_to_policy_client(monkeypatch) -> None:
+    from src.integrations.kis.investor_flow import KisInvestorFlowCollector
+
+    sentinel = _StubClient([])
+    monkeypatch.setattr("src.integrations.kis.investor_flow.default_client", lambda: sentinel)
+    assert KisInvestorFlowCollector()._client is sentinel
