@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import polars as pl
@@ -68,6 +68,9 @@ from src.research.registry import RunRegistry, RunReturns
 from src.research.simulator import SimConfig, simulate
 from src.research.stats import annualized_log_growth
 from src.research.trend_overlay import TrendOverlay, TrendOverlaySpec, trend_derivative_config
+
+if TYPE_CHECKING:
+    from src.research.operate import OperateState
 
 __all__ = [
     "EvaluationRun",
@@ -839,6 +842,72 @@ class Pipeline:
         )
         combined = combine_sleeve_targets(sleeves, lo=max(lo, 1), hi=hi + 1)
         return {row: weights for row, weights in combined.items() if lo - 1 <= row <= hi - 1}
+
+    def targets_through_last_row(
+        self, spec: StrategySpec, *, capital_krw: int
+    ) -> tuple[dict[int, NDArray[np.float64]], OperateState]:
+        """Research-path combined targets for rows lo-1..hi inclusive and the equivalent operational state at hi."""
+        from src.research.operate import bootstrap_state
+        from src.research.policy import decision_rows, select_row
+
+        ctx = self._ctx
+        sessions = _sessions_of(ctx.cube)
+        lo, hi, _ = self._window_rows(spec)
+        if isinstance(capital_krw, bool) or not isinstance(capital_krw, int) or capital_krw < 1:
+            raise ValueError(f"capital_krw must be an int >= 1, got {capital_krw!r}")
+        capital = int(capital_krw)
+        panel = self.panel_for(hi)
+        base_scores = np.asarray(self.scores(spec, panel=panel).scores, dtype=np.float64)
+        uni_full = np.asarray(universe_mask(ctx.cube, spec.policy.universe), dtype=bool)
+        uni = np.ascontiguousarray(uni_full[: hi + 1])
+        close_full = np.asarray(ctx.cube.arrays["close"], dtype=np.float64)[: hi + 1]
+        buffer = float(self._sim_config(capital).cash_buffer)
+        sleeve_capital = sleeve_capital_krw(capital, spec.book)
+        view = SimpleNamespace(arrays={"close": close_full})
+        matrix = ScoreMatrix(
+            scores=np.ascontiguousarray(np.asarray(base_scores, dtype=np.float64), dtype=np.float32),
+            test_years=(),
+            config_hash="pipeline",
+            last_row=hi,
+        )
+        sleeves = build_sleeve_targets(
+            spec.policy,
+            view,  # type: ignore[arg-type]
+            panel,
+            matrix,
+            np.asarray(uni, dtype=bool),
+            sessions=sessions,
+            sleeves=int(spec.book.sleeves),
+            lo=lo,
+            hi=hi + 1,
+            sleeve_capital_krw=sleeve_capital,
+            cash_buffer=buffer,
+        )
+        combined = combine_sleeve_targets(sleeves, lo=max(lo, 1), hi=hi + 1)
+        every = int(spec.policy.rebalance_every_sessions)
+        slot_krw = float(sleeve_capital) * (1.0 - buffer) / float(spec.policy.n)
+        dev_enabled = spec.policy.trend_min_dev_ma20 is not None
+        ret_enabled = spec.policy.trend_min_ret21 is not None
+        dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64) if dev_enabled else None
+        ret = np.asarray(panel.features["ret_21"], dtype=np.float64) if ret_enabled else None
+        incumbents: list[frozenset[int]] = []
+        for phase in range(int(spec.book.sleeves)):
+            rows = decision_rows(sessions, lo=lo, hi=hi + 1, every=every, phase=phase)
+            carried: frozenset[int] = frozenset()
+            for row in rows:
+                _, carried = select_row(
+                    spec.policy,
+                    score_row=np.asarray(base_scores[row], dtype=np.float64),
+                    universe_row=np.asarray(uni[row], dtype=bool),
+                    close_row=np.asarray(close_full[row], dtype=np.float64),
+                    dev_row=None if dev is None else np.asarray(dev[row], dtype=np.float64),
+                    ret_row=None if ret is None else np.asarray(ret[row], dtype=np.float64),
+                    incumbents=carried,
+                    slot_krw=slot_krw,
+                )
+            incumbents.append(carried)
+        state = bootstrap_state(spec, ctx.cube, sleeves, incumbents, lo=lo, last_row=hi)
+        return combined, state
 
     def evaluate(self, spec: StrategySpec, *, capital_krw: int | None = None) -> EvaluationRun:
         """Evaluate one spec at ``capital_krw`` (default ``protocol.primary_capital_krw``) on the account engine

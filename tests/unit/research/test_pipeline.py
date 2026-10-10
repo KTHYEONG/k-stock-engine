@@ -2155,3 +2155,67 @@ def test_freeze_provenance_and_identity(tmp_path: Path, monkeypatch: pytest.Monk
     assert manifest["last_train_session"] == sessions[first_idx - 1].isoformat()
     assert manifest["created_at"] == _NOW.isoformat()
     assert len(manifest["files"]) == len(spec.scorer.horizons)
+
+
+def test_targets_through_last_row_matches_research_loop() -> None:
+    from types import SimpleNamespace
+
+    from src.research.book import BookSpec, build_sleeve_targets, combine_sleeve_targets, sleeve_capital_krw
+    from src.research.model import ScoreMatrix
+    from src.research.operate import bootstrap_state
+    from src.research.panel import FeaturePanel
+    from src.research.pipeline import Pipeline
+    from src.research.policy import TrendCashPolicy, UniverseRule, decision_rows, select_row, universe_mask
+    from tests.fixtures.synthetic_panel import synthetic_cube, synthetic_sessions
+
+    sessions = synthetic_sessions(60, start=date(2021, 1, 4))
+    cube = synthetic_cube(sessions, INSTRS[:4])
+    policy = TrendCashPolicy(
+        family="ml_trend_cash", n=2, keep_rank_multiple=3.0, rebalance_every_sessions=2,
+        universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
+        trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,
+    )
+    book = BookSpec(sleeves=2, stock_capital_fraction=0.75)
+    spec = SimpleNamespace(policy=policy, book=book, spec_hash="h" * 16)
+    lo, hi = 10, 50
+    rng = np.random.default_rng(31)
+    feats = {
+        "dev_ma20": np.ascontiguousarray(rng.standard_normal((hi + 1, 4)), dtype=np.float32),
+        "ret_21": np.ascontiguousarray(rng.standard_normal((hi + 1, 4)), dtype=np.float32),
+    }
+    panel = FeaturePanel(features=feats, labels={}, last_row=hi)
+    scored = np.ascontiguousarray(rng.standard_normal((hi + 1, 4)), dtype=np.float32)
+    matrix = ScoreMatrix(scores=scored, test_years=(2021,), config_hash="t", last_row=hi)
+    pipe = Pipeline.__new__(Pipeline)
+    pipe._ctx = SimpleNamespace(cube=cube)
+    pipe._window_rows = lambda _spec: (lo, hi, None)  # noqa: E731
+    pipe.panel_for = lambda _last: panel  # noqa: E731
+    pipe.scores = lambda _spec, panel=None: matrix  # noqa: E731
+    pipe._sim_config = lambda _cap: SimpleNamespace(cash_buffer=0.0)  # noqa: E731
+    combined, state = pipe.targets_through_last_row(spec, capital_krw=10_000_000)
+    uni = np.ascontiguousarray(np.asarray(universe_mask(cube, policy.universe), dtype=bool))[: hi + 1]
+    close = np.asarray(cube.arrays["close"], dtype=np.float64)[: hi + 1]
+    capital, buffer = 10_000_000, 0.0
+    sleeves = build_sleeve_targets(
+        policy, SimpleNamespace(arrays={"close": close}), panel, matrix, uni,
+        sessions=list(cube.sessions), sleeves=2, lo=lo, hi=hi + 1,
+        sleeve_capital_krw=sleeve_capital_krw(capital, book), cash_buffer=buffer,
+    )
+    expected = combine_sleeve_targets(sleeves, lo=max(lo, 1), hi=hi + 1)
+    assert set(combined) == set(expected)
+    for row in expected:
+        assert np.array_equal(np.asarray(combined[row]), np.asarray(expected[row]))
+    slot = float(sleeve_capital_krw(capital, book)) / float(policy.n)
+    incumb: list[frozenset[int]] = []
+    for phase in range(2):
+        carried: frozenset[int] = frozenset()
+        for row in decision_rows(list(cube.sessions), lo=lo, hi=hi + 1, every=2, phase=phase):
+            _, carried = select_row(
+                policy, score_row=np.asarray(scored[row], dtype=np.float64), universe_row=uni[row],
+                close_row=close[row], dev_row=feats["dev_ma20"][row], ret_row=feats["ret_21"][row],
+                incumbents=carried, slot_krw=slot,
+            )
+        incumb.append(carried)
+    assert state == bootstrap_state(spec, cube, sleeves, incumb, lo=lo, last_row=hi)
+    with pytest.raises(ValueError, match="capital_krw"):
+        pipe.targets_through_last_row(spec, capital_krw=0)

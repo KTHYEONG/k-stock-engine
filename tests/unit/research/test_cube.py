@@ -1361,3 +1361,220 @@ def test_panel_float_columns_read_real_parquet_partitions(tmp_path: Path) -> Non
     assert bool(np.isnan(out["market_cap"][1, 1]))
     assert out["trading_value"][1, 1] == 30.0
     assert bool(np.isnan(out["trading_value"][0, 1]))
+
+
+def _tail_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n: int = 700) -> tuple[object, list[date]]:
+    from src.backtest.market import MarketArrays
+    from src.core.market_rules import load_krx_market_rules
+
+    sessions = _sessions(n, start=date(2018, 1, 2))
+    insts = [INST, INST2]
+    shape = (len(sessions), len(insts))
+    rng = np.random.default_rng(5)
+    close_i = np.ascontiguousarray(100 + np.cumsum(rng.integers(0, 3, size=shape), axis=0), dtype=np.int64)
+    fake = MarketArrays(
+        dataset_id="market_panel_0123456789abcdef",
+        sessions=tuple(sessions),
+        instrument_ids=tuple(insts),
+        int_fields={
+            "open": close_i, "high": close_i, "low": close_i, "close": close_i,
+            "base_price": np.maximum(close_i - 1, 1), "volume": np.ones(shape, dtype=np.int64),
+            "tick_size": np.zeros(shape, dtype=np.int64),
+            "upper_limit": np.zeros(shape, dtype=np.int64),
+            "lower_limit": np.zeros(shape, dtype=np.int64),
+        },
+        float_fields={
+            "sell_tax_rate": np.zeros(shape), "adtv20": np.full(shape, 1e8),
+            "ret_vol60": np.full(shape, 0.01), "share_factor": np.ones(shape),
+        },
+        bool_fields={
+            "present": np.ones(shape, dtype=bool),
+            "eligible": np.ones(shape, dtype=bool),
+            "open_at_upper": np.zeros(shape, dtype=bool), "open_at_lower": np.zeros(shape, dtype=bool),
+            "entry_blocked": np.zeros(shape, dtype=bool),
+        },
+        market=np.array([[1, 2]] * len(sessions), dtype=np.int8),
+    )
+    monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: fake)
+    monkeypatch.setattr(cube_mod, "panel_axes", lambda panel_dir: (tuple(sessions), tuple(insts)))
+    monkeypatch.setattr(cube_mod, "_load_tail_market", lambda panel_dir, first_session: fake)
+    monkeypatch.setattr(
+        cube_mod, "_panel_float_columns",
+        lambda _dir, names, sess, ids: {n_: np.full((len(sess), len(ids)), 5.0) for n_ in names},
+    )
+    monkeypatch.setattr(cube_mod, "_require_kind", lambda _path, _kind: None)
+    avail = _dt(sessions[110])
+    facts = pl.DataFrame(
+        [
+            _fact(INST, "2018Q1", "equity", 100.0, avail),
+            _fact(INST, "2018Q1", "sales", 50.0, avail),
+            _fact(INST2, "2018Q1", "equity", 200.0, avail),
+            _fact(INST2, "2018Q1", "sales", 60.0, avail),
+        ]
+    )
+    dividends = pl.DataFrame(
+        [
+            {"instrument_id": INST, "ex_session": sessions[120], "dps_krw": 2, "available_at": _dt(sessions[110])},
+            {"instrument_id": INST, "ex_session": sessions[400], "dps_krw": 3, "available_at": _dt(sessions[390])},
+        ]
+    )
+    flows = pl.DataFrame(
+        [
+            {"instrument_id": INST, "session": sessions[150], "foreign_net_shares": 10,
+             "institution_net_shares": 5, "individual_net_shares": -3, "available_at": _dt(sessions[151])},
+            {"instrument_id": INST, "session": sessions[300], "foreign_net_shares": 7,
+             "institution_net_shares": 3, "individual_net_shares": -1, "available_at": _dt(sessions[301])},
+        ]
+    )
+    releases = pl.DataFrame(
+        [
+            {"instrument_id": INST, "fiscal_period": "2018Q1", "metric": "sales",
+             "span": "quarter", "value_krw": 50.0, "prior_year_value_krw": 40.0,
+             "available_at": _dt(sessions[120]), "basis": "consolidated", "release_kind": "preliminary"},
+        ]
+    )
+
+    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+        name = Path(path).name
+        if "financial_facts" in name:
+            return facts
+        if "dividend" in name:
+            return dividends
+        if "investor_flow" in name:
+            return flows
+        return releases
+
+    monkeypatch.setattr(cube_mod, "_read_frame", _frame)
+    monkeypatch.setattr(
+        cube_mod, "_exit_arrays",
+        lambda _panel, _sess, _insts: (
+            np.full(len(_insts), -1, dtype=np.int64), np.zeros(len(_insts), dtype=np.bool_)
+        ),
+    )
+    rules = load_krx_market_rules(Path("config/market/krx_market_rules.toml"))
+    inputs = cube_mod.CubeInputs(
+        market_panel=tmp_path, dividend_events=tmp_path / "dividend",
+        financial_facts=tmp_path / "financial_facts", investor_flow=tmp_path / "investor_flow",
+        earnings_releases=tmp_path / "releases", market_rules=rules,
+        dividend_withholding_rate=Decimal("0.1"),
+    )
+    return inputs, sessions
+
+
+def test_tail_cube_id_and_sessions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    assert cube_mod.research_cube_id(inputs) == cube_mod.research_cube_id(inputs, first_session=None)
+    assert cube_mod.research_cube_id(inputs, first_session=sessions[100]) != cube_mod.research_cube_id(inputs)
+    full = cube_mod.build_research_cube(inputs)
+    tail = cube_mod.build_research_cube(inputs, first_session=sessions[100])
+    assert tail.sessions == tuple(sessions[100:])
+    assert set(tail.instrument_ids) <= {INST, INST2}
+    assert len(tail.sessions) == 600
+
+
+def test_tail_cube_matches_full_on_last_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from src.research.panel import FEATURE_NAMES, build_panel
+
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    full = cube_mod.build_research_cube(inputs)
+    tail = cube_mod.build_research_cube(inputs, first_session=sessions[100])
+    full_panel = build_panel(full, last_row=len(sessions) - 1)
+    tail_panel = build_panel(tail, last_row=len(tail.sessions) - 1)
+    assert tail_panel.last_row == len(tail.sessions) - 1
+    offset = len(sessions) - len(tail.sessions)
+    full_names = list(full.instrument_ids)
+    for name in FEATURE_NAMES:
+        a = np.asarray(tail_panel.features[name], dtype=np.float64)
+        b = np.asarray(full_panel.features[name], dtype=np.float64)
+        for col, inst in enumerate(tail.instrument_ids):
+            acol = a[-250:, col]
+            bcol = b[-250:, full_names.index(inst)]
+            assert np.array_equal(np.isnan(acol), np.isnan(bcol)), name
+            mask = ~np.isnan(acol)
+            assert np.allclose(acol[mask], bcol[mask], rtol=1e-6, atol=1e-7), name
+    from src.research.policy import UniverseRule, universe_mask
+
+    rule = UniverseRule(min_adtv20_krw=0, min_price_krw=0)
+    tail_uni = np.asarray(universe_mask(tail, rule), dtype=bool)[-250:]
+    full_uni = np.asarray(universe_mask(full, rule), dtype=bool)[-250:]
+    for col, inst in enumerate(tail.instrument_ids):
+        assert np.array_equal(tail_uni[:, col], full_uni[:, full_names.index(inst)])
+
+
+def test_tail_cube_drops_pre_window_flows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    tail = cube_mod.build_research_cube(inputs, first_session=sessions[100])
+    assert np.all(~np.isfinite(np.asarray(tail.arrays["flow_for_krw"], dtype=np.float64)[:20]))
+
+
+def test_unknown_tail_start_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    with pytest.raises(PITDataError):
+        cube_mod.build_research_cube(inputs, first_session=date(2017, 12, 31))
+
+
+def test_market_subset_mismatch_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    with pytest.raises(PITDataError):
+        cube_mod._build_market_arrays(inputs, (date(2030, 1, 1),), (INST,))
+
+
+def test_tail_without_presence_keeps_instruments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from src.backtest.market import MarketArrays
+
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    arrays = cube_mod.load_market_arrays(inputs.market_panel, cache_root=tmp_path)
+    blank = dict(arrays.bool_fields)
+    blank["present"] = np.zeros_like(blank["present"])
+    dark = MarketArrays(
+        dataset_id=arrays.dataset_id, sessions=arrays.sessions, instrument_ids=arrays.instrument_ids,
+        int_fields=dict(arrays.int_fields), float_fields=dict(arrays.float_fields),
+        bool_fields=blank, market=np.asarray(arrays.market),
+    )
+    monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: dark)
+    monkeypatch.setattr(cube_mod, "_load_tail_market", lambda panel_dir, first_session: dark)
+    with pytest.raises(PITDataError, match="no present"):
+        cube_mod.build_research_cube(inputs, first_session=sessions[100])
+
+
+def test_tail_market_reads_only_kept_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.fixtures.synthetic_panel import synthetic_panel_row
+    import src.data.datasets as datasets
+
+    sessions = _sessions(3)
+    records = [synthetic_panel_row(day, INST) for day in sessions]
+    records.append(synthetic_panel_row(sessions[0], INST2))
+    path = tmp_path / "panel.parquet"
+    pl.DataFrame(records).write_parquet(path)
+    monkeypatch.setattr(datasets, "dataset_partition_paths", lambda directory: [path])
+    assert cube_mod.panel_axes(tmp_path) == (tuple(sessions), (INST, INST2))
+    tail = cube_mod._load_tail_market(tmp_path, sessions[1])
+    assert tail.sessions == tuple(sessions[1:])
+    assert tail.instrument_ids == (INST,)
+    assert tail.bool_fields["present"].shape == (2, 1)
+    assert np.all(tail.int_fields["close"] == 10000)
+    floats = cube_mod._panel_float_columns(tmp_path, ("adtv20",), tail.sessions, tail.instrument_ids)
+    assert np.array_equal(floats["adtv20"], tail.float_fields["adtv20"])
+    pl.DataFrame([*records, records[-1]]).write_parquet(path)
+    with pytest.raises(PITDataError, match="duplicate"):
+        cube_mod._load_tail_market(tmp_path, sessions[0])
+
+
+def test_pre_tail_availability_preserves_earn_age(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from src.research.panel import build_panel
+
+    inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
+    original = cube_mod._read_frame
+
+    def earlier(path: Path, columns: object = None) -> pl.DataFrame:
+        frame = original(path, columns)
+        if "financial_facts" in path.name or "releases" in path.name:
+            return frame.with_columns(pl.lit(_dt(sessions[5])).alias("available_at"))
+        return frame
+
+    monkeypatch.setattr(cube_mod, "_read_frame", earlier)
+    full = cube_mod.build_research_cube(inputs)
+    tail = cube_mod.build_research_cube(inputs, first_session=sessions[100])
+    a = build_panel(full, last_row=699).features["earn_age"][-250:]
+    b = build_panel(tail, last_row=599).features["earn_age"][-250:]
+    np.testing.assert_array_equal(a, b)

@@ -868,3 +868,921 @@ def test_promote_rebaseline_flags_are_exclusive(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as exc2:
         main(["promote", "--spec", str(spec), "--policy-override", "x", "--rebaseline", "y"])
     assert exc2.value.code == 2
+
+
+def _parity_fake_pipeline(sessions: list[Any], instruments: list[str], combined: dict[int, Any]) -> Any:
+    class _FakeParity:
+        def __init__(self) -> None:
+            self._ctx = SimpleNamespace(
+                protocol=SimpleNamespace(primary_capital_krw=10_000_000),
+                cube=SimpleNamespace(sessions=tuple(sessions), instrument_ids=tuple(instruments)),
+            )
+
+        def targets_through_last_row(self, spec: object, *, capital_krw: int) -> tuple[object, object]:
+            return combined, None
+
+    return _FakeParity()
+
+
+def test_parity_detects_a_divergence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.operate import SealedDecision, seal
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    instruments = ["KRX:000001", "KRX:000002"]
+    weights = np.zeros(2, dtype=np.float64)
+    weights[0] = 0.5
+    combined = {1: np.ascontiguousarray(weights)}
+    monkeypatch.setattr(cli_module, "_pipeline_for", lambda args: _parity_fake_pipeline(sessions, instruments, combined))
+    decisions = tmp_path / "decisions"
+    record = SealedDecision(
+        data_session=sessions[1],
+        execution_session=sessions[2],
+        sealed_at=datetime(2021, 1, 6, 9, 0, tzinfo=UTC),
+        spec_hash="s" * 64,
+        models_id="m",
+        inputs={"cube": "c"},
+        targets={"KRX:000001": 0.9},
+        reference={"KRX:000001": 5000.0},
+        overlay={"regime_fraction": 0.0, "trend_signal": 0.0, "trend_vol_scale": 1.0},
+        state_digest="d" * 64,
+        prev_hash="",
+        hash="",
+    )
+    seal(decisions, record)
+    spec = _write_spec(tmp_path / "spec.toml")
+    code = main(["parity", "--spec", str(spec), "--decisions-dir", str(decisions)])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["diverged"] is True
+    entry = next(item for item in payload["sessions"] if item["data_session"] == "2021-01-05")
+    assert entry["max_abs_weight_diff"] > 1e-9
+
+
+def test_decide_is_idempotent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date, timedelta
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research import cube as cube_mod
+    from src.research.book import BookSpec, build_sleeve_targets, sleeve_capital_krw
+    from src.research.cli import main
+    from src.research.hedge import HedgeInputs
+    from src.research.model import FrozenScorer, ScorerConfig, ScoreMatrix, score_rows
+    from src.research.operate import bootstrap_state, load_state
+    from src.research.panel import build_panel, feature_names_for
+    from src.research.policy import TrendCashPolicy, UniverseRule, decision_rows, select_row, universe_mask
+
+    base = date(2021, 1, 4)
+    sessions = []
+    day = base
+    while len(sessions) < 20:
+        if day.weekday() < 5:
+            sessions.append(day)
+        day += timedelta(days=1)
+
+    from src.backtest.market import MarketArrays
+
+    shape = (len(sessions), 2)
+    rng = np.random.default_rng(9)
+    close_i = np.ascontiguousarray(100 + np.cumsum(rng.integers(0, 3, size=shape), axis=0), dtype=np.int64)
+    fake = MarketArrays(
+        dataset_id="market_panel_0123456789abcdef",
+        sessions=tuple(sessions),
+        instrument_ids=("KRX:000001", "KRX:000002"),
+        int_fields={
+            "open": close_i, "high": close_i, "low": close_i, "close": close_i,
+            "base_price": np.maximum(close_i - 1, 1), "volume": np.ones(shape, dtype=np.int64),
+            "tick_size": np.zeros(shape, dtype=np.int64),
+            "upper_limit": np.zeros(shape, dtype=np.int64),
+            "lower_limit": np.zeros(shape, dtype=np.int64),
+        },
+        float_fields={
+            "sell_tax_rate": np.zeros(shape), "adtv20": np.full(shape, 1e8),
+            "ret_vol60": np.full(shape, 0.01), "share_factor": np.ones(shape),
+        },
+        bool_fields={
+            "present": np.ones(shape, dtype=bool),
+            "eligible": np.ones(shape, dtype=bool),
+            "open_at_upper": np.zeros(shape, dtype=bool), "open_at_lower": np.zeros(shape, dtype=bool),
+            "entry_blocked": np.zeros(shape, dtype=bool),
+        },
+        market=np.ones(shape, dtype=np.int8),
+    )
+    monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: fake)
+    monkeypatch.setattr(
+        cube_mod, "_panel_float_columns",
+        lambda _dir, names, sess, ids: {n: np.full((len(sess), len(ids)), 5.0) for n in names},
+    )
+    monkeypatch.setattr(cube_mod, "_require_kind", lambda _path, _kind: None)
+    import polars as pl
+
+    krx = __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("Asia/Seoul")
+    from datetime import datetime as _dtm
+
+    def _at(d: Any) -> Any:
+        return _dtm(d.year, d.month, d.day, 9, 0, tzinfo=krx)
+
+    facts = pl.DataFrame([
+        {"company_id": "KRX:000001", "ticker": "000001", "fiscal_period": "2020Q4", "fact": "equity",
+         "value": 100.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000001", "ticker": "000001", "fiscal_period": "2020Q4", "fact": "sales",
+         "value": 50.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000002", "ticker": "000002", "fiscal_period": "2020Q4", "fact": "equity",
+         "value": 200.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000002", "ticker": "000002", "fiscal_period": "2020Q4", "fact": "sales",
+         "value": 60.0, "available_at": _at(sessions[5]), "consolidated": True},
+    ])
+    dividends = pl.DataFrame([
+        {"instrument_id": "KRX:000001", "ex_session": sessions[8], "dps_krw": 2, "available_at": _at(sessions[7])},
+    ])
+    flows = pl.DataFrame(
+        [
+            {"instrument_id": "KRX:000001", "session": sessions[6], "foreign_net_shares": 10,
+             "institution_net_shares": 5, "individual_net_shares": -3, "available_at": _at(sessions[7])},
+        ],
+        schema={"instrument_id": pl.String, "session": pl.Date, "foreign_net_shares": pl.Float64,
+                "institution_net_shares": pl.Float64, "individual_net_shares": pl.Float64,
+                "available_at": pl.Datetime("us", "Asia/Seoul")},
+    )
+    releases = pl.DataFrame([
+        {"instrument_id": "KRX:000001", "fiscal_period": "2020Q4", "metric": "sales",
+         "span": "quarter", "value_krw": 50.0, "prior_year_value_krw": 40.0,
+         "available_at": _at(sessions[7]), "basis": "consolidated", "release_kind": "preliminary"},
+    ])
+
+    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+        name = Path(path).name
+        if "financial_facts" in name:
+            return facts
+        if "dividend" in name:
+            return dividends
+        if "investor_flow" in name:
+            return flows
+        return releases
+
+    monkeypatch.setattr(cube_mod, "_read_frame", _frame)
+    monkeypatch.setattr(
+        cube_mod, "_exit_arrays",
+        lambda _panel, _sess, _insts: (np.full(len(_insts), -1, dtype=np.int64), np.zeros(len(_insts), dtype=np.bool_)),
+    )
+    from src.core.market_rules import load_krx_market_rules
+
+    rules = load_krx_market_rules(Path("config/market/krx_market_rules.toml"))
+    inputs = cube_mod.CubeInputs(
+        market_panel=tmp_path, dividend_events=tmp_path / "dividend",
+        financial_facts=tmp_path / "financial_facts", investor_flow=tmp_path / "investor_flow",
+        earnings_releases=tmp_path / "releases", market_rules=rules,
+        dividend_withholding_rate=__import__("decimal", fromlist=["Decimal"]).Decimal("0.1"),
+    )
+    cube = cube_mod.build_research_cube(inputs)
+    panel = build_panel(cube, last_row=len(sessions) - 1)
+    policy = TrendCashPolicy(
+        family="ml_trend_cash", n=1, keep_rank_multiple=3.0, rebalance_every_sessions=2,
+        universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
+        trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,
+    )
+    book = BookSpec(sleeves=2, stock_capital_fraction=0.75)
+    config = ScorerConfig(horizons=(5,), min_cross_section=1, min_train_rows=1)
+
+    class _Stub:
+        def model_to_string(self) -> str:
+            return "stub"
+
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            mat = np.asarray(data, dtype=np.float64)
+            if mat.shape[0] == 0 or mat.shape[1] == 0:
+                return np.zeros(mat.shape[0], dtype=np.float64)
+            return np.ascontiguousarray(mat[:, 0], dtype=np.float64)
+
+    scorer = FrozenScorer(config=config, year=2021, boosters={(int(config.seed), 5): _Stub()})  # type: ignore[dict-item]
+    uni = np.ascontiguousarray(np.asarray(universe_mask(cube, policy.universe), dtype=bool))
+    mats = [np.asarray(panel.features[name]) for name in feature_names_for("full62")]
+    scored = np.asarray(score_rows(mats, uni, list(range(len(sessions))), scorer), dtype=np.float64)
+    lo, last = 4, 12
+    capital = 10_000_000
+    buffer = 0.0
+    matrix = ScoreMatrix(scores=np.ascontiguousarray(scored, dtype=np.float32), test_years=(), config_hash="t", last_row=len(sessions) - 1)
+    view = SimpleNamespace(arrays={"close": np.asarray(cube.arrays["close"], dtype=np.float64)})
+    sleeves = build_sleeve_targets(
+        policy, view, panel, matrix, uni, sessions=list(cube.sessions), sleeves=2, lo=lo,
+        hi=len(sessions), sleeve_capital_krw=sleeve_capital_krw(capital, book), cash_buffer=buffer,
+    )
+    slot = float(sleeve_capital_krw(capital, book)) / float(policy.n)
+    close = np.asarray(cube.arrays["close"], dtype=np.float64)
+    dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
+    ret = np.asarray(panel.features["ret_21"], dtype=np.float64)
+    incumb: list[frozenset[int]] = []
+    for phase in range(2):
+        carried: frozenset[int] = frozenset()
+        for row in decision_rows(list(cube.sessions), lo=lo, hi=len(sessions), every=2, phase=phase):
+            _, carried = select_row(
+                policy, score_row=scored[row], universe_row=uni[row], close_row=close[row],
+                dev_row=dev[row], ret_row=ret[row], incumbents=carried, slot_krw=slot,
+            )
+        incumb.append(carried)
+    from src.research.pipeline import load_strategy_spec
+
+    spec_toml = _write_spec(tmp_path / "spec.toml", n=1)
+    spec_toml.write_text(
+        '[policy]\nfamily = "ml_trend_cash"\nn = 1\nrebalance_every_sessions = 2\nmin_units_per_slot = 0\n'
+        "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
+        "[scorer]\nfirst_test_year = 2019\nmin_train_rows = 1\nmin_cross_section = 1\n"
+        "num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\nhorizons = [5]\n"
+        "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
+        "[hedge]\nhedge_ratio = 1.0\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
+        "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
+        "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"
+        "futures_cost_rate = 0.0003\ninverse_cost_rate = 0.0007\nresize_sell_cost_rate = 0.0025\n"
+        "resize_buy_cost_rate = 0.0005\nfutures_tax_rate = 0.11\n"
+        "futures_annual_deduction_krw = 2500000\ninverse_tax_rate = 0.154\n",
+        encoding="utf-8",
+    )
+    spec = load_strategy_spec(spec_toml)
+    state = bootstrap_state(spec, cube, sleeves, incumb, lo=lo, last_row=last)
+    state_path = tmp_path / "state.json"
+    from src.research.operate import save_state
+
+    save_state(state_path, state)
+    hedge = HedgeInputs(
+        sessions=tuple(sessions),
+        index_level=np.ascontiguousarray(np.full(len(sessions), 400.0)),
+        inverse_close=np.ascontiguousarray(np.full(len(sessions), 10000.0)),
+    )
+    ctx = SimpleNamespace(
+        protocol=SimpleNamespace(primary_capital_krw=capital),
+        cash_returns=np.ascontiguousarray(np.full(len(sessions), 0.0001)),
+        hedge_inputs=hedge,
+        trend_inputs=None,
+        dataset_ids={"market_panel": "m"},
+    )
+    pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
+    monkeypatch.setattr(
+        cli_module, "_decide_context", lambda args, tail: SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=inputs)
+    )
+    monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorer)
+    models = tmp_path / "models"
+    models.mkdir()
+    decisions = tmp_path / "decisions"
+    argv = ["decide", "--spec", str(spec_toml), "--state", str(state_path), "--models-dir", str(models),
+            "--decisions-dir", str(decisions)]
+    assert main(argv) == 0
+    first_out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert len(first_out["sealed"]) == len(sessions) - 1 - last
+    assert load_state(state_path).last_session == sessions[-1]
+    assert main(argv) == 0
+    second_out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert second_out["sealed"] == []
+
+
+def test_operate_bootstrap_writes_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.operate import OperateState, SleeveState, load_state
+
+    state = OperateState(
+        spec_hash="s" * 64,
+        anchor_session=date(2021, 1, 4),
+        last_session=date(2021, 1, 5),
+        sessions_since_anchor=1,
+        sleeves=(
+            SleeveState(phase=0, incumbents=(), weights={}, decided_session=None),
+            SleeveState(phase=1, incumbents=(), weights={}, decided_session=None),
+        ),
+    )
+
+    class _FakeBoot:
+        def __init__(self) -> None:
+            self._ctx = SimpleNamespace(protocol=SimpleNamespace(primary_capital_krw=10_000_000))
+
+        def targets_through_last_row(self, spec: object, *, capital_krw: int) -> tuple[object, object]:
+            assert capital_krw == 10_000_000
+            return {}, state
+
+    monkeypatch.setattr(cli_module, "_pipeline_for", lambda args: _FakeBoot())
+    spec = _write_spec(tmp_path / "spec.toml")
+    out = tmp_path / "state.json"
+    assert main(["operate-bootstrap", "--spec", str(spec), "--out", str(out)]) == 0
+    assert load_state(out) == state
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["last_session"] == "2021-01-05"
+    assert payload["out"] == str(out)
+
+
+def test_scorer_for_missing_and_prefix_cube(tmp_path: Path) -> None:
+    from datetime import date, timedelta
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+
+    with pytest.raises(ValueError, match="no frozen scorer"):
+        cli_module._scorer_for(tmp_path, 2021, "abc")
+    sessions = [date(2021, 1, 4) + timedelta(days=i) for i in range(5)]
+    shape = (5, 2)
+    arrays = {
+        "close": np.ascontiguousarray(np.full(shape, 100.0)),
+        "present": np.ones(shape, dtype=bool),
+    }
+    from src.research.cube import ResearchCube
+
+    cube = ResearchCube.from_arrays(
+        cube_id="c", sessions=sessions, instrument_ids=["KRX:000001", "KRX:000002"],
+        arrays=arrays, exit_at=np.array([5, -1], dtype=np.int64), exit_halted=np.zeros(2, dtype=np.bool_),
+    )
+    prefix = cli_module._prefix_cube(cube, 2)
+    assert tuple(prefix.sessions) == tuple(sessions[:3])
+    assert list(prefix.exit_at) == [-1, -1]
+    assert np.asarray(prefix.arrays["close"]).shape == (3, 2)
+
+
+def test_parity_clean_and_missing_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.operate import SealedDecision, seal
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    instruments = ["KRX:000001", "KRX:000002"]
+    weights = np.zeros(2, dtype=np.float64)
+    weights[0] = 0.5
+    combined = {1: np.ascontiguousarray(weights)}
+    monkeypatch.setattr(cli_module, "_pipeline_for", lambda args: _parity_fake_pipeline(sessions, instruments, combined))
+    decisions = tmp_path / "decisions"
+    seal(
+        decisions,
+        SealedDecision(
+            data_session=sessions[1], execution_session=sessions[2],
+            sealed_at=datetime(2021, 1, 6, 9, 0, tzinfo=UTC), spec_hash="s" * 64, models_id="m",
+            inputs={"cube": "c"}, targets={"KRX:000001": 0.5}, reference={"KRX:000001": 5000.0},
+            overlay={"regime_fraction": 0.0, "trend_signal": 0.0, "trend_vol_scale": 1.0},
+            state_digest="d" * 64, prev_hash="", hash="",
+        ),
+    )
+    spec = _write_spec(tmp_path / "spec.toml")
+    assert main(["parity", "--spec", str(spec), "--decisions-dir", str(decisions)]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["diverged"] is False
+    seal(
+        decisions,
+        SealedDecision(
+            data_session=date(2022, 5, 4), execution_session=date(2022, 5, 6),
+            sealed_at=datetime(2021, 1, 6, 9, 0, tzinfo=UTC), spec_hash="s" * 64, models_id="m",
+            inputs={"cube": "c"}, targets={"KRX:000001": 0.5}, reference={"KRX:000001": 5000.0},
+            overlay={"regime_fraction": 0.0, "trend_signal": 0.0, "trend_vol_scale": 1.0},
+            state_digest="d" * 64, prev_hash="", hash="",
+        ),
+    )
+    assert main(["parity", "--spec", str(spec), "--decisions-dir", str(decisions)]) == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["diverged"] is True
+
+
+def test_peak_rss_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from src.research import cli as cli_module
+
+    monkeypatch.setitem(sys.modules, "resource", None)
+    assert cli_module._peak_rss_mb() == 0.0
+
+
+def _tiny_decide_cube(sessions: list[Any]) -> Any:
+    import numpy as np
+
+    from src.research.cube import ResearchCube
+
+    shape = (len(sessions), 2)
+    return ResearchCube.from_arrays(
+        cube_id="c",
+        sessions=sessions,
+        instrument_ids=["KRX:000001", "KRX:000002"],
+        arrays={
+            "close": np.ascontiguousarray(np.full(shape, 5000.0)),
+            "present": np.ones(shape, dtype=bool),
+            "eligible": np.ones(shape, dtype=bool),
+            "entry_blocked": np.zeros(shape, dtype=bool),
+            "volume": np.full(shape, 100000.0),
+            "adtv20": np.full(shape, 1e9),
+            "ret_vol60": np.full(shape, 0.02),
+        },
+        exit_at=np.full(2, -1, dtype=np.int64),
+        exit_halted=np.zeros(2, dtype=np.bool_),
+    )
+
+
+def _tiny_decide_state(tmp_path: Path, spec: Any, cube: Any, last: Any) -> Path:
+    from src.research.operate import bootstrap_state, save_state
+
+    state = bootstrap_state(spec, cube, ({}, {}, {}, {}, {}), (frozenset(), frozenset(), frozenset(), frozenset(), frozenset()), lo=1, last_row=0)
+    import dataclasses
+
+    state = dataclasses.replace(
+        state, last_session=last,
+        sessions_since_anchor=cube.sessions.index(last) if last in cube.sessions else 1,
+    )
+    path = tmp_path / "state.json"
+    save_state(path, state)
+    return path
+
+
+def _tiny_decide_ctx(sessions: list[Any], *, cash: float = 0.0001, hedge: float = 400.0) -> Any:
+    import numpy as np
+
+    from src.research.hedge import HedgeInputs
+
+    return SimpleNamespace(
+        protocol=SimpleNamespace(primary_capital_krw=10_000_000),
+        cash_returns=np.ascontiguousarray(np.full(len(sessions), cash)),
+        hedge_inputs=HedgeInputs(
+            sessions=tuple(sessions),
+            index_level=np.ascontiguousarray(np.full(len(sessions), hedge)),
+            inverse_close=np.ascontiguousarray(np.full(len(sessions), 10000.0)),
+        ),
+        trend_inputs=None,
+        dataset_ids={"market_panel": "m"},
+    )
+
+
+def _tiny_decide_resolved(cube: Any, ctx: Any) -> Any:
+    pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
+    return SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=None)
+
+
+def test_decide_rejects_tail_sessions_below_700(tmp_path: Path) -> None:
+    from src.research import cli as cli_module
+
+    args = SimpleNamespace(scope_config=None, data_root=None)
+    with pytest.raises(ValueError, match="tail-sessions"):
+        cli_module._decide_context(args, 699)
+
+
+def test_decide_spec_mismatch_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    other = load_strategy_spec(_write_spec(tmp_path / "other.toml", n=3))
+    ctx = _tiny_decide_ctx(sessions)
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, other, cube, sessions[0])
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+
+
+def test_decide_unknown_session_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    ctx = _tiny_decide_ctx(sessions)
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, date(2022, 12, 31))
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+
+
+def test_decide_nan_cash_seals_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from datetime import date
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    ctx = _tiny_decide_ctx(sessions)
+    ctx.cash_returns[1] = np.nan
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
+    decisions = tmp_path / "d"
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(decisions)])
+    assert code == 1
+    assert not decisions.exists() or not list(decisions.iterdir())
+
+
+def test_decide_nan_hedge_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from datetime import date
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    ctx = _tiny_decide_ctx(sessions)
+    ctx.hedge_inputs = SimpleNamespace(
+        sessions=tuple(sessions),
+        index_level=np.ascontiguousarray(np.full(len(sessions), np.nan)),
+        inverse_close=np.ascontiguousarray(np.full(len(sessions), 10000.0)),
+    )
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+
+
+def test_decide_missing_trend_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    trending = SimpleNamespace(
+        policy=spec.policy, book=spec.book, scorer=spec.scorer, spec_hash=spec.spec_hash,
+        trend_overlay=object(), regime_hedge=None,
+    )
+    monkeypatch.setattr(cli_module, "_load_spec", lambda path: trending)
+    ctx = _tiny_decide_ctx(sessions)
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+
+
+def test_decide_calendar_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import date
+
+    import numpy as np
+
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.model import FrozenScorer, ScorerConfig
+    from src.research.panel import FeaturePanel
+    from src.research.pipeline import load_strategy_spec
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml", n=1))
+
+    class _Stub:
+        def model_to_string(self) -> str:
+            return "stub"
+
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            return np.zeros(np.asarray(data).shape[0], dtype=np.float64)
+
+    config = ScorerConfig(horizons=(5,), min_cross_section=1, min_train_rows=1)
+    scorer = FrozenScorer(config=config, year=2021, boosters={(int(config.seed), 5): _Stub()})  # type: ignore[dict-item]
+    from src.research.panel import feature_names_for as _names_for
+
+    panel = FeaturePanel(
+        features={
+            name: np.zeros((3, 2), dtype=np.float32) for name in _names_for("full62")
+        },
+        labels={},
+        last_row=2,
+    )
+    monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorer)
+    import src.research.operate as operate_module
+
+    real_advance = operate_module._advance_with_states
+
+    def _one_day(state: Any, spec: Any, cube: Any, panel: Any, scorer: Any, *, capital_krw: int, cash_buffer: float,
+                 series: Any) -> Any:
+        final, _, snapshots = real_advance(state, spec, cube, panel, scorer, capital_krw=capital_krw,
+                                           cash_buffer=cash_buffer, series=series)
+        return final, ((sessions[1], {"KRX:000001": 0.5}),), snapshots[:1]
+
+    monkeypatch.setattr(operate_module, "_advance_with_states", _one_day)
+    import src.core.krx_calendar as calendar_module
+
+    original_calendar = calendar_module.xkrx_calendar_through
+
+    def calendar_for(day: Any) -> Any:
+        if day == sessions[-1]:
+            return original_calendar(day)
+        raise ValueError("no calendar")
+
+    monkeypatch.setattr(calendar_module, "xkrx_calendar_through", calendar_for)
+    from src.research import panel as panel_module
+
+    monkeypatch.setattr(panel_module, "build_panel", lambda cube, last_row: panel)
+    ctx = _tiny_decide_ctx(sessions)
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+
+
+def test_decide_multi_year_catch_up(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import date, timedelta
+
+    import numpy as np
+    import polars as pl
+
+    from src.research import cli as cli_module
+    from src.research import cube as cube_mod
+    from src.research.book import BookSpec, build_sleeve_targets, sleeve_capital_krw
+    from src.research.cli import main
+    from src.research.hedge import HedgeInputs
+    from src.research.model import FrozenScorer, ScorerConfig, ScoreMatrix, score_rows
+    from src.research.operate import bootstrap_state, load_state, save_state
+    from src.research.panel import build_panel, feature_names_for
+    from src.research.policy import TrendCashPolicy, UniverseRule, decision_rows, select_row, universe_mask
+
+    base = date(2021, 12, 20)
+    sessions = []
+    day = base
+    while len(sessions) < 21:
+        if day.weekday() < 5 and day != date(2021, 12, 31):
+            sessions.append(day)
+        day += timedelta(days=1)
+    sessions = sessions[:20]
+    assert sessions[0].year == 2021
+    assert sessions[-1].year == 2022
+
+    from src.backtest.market import MarketArrays
+
+    shape = (len(sessions), 2)
+    rng = np.random.default_rng(9)
+    close_i = np.ascontiguousarray(100 + np.cumsum(rng.integers(0, 3, size=shape), axis=0), dtype=np.int64)
+    fake = MarketArrays(
+        dataset_id="market_panel_0123456789abcdef",
+        sessions=tuple(sessions),
+        instrument_ids=("KRX:000001", "KRX:000002"),
+        int_fields={
+            "open": close_i, "high": close_i, "low": close_i, "close": close_i,
+            "base_price": np.maximum(close_i - 1, 1), "volume": np.ones(shape, dtype=np.int64),
+            "tick_size": np.zeros(shape, dtype=np.int64),
+            "upper_limit": np.zeros(shape, dtype=np.int64),
+            "lower_limit": np.zeros(shape, dtype=np.int64),
+        },
+        float_fields={
+            "sell_tax_rate": np.zeros(shape), "adtv20": np.full(shape, 1e8),
+            "ret_vol60": np.full(shape, 0.01), "share_factor": np.ones(shape),
+        },
+        bool_fields={
+            "present": np.ones(shape, dtype=bool),
+            "eligible": np.ones(shape, dtype=bool),
+            "open_at_upper": np.zeros(shape, dtype=bool), "open_at_lower": np.zeros(shape, dtype=bool),
+            "entry_blocked": np.zeros(shape, dtype=bool),
+        },
+        market=np.ones(shape, dtype=np.int8),
+    )
+    monkeypatch.setattr(cube_mod, "load_market_arrays", lambda panel_dir, cache_root: fake)
+    monkeypatch.setattr(
+        cube_mod, "_panel_float_columns",
+        lambda _dir, names, sess, ids: {n: np.full((len(sess), len(ids)), 5.0) for n in names},
+    )
+    monkeypatch.setattr(cube_mod, "_require_kind", lambda _path, _kind: None)
+    krx = __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("Asia/Seoul")
+    from datetime import datetime as _dtm
+
+    def _at(d: Any) -> Any:
+        return _dtm(d.year, d.month, d.day, 9, 0, tzinfo=krx)
+
+    facts = pl.DataFrame([
+        {"company_id": "KRX:000001", "ticker": "000001", "fiscal_period": "2021Q3", "fact": "equity",
+         "value": 100.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000001", "ticker": "000001", "fiscal_period": "2021Q3", "fact": "sales",
+         "value": 50.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000002", "ticker": "000002", "fiscal_period": "2021Q3", "fact": "equity",
+         "value": 200.0, "available_at": _at(sessions[5]), "consolidated": True},
+        {"company_id": "KRX:000002", "ticker": "000002", "fiscal_period": "2021Q3", "fact": "sales",
+         "value": 60.0, "available_at": _at(sessions[5]), "consolidated": True},
+    ])
+    dividends = pl.DataFrame([
+        {"instrument_id": "KRX:000001", "ex_session": sessions[8], "dps_krw": 2, "available_at": _at(sessions[7])},
+    ])
+    flows = pl.DataFrame(
+        [
+            {"instrument_id": "KRX:000001", "session": sessions[6], "foreign_net_shares": 10,
+             "institution_net_shares": 5, "individual_net_shares": -3, "available_at": _at(sessions[7])},
+        ],
+        schema={"instrument_id": pl.String, "session": pl.Date, "foreign_net_shares": pl.Float64,
+                "institution_net_shares": pl.Float64, "individual_net_shares": pl.Float64,
+                "available_at": pl.Datetime("us", "Asia/Seoul")},
+    )
+    releases = pl.DataFrame([
+        {"instrument_id": "KRX:000001", "fiscal_period": "2021Q3", "metric": "sales",
+         "span": "quarter", "value_krw": 50.0, "prior_year_value_krw": 40.0,
+         "available_at": _at(sessions[7]), "basis": "consolidated", "release_kind": "preliminary"},
+    ])
+
+    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+        name = Path(path).name
+        if "financial_facts" in name:
+            return facts
+        if "dividend" in name:
+            return dividends
+        if "investor_flow" in name:
+            return flows
+        return releases
+
+    monkeypatch.setattr(cube_mod, "_read_frame", _frame)
+    monkeypatch.setattr(
+        cube_mod, "_exit_arrays",
+        lambda _panel, _sess, _insts: (np.full(len(_insts), -1, dtype=np.int64), np.zeros(len(_insts), dtype=np.bool_)),
+    )
+    from src.core.market_rules import load_krx_market_rules
+
+    rules = load_krx_market_rules(Path("config/market/krx_market_rules.toml"))
+    inputs = cube_mod.CubeInputs(
+        market_panel=tmp_path, dividend_events=tmp_path / "dividend",
+        financial_facts=tmp_path / "financial_facts", investor_flow=tmp_path / "investor_flow",
+        earnings_releases=tmp_path / "releases", market_rules=rules,
+        dividend_withholding_rate=__import__("decimal", fromlist=["Decimal"]).Decimal("0.1"),
+    )
+    cube = cube_mod.build_research_cube(inputs)
+    panel = build_panel(cube, last_row=len(sessions) - 1)
+    policy = TrendCashPolicy(
+        family="ml_trend_cash", n=1, keep_rank_multiple=3.0, rebalance_every_sessions=2,
+        universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
+        trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,
+    )
+    book = BookSpec(sleeves=2, stock_capital_fraction=0.75)
+    config = ScorerConfig(horizons=(5,), min_cross_section=1, min_train_rows=1)
+
+    class _Stub:
+        def model_to_string(self) -> str:
+            return "stub"
+
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            mat = np.asarray(data, dtype=np.float64)
+            if mat.shape[0] == 0 or mat.shape[1] == 0:
+                return np.zeros(mat.shape[0], dtype=np.float64)
+            return np.ascontiguousarray(mat[:, 0], dtype=np.float64)
+
+    scorers = {
+        year: FrozenScorer(config=config, year=year, boosters={(int(config.seed), 5): _Stub()})  # type: ignore[dict-item]
+        for year in (2021, 2022)
+    }
+    uni = np.ascontiguousarray(np.asarray(universe_mask(cube, policy.universe), dtype=bool))
+    mats = [np.asarray(panel.features[name]) for name in feature_names_for("full62")]
+    scored = np.asarray(score_rows(mats, uni, list(range(len(sessions))), scorers[2021]), dtype=np.float64)
+    lo, last = 4, 7
+    capital = 10_000_000
+    matrix = ScoreMatrix(scores=np.ascontiguousarray(scored, dtype=np.float32), test_years=(), config_hash="t", last_row=len(sessions) - 1)
+    view = SimpleNamespace(arrays={"close": np.asarray(cube.arrays["close"], dtype=np.float64)})
+    sleeves = build_sleeve_targets(
+        policy, view, panel, matrix, uni, sessions=list(cube.sessions), sleeves=2, lo=lo,
+        hi=len(sessions), sleeve_capital_krw=sleeve_capital_krw(capital, book), cash_buffer=0.0,
+    )
+    slot = float(sleeve_capital_krw(capital, book)) / float(policy.n)
+    close = np.asarray(cube.arrays["close"], dtype=np.float64)
+    dev = np.asarray(panel.features["dev_ma20"], dtype=np.float64)
+    ret = np.asarray(panel.features["ret_21"], dtype=np.float64)
+    incumb: list[frozenset[int]] = []
+    for phase in range(2):
+        carried: frozenset[int] = frozenset()
+        for row in decision_rows(list(cube.sessions), lo=lo, hi=len(sessions), every=2, phase=phase):
+            _, carried = select_row(
+                policy, score_row=scored[row], universe_row=uni[row], close_row=close[row],
+                dev_row=dev[row], ret_row=ret[row], incumbents=carried, slot_krw=slot,
+            )
+        incumb.append(carried)
+    spec_toml = tmp_path / "spec.toml"
+    spec_toml.write_text(
+        '[policy]\nfamily = "ml_trend_cash"\nn = 1\nrebalance_every_sessions = 2\nmin_units_per_slot = 0\n'
+        "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
+        "[scorer]\nfirst_test_year = 2019\nmin_train_rows = 1\nmin_cross_section = 1\n"
+        "num_boost_round = 2\nmin_data_in_leaf = 2\nnum_threads = 1\nhorizons = [5]\n"
+        "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
+        "[hedge]\nhedge_ratio = 1.0\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
+        "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
+        "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"
+        "futures_cost_rate = 0.0003\ninverse_cost_rate = 0.0007\nresize_sell_cost_rate = 0.0025\n"
+        "resize_buy_cost_rate = 0.0005\nfutures_tax_rate = 0.11\n"
+        "futures_annual_deduction_krw = 2500000\ninverse_tax_rate = 0.154\n",
+        encoding="utf-8",
+    )
+    from src.research.pipeline import load_strategy_spec
+
+    spec = load_strategy_spec(spec_toml)
+    state_path = tmp_path / "state.json"
+    save_state(state_path, bootstrap_state(spec, cube, sleeves, incumb, lo=lo, last_row=last))
+    hedge = HedgeInputs(
+        sessions=tuple(sessions),
+        index_level=np.ascontiguousarray(np.full(len(sessions), 400.0)),
+        inverse_close=np.ascontiguousarray(np.full(len(sessions), 10000.0)),
+    )
+    ctx = SimpleNamespace(
+        protocol=SimpleNamespace(primary_capital_krw=capital),
+        cash_returns=np.ascontiguousarray(np.full(len(sessions), 0.0001)),
+        hedge_inputs=hedge,
+        trend_inputs=None,
+        dataset_ids={"market_panel": "m"},
+    )
+    pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
+    monkeypatch.setattr(
+        cli_module, "_decide_context", lambda args, tail: SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=inputs)
+    )
+    monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorers[year])
+    models = tmp_path / "models"
+    models.mkdir()
+    decisions = tmp_path / "decisions"
+    prior_state = state_path.read_text(encoding="utf-8")
+
+    def missing_year(models_dir: Path, year: int, expected: str) -> Any:
+        if year == 2022:
+            raise ValueError("missing 2022 model")
+        return scorers[year]
+
+    monkeypatch.setattr(cli_module, "_scorer_for", missing_year)
+    assert main(["decide", "--spec", str(spec_toml), "--state", str(state_path), "--models-dir", str(models),
+                 "--decisions-dir", str(decisions)]) == 1
+    assert not decisions.exists()
+    assert state_path.read_text(encoding="utf-8") == prior_state
+    capsys.readouterr()
+    monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorers[year])
+    assert main(["decide", "--spec", str(spec_toml), "--state", str(state_path), "--models-dir", str(models),
+                 "--decisions-dir", str(decisions)]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert len(out["sealed"]) == len(sessions) - 1 - last
+    chained = {
+        json.loads(line)["data_session"]
+        for line in (decisions / "chain.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert chained == set(out["sealed"])
+    assert load_state(state_path).last_session == sessions[-1]
+    chain_before = (decisions / "chain.jsonl").read_bytes()
+    state_path.write_text(prior_state, encoding="utf-8")
+    assert main(["decide", "--spec", str(spec_toml), "--state", str(state_path), "--models-dir", str(models),
+                 "--decisions-dir", str(decisions)]) == 0
+    replay = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert replay["sealed"] == []
+    assert (decisions / "chain.jsonl").read_bytes() == chain_before
+    assert load_state(state_path).last_session == sessions[-1]
+
+
+def test_scorer_for_loads_year_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.research import cli as cli_module
+    import src.research.model as model_module
+
+    year_dir = tmp_path / "2021"
+    year_dir.mkdir()
+    (year_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    seen: list[str] = []
+    monkeypatch.setattr(
+        model_module, "load_frozen_scorer",
+        lambda directory, expected_config_hash: seen.append(str(directory)) or "scorer",
+    )
+    assert cli_module._scorer_for(tmp_path, 2021, "abc") == "scorer"
+    assert seen == [str(year_dir)]
+
+
+@pytest.mark.parametrize("tail", [0, 699, -1])
+def test_decide_validates_tail_before_resolving_data(tail: int) -> None:
+    from src.research.cli import _run_decide
+
+    with pytest.raises(ValueError, match="tail-sessions"):
+        _run_decide(SimpleNamespace(tail_sessions=tail))
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -1.0])
+def test_parity_refuses_invalid_tolerance(tolerance: float, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.research import cli
+
+    monkeypatch.setattr(cli, "_pipeline_for", lambda args: object())
+    monkeypatch.setattr(cli, "_load_spec", lambda path: object())
+    with pytest.raises(ValueError, match="tolerance"):
+        cli._run_parity(SimpleNamespace(spec=Path("spec.toml"), tolerance=tolerance))
