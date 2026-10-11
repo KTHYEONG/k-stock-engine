@@ -198,3 +198,101 @@ def test_scheduled_capture_records_outcome(tmp_path, monkeypatch, scenario):  # 
     assert load_run_outcomes(events, day) == {"auction_open": expected}
     assert rc == (1 if expected in ("NO_DECISION", "DEGRADED") else 0)
     assert "secret-value" not in (events / "2026-10" / "2026-10-08.jsonl").read_text()
+
+
+def test_rehearse_cli_success_and_missing_keys(tmp_path, monkeypatch, capsys):  # type: ignore[no-untyped-def]
+    import json as _json
+    from datetime import datetime as _datetime
+
+    import src.execution.cli as cli
+    from src.execution.application.rehearsal import RehearsalReport
+    from src.research.operate import SealedDecision
+
+    session = date(2026, 10, 2)
+    decision = SealedDecision(
+        data_session=date(2026, 10, 1), execution_session=session,
+        sealed_at=_datetime(2026, 10, 1, 20, 0, tzinfo=KRX_TZ),
+        spec_hash="s", models_id="m", inputs={}, targets={"KRX:005930": 0.5},
+        reference={"KRX:005930": 50000.0}, overlay={}, state_digest="d", prev_hash="", hash="h" * 32,
+    )
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (decision,))
+    monkeypatch.setenv("KIS_MOCK_APP_KEY", "k")
+    monkeypatch.setenv("KIS_MOCK_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_MOCK_ACCOUNT_NO", "12345678-01")
+    monkeypatch.setenv("KIS_ENV", "vps")
+    fake = RehearsalReport(
+        session=session, intents=1, submitted=1, rejected=0,
+        duplicates_blocked=0, reconciled=False, position_mismatches=(),
+    )
+    monkeypatch.setattr("src.execution.application.rehearsal.rehearse_open", lambda *a, **k: fake)
+    store_path = tmp_path / "state.db"
+    evidence_path = tmp_path / "evidence.json"
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", session.isoformat(),
+    ])
+    assert code == 0
+    payload = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["session"] == session.isoformat()
+    assert evidence_path.is_file()
+    monkeypatch.delenv("KIS_MOCK_APP_KEY", raising=False)
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", session.isoformat(),
+    ])
+    assert code == 1
+    monkeypatch.setenv("KIS_MOCK_APP_KEY", "k")
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: ())
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", session.isoformat(),
+    ])
+    assert code == 1
+    capsys.readouterr()
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (decision,))
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", "2026-10-05",
+    ])
+    assert code == 1
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_today", lambda: session)
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+    ])
+    assert code == 0
+    capsys.readouterr()
+    second_session = date(2026, 10, 5)
+    decision2 = SealedDecision(
+        data_session=date(2026, 10, 2), execution_session=second_session,
+        sealed_at=_datetime(2026, 10, 2, 20, 0, tzinfo=KRX_TZ),
+        spec_hash="s", models_id="m", inputs={}, targets={"KRX:005930": 0.5},
+        reference={"KRX:005930": 50000.0}, overlay={}, state_digest="d", prev_hash="", hash="h" * 32,
+    )
+    fake2 = RehearsalReport(
+        session=second_session, intents=1, submitted=1, rejected=0,
+        duplicates_blocked=0, reconciled=False, position_mismatches=(),
+    )
+    monkeypatch.setattr(
+        "src.research.operate.read_chain", lambda path: (decision, decision2)
+    )
+    monkeypatch.setattr("src.execution.application.rehearsal.rehearse_open", lambda *a, **k: fake2)
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", second_session.isoformat(),
+    ])
+    assert code == 0
+    capsys.readouterr()
+    evidence_path.write_text("corrupt{", encoding="utf-8")
+    code = cli.main([
+        "rehearse", "--decisions-dir", str(tmp_path), "--store-path", str(store_path),
+        "--evidence-path", str(evidence_path), "--nav-krw", "10000000",
+        "--session", second_session.isoformat(),
+    ])
+    assert code == 0
