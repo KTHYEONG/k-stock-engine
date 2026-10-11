@@ -203,6 +203,16 @@ def test_exit_unknown_session_rejected(tmp_path: Path) -> None:
         build_engine_events(arrays=arrays, panel_dir=tmp_path / "gold" / "market_panel_test", dividends=None)
 
 
+def test_exit_before_window_is_skipped_but_unknown_inside_window_fails(tmp_path: Path) -> None:
+    rows = [_mrow(DAY1, "KRX:A"), _mrow(DAY2, "KRX:A")]
+    arrays = _panel(tmp_path, rows, [_exit_row("KRX:GONE", DAY0)])
+    events = build_engine_events(arrays=arrays, panel_dir=tmp_path / "gold" / "market_panel_test", dividends=None)
+    assert not events.exits_by_session
+    arrays = _panel(tmp_path, rows, [_exit_row("KRX:GONE", DAY1)])
+    with pytest.raises(PITDataError, match="unknown instrument"):
+        build_engine_events(arrays=arrays, panel_dir=tmp_path / "gold" / "market_panel_test", dividends=None)
+
+
 def test_exit_invalid_kind_rejected(tmp_path: Path) -> None:
     arrays = _panel(
         tmp_path,

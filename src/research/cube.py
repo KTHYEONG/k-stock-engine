@@ -261,6 +261,15 @@ def _log_phase(name: str, arrays: Mapping[str, NDArray[Any]], shape: tuple[int, 
     _LOG.info("[DATA] stage=%s shape=%dx%d %s", name, shape[0], shape[1], " ".join(parts))
 
 
+_FACT_ROW_COLUMNS: tuple[str, ...] = (
+    "instrument_id", "company_id", "ticker", "fiscal_period", "fact", "value", "available_at", "consolidated",
+)
+_RELEASE_ROW_COLUMNS: tuple[str, ...] = (
+    "instrument_id", "company_id", "ticker", "fiscal_period", "available_at", "basis", "release_kind", "kind", "span",
+    "metric", "value_krw", "prior_year_value_krw",
+)
+
+
 def _quarter_fact_map(
     facts: pl.DataFrame, sessions: Sequence[date], instrument_ids: Sequence[str],
     availability_sessions: Sequence[date] | None = None,
@@ -276,7 +285,8 @@ def _quarter_fact_map(
     offset = list(timeline).index(sessions[0]) if sessions else 0
     times = _decision_times(timeline)
     try:
-        rows = facts.to_dicts()
+        # Streamed over the columns read below: a full to_dicts() of the fact history costs over 1 GiB.
+        rows = facts.select([name for name in _FACT_ROW_COLUMNS if name in facts.columns]).iter_rows(named=True)
     except (ValueError, pl.exceptions.PolarsError) as exc:  # pragma: no cover
         raise PITDataError(f"invalid financial facts frame: {exc}") from exc
     for row in rows:
@@ -457,7 +467,7 @@ def _release_tables(
 ]:
     index_of = {inst: idx for idx, inst in enumerate(instrument_ids)}
     try:
-        rows = releases.to_dicts()
+        rows = releases.select([name for name in _RELEASE_ROW_COLUMNS if name in releases.columns]).to_dicts()
     except (ValueError, pl.exceptions.PolarsError) as exc:  # pragma: no cover
         raise PITDataError(f"invalid earnings releases frame: {exc}") from exc
     per_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
@@ -831,11 +841,16 @@ def assemble_dividends(
     return {"dps_ttm": dps_ttm, "div_ret": div_ret}
 
 
-def _read_frame(dataset_dir: Path, columns: Sequence[str] | None = None) -> pl.DataFrame:
+def _read_frame(
+    dataset_dir: Path, columns: Sequence[str] | None = None, *, sessions: Sequence[date] | None = None
+) -> pl.DataFrame:
     from src.data.datasets import read_dataset
 
     try:
-        return read_dataset(Path(dataset_dir), columns=columns).collect()
+        scan = read_dataset(Path(dataset_dir), columns=columns)
+        if sessions is not None:
+            scan = scan.filter(pl.col("session").cast(pl.Date).is_in(list(sessions)))
+        return scan.collect()
     except PITDataError:
         raise
     except Exception as exc:  # pragma: no cover
@@ -1133,22 +1148,20 @@ def build_research_cube(
             raise PITDataError("tail market has no present instruments")
     facts = _read_frame(Path(inputs.financial_facts))
     dividends = _read_frame(Path(inputs.dividend_events))
-    flows = _read_frame(Path(inputs.investor_flow))
+    if first_session is None:
+        flows = _read_frame(Path(inputs.investor_flow))
+    else:
+        flows = _read_frame(Path(inputs.investor_flow), sessions=sessions)
     releases = _read_frame(Path(inputs.earnings_releases))
     if first_session is not None:
         flows = flows.filter(pl.col("session").cast(pl.Date).is_in(list(sessions)))
         dividends = dividends.filter(pl.col("ex_session").cast(pl.Date).is_in(list(sessions)))
     if "company_id" in facts.columns and "fiscal_period" in facts.columns and "fact" in facts.columns:
-        try:
-            keys = facts.select(["company_id", "fiscal_period", "fact"]).to_dicts()
-            seen_keys: set[tuple[str, str, str]] = set()
-            for row in keys:
-                key = (str(row.get("company_id")), str(row.get("fiscal_period")), str(row.get("fact")))
-                if key in seen_keys:
-                    raise PITDataError(f"duplicated financial fact key: {key}")
-                seen_keys.add(key)
-        except (ValueError, pl.exceptions.PolarsError) as exc:  # pragma: no cover
-            raise PITDataError(f"invalid financial facts keys: {exc}") from exc
+        key_columns = facts.select(["company_id", "fiscal_period", "fact"])
+        duplicated = key_columns.filter(key_columns.is_duplicated())
+        if duplicated.height:
+            first = duplicated.row(0)
+            raise PITDataError(f"duplicated financial fact key: {(str(first[0]), str(first[1]), str(first[2]))}")
     for frame, label in (
         (dividends, "dividend events"),
         (flows, "investor flow"),
@@ -1160,6 +1173,7 @@ def build_research_cube(
         # 시세가 없는 비유니버스 종목의 공시라 매매 대상이 될 수 없다. 조용히 버리지 않고 규모를 남긴다.
         _LOG.info("[DATA] stage=facts_outside_panel instruments=%d skipped", len(outside))
     market_part = _build_market_arrays(inputs, sessions, instrument_ids, market_cache_root=cache_root, source=arrays)
+    del arrays
     shape = (len(sessions), len(instrument_ids))
     base = np.asarray(market_part["base_price"], dtype=np.float64)
     close = np.asarray(market_part["close"], dtype=np.float64)
