@@ -1,0 +1,543 @@
+"""Operations job entrypoint invariants."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+
+import src.ops.jobs as jobs
+from src.core.pit import PITDataError
+from src.ops.guards import GuardRefused
+from src.ops.jobs import (
+    EVENING_COLLECT_STEPS,
+    KRX_COLLECT_STEPS,
+    audit,
+    backup,
+    collect_eve,
+    main,
+    morning,
+    weekly_report,
+)
+from src.ops.run_outcome import load_run_outcomes
+
+KRX_TZ = ZoneInfo("Asia/Seoul")
+DAY = date(2026, 10, 8)
+
+
+def _morning_now() -> datetime:
+    return datetime(2026, 10, 8, 7, 30, tzinfo=KRX_TZ)
+
+
+class _Clock:
+    def __init__(self, start: datetime) -> None:
+        self.current = start
+        self.sleeps: list[float] = []
+
+    def now(self) -> datetime:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += timedelta(seconds=seconds)
+
+
+def _trading(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
+    monkeypatch.setattr(jobs, "trading_day", lambda day: value)
+
+
+def _healthy_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(jobs, "require_headroom", lambda **kwargs: None)
+
+
+def test_holiday_is_clean_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, False)
+    calls: list[str] = []
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: calls.append("refresh"))
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: calls.append("wait") or True)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert calls == []
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {
+        "collect_eve": "SKIPPED",
+        "morning": "SKIPPED",
+    }
+
+
+def test_low_memory_refuses_to_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+
+    def _refuse(**kwargs: object) -> None:
+        raise GuardRefused("insufficient headroom: MemAvailable 100 MB (need 3500)")
+
+    monkeypatch.setattr(jobs, "require_headroom", _refuse)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert backup(tmp_path, now=_morning_now()) == 1
+    outcomes = load_run_outcomes(tmp_path / "ops" / "events", DAY)
+    assert outcomes == {"collect_eve": "DEGRADED", "morning": "DEGRADED", "backup": "DEGRADED"}
+    line = (tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8")
+    assert "100 MB" in line
+
+
+def test_collect_eve_outcomes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    assert {"kis_investor_flow", "ls_investor_flow", "dart_facts"} <= EVENING_COLLECT_STEPS
+    monkeypatch.setattr(
+        jobs, "_run_refresh",
+        lambda root, **kwargs: SimpleNamespace(blocking_job=None, planned=["a"], built=["a"]),
+    )
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_eve": "OK"}
+
+    def _blocked(root: Path, **kwargs: object) -> SimpleNamespace:
+        assert kwargs["collect_steps"] == EVENING_COLLECT_STEPS
+        return SimpleNamespace(blocking_job="kis_investor_flow", planned=[], built=[])
+
+    monkeypatch.setattr(jobs, "_run_refresh", _blocked)
+    assert collect_eve(tmp_path, today=date(2026, 10, 12), now=_morning_now()) == 1
+
+    def _boom(root: Path, **kwargs: object) -> SimpleNamespace:
+        raise PITDataError("catalog unreadable")
+
+    monkeypatch.setattr(jobs, "_run_refresh", _boom)
+    assert collect_eve(tmp_path, today=date(2026, 10, 13), now=_morning_now()) == 1
+
+
+def _morning_stubs(
+    monkeypatch: pytest.MonkeyPatch, calls: list[str], sealed_at: datetime
+) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_previous_session", lambda day: date(2026, 10, 7))
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **kwargs: calls.append("build"))
+    monkeypatch.setattr(
+        jobs, "_decide_phase", lambda root: calls.append("decide") or ["2026-10-07"]
+    )
+    monkeypatch.setattr(jobs, "_shadow_phase", lambda root: calls.append("shadow"))
+    monkeypatch.setattr(jobs, "_sealed_at_for", lambda decisions, execution: sealed_at)
+
+
+def test_morning_waits_for_krx_then_seals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert {"krx_daily_market", "krx_cash_series"} <= KRX_COLLECT_STEPS
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    polls = iter([False, False, True])
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: (calls.append("poll"), next(polls))[1])
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert calls == ["poll", "poll", "poll", "build", "decide", "shadow"]
+    assert clock.sleeps == [60.0, 60.0]
+    outcomes = load_run_outcomes(tmp_path / "ops" / "events", DAY)
+    assert outcomes == {"morning": "OK"}
+
+
+def test_krx_never_arrives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: calls.append("poll") or False)
+    clock = _Clock(datetime(2026, 10, 8, 8, 54, tzinfo=KRX_TZ))
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert "decide" not in calls
+    assert "shadow" not in calls
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "NO_DECISION"}
+
+
+def test_late_seal_is_degraded_not_hidden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 9, 4, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert "decide" in calls
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "DEGRADED"}
+
+
+def test_morning_failure_modes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+
+    def _pit(root: Path, **kwargs: object) -> None:
+        raise PITDataError("cash return is missing")
+
+    monkeypatch.setattr(jobs, "_build_all", _pit)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "NO_DECISION"}
+
+    def _boom(root: Path, **kwargs: object) -> None:
+        raise RuntimeError("scorer missing")
+
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **kwargs: None)
+    monkeypatch.setattr(jobs, "_decide_phase", _boom)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=date(2026, 10, 12), now=clock.now, sleep=clock.sleep) == 1
+
+    def _no_prev(day: date) -> date:
+        raise PITDataError("no session before")
+
+    monkeypatch.setattr(jobs, "_previous_session", _no_prev)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=date(2026, 10, 13), now=clock.now, sleep=clock.sleep) == 1
+
+
+def test_poll_and_build_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+
+    seen: dict[str, object] = {}
+
+    def _refresh(root: Path, **kwargs: object) -> SimpleNamespace:
+        seen.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(jobs, "_run_refresh", _refresh)
+    monkeypatch.setattr(graph, "run_collection_jobs", lambda *a, **k: seen.update(k))
+    monkeypatch.setattr(graph, "_default_collection_steps", lambda: (("krx_daily_market", lambda: None),))
+    monkeypatch.setattr(jobs, "_data_session_present", lambda root, session: session == DAY)
+    assert jobs._poll_krx_once(tmp_path, DAY, _morning_now()) is True
+    assert seen["steps"][0][0] == "krx_daily_market"
+    assert jobs._poll_krx_once(tmp_path, date(2026, 10, 7), _morning_now()) is False
+    jobs._build_all(tmp_path, decision_time=_morning_now())
+    assert seen["collect"] is False
+    assert seen["collect_steps"] is None
+
+
+def test_wait_for_krx_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _Clock(_morning_now())
+    deadline = datetime(2026, 10, 8, 8, 55, tzinfo=KRX_TZ)
+    answers = iter([False, True])
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: next(answers))
+    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline) is True
+    assert clock.sleeps == [60.0]
+    clock = _Clock(deadline + timedelta(seconds=1))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: False)
+    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline) is False
+
+
+def test_backup_failure_removes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_guard(monkeypatch)
+    pruned: list[str] = []
+    monkeypatch.setattr(jobs, "_prune_bronze", lambda *a, **k: pruned.append("prune") or {})
+
+    def _fail(**kwargs: object) -> dict[str, object]:
+        raise PITDataError("lake backup push failed rc=1")
+
+    monkeypatch.setattr(jobs, "_push_backup_sources", _fail)
+    assert backup(tmp_path, now=_morning_now()) == 1
+    assert pruned == []
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"backup": "DEGRADED"}
+
+    monkeypatch.setattr(jobs, "_push_backup_sources", lambda **kwargs: {"bronze": {}})
+
+    def _prune_fail(root: Path, **kwargs: object) -> dict[str, object]:
+        raise PITDataError("pack failed")
+
+    monkeypatch.setattr(jobs, "_prune_bronze", _prune_fail)
+    assert backup(tmp_path, now=datetime(2026, 10, 8, 2, 30, tzinfo=KRX_TZ)) == 1
+
+    monkeypatch.setattr(jobs, "_prune_bronze", lambda *a, **k: {"removed": 3})
+    assert backup(tmp_path, now=datetime(2026, 10, 8, 2, 30, tzinfo=KRX_TZ)) == 0
+
+
+def test_pruning_is_gated_by_offsite_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.runtime import resolve_data_runtime
+
+    bronze = resolve_data_runtime(data_root=tmp_path).workspace.bronze_root
+    (bronze / "catalog").mkdir(parents=True, exist_ok=True)
+    kind = bronze / "daily_market"
+    kind.mkdir(parents=True, exist_ok=True)
+    confirmed = kind / "confirmed.bin"
+    unconfirmed = kind / "unconfirmed.bin"
+    confirmed.write_bytes(b"a" * 64)
+    unconfirmed.write_bytes(b"b" * 64)
+    old = (_morning_now() - timedelta(days=20)).timestamp()
+    os.utime(confirmed, (old, old))
+    os.utime(unconfirmed, (old, old))
+    report = jobs._prune_bronze(tmp_path, now=_morning_now(), confirmed={"daily_market/confirmed.bin"})
+    assert report["removed"] == 1
+    assert not confirmed.exists()
+    assert unconfirmed.exists()
+
+    flaky = kind / "flaky.bin"
+    flaky.write_bytes(b"c" * 64)
+    os.utime(flaky, (old, old))
+    real_older = jobs._is_older_than
+
+    def _flaky_older(path: Path, cutoff_ts: float) -> bool:
+        if path.name == "flaky.bin":
+            raise OSError("gone")
+        return real_older(path, cutoff_ts)
+
+    monkeypatch.setattr(jobs, "_is_older_than", _flaky_older)
+    report = jobs._prune_bronze(
+        tmp_path, now=_morning_now(), confirmed={"daily_market/confirmed.bin", "daily_market/flaky.bin"}
+    )
+    assert flaky.exists()
+
+
+def test_push_backup_sources_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    status = tmp_path / "status.json"
+
+    def _ok(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert "--no-lock" in command
+        assert "--status" in command
+        assert command.count("--source") == 4
+        assert str(jobs._tool_path()) in command[1]
+        payload = json.dumps({"bronze": {"scanned": 1}})
+        return subprocess.CompletedProcess(command, 0, stdout=payload + "\n", stderr="")
+
+    monkeypatch.setattr(jobs.subprocess, "run", _ok)
+    assert jobs._push_backup_sources(status_path=status, no_lock=True) == {"bronze": {"scanned": 1}}
+
+    def _timeout(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, 1.0)
+
+    monkeypatch.setattr(jobs.subprocess, "run", _timeout)
+    with pytest.raises(PITDataError, match="timed out"):
+        jobs._push_backup_sources(status_path=status, no_lock=False)
+
+    def _rc1(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(jobs.subprocess, "run", _rc1)
+    with pytest.raises(PITDataError, match="rc=1"):
+        jobs._push_backup_sources(status_path=status, no_lock=True)
+
+    def _bad(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout="not json\n", stderr="")
+
+    monkeypatch.setattr(jobs.subprocess, "run", _bad)
+    with pytest.raises(PITDataError, match="no report"):
+        jobs._push_backup_sources(status_path=status, no_lock=True)
+
+
+def test_confirmed_paths_and_session_presence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data import lake_backup as lake
+
+    entries = [SimpleNamespace(path="a.bin"), SimpleNamespace(path="b.bin")]
+    monkeypatch.setattr(lake, "RcloneStore", lambda remote, rclone_bin: SimpleNamespace(remote=remote))
+    monkeypatch.setattr(lake, "_load_index", lambda store, work: entries)
+    (tmp_path / "c.toml").write_text('remote = "gdrive:x"\n', encoding="utf-8")
+    paths = jobs._confirmed_bronze_paths(config_path=tmp_path / "c.toml", work_root=tmp_path)
+    assert paths == {"a.bin", "b.bin"}
+
+    assert jobs._data_session_present(tmp_path, DAY) is False
+
+    from src.data.receipt_catalog import EvidenceStatus
+
+    class _Catalog:
+        def __init__(self, root: Path) -> None:
+            self._root = root
+
+        def latest(self, *, source: str, natural_keys: set[str]) -> dict[str, SimpleNamespace]:
+            assert source == "krx_daily_market"
+            return {DAY.isoformat(): SimpleNamespace(status=EvidenceStatus.SUCCESS)}
+
+    monkeypatch.setattr("src.data.receipt_catalog.ReceiptCatalog", _Catalog)
+    assert jobs._data_session_present(tmp_path, DAY) is True
+
+    def _fail(**kwargs: object) -> object:
+        raise PITDataError("catalog locked")
+
+    monkeypatch.setattr("src.data.runtime.resolve_data_runtime", _fail)
+    assert jobs._data_session_present(tmp_path, DAY) is False
+
+
+def test_run_refresh_and_research_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+    import src.research.cli as research_cli
+    import src.research.pipeline as pipeline
+
+    seen: dict[str, object] = {}
+    real_ctx = graph.build_refresh_context
+
+    def _ctx(runtime: object, **kwargs: object) -> object:
+        seen["runtime"] = runtime
+        return real_ctx(runtime, **kwargs)
+
+    def _scope(ctx: object, **kwargs: object) -> object:
+        seen["scope"] = kwargs
+        seen["ctx"] = ctx
+        return SimpleNamespace(status="ok")
+
+    monkeypatch.setattr(graph, "build_refresh_context", _ctx)
+    monkeypatch.setattr(graph, "refresh_scope", _scope)
+    jobs._run_refresh(tmp_path, decision_time=_morning_now(), collect=True, collect_steps=frozenset({"a"}))
+    assert seen["scope"]["collect_steps"] == frozenset({"a"})
+    jobs._run_refresh(tmp_path, decision_time=_morning_now(), collect=True, collect_steps=EVENING_COLLECT_STEPS)
+    assert "daily_market" in seen["ctx"].deferred_build_kinds
+
+    paths = jobs._research_paths(tmp_path)
+    assert paths.decisions.name == "decisions"
+    assert paths.shadow.name == "shadow"
+    assert paths.state.name == "state.json"
+    assert jobs._backup_config_path().name == "lake_backup.toml"
+
+    monkeypatch.setattr(research_cli, "_load_spec", lambda path: SimpleNamespace(spec_hash="s"))
+    monkeypatch.setattr(pipeline, "_scores_identity", lambda spec: "i" * 20)
+    base = jobs._models_base(tmp_path / "spec.toml", tmp_path)
+    assert base.name == "i" * 16
+
+    monkeypatch.setattr(research_cli, "_run_decide", lambda args: {"sealed": ["2026-10-07"], "extra": 1})
+    assert jobs._decide_phase(tmp_path) == ["2026-10-07"]
+    monkeypatch.setattr(research_cli, "_run_decide", lambda args: {"sealed": "oops"})
+    assert jobs._decide_phase(tmp_path) == []
+    shadowed: list[str] = []
+    monkeypatch.setattr(research_cli, "_run_shadow", lambda args: shadowed.append("shadow"))
+    jobs._shadow_phase(tmp_path)
+    assert shadowed == ["shadow"]
+
+
+def test_sealed_at_and_previous_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.research.operate as operate
+
+    first = SimpleNamespace(execution_session=DAY, sealed_at=datetime(2026, 10, 8, 8, 30, tzinfo=KRX_TZ))
+    second = SimpleNamespace(execution_session=DAY, sealed_at=datetime(2026, 10, 8, 8, 45, tzinfo=KRX_TZ))
+    other = SimpleNamespace(
+        execution_session=date(2026, 10, 7), sealed_at=datetime(2026, 10, 7, 8, 30, tzinfo=KRX_TZ)
+    )
+    monkeypatch.setattr(operate, "read_chain", lambda path: (first, second, other))
+    assert jobs._sealed_at_for(Path("/x"), DAY) == second.sealed_at
+    monkeypatch.setattr(operate, "read_chain", lambda path: ())
+    assert jobs._sealed_at_for(Path("/x"), DAY) is None
+
+    from datetime import datetime as _dt
+
+    sessions = (
+        _dt(2026, 10, 7, 9, 0, tzinfo=KRX_TZ),
+        _dt(2026, 10, 8, 9, 0, tzinfo=KRX_TZ),
+    )
+    monkeypatch.setattr(
+        "src.core.krx_calendar.xkrx_calendar_through", lambda day: SimpleNamespace(sessions=sessions)
+    )
+    assert jobs._previous_session(DAY) == date(2026, 10, 7)
+    with pytest.raises(PITDataError):
+        jobs._previous_session(date(2026, 10, 9))
+    lonely = SimpleNamespace(sessions=(_dt(2026, 10, 8, 9, 0, tzinfo=KRX_TZ),))
+    monkeypatch.setattr("src.core.krx_calendar.xkrx_calendar_through", lambda day: lonely)
+    with pytest.raises(PITDataError):
+        jobs._previous_session(DAY)
+
+
+def test_audit_and_weekly_report_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(jobs, "run_daily_audit", lambda root, **kwargs: {"severity": "OK", "open_issues": []})
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    monkeypatch.setattr(
+        jobs, "run_daily_audit", lambda root, **kwargs: {"severity": "WARNING", "open_issues": [{"key": "x"}]}
+    )
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert weekly_report(tmp_path, today=DAY, now=_morning_now()) == 0
+    target = tmp_path / "ops" / "reports" / "weekly-2026-10-08.json"
+    assert target.is_file()
+    assert json.loads(capsys.readouterr().out)["week_ending"] == "2026-10-08"
+
+
+def test_main_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(jobs, "collect_eve", lambda root, **kwargs: seen.append("collect-eve") or 0)
+    assert main(["--data-root", str(tmp_path), "--date", "2026-10-08", "collect-eve"]) == 0
+    clock = _Clock(_morning_now())
+    monkeypatch.setattr("src.ops.jobs.time", SimpleNamespace(sleep=clock.sleep, monotonic=lambda: 0.0))
+    monkeypatch.setattr(
+        jobs, "morning", lambda root, **kwargs: seen.append("morning") or 3
+    )
+    assert main(["--data-root", str(tmp_path), "morning"]) == 3
+    monkeypatch.setattr(jobs, "backup", lambda root, **kwargs: seen.append("backup") or 0)
+    assert main(["--data-root", str(tmp_path), "backup", "--no-lock"]) == 0
+    monkeypatch.setattr(jobs, "audit", lambda root, **kwargs: seen.append("audit") or 0)
+    assert main(["--data-root", str(tmp_path), "audit"]) == 0
+    monkeypatch.setattr(jobs, "weekly_report", lambda root, **kwargs: seen.append("weekly-report") or 0)
+    assert main(["--data-root", str(tmp_path), "weekly-report"]) == 0
+    assert seen == ["collect-eve", "morning", "backup", "audit", "weekly-report"]
+    assert jobs._as_int(3) == 3
+    assert jobs._as_int(True) == 0
+    assert jobs._as_int("x") == 0
+    assert jobs._default_data_root().name == "data"
+
+
+def test_morning_poll_failure_and_missing_seal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, _morning_now())
+    clock = _Clock(_morning_now())
+
+    def fail(*args: object, **kwargs: object) -> bool:
+        raise PITDataError("token=do-not-persist")
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", fail)
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY)["morning"] == "NO_DECISION"
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_sealed_at_for", lambda *a: None)
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert "shadow" not in calls
+    assert "do-not-persist" not in (tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text()
+
+
+def test_session_presence_uses_real_keyed_receipt(tmp_path: Path) -> None:
+    import hashlib
+
+    from src.core.pit import EvidenceKind
+    from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
+    from src.data.runtime import resolve_data_runtime
+
+    bronze = resolve_data_runtime(data_root=tmp_path).workspace.bronze_root
+    bronze.mkdir(parents=True)
+    payload = bronze / "page.json"
+    payload.write_bytes(b'{"records": [1]}')
+    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+    catalog = ReceiptCatalog(bronze / "catalog")
+    receipt = ReceiptIndexEntry("krx_daily_market", DAY.isoformat(), DAY, None,
+                                EvidenceStatus.SUCCESS, digest, _morning_now(), payload)
+    blob = BlobEntry(digest, EvidenceKind.DAILY_MARKET, "krx_daily_market", True, None, _morning_now(), payload)
+    catalog.publish([receipt], blobs=[blob])
+    assert list(catalog.ranges(source="krx_daily_market")) == []
+    assert jobs._data_session_present(tmp_path, DAY)
+    assert not jobs._data_session_present(tmp_path, date(2026, 10, 7))
+
+
+def test_initial_seal_waits_for_realized_shadow_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.research import cli as research_cli
+
+    monkeypatch.setattr("src.research.operate.read_chain", lambda _: (
+        SimpleNamespace(data_session=date(2026, 10, 7), execution_session=DAY),
+    ))
+    called: list[str] = []
+    monkeypatch.setattr(research_cli, "_run_shadow", lambda _: called.append("shadow"))
+    jobs._shadow_phase(tmp_path)
+    assert called == []
+
+
+def test_shadow_failure_is_degraded_after_seal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _morning_stubs(monkeypatch, [], _morning_now())
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+
+    def fail(_: Path) -> None:
+        raise PITDataError("shadow changed")
+
+    monkeypatch.setattr(jobs, "_shadow_phase", fail)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY)["morning"] == "DEGRADED"
+
+
+def test_backup_failure_retains_last_success_timestamp(tmp_path: Path) -> None:
+    status = tmp_path / "status.json"
+    stamp = "2026-10-07T00:00:00+00:00"
+    status.write_text(json.dumps({"finished_at": stamp, "rc": 0}))
+    jobs._ensure_backup_failure_status(status, _morning_now())
+    failed = json.loads(status.read_text())
+    assert failed["rc"] == 1
+    assert failed["last_ok_at"] == stamp
+    before = status.read_text()
+    jobs._ensure_backup_failure_status(status, _morning_now())
+    assert status.read_text() == before

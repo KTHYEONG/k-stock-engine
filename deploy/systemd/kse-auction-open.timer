@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE pre-open auction capture (Mon-Fri 08:39:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 08:39:30 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-auction-open.service
+
+[Install]
+WantedBy=timers.target

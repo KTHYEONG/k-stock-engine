@@ -1,0 +1,584 @@
+"""Scheduled entrypoints: evening collection, morning seal and Drive backup."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import logging
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Mapping
+from datetime import date, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Final
+
+from src.core.pit import PITDataError
+from src.core.time import KRX_TZ
+from src.ops.audit import run_daily_audit
+from src.ops.guards import (
+    DEFAULT_MIN_AVAILABLE_MB,
+    DEFAULT_MIN_FREE_DISK_GB,
+    GuardRefused,
+    require_headroom,
+    trading_day,
+)
+from src.ops.run_outcome import record_run_outcome
+
+__all__ = [
+    "EVENING_COLLECT_STEPS",
+    "KRX_COLLECT_STEPS",
+    "POLL_INTERVAL_S",
+    "audit",
+    "backup",
+    "collect_eve",
+    "main",
+    "morning",
+    "weekly_report",
+]
+
+_LOG = logging.getLogger(__name__)
+
+EVENING_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
+    {
+        "dart_corp_codes",
+        "dart_disclosures",
+        "dart_facts",
+        "dividend_decisions",
+        "earnings_releases",
+        "kind_notice_search",
+        "kind_notice_documents",
+        "ls_investor_flow",
+        "kis_investor_flow",
+    }
+)
+KRX_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
+    {
+        "krx_daily_market",
+        "krx_security_master",
+        "krx_hedge_series",
+        "krx_trend_series",
+        "krx_cash_series",
+    }
+)
+POLL_INTERVAL_S: Final = 60.0
+
+_DEADLINE_HOUR: Final = 8
+_DEADLINE_MINUTE: Final = 55
+_LATE_SEAL_HOUR: Final = 9
+_PRUNE_AFTER_DAYS: Final = 14
+_PUSH_SOURCES: Final = ("bronze", "bronze_catalog", "state", "ops")
+
+
+def _events_root(data_root: Path) -> Path:
+    return Path(data_root) / "ops" / "events"
+
+
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=KRX_TZ)
+
+
+def _record(
+    data_root: Path,
+    job: str,
+    outcome: str,
+    run_date: date,
+    moment: datetime,
+    reason: str = "",
+    metrics: Mapping[str, object] | None = None,
+) -> None:
+    record_run_outcome(
+        _events_root(data_root), job, outcome, run_date=run_date, now=_aware(moment), reason=reason, metrics=metrics
+    )
+
+
+def _peak_rss_mb() -> float:
+    with contextlib.suppress(Exception):
+        import resource
+
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+    return 0.0  # pragma: no cover - Linux always provides resource
+
+
+def _guard_headroom(data_root: Path) -> GuardRefused | None:
+    try:
+        require_headroom(
+            min_available_mb=DEFAULT_MIN_AVAILABLE_MB,
+            min_free_disk_gb=DEFAULT_MIN_FREE_DISK_GB,
+            data_root=Path(data_root),
+        )
+    except GuardRefused as exc:
+        return exc
+    return None
+
+
+def _previous_session(day: date) -> date:
+    from src.core.krx_calendar import xkrx_calendar_through
+
+    ordered = sorted({moment.astimezone(KRX_TZ).date() for moment in xkrx_calendar_through(day).sessions})
+    try:
+        pos = ordered.index(day)
+    except ValueError as exc:
+        raise PITDataError(f"{day.isoformat()} is not an XKRX session") from exc
+    if pos == 0:
+        raise PITDataError(f"no XKRX session before {day.isoformat()}")
+    return ordered[pos - 1]
+
+
+def _run_refresh(
+    data_root: Path, *, decision_time: datetime, collect: bool, collect_steps: frozenset[str] | None
+) -> object:
+    from dataclasses import replace
+
+    from src.data.pipeline_graph import build_refresh_context, refresh_scope
+    from src.data.runtime import resolve_data_runtime
+
+    runtime = resolve_data_runtime(data_root=Path(data_root))
+    ctx = build_refresh_context(runtime, decision_time=_aware(decision_time))
+    if collect_steps == EVENING_COLLECT_STEPS:
+        ctx = replace(ctx, deferred_build_kinds=frozenset({
+            "ordinary_universe", "daily_market", "hedge_series", "trend_series", "cash_series",
+            "market_panel", "reference_benchmarks", "market_actions",
+        }))
+    return refresh_scope(
+        ctx, collect=collect, dry_run=False, emit=lambda payload: _LOG.debug("refresh %s", dict(payload)),
+        collect_steps=collect_steps,
+    )
+
+
+def _data_session_present(data_root: Path, session: date) -> bool:
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        runtime = resolve_data_runtime(data_root=Path(data_root))
+        catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+        receipt = catalog.latest(source="krx_daily_market", natural_keys={session.isoformat()}).get(session.isoformat())
+        return receipt is not None and receipt.status == EvidenceStatus.SUCCESS
+    except PITDataError:
+        return False
+    return False
+
+
+def _poll_krx_once(data_root: Path, session: date, decision_time: datetime) -> bool:
+    from dataclasses import replace
+
+    from src.data.pipeline_graph import _default_collection_steps, build_refresh_context, run_collection_jobs
+    from src.data.runtime import resolve_data_runtime
+
+    ctx = build_refresh_context(resolve_data_runtime(data_root=Path(data_root)), decision_time=_aware(decision_time))
+    ctx = replace(ctx, retry_krx_session=session)
+    steps = tuple(step for step in _default_collection_steps() if step[0] in KRX_COLLECT_STEPS)
+    run_collection_jobs(ctx, dry_run=False, emit=lambda payload: None, steps=steps)
+    return _data_session_present(Path(data_root), session)
+
+
+def _wait_for_krx(
+    data_root: Path, session: date, *, now: Callable[[], datetime], sleep: Callable[[float], None],
+    deadline: datetime,
+) -> bool:
+    while True:
+        if _aware(now()) > deadline:
+            return False
+        if _poll_krx_once(Path(data_root), session, _aware(now())):
+            return True
+        if _aware(now()) >= deadline:
+            return False
+        sleep(min(POLL_INTERVAL_S, (deadline - _aware(now())).total_seconds()))
+
+
+def _build_all(data_root: Path, *, decision_time: datetime) -> object:
+    return _run_refresh(data_root, decision_time=decision_time, collect=False, collect_steps=None)
+
+
+def _research_paths(data_root: Path) -> SimpleNamespace:
+    from src.config.runtime import load_runtime_config
+    from src.data.runtime import resolve_data_runtime
+
+    runtime = resolve_data_runtime(data_root=Path(data_root))
+    state_root = runtime.workspace.state_root
+    return SimpleNamespace(
+        runtime=runtime,
+        state_root=state_root,
+        spec=load_runtime_config().champion_file,
+        state=state_root / "operate" / "state.json",
+        decisions=state_root / "decisions",
+        shadow=state_root / "shadow",
+    )
+
+
+def _models_base(spec_path: Path, state_root: Path) -> Path:
+    from src.research.cli import _load_spec
+    from src.research.pipeline import _scores_identity
+
+    identity = _scores_identity(_load_spec(Path(spec_path)))
+    return Path(state_root) / "research" / "models" / identity[:16]
+
+
+def _decide_phase(data_root: Path) -> list[str]:
+    from src.research.cli import _run_decide
+
+    paths = _research_paths(Path(data_root))
+    args = argparse.Namespace(
+        scope_config=None, data_root=Path(data_root), spec=paths.spec, state=paths.state,
+        models_dir=_models_base(paths.spec, paths.state_root), decisions_dir=paths.decisions,
+        tail_sessions=800, capital=None,
+    )
+    result = dict(_run_decide(args))
+    sealed = result.get("sealed", [])
+    items = sealed if isinstance(sealed, list) else []
+    return [str(item) for item in items]
+
+
+def _shadow_phase(data_root: Path) -> None:
+    from src.research.cli import _run_shadow
+    from src.research.operate import read_chain
+
+    paths = _research_paths(Path(data_root))
+    chain = read_chain(paths.decisions)
+    if chain and min(item.execution_session for item in chain) > max(item.data_session for item in chain):
+        return
+    args = argparse.Namespace(
+        scope_config=None, data_root=Path(data_root), spec=paths.spec, decisions_dir=paths.decisions,
+        shadow_dir=paths.shadow, tail_sessions=800, capital=None,
+    )
+    _run_shadow(args)
+
+
+def _sealed_at_for(paths_decisions: Path, execution: date) -> datetime | None:
+    from src.research.operate import read_chain
+
+    stamps = [item.sealed_at for item in read_chain(Path(paths_decisions)) if item.execution_session == execution]
+    return max(stamps) if stamps else None
+
+
+def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
+    """Evening collection and build of everything except the KRX-derived nodes; returns the process exit code."""
+    root = Path(data_root)
+    moment = _aware(now)
+    if not trading_day(today):
+        _record(root, "collect_eve", "SKIPPED", today, moment, reason="non_trading_day")
+        return 0
+    refused = _guard_headroom(root)
+    if refused is not None:
+        _record(root, "collect_eve", "DEGRADED", today, moment, reason=str(refused)[:300],
+                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
+        return 1
+    try:
+        report = _run_refresh(root, decision_time=moment, collect=True, collect_steps=EVENING_COLLECT_STEPS)
+    except Exception as exc:
+        _record(root, "collect_eve", "DEGRADED", today, moment, reason=type(exc).__name__)
+        return 1
+    blocking = getattr(report, "blocking_job", None)
+    if blocking is not None:
+        _record(
+            root, "collect_eve", "DEGRADED", today, moment, reason=f"blocked on {blocking}"[:300],
+            metrics={"blocking_job": str(blocking)},
+        )
+        return 1
+    planned = list(getattr(report, "planned", ()))
+    built = list(getattr(report, "built", ()))
+    _record(
+        root, "collect_eve", "OK", today, moment,
+        metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb()},
+    )
+    return 0
+
+
+def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep: Callable[[float], None]) -> int:
+    """Wait for yesterday's KRX bars, refresh the KRX-derived nodes, seal the decision, update the shadow ledger."""
+    root = Path(data_root)
+    if not trading_day(today):
+        _record(root, "morning", "SKIPPED", today, _aware(now()), reason="non_trading_day")
+        return 0
+    refused = _guard_headroom(root)
+    if refused is not None:
+        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=str(refused)[:300],
+                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
+        return 1
+    try:
+        data_session = _previous_session(today)
+    except PITDataError as exc:
+        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__)
+        return 1
+    started = time.monotonic()
+    deadline = datetime(today.year, today.month, today.day, _DEADLINE_HOUR, _DEADLINE_MINUTE, tzinfo=KRX_TZ)
+    try:
+        waited = _wait_for_krx(root, data_session, now=now, sleep=sleep, deadline=deadline)
+    except Exception as exc:
+        outcome = "NO_DECISION" if isinstance(exc, PITDataError) else "DEGRADED"
+        _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__)
+        return 1
+    wait_s = time.monotonic() - started
+    if not waited:
+        _record(
+            root, "morning", "NO_DECISION", today, _aware(now()), reason="krx_absent_at_deadline",
+            metrics={"data_session": data_session.isoformat(), "wait_s": wait_s},
+        )
+        return 1
+    phase = "build"
+    try:
+        mark = time.monotonic()
+        _build_all(root, decision_time=_aware(now()))
+        build_s = time.monotonic() - mark
+        mark = time.monotonic()
+        sealed = _decide_phase(root)
+        decide_s = time.monotonic() - mark
+        sealed_at = _sealed_at_for(_research_paths(root).decisions, today)
+        if sealed_at is None:
+            raise PITDataError("no sealed decision for today's execution session")
+        phase = "shadow"
+        mark = time.monotonic()
+        _shadow_phase(root)
+        shadow_s = time.monotonic() - mark
+    except PITDataError as exc:
+        outcome = "DEGRADED" if phase == "shadow" else "NO_DECISION"
+        _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__,
+                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s})
+        return 1
+    except Exception as exc:
+        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
+                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s})
+        return 1
+    elapsed_s = time.monotonic() - started
+    metrics: dict[str, object] = {
+        "data_session": data_session.isoformat(),
+        "sealed": sealed,
+        "sealed_at": _aware(sealed_at).astimezone(KRX_TZ).isoformat(),
+        "elapsed_s": elapsed_s,
+        "peak_rss_mb": _peak_rss_mb(),
+        "wait_s": wait_s,
+        "build_s": build_s,
+        "decide_s": decide_s,
+        "shadow_s": shadow_s,
+    }
+    opened = datetime(today.year, today.month, today.day, _LATE_SEAL_HOUR, tzinfo=KRX_TZ)
+    if _aware(sealed_at).astimezone(KRX_TZ) >= opened:
+        _record(root, "morning", "DEGRADED", today, _aware(now()), reason="late_seal", metrics=metrics)
+        return 1
+    _record(root, "morning", "OK", today, _aware(now()), metrics=metrics)
+    return 0
+
+
+def _tool_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "tools" / "devops" / "lake_backup.py"
+
+
+def _backup_config_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "config" / "data" / "lake_backup.toml"
+
+
+def _confirmed_bronze_paths(*, config_path: Path, work_root: Path) -> set[str]:
+    import shutil
+    import tomllib
+
+    from src.data import lake_backup as lake
+
+    config = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
+    rclone = shutil.which("rclone") or str(Path.home() / ".local" / "bin" / "rclone")
+    store = lake.RcloneStore(str(config["remote"]).rstrip("/") + "/bronze", rclone_bin=rclone)
+    work = Path(work_root) / "bronze-index"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        return {entry.path for entry in lake._load_index(store, work)}  # noqa: SLF001
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _is_older_than(path: Path, cutoff_ts: float) -> bool:
+    return path.is_file() and path.stat().st_mtime < cutoff_ts
+
+
+def _prune_bronze(data_root: Path, *, now: datetime, confirmed: set[str] | None = None) -> dict[str, object]:
+    from src.data.payload_store import pack_loose
+    from src.data.runtime import resolve_data_runtime
+
+    runtime = resolve_data_runtime(data_root=Path(data_root))
+    bronze_root = runtime.workspace.bronze_root
+    offsite = set(confirmed) if confirmed is not None else _confirmed_bronze_paths(
+        config_path=_backup_config_path(), work_root=Path(data_root) / "state" / "lake_tmp"
+    )
+    cutoff = _aware(now).timestamp() - float(_PRUNE_AFTER_DAYS * 24 * 3600)
+    eligible: set[str] = set()
+    for rel in offsite:
+        try:
+            if _is_older_than(bronze_root / rel, cutoff):
+                eligible.add(rel)
+        except OSError:
+            continue
+    kinds = sorted(
+        item.name
+        for item in bronze_root.iterdir()
+        if item.is_dir() and not item.is_symlink() and item.name not in ("catalog", "_packs")
+    ) if bronze_root.is_dir() else []
+    report = pack_loose(bronze_root, kinds=kinds, offsite_paths=eligible, remove=True, paths=eligible)
+    return {
+        "packed": report.packed,
+        "removed": report.removed,
+        "skipped_unverified": report.skipped_unverified,
+        "raw_bytes": report.raw_bytes,
+        "packed_bytes": report.packed_bytes,
+    }
+
+
+def _push_backup_sources(*, status_path: Path, no_lock: bool) -> dict[str, object]:
+    command = [sys.executable, str(_tool_path()), "push", "--status", str(status_path),
+               "--data-root", str(status_path.parent.parent)]
+    for name in _PUSH_SOURCES:
+        command += ["--source", name]
+    if no_lock:
+        command += ["--no-lock"]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=3 * 3600, check=False)  # noqa: S603
+    except subprocess.TimeoutExpired as exc:
+        raise PITDataError(f"lake backup push timed out: {exc}") from exc
+    if completed.returncode != 0:
+        raise PITDataError(f"lake backup push failed rc={completed.returncode}: {completed.stderr.strip()[-300:]}")
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError) as exc:
+        raise PITDataError(f"lake backup push returned no report: {exc}") from exc
+    return {str(key): value for key, value in dict(payload).items()}
+
+
+def _as_int(value: object) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _ensure_backup_failure_status(path: Path, moment: datetime) -> None:
+    from datetime import UTC
+
+    previous: dict[str, object] = {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            previous = payload
+    except (OSError, ValueError):
+        previous = {}
+    if previous.get("rc") not in (None, 0):
+        return
+    last_ok = previous.get("last_ok_at")
+    if last_ok is None and previous.get("rc") == 0:
+        last_ok = previous.get("finished_at")
+    failed = {"finished_at": _aware(moment).astimezone(UTC).isoformat(), "rc": 1,
+              "last_ok_at": last_ok, "sources": {}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=".backup-status.", suffix=".tmp", delete=False) as handle:
+        handle.write(json.dumps(failed) + "\n")
+        handle.flush()
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
+    """Push Bronze, catalog, state and ops to Drive, then pack and prune loose Bronze confirmed offsite."""
+    root = Path(data_root)
+    moment = _aware(now)
+    run_date = moment.astimezone(KRX_TZ).date()
+    refused = _guard_headroom(root)
+    if refused is not None:
+        _record(root, "backup", "DEGRADED", run_date, moment, reason=str(refused)[:300],
+                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
+        return 1
+    status_path = root / "state" / "lake_backup_status.json"
+    try:
+        sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
+    except Exception as exc:
+        _ensure_backup_failure_status(status_path, moment)
+        _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__)
+        return 1
+    try:
+        pruned = _prune_bronze(root, now=moment)
+    except Exception as exc:
+        _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
+                metrics={"sources": sorted(sources)})
+        return 1
+    _record(root, "backup", "OK", run_date, moment,
+            metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed"))})
+    return 0
+
+
+def audit(data_root: Path, *, today: date, now: datetime) -> int:
+    """Run the daily audit and mirror its severity as the process exit code."""
+    heartbeat = run_daily_audit(Path(data_root), today=today, now=_aware(now))
+    severity = str(heartbeat.get("severity", "WARNING"))
+    issues = heartbeat.get("open_issues")
+    count = len(issues) if isinstance(issues, list) else 0
+    _LOG.info("[OPS] command=audit severity=%s issues=%d", severity, count)
+    return 0 if severity in ("OK", "HOLIDAY_SKIP") and count == 0 else 1
+
+
+def weekly_report(data_root: Path, *, today: date, now: datetime) -> int:
+    """Aggregate the last seven days of outcomes into a weekly report file."""
+    from datetime import timedelta
+
+    from src.ops.run_outcome import load_run_outcomes
+
+    root = Path(data_root)
+    moment = _aware(now)
+    days = [today - timedelta(days=offset) for offset in range(7)]
+    summary = {day.isoformat(): load_run_outcomes(_events_root(root), day) for day in days}
+    report = {
+        "week_ending": today.isoformat(),
+        "generated_at": moment.astimezone(KRX_TZ).isoformat(),
+        "days": summary,
+    }
+    target = root / "ops" / "reports" / f"weekly-{today.isoformat()}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=str(target.parent), prefix=".weekly.", suffix=".tmp", delete=False
+    ) as handle:
+        handle.write(json.dumps(report, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        temporary = Path(handle.name)
+    temporary.replace(target)
+    sys.stdout.write(json.dumps(report, sort_keys=True, ensure_ascii=False) + "\n")
+    return 0
+
+
+def _default_data_root() -> Path:
+    from src.config.runtime import load_runtime_config
+
+    return Path(load_runtime_config().data_root)
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="src.ops.jobs")
+    parser.add_argument("--data-root", type=Path, required=False, default=None)
+    parser.add_argument("--date", type=str, required=False, default=None)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("collect-eve")
+    sub.add_parser("morning")
+    prune = sub.add_parser("backup")
+    prune.add_argument("--no-lock", action="store_true")
+    sub.add_parser("audit")
+    sub.add_parser("weekly-report")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch one scheduled operations command; returns the process exit code."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    args = _parse_args(argv)
+    data_root = Path(args.data_root) if args.data_root is not None else _default_data_root()
+    today = date.fromisoformat(args.date) if args.date else datetime.now(KRX_TZ).date()
+    moment = datetime.now(KRX_TZ)
+    if args.command == "collect-eve":
+        return collect_eve(data_root, today=today, now=moment)
+    if args.command == "morning":
+        return morning(data_root, today=today, now=lambda: datetime.now(KRX_TZ), sleep=time.sleep)
+    if args.command == "backup":
+        return backup(data_root, now=moment, no_lock=args.no_lock)
+    if args.command == "audit":
+        return audit(data_root, today=today, now=moment)
+    if args.command == "weekly-report":
+        return weekly_report(data_root, today=today, now=moment)
+    raise SystemExit(f"unknown command {args.command}")  # pragma: no cover - argparse rejects unknown commands
+
+
+if __name__ == "__main__":  # pragma: no cover - entrypoint glue
+    raise SystemExit(main())

@@ -170,7 +170,8 @@ def _current_pack(bronze_root: Path, kind: str, connection: sqlite3.Connection) 
 
 
 def pack_loose(
-    bronze_root: Path, *, kinds: Sequence[str], offsite_paths: Collection[str] | None, remove: bool
+    bronze_root: Path, *, kinds: Sequence[str], offsite_paths: Collection[str] | None, remove: bool,
+    paths: Collection[str] | None = None,
 ) -> PackReport:
     """Pack listed Bronze kind directories, removing only offsite-confirmed loose files."""
     root = Path(bronze_root).resolve()
@@ -182,15 +183,17 @@ def pack_loose(
     packs.mkdir(parents=True, exist_ok=True)
     with (packs / "writer.lock").open("a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        return _pack_loose(root, kinds=kinds, offsite_paths=offsite_paths, remove=remove)
+        return _pack_loose(root, kinds=kinds, offsite_paths=offsite_paths, remove=remove, paths=paths)
 
 
 def _pack_loose(
-    bronze_root: Path, *, kinds: Sequence[str], offsite_paths: Collection[str] | None, remove: bool
+    bronze_root: Path, *, kinds: Sequence[str], offsite_paths: Collection[str] | None, remove: bool,
+    paths: Collection[str] | None = None,
 ) -> PackReport:
     """Move loose payload/receipt files of the given kind directories into packs; returns counts."""
     root = Path(bronze_root).resolve()
     offsite = set(offsite_paths) if offsite_paths is not None else None
+    selected = set(paths) if paths is not None else None
     db_path = _index_path(root)
     connection = _connect_index(db_path)
     packed = 0
@@ -215,6 +218,8 @@ def _pack_loose(
                 if file_path.is_symlink() or not file_path.resolve().is_relative_to(kind_dir):
                     raise PITDataError(f"Bronze member escapes its kind directory: {file_path}")
                 rel_path = file_path.relative_to(root).as_posix()
+                if selected is not None and rel_path not in selected:
+                    continue
                 try:
                     raw = file_path.read_bytes()
                 except OSError:

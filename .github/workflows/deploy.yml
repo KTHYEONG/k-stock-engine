@@ -1,0 +1,134 @@
+name: Oracle CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  IMAGE: ghcr.io/kthyeong/k-stock-engine
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type check (mypy)
+        run: uv run mypy src
+
+      - name: Run test suite (fail-closed deploy gate)
+        run: uv run pytest
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          build-args: KSE_CODE_COMMIT=${{ github.sha }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [test, build-and-push]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    concurrency:
+      group: deploy-or-vps
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Pull latest image and converge host units on VPS over Tailscale
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          HOST: ${{ secrets.HOST }}
+          REMOTE_USER: ${{ secrets.USERNAME }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          STAGE=runner_init
+          trap 'rc=$?; echo "::error title=vps-deploy/k-stock-engine/${STAGE}::rc=${rc} line=${LINENO} side=runner"' ERR
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          SSH_OPTS="-i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+
+          STAGE=stage_lib
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/.deploy"
+          scp $SSH_OPTS deploy/vps-deploy-lib.sh "$REMOTE_USER@$HOST:~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh"
+          scp $SSH_OPTS -r deploy "$REMOTE_USER@$HOST:~/k-stock-engine/.deploy/staging-$COMMIT_SHA"
+
+          STAGE=remote
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" bash -s <<EOF
+          set -e
+          source ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+          vps_deploy_init k-stock-engine $COMMIT_SHA
+          vps_stage pull
+          echo '$GHCR_PAT' | docker login ghcr.io -u '$GHCR_USER' --password-stdin
+          vps_pull_verified ghcr.io/kthyeong/k-stock-engine $COMMIT_SHA
+          vps_stage preflight
+          vps_stage blackout_wait
+          docker run --rm --memory=512m --memory-swap=512m --cpus=0.5 -e TZ=Asia/Seoul ghcr.io/kthyeong/k-stock-engine:sha-$COMMIT_SHA uv run python -m src.ops.deploy_window --wait
+          LATEST_MAIN_SHA="\$(git ls-remote https://github.com/kthyeong/k-stock-engine refs/heads/main | cut -f1)"
+          test -n "\$LATEST_MAIN_SHA"
+          if [ "\$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
+            echo "SKIP: superseded by \$LATEST_MAIN_SHA"
+            rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+            exit 0
+          fi
+          vps_stage promote
+          vps_promote_latest ghcr.io/kthyeong/k-stock-engine $COMMIT_SHA
+          docker push ghcr.io/kthyeong/k-stock-engine:latest
+          vps_stage converge
+          bash ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/install_systemd.sh
+          rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+          EOF

@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE pre-open auction capture (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=30min
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kse-auction-open --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --memory=512m --memory-swap=512m --cpus=0.5 --env-file %h/quant-secrets/k-stock-engine.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=standard -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.execution auction-open --decisions-dir /app/data/state/kr_swing_2019_v1/decisions --shadow-dir /app/data/state/kr_swing_2019_v1/shadow --out /app/data/ops/auction/open.json --events-root /app/data/ops/events --limit 80
+ExecStopPost=-/usr/bin/docker rm -f kse-auction-open
