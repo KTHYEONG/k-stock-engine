@@ -10,6 +10,10 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.integrations.kis.client import KisCredentials
 
 __all__ = ["main"]
 
@@ -31,6 +35,14 @@ def _build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--out", type=Path, required=True)
     capture.add_argument("--limit", type=int, required=False, default=80)
     capture.add_argument("--events-root", type=Path, default=None)
+    rehearse = sub.add_parser("rehearse")
+    rehearse.add_argument("--decisions-dir", type=Path, required=True)
+    rehearse.add_argument("--store-path", type=Path, required=True)
+    rehearse.add_argument("--evidence-path", type=Path, required=True)
+    rehearse.add_argument("--nav-krw", type=int, required=True)
+    rehearse.add_argument("--cash-buffer", type=float, default=0.02)
+    rehearse.add_argument("--rebalance-band", type=float, default=0.0)
+    rehearse.add_argument("--session", type=str, default=None)
     return parser
 
 
@@ -123,16 +135,118 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.core.pit import PITDataError
 
     args = _build_parser().parse_args(argv)
-    if args.events_root is not None:
+    if getattr(args, "events_root", None) is not None:
         return _scheduled_capture(args)
     try:
         if args.command == "auction-open":
             _emit(_run_auction_open(args))
+        elif args.command == "rehearse":
+            _emit(_run_rehearse(args))
     except (PITDataError, ValueError, OSError) as exc:
         _LOG.error("[EXEC] command=%s status=failed error=%s", args.command, exc)
         _emit({"error": str(exc)})
         return 1
     return 0
+
+
+def _mock_credentials() -> KisCredentials:
+    import os
+
+    from src.integrations.kis.client import KisCredentials
+
+    app_key = os.environ.get("KIS_MOCK_APP_KEY", "").strip()
+    app_secret = os.environ.get("KIS_MOCK_APP_SECRET", "").strip()
+    account_raw = os.environ.get("KIS_MOCK_ACCOUNT_NO", "").strip()
+    env = os.environ.get("KIS_ENV", "vps").strip() or "vps"
+    if not app_key or not app_secret or not account_raw:
+        raise ValueError("mock keys are required: KIS_MOCK_APP_KEY/SECRET/ACCOUNT_NO")
+    product = "01"
+    account_no = account_raw
+    if "-" in account_raw:
+        account_no, product = account_raw.split("-", 1)
+    return KisCredentials(
+        app_key=app_key,
+        app_secret=app_secret,
+        account_no=account_no,
+        account_product_code=product or "01",
+        env=env,
+    )
+
+
+def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
+    from datetime import datetime as _datetime
+
+    from src.config.runtime import load_runtime_config
+    from src.core.market_rules import KrxMarket, load_krx_market_rules
+    from src.core.time import KRX_TZ
+    from src.execution.adapters.kis_broker import KisMockBroker
+    from src.execution.adapters.sqlite_state_store import SqliteStateStore
+    from src.execution.application.rehearsal import RehearsalReport, rehearse_open, update_readiness
+    from src.integrations.kis.client import KisClient
+    from src.research.operate import read_chain
+
+    chain = read_chain(Path(args.decisions_dir))
+    if not chain:
+        raise ValueError("no sealed decisions")
+    if getattr(args, "session", None):
+        session = date.fromisoformat(str(args.session))
+    else:
+        session = _today()
+    matches = [item for item in chain if item.execution_session == session]
+    if not matches:
+        raise ValueError(f"no decision for execution session {session.isoformat()}")
+    decision = max(matches, key=lambda item: item.sealed_at)
+    rules = load_krx_market_rules(load_runtime_config().market_rules)
+    names = set(decision.targets) | set(decision.reference)
+    markets = dict.fromkeys(names, KrxMarket.KOSPI)
+    client = KisClient(_mock_credentials())
+    broker = KisMockBroker(client, rules=rules, markets=markets, session=session)
+    store = SqliteStateStore(Path(args.store_path))
+    try:
+        report = rehearse_open(
+            decision,
+            broker,
+            store,
+            nav_krw=int(args.nav_krw),
+            cash_buffer=float(args.cash_buffer),
+            rebalance_band=float(args.rebalance_band),
+            now=_datetime.now(KRX_TZ),
+        )
+    finally:
+        store.close()
+    evidence_path = Path(args.evidence_path)
+    prior: list[RehearsalReport] = [report]
+    try:
+        import json as _json
+
+        if evidence_path.is_file():
+            payload = _json.loads(evidence_path.read_text(encoding="utf-8"))
+            for row in payload.get("reports", []):
+                if str(row.get("session")) == report.session.isoformat():
+                    continue
+                prior.append(
+                    RehearsalReport(
+                        session=date.fromisoformat(str(row["session"])),
+                        intents=int(row["intents"]),
+                        submitted=int(row["submitted"]),
+                        rejected=int(row["rejected"]),
+                        duplicates_blocked=int(row["duplicates_blocked"]),
+                        reconciled=bool(row["reconciled"]),
+                        position_mismatches=tuple(row.get("position_mismatches", [])),
+                    )
+                )
+    except (OSError, ValueError, KeyError):
+        prior = [report]
+    update_readiness(evidence_path, prior)
+    return {
+        "session": report.session.isoformat(),
+        "intents": report.intents,
+        "submitted": report.submitted,
+        "rejected": report.rejected,
+        "duplicates_blocked": report.duplicates_blocked,
+        "reconciled": report.reconciled,
+        "position_mismatches": list(report.position_mismatches),
+    }
 
 
 def _scheduled_capture(args: argparse.Namespace) -> int:
