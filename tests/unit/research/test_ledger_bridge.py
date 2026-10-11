@@ -575,3 +575,93 @@ def test_overlay_market_with_legs_construction() -> None:
     assert np.array_equal(market.inverse_close, primary.inverse_close)
     assert "kq150" in market.legs
     assert np.array_equal(market.legs["kq150"], sec1.index_level)
+
+
+def test_default_outcome_has_no_order_records(tmp_path: Path) -> None:
+    """Default run_ledger leaves ledger_hash and returns identical with empty fills."""
+    sessions = synthetic_sessions(4, start=date(2020, 1, 6))
+    instruments = ["KRX:000001", "KRX:000002"]
+    rows = [synthetic_panel_row(day, inst) for day in sessions for inst in instruments]
+    panel = write_synthetic_panel(tmp_path / "gold", "market_panel_default", rows)
+    cube = synthetic_cube(sessions, instruments)
+    auth = _auth(sessions)
+    rules = load_krx_market_rules(RULES_PATH)
+    common = {
+        "cube": cube,
+        "targets": {0: np.array([0.5, 0.5])},
+        "panel_dir": panel,
+        "dividends": pl.DataFrame(),
+        "engine_config_path": ENGINE_TOML,
+        "rules": rules,
+        "market_cache_root": tmp_path / "cache",
+        "capital_krw": 10_000_000,
+        "halted_exit_policy": DelistPolicy.LAST_CLOSE,
+        "start": sessions[0],
+        "end": sessions[-1],
+        "authorization": auth,
+    }
+    plain = run_ledger(**common)
+    recorded = run_ledger(**common, record_orders=True)
+    assert plain.fills == ()
+    assert plain.rejects == ()
+    assert recorded.ledger_hash == plain.ledger_hash
+    assert np.array_equal(np.asarray(recorded.log_returns), np.asarray(plain.log_returns))
+
+
+def test_recorded_fills_reconcile_with_journal(tmp_path: Path) -> None:
+    """Signed fill notional matches stock journal totals; capacity rejects keep their reason."""
+    sessions = synthetic_sessions(5, start=date(2020, 1, 6))
+    instruments = ["KRX:000001", "KRX:000002"]
+    rows = []
+    for day in sessions:
+        for inst in instruments:
+            row = synthetic_panel_row(day, inst)
+            if inst == "KRX:000002":
+                row["adtv20"] = 1.0
+            rows.append(row)
+    panel = write_synthetic_panel(tmp_path / "gold", "market_panel_capacity", rows)
+    cube = synthetic_cube(sessions, instruments, adtv20=1_000_000_000_000.0)
+    auth = _auth(sessions)
+    rules = load_krx_market_rules(RULES_PATH)
+    outcome = run_ledger(
+        cube=cube,
+        targets={0: np.array([0.5, 0.5])},
+        panel_dir=panel,
+        dividends=pl.DataFrame(),
+        engine_config_path=ENGINE_TOML,
+        rules=rules,
+        market_cache_root=tmp_path / "cache",
+        capital_krw=10_000_000,
+        halted_exit_policy=DelistPolicy.LAST_CLOSE,
+        start=sessions[0],
+        end=sessions[-1],
+        authorization=auth,
+        record_orders=True,
+    )
+    buys = sum(fill.quantity * fill.price for fill in outcome.fills if fill.side == "buy")
+    sells = sum(fill.quantity * fill.price for fill in outcome.fills if fill.side == "sell")
+    assert -buys == outcome.journal_totals_krw["buy"]
+    assert sells == outcome.journal_totals_krw.get("sell", 0)
+    assert any(reject.reason == "capacity" for reject in outcome.rejects)
+    assert all(fill.session > fill.decision_session for fill in outcome.fills)
+
+
+def test_ledger_order_records_skip_unknown_sessions() -> None:
+    """Order records whose decision index falls outside the panel are skipped, not crashed on."""
+    from types import SimpleNamespace
+
+    from src.backtest.costs import Side
+    from src.backtest.execution import Order
+    from src.research.ledger_bridge import _ledger_fills, _ledger_rejects
+
+    sessions = synthetic_sessions(3, start=date(2020, 1, 6))
+    instruments = ["KRX:000001"]
+    arrays = SimpleNamespace(sessions=tuple(sessions), instrument_ids=tuple(instruments))
+    good_order = Order(0, Side.BUY, 10, 0)
+    bad_order = Order(0, Side.SELL, 5, 99)
+    fills = SimpleNamespace(fills=(SimpleNamespace(order=good_order, quantity=10, price=100),
+                                    SimpleNamespace(order=bad_order, quantity=5, price=100)))
+    assert len(_ledger_fills(arrays, fills)) == 1
+    rejects = SimpleNamespace(rejects=(SimpleNamespace(order=good_order, reason="capacity"),
+                                        SimpleNamespace(order=bad_order, reason="capacity")))
+    assert len(_ledger_rejects(arrays, rejects)) == 1

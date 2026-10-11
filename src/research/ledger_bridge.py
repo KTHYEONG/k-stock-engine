@@ -28,7 +28,9 @@ from src.research.cube import ResearchCube
 from src.research.hedge import HedgeInputs
 
 __all__ = [
+    "LedgerFill",
     "LedgerOutcome",
+    "LedgerReject",
     "cash_returns_from_frame",
     "overlay_market_from_inputs",
     "overlay_market_with_legs",
@@ -36,6 +38,25 @@ __all__ = [
 ]
 
 _LOG = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerFill:
+    session: date
+    decision_session: date
+    instrument_id: str
+    side: str
+    quantity: int
+    price: int
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerReject:
+    session: date
+    instrument_id: str
+    side: str
+    quantity: int
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +74,8 @@ class LedgerOutcome:
     turnover_per_year: float = 0.0
     ledger_hash: str = ""
     nav_krw: NDArray[np.float64] | None = None
+    fills: tuple[LedgerFill, ...] = ()
+    rejects: tuple[LedgerReject, ...] = ()
 
     def __post_init__(self) -> None:
         if self.reject_counts is None:
@@ -229,6 +252,8 @@ def run_ledger(
     sessions_per_year: int = 252,
     market_arrays: MarketArrays | None = None,
     rebalance_band: float = 0.0,
+    record_orders: bool = False,
+    settle_final_taxes: bool = True,
 ) -> LedgerOutcome:
     """Replay screening targets through the integer-ledger engine.
 
@@ -295,6 +320,7 @@ def run_ledger(
         derivatives=derivatives,
         leg_derivatives=leg_derivatives,
         rebalance_band=rebalance_band,
+        settle_final_taxes=settle_final_taxes,
     )
     sessions = tuple(arrays.sessions[record.session_idx] for record in result.nav)
     logs = np.empty(len(result.nav), dtype=np.float64)
@@ -350,4 +376,49 @@ def run_ledger(
         turnover_per_year=float(turnover),
         ledger_hash=result.ledger_hash,
         nav_krw=np.ascontiguousarray(navs, dtype=np.float64),
+        fills=_ledger_fills(arrays, result) if record_orders else (),
+        rejects=_ledger_rejects(arrays, result) if record_orders else (),
     )
+
+
+def _ledger_fills(arrays: MarketArrays, result: object) -> tuple[LedgerFill, ...]:
+    fills = getattr(result, "fills", ())
+    out: list[LedgerFill] = []
+    for fill in fills:
+        order = fill.order
+        decision_idx = int(order.decision_session_idx)
+        exec_idx = decision_idx + 1
+        if not 0 <= decision_idx < len(arrays.sessions) or not 0 <= exec_idx < len(arrays.sessions):
+            continue
+        out.append(
+            LedgerFill(
+                session=arrays.sessions[exec_idx],
+                decision_session=arrays.sessions[decision_idx],
+                instrument_id=str(arrays.instrument_ids[int(order.instrument_idx)]),
+                side=str(order.side.value),
+                quantity=int(fill.quantity),
+                price=int(fill.price),
+            )
+        )
+    return tuple(out)
+
+
+def _ledger_rejects(arrays: MarketArrays, result: object) -> tuple[LedgerReject, ...]:
+    rejects = getattr(result, "rejects", ())
+    out: list[LedgerReject] = []
+    for reject in rejects:
+        order = reject.order
+        decision_idx = int(order.decision_session_idx)
+        exec_idx = decision_idx + 1
+        if not 0 <= decision_idx < len(arrays.sessions) or not 0 <= exec_idx < len(arrays.sessions):
+            continue
+        out.append(
+            LedgerReject(
+                session=arrays.sessions[exec_idx],
+                instrument_id=str(arrays.instrument_ids[int(order.instrument_idx)]),
+                side=str(order.side.value),
+                quantity=int(order.quantity),
+                reason=str(reject.reason),
+            )
+        )
+    return tuple(out)
