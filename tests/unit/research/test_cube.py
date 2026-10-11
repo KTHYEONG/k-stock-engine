@@ -782,7 +782,7 @@ def test_build_assembles_market_returns_and_exits(monkeypatch: pytest.MonkeyPatc
         ]
     )
 
-    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+    def _frame(path: Path, columns: object = None, **_: object) -> pl.DataFrame:
         name = Path(path).name
         if "financial_facts" in name:
             return facts
@@ -964,7 +964,7 @@ def test_build_validation_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     )
     bad_flows = pl.DataFrame([{"instrument_id": "KRX:999999", "session": sessions[0]}])
 
-    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+    def _frame(path: Path, columns: object = None, **_: object) -> pl.DataFrame:
         name = Path(path).name
         if name == "f":
             return good_facts
@@ -1238,7 +1238,7 @@ def test_build_facts_unknown_instrument(
                 "available_at": pl.Datetime("us", "Asia/Seoul")}
     )
 
-    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+    def _frame(path: Path, columns: object = None, **_: object) -> pl.DataFrame:
         if path.name == "f":
             return facts
         return empty_flows if path.name == "i" else pl.DataFrame([])
@@ -1434,7 +1434,7 @@ def _tail_inputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n: int = 700) 
         ]
     )
 
-    def _frame(path: Path, columns: object = None) -> pl.DataFrame:
+    def _frame(path: Path, columns: object = None, **_: object) -> pl.DataFrame:
         name = Path(path).name
         if "financial_facts" in name:
             return facts
@@ -1566,7 +1566,7 @@ def test_pre_tail_availability_preserves_earn_age(monkeypatch: pytest.MonkeyPatc
     inputs, sessions = _tail_inputs(monkeypatch, tmp_path)
     original = cube_mod._read_frame
 
-    def earlier(path: Path, columns: object = None) -> pl.DataFrame:
+    def earlier(path: Path, columns: object = None, **_: object) -> pl.DataFrame:
         frame = original(path, columns)
         if "financial_facts" in path.name or "releases" in path.name:
             return frame.with_columns(pl.lit(_dt(sessions[5])).alias("available_at"))
@@ -1578,3 +1578,12 @@ def test_pre_tail_availability_preserves_earn_age(monkeypatch: pytest.MonkeyPatc
     a = build_panel(full, last_row=699).features["earn_age"][-250:]
     b = build_panel(tail, last_row=599).features["earn_age"][-250:]
     np.testing.assert_array_equal(a, b)
+
+
+def test_read_frame_pushes_session_filter_into_scan(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    days = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    frame = pl.DataFrame({"session": days, "value": [1, 2, 3]})
+    monkeypatch.setattr("src.data.datasets.read_dataset", lambda path, columns=None: frame.lazy())
+    assert cube_mod._read_frame(tmp_path).height == 3
+    kept = cube_mod._read_frame(tmp_path, sessions=days[1:])
+    assert kept["value"].to_list() == [2, 3]

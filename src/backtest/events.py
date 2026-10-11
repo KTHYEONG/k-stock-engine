@@ -110,9 +110,12 @@ def _exit_events(
     grouped: dict[int, list[ExitEvent]] = {}
     for row in frame.to_dicts():
         instrument_id = row["instrument_id"]
+        last_session = _as_date(row["last_session"], what="exit last_session")
+        if sessions and last_session < sessions[0]:
+            # A tail window starts after this exit; the instrument is not in the arrays and cannot be held.
+            continue
         if not isinstance(instrument_id, str) or instrument_id not in instrument_index:
             raise PITDataError(f"exit references unknown instrument: {instrument_id!r}")
-        last_session = _as_date(row["last_session"], what="exit last_session")
         if last_session not in session_index:
             raise PITDataError(f"exit references unknown session: {last_session!r}")
         last_idx = session_index[last_session]
