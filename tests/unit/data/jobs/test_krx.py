@@ -458,3 +458,27 @@ def test_trend_job_registered_and_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp
         day.isoformat() for day in SESSIONS[1:]
     ]
     assert len(krx_jobs.KrxHedgeSeriesJob().pending(ctx)) == len(SESSIONS)
+def test_morning_retry_preserves_empty_evidence_until_page_arrives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+    from datetime import timedelta
+
+    import src.data.jobs.krx as krx_jobs
+    from src.data.receipt_catalog import EvidenceStatus
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    collector = _KrxCollector()
+    clock = [NOW_AFTER_CLOSE]
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=collector, now=lambda: clock[0])
+    job = krx_jobs.KrxDailyMarketJob()
+    first, _ = _run(job, ctx)
+    assert first.status == "complete"
+    assert job.pending(ctx) == []
+    retry = replace(ctx, retry_empty_session=SESSIONS[-1])
+    assert [unit.natural_key for unit in job.pending(retry)] == [SESSIONS[-1].isoformat()]
+    collector._daily[SESSIONS[-1]] = [_daily_row()]
+    clock[0] += timedelta(seconds=60)
+    second, _ = _run(job, retry)
+    assert second.done == 1
+    latest = ctx.catalog.latest(source=job.source, natural_keys={SESSIONS[-1].isoformat()})
+    assert latest[SESSIONS[-1].isoformat()].status == EvidenceStatus.SUCCESS
+    assert job.pending(retry) == []

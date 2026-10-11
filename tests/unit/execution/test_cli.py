@@ -168,3 +168,33 @@ def test_today_and_closed_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, c
     monkeypatch.setattr("src.research.operate.read_chain", lambda path: (decision,))
     assert cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path), "--out", str(tmp_path)]) == 0
     assert json.loads(capsys.readouterr().out)["symbols"] == 0
+@pytest.mark.parametrize("scenario", ["closed", "missing", "late_open", "ok", "unresolved", "error"])
+def test_scheduled_capture_records_outcome(tmp_path, monkeypatch, scenario):  # type: ignore[no-untyped-def]
+    from datetime import date
+    from types import SimpleNamespace
+
+    from src.execution import cli
+    from src.ops.run_outcome import load_run_outcomes
+
+    day = date(2026, 10, 8)
+    monkeypatch.setattr(cli, "_today", lambda: day)
+    monkeypatch.setattr("src.ops.guards.trading_day", lambda _: scenario != "closed")
+    monkeypatch.setattr("src.research.operate.read_chain", lambda _: () if scenario == "missing" else (
+        SimpleNamespace(execution_session=day),
+    ))
+    monkeypatch.setattr(cli, "_session_open", lambda _: None if scenario == "late_open" else object())
+
+    def capture(args):  # type: ignore[no-untyped-def]
+        if scenario == "error":
+            raise ValueError("secret-value")
+        return {"unresolved": ["005930"] if scenario == "unresolved" else []}
+
+    monkeypatch.setattr(cli, "_run_auction_open", capture)
+    events = tmp_path / "events"
+    rc = cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path),
+                   "--out", str(tmp_path / "out.json"), "--events-root", str(events)])
+    expected = {"closed": "SKIPPED", "missing": "NO_DECISION", "late_open": "SKIPPED",
+                "ok": "OK", "unresolved": "DEGRADED", "error": "DEGRADED"}[scenario]
+    assert load_run_outcomes(events, day) == {"auction_open": expected}
+    assert rc == (1 if expected in ("NO_DECISION", "DEGRADED") else 0)
+    assert "secret-value" not in (events / "2026-10" / "2026-10-08.jsonl").read_text()

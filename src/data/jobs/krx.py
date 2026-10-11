@@ -203,7 +203,9 @@ def _pending_index_series(
     units: list[JobUnit] = []
     for day in sessions:
         entry = answered.get(day.isoformat())
-        if entry is not None and entry.status in _ANSWERED:
+        if entry is not None and entry.status in _ANSWERED and not (
+            entry.status == EvidenceStatus.EMPTY and day == ctx.retry_empty_session
+        ):
             continue
         units.append(
             JobUnit(
@@ -303,7 +305,9 @@ def _pending_sessions(*, source: str, ctx: JobContext) -> Sequence[JobUnit]:
     units: list[JobUnit] = []
     for day in sessions:
         entry = answered.get(day.isoformat())
-        if entry is not None and entry.status in _ANSWERED:
+        if entry is not None and entry.status in _ANSWERED and not (
+            entry.status == EvidenceStatus.EMPTY and day == ctx.retry_empty_session
+        ):
             continue
         units.append(
             JobUnit(

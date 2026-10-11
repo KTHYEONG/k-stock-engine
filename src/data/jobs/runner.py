@@ -13,7 +13,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -118,6 +118,7 @@ class JobContext:
     collector: Any
     now: Callable[[], datetime]
     sleep: Callable[[float], None]
+    retry_empty_session: date | None = None
 
     def headroom(self) -> int:
         """Request capacity left for this job after holding back its reserve."""

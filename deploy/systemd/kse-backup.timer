@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE offsite backup (daily 02:30 KST, shared Drive lock)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Seoul
+AccuracySec=1s
+Persistent=true
+Unit=kse-backup.service
+
+[Install]
+WantedBy=timers.target
