@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
+from functools import lru_cache
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,6 +34,18 @@ from src.backtest.overlay import (
 )
 from src.core.market_rules import KrxMarketRules
 from src.core.pit import PITDataError
+
+
+@lru_cache(maxsize=16)
+def _last_session_of_year(year: int) -> date:
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+
+    return max(
+        instant.astimezone(KRX_TZ).date()
+        for instant in xkrx_calendar_through(date(year, 12, 31)).sessions
+        if instant.astimezone(KRX_TZ).year == year
+    )
 
 
 class DelistPolicy(StrEnum):
@@ -490,6 +503,7 @@ def run_backtest(
     derivatives: DerivativeConfig | None = None,
     leg_derivatives: Mapping[str, DerivativeConfig] | None = None,
     rebalance_band: float = 0.0,
+    settle_final_taxes: bool = True,
 ) -> BacktestResult:
     """Replay pre-decided target weights on the fixed session timeline.
 
@@ -505,6 +519,8 @@ def run_backtest(
     close_{t-1} - 1) credits the cash held overnight before session t's orders. ``None`` disables the sweep.
     The cash-yield tax is assessed on the last session of each calendar year and on the run's last session,
     before the close mark, so every ``NavRecord`` already reflects it and ``nav[-1].cash`` equals the journal sum.
+    ``settle_final_taxes=False`` retains calendar-year settlement but omits terminal-run settlement,
+    keeping forward-ledger prefixes invariant when another certified session arrives.
 
     With an overlay, ``targets`` are fractions of the **stock book**; the engine sizes stock orders against
     ``nav - required_reserve(target contracts) - target inverse value`` so the cash the hedge needs at the close
@@ -745,7 +761,10 @@ def run_backtest(
                     price=inverse_price, config=derivatives,
                 )
             pending_overlay = None
-        year_end = t == hi or sessions[t].year != sessions[t + 1].year
+        calendar_year_end = t + 1 < len(sessions) and sessions[t].year != sessions[t + 1].year
+        if not settle_final_taxes and t + 1 == len(sessions):
+            calendar_year_end = sessions[t] == _last_session_of_year(sessions[t].year)
+        year_end = calendar_year_end or (t == hi and settle_final_taxes)
         if year_end:
             if sweep is not None:
                 ledger.settle_cash_yield_tax(session_idx=t, config=config.costs)

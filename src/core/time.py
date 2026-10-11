@@ -11,6 +11,7 @@ from datetime import datetime, time, tzinfo
 from zoneinfo import ZoneInfo
 
 KRX_TZ = ZoneInfo("Asia/Seoul")
+OPEN_SNAPSHOT_OFFSETS_MIN = (-20, -10, -5, -2, -1)
 
 
 class TemporalViolationError(ValueError):

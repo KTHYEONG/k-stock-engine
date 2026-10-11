@@ -97,6 +97,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parity.add_argument("--spec", type=Path, required=True)
     parity.add_argument("--decisions-dir", type=Path, required=True)
     parity.add_argument("--tolerance", type=float, required=False, default=1e-9)
+
+    shadow = sub.add_parser("shadow-run")
+    _common_args(shadow)
+    shadow.add_argument("--spec", type=Path, required=True)
+    shadow.add_argument("--decisions-dir", type=Path, required=True)
+    shadow.add_argument("--shadow-dir", type=Path, required=True)
+    shadow.add_argument("--tail-sessions", type=int, required=False, default=800)
+    shadow.add_argument("--capital", type=int, required=False, default=None)
     return parser
 
 
@@ -558,6 +566,41 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
     }
 
 
+def _run_shadow(args: argparse.Namespace) -> Mapping[str, object]:
+    from src.core.pit import PITDataError
+    from src.research.operate import read_chain
+    from src.research.shadow import append_shadow, run_shadow
+
+    tail_sessions = int(getattr(args, "tail_sessions", 800))
+    if tail_sessions < 700:
+        raise ValueError(f"--tail-sessions must be >= 700, got {tail_sessions}")
+    resolved = _decide_context(args, tail_sessions)
+    pipeline, ctx = resolved.pipeline, resolved.context
+    spec = _load_spec(args.spec)
+    chain = read_chain(Path(args.decisions_dir))
+    if not chain:
+        raise PITDataError("no sealed decisions to shadow")
+    sessions = list(resolved.cube.sessions)
+    start = sorted(chain, key=lambda item: item.data_session)[0].execution_session
+    if start not in set(sessions):
+        raise PITDataError(f"shadow start {start.isoformat()} is not in the tail cube")
+    if sessions.index(start) < 253:
+        raise PITDataError("--tail-sessions must cover the shadow start plus 253 sessions of index history")
+    capital = int(args.capital) if getattr(args, "capital", None) is not None else int(ctx.protocol.primary_capital_krw)
+    official = run_shadow(pipeline, spec, chain, capital_krw=capital, on_time_only=True)
+    ideal = run_shadow(pipeline, spec, chain, capital_krw=capital, on_time_only=False)
+    appended = {
+        "official": append_shadow(Path(args.shadow_dir), official, variant="official"),
+        "ideal": append_shadow(Path(args.shadow_dir), ideal, variant="ideal"),
+    }
+    return {
+        "appended": appended,
+        "last_session": official.sessions[-1].isoformat() if official.sessions else None,
+        "late_sessions": [day.isoformat() for day in official.late_sessions],
+        "nav_krw": float(official.nav_krw[-1]) if len(official.nav_krw) else None,
+    }
+
+
 def _peak_rss_mb() -> float:
     import contextlib
 
@@ -895,6 +938,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload, code = _run_parity(args)
             _emit(payload)
             return code
+        elif args.command == "shadow-run":
+            _emit(_run_shadow(args))
         elif args.command == "champion":
             _emit(_run_champion(args))
         elif args.command == "challenge":
