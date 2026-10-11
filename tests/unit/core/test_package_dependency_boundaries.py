@@ -27,6 +27,11 @@ ALLOWED: dict[str, frozenset[str]] = {
 # (importing file relative to repo root, imported top-level package)
 KNOWN_VIOLATIONS: frozenset[tuple[str, str]] = frozenset()
 
+# CLI composition roots wire domain services to configuration and provider adapters.
+COMPOSITION_ROOTS = {
+    "src/execution/cli.py": frozenset({"config", "integrations", "research"}),
+}
+
 
 def _imported_modules(tree: ast.AST) -> list[str]:
     modules: list[str] = []
@@ -48,7 +53,8 @@ def _observed_violations() -> set[tuple[str, str]]:
             parts = module.split(".")
             if parts[0] != "src" or len(parts) < 2 or parts[1] == package:
                 continue
-            if parts[1] not in ALLOWED[package]:
+            allowed = ALLOWED[package] | COMPOSITION_ROOTS.get(path.relative_to(SRC.parent).as_posix(), frozenset())
+            if parts[1] not in allowed:
                 found.add((path.relative_to(SRC.parent).as_posix(), parts[1]))
     return found
 

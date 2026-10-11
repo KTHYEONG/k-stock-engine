@@ -1,0 +1,170 @@
+"""Execution CLI entry points: auction-open guards and wiring."""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from src.core.time import KRX_TZ
+
+
+@pytest.fixture(autouse=True)
+def fixed_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.execution.cli._today", lambda: date(2026, 10, 2))
+
+
+def test_auction_open_cli_early_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json as _json
+    from datetime import datetime as _datetime
+
+    import src.execution.cli as cli
+
+    code = cli.main(["auction-open", "--decisions-dir", str(tmp_path / "dec"), "--shadow-dir", str(tmp_path / "sh"), "--out", str(tmp_path / "out")])
+    assert code == 0
+    assert _json.loads(capsys.readouterr().out.strip().splitlines()[-1])["symbols"] == 0
+
+    from src.research.operate import SealedDecision
+
+    sunday = date(2026, 10, 4)
+    friday = date(2026, 10, 2)
+    chain = (SealedDecision(
+        data_session=friday, execution_session=sunday,
+        sealed_at=_datetime(2026, 10, 2, 20, 0, tzinfo=KRX_TZ), spec_hash="s", models_id="m",
+        inputs={}, targets={}, reference={}, overlay={}, state_digest="d", prev_hash="", hash="",
+    ),)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: chain)
+    code = cli.main(["auction-open", "--decisions-dir", str(tmp_path / "dec"), "--shadow-dir", str(tmp_path / "sh"), "--out", str(tmp_path / "out")])
+    assert code == 0
+    assert _json.loads(capsys.readouterr().out.strip().splitlines()[-1])["symbols"] == 0
+
+
+def test_session_open_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.execution.cli import _session_open
+
+    friday = date(2026, 10, 2)
+    instant = _session_open(friday)
+    assert instant is not None
+    assert (instant.hour, instant.minute) == (9, 0)
+    assert _session_open(date(2026, 10, 4)) is None
+    monkeypatch.setattr("src.core.krx_calendar.xkrx_calendar_through", lambda day: (_ for _ in ()).throw(ValueError("no calendar")))
+    assert _session_open(friday) is None
+
+
+def test_net_holdings_from_fills(tmp_path: Path) -> None:
+    import polars as pl
+
+    from src.execution.cli import _net_holdings
+
+    assert _net_holdings(tmp_path) == ()
+    root = tmp_path / "official"
+    root.mkdir(parents=True)
+    pl.DataFrame(
+        {"session": [], "decision_session": [], "instrument_id": [], "side": [], "quantity": [], "price": []},
+        schema={"session": pl.Date, "decision_session": pl.Date, "instrument_id": pl.String, "side": pl.String, "quantity": pl.Int64, "price": pl.Int64},
+    ).write_parquet(root / "fills.parquet")
+    assert _net_holdings(tmp_path) == ()
+    day = date(2026, 10, 2)
+    pl.DataFrame(
+        {"session": [day, day, day], "decision_session": [day, day, day],
+         "instrument_id": ["KRX:005930", "KRX:005930", "KRX:000660"], "side": ["buy", "sell", "buy"],
+         "quantity": [10, 10, 5], "price": [10000, 10000, 10000]},
+        schema={"session": pl.Date, "decision_session": pl.Date, "instrument_id": pl.String, "side": pl.String, "quantity": pl.Int64, "price": pl.Int64},
+    ).write_parquet(root / "fills.parquet")
+    assert _net_holdings(tmp_path) == ("KRX:000660",)
+
+
+def test_auction_open_live_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json as _json
+    from datetime import datetime as _datetime
+
+    import src.execution.cli as cli
+    from src.execution.auction_capture import AuctionRow
+    from src.research.operate import SealedDecision
+
+    friday = date(2026, 10, 2)
+    thursday = date(2026, 10, 1)
+    chain = (SealedDecision(
+        data_session=thursday, execution_session=friday,
+        sealed_at=_datetime(2026, 10, 1, 20, 0, tzinfo=KRX_TZ), spec_hash="s", models_id="m",
+        inputs={}, targets={"KRX:005930": 0.5}, reference={}, overlay={}, state_digest="d", prev_hash="", hash="",
+    ),)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: chain)
+    monkeypatch.setattr("src.integrations.kis.build_pool_client", lambda policy, admission_class=None: object())
+    open_at = _datetime(2026, 10, 2, 9, 0, tzinfo=KRX_TZ)
+    rows = (
+        AuctionRow(friday, "005930", "expected", open_at, open_at, "{}", "[]"),
+        AuctionRow(friday, "005930", "open", open_at, open_at, "{}", "{}"),
+    )
+    monkeypatch.setattr("src.execution.auction_capture.capture_open_auction", lambda client, symbols, **kwargs: rows)
+    code = cli.main(["auction-open", "--decisions-dir", str(tmp_path / "dec"), "--shadow-dir", str(tmp_path / "sh"), "--out", str(tmp_path / "out")])
+    assert code == 0
+    payload = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload == {"expected_rows": 1, "open_resolved": 1, "symbols": 1, "unresolved": []}
+    assert (tmp_path / "out" / "2026-10" / "2026-10-02.parquet").is_file()
+
+
+def test_auction_open_bad_limit_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json as _json
+    from datetime import datetime as _datetime
+
+    import src.execution.cli as cli
+    from src.research.operate import SealedDecision
+
+    friday = date(2026, 10, 2)
+    chain = (SealedDecision(
+        data_session=date(2026, 10, 1), execution_session=friday,
+        sealed_at=_datetime(2026, 10, 1, 20, 0, tzinfo=KRX_TZ), spec_hash="s", models_id="m",
+        inputs={}, targets={}, reference={}, overlay={}, state_digest="d", prev_hash="", hash="",
+    ),)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: chain)
+    code = cli.main(["auction-open", "--decisions-dir", str(tmp_path / "dec"), "--shadow-dir", str(tmp_path / "sh"), "--out", str(tmp_path / "out"), "--limit", "0"])
+    assert code == 1
+    assert "limit" in _json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+
+
+def test_session_open_shifted_and_empty_symbols(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json as _json
+    from datetime import datetime as _datetime
+    from types import SimpleNamespace
+
+    import src.core.krx_calendar as _calendar
+    import src.execution.cli as cli
+    from src.execution.cli import _session_open
+    from src.research.operate import SealedDecision
+
+    friday = date(2026, 10, 2)
+    real_calendar = _calendar.xkrx_calendar_through
+    shifted = SimpleNamespace(sessions=(_datetime(2026, 10, 2, 10, 0, tzinfo=KRX_TZ),))
+    monkeypatch.setattr("src.core.krx_calendar.xkrx_calendar_through", lambda day: shifted)
+    assert _session_open(friday) is None
+    monkeypatch.setattr("src.core.krx_calendar.xkrx_calendar_through", real_calendar)
+    chain = (SealedDecision(
+        data_session=date(2026, 10, 1), execution_session=friday,
+        sealed_at=_datetime(2026, 10, 1, 20, 0, tzinfo=KRX_TZ), spec_hash="s", models_id="m",
+        inputs={}, targets={}, reference={}, overlay={}, state_digest="d", prev_hash="", hash="",
+    ),)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: chain)
+    code = cli.main(["auction-open", "--decisions-dir", str(tmp_path / "dec"), "--shadow-dir", str(tmp_path / "sh"), "--out", str(tmp_path / "out")])
+    assert code == 0
+    assert _json.loads(capsys.readouterr().out.strip().splitlines()[-1])["symbols"] == 0
+
+
+def test_today_and_closed_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+    from datetime import datetime
+
+    import src.execution.cli as cli
+    from src.research.operate import SealedDecision
+
+    monkeypatch.undo()
+    assert cli._today() == datetime.now(KRX_TZ).date()
+    monkeypatch.setattr(cli, "_today", lambda: date(2026, 10, 4))
+    decision = SealedDecision(
+        date(2026, 10, 1), date(2026, 10, 2), datetime(2026, 10, 1, 20, tzinfo=KRX_TZ),
+        "s", "m", {}, {}, {}, {}, "d", "", "",
+    )
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (decision,))
+    assert cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path), "--out", str(tmp_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["symbols"] == 0
