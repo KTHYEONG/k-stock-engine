@@ -154,7 +154,44 @@ class KisMockBroker:
         )
 
     def reconcile(self, account: str) -> list[OrderStateRecord]:
-        raise NotImplementedError("daily order inquiry TR is unconfirmed for the mock domain")
+        if str(account) != self.account:
+            raise ValueError("account does not match the broker account")
+        return self.order_states(self._session)
+
+    def order_states(self, session: date) -> list[OrderStateRecord]:
+        """Broker-side order states of one session; ``order_id`` and ``reason`` carry the broker order number."""
+        records: list[OrderStateRecord] = []
+        for row in self._client.inquire_daily_ccld(session):
+            order_no = str(row.get("odno", "")).strip()
+            symbol = str(row.get("pdno", "")).strip()
+            if not order_no or not symbol:
+                continue
+            quantity = float(str(row.get("ord_qty", "0") or "0"))
+            filled = float(str(row.get("tot_ccld_qty", "0") or "0"))
+            remaining = float(str(row.get("rmn_qty", "0") or "0"))
+            if str(row.get("cncl_yn", "")).strip().upper() == "Y":
+                state = OrderState.CANCELED
+            elif quantity > 0 and filled >= quantity and remaining == 0:
+                state = OrderState.FILLED
+            else:
+                state = OrderState.SUBMITTED
+            average = float(str(row.get("avg_prvs", "0") or "0"))
+            side = OrderSide.SELL if str(row.get("sll_buy_dvsn_cd", "")).strip() == "01" else OrderSide.BUY
+            records.append(
+                OrderStateRecord(
+                    order_id=order_no,
+                    intent_id="",
+                    instrument_id=f"KRX:{symbol}",
+                    asset_kind=AssetKind.STOCK,
+                    side=side,
+                    state=state,
+                    submitted_quantity=quantity,
+                    filled_quantity=filled,
+                    filled_price=average if filled > 0 and average > 0 else None,
+                    reason=order_no,
+                )
+            )
+        return records
 
     def snapshot(self, *, as_of: datetime) -> PortfolioSnapshot:
         output1, output2 = self._client.inquire_balance()
