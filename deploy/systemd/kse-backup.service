@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE offsite backup (Drive lake push, prune confirmed Bronze)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=3h
+ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock /usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kse-backup --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --memory=1g --memory-swap=1g --cpus=1.0 --env-file %h/quant-secrets/k-stock-engine.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs -v %h/.config/rclone:/tmp/.config/rclone:ro ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.ops.jobs backup --no-lock
+ExecStopPost=-/usr/bin/docker rm -f kse-backup

@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE weekly operations report
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=60min
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kse-weekly-report --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --memory=2g --memory-swap=2g --cpus=1.0 --env-file %h/quant-secrets/k-stock-engine.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.ops.jobs weekly-report
+ExecStopPost=-/usr/bin/docker rm -f kse-weekly-report

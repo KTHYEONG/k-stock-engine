@@ -1,0 +1,12 @@
+[Unit]
+Description=KSE daily audit (Mon-Fri 21:40 and Sat-Sun 12:00 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 21:40:00 Asia/Seoul
+OnCalendar=Sat,Sun 12:00:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-daily-audit.service
+
+[Install]
+WantedBy=timers.target

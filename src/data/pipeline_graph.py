@@ -54,6 +54,8 @@ class RefreshContext:
     catalog: ReceiptCatalog
     decision_time: datetime
     superseded_receipts: frozenset[str] = frozenset()
+    deferred_build_kinds: frozenset[str] = frozenset()
+    retry_krx_session: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1122,6 +1124,8 @@ def plan_refresh(ctx: RefreshContext) -> tuple[BuildNode, ...]:
     stale: set[str] = set()
     plan: list[BuildNode] = []
     for node in _VALIDATED_GRAPH:
+        if node.kind in ctx.deferred_build_kinds:
+            continue
         dataset_id = snapshot.get(node.kind)
         if dataset_id is None or any(dependency in stale for dependency in node.inputs):
             stale.add(node.kind)
@@ -1274,6 +1278,7 @@ def _run_krx_collection_step(
             quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
         )
     job_ctx = build_krx_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
+    job_ctx = replace(job_ctx, retry_empty_session=ctx.retry_krx_session)
     report = run_job(
         resolve_krx_job(job_name),
         job_ctx,

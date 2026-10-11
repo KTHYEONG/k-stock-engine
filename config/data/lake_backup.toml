@@ -7,7 +7,7 @@ name = "bronze"
 root = "data/bronze/kr_swing_2019_v1"
 immutable = true
 exclude = ["catalog/*", "_packs/*"]
-segment_mib = 512
+segment_mib = 128
 
 # SQLite catalogs change on every collection; they are snapshotted through the SQLite backup API.
 [[source]]
@@ -40,3 +40,20 @@ immutable = true
 name = "artifacts"
 root = "data/artifacts"
 exclude = ["*.tmp"]
+
+# Operations events, heartbeats and reports; mutable by design.
+[[source]]
+name = "ops"
+root = "data/ops"
+exclude = ["*.tmp"]
+
+# Derived releases are immutable once written.
+[[source]]
+name = "silver"
+root = "data/silver/kr_swing_2019_v1"
+immutable = true
+
+[[source]]
+name = "gold"
+root = "data/gold/kr_swing_2019_v1"
+immutable = true
