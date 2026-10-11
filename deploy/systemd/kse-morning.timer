@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE morning seal (Mon-Fri 08:32 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 08:32:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-morning.service
+
+[Install]
+WantedBy=timers.target

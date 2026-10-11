@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE evening collection (Mon-Fri 18:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 18:30:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-collect-eve.service
+
+[Install]
+WantedBy=timers.target

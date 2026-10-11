@@ -22,6 +22,7 @@ ALLOWED: dict[str, frozenset[str]] = {
     "data": frozenset({"core", "config", "integrations"}),
     "backtest": frozenset({"core", "config", "data"}),
     "research": frozenset({"core", "config", "data", "backtest"}),
+    "ops": frozenset({"core", "config", "data", "research"}),
 }
 
 # (importing file relative to repo root, imported top-level package)
@@ -29,7 +30,7 @@ KNOWN_VIOLATIONS: frozenset[tuple[str, str]] = frozenset()
 
 # CLI composition roots wire domain services to configuration and provider adapters.
 COMPOSITION_ROOTS = {
-    "src/execution/cli.py": frozenset({"config", "integrations", "research"}),
+    "src/execution/cli.py": frozenset({"config", "integrations", "research", "ops"}),
 }
 
 

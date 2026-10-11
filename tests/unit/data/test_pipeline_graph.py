@@ -1412,3 +1412,11 @@ def test_facts_preview_rejects_unreadable_present_bridge(
     monkeypatch.setattr(inc, "load_frozen_dart_ticker_bridge", _unreadable)
     with pytest.raises(PITDataError, match="bridge unreadable"):
         graph._preview_financial_facts(ctx)
+def test_deferred_krx_nodes_are_not_scheduled(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    deferred = frozenset({"daily_market", "ordinary_universe", "hedge_series"})
+    plan = plan_refresh(replace(ctx, deferred_build_kinds=deferred))
+    assert not deferred.intersection(node.kind for node in plan)
+    assert "financial_facts" in {node.kind for node in plan}
