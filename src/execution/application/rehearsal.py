@@ -11,10 +11,10 @@ from src.core.time import KRX_TZ
 from src.execution.application.plan_orders import plan_intents
 from src.execution.application.readiness import ReadinessEvidence
 from src.execution.application.submit_intents import ExecutionContext, submit_intents
+from src.execution.domain.decision import TargetDecision
 from src.execution.domain.intents import TradeIntent
 from src.execution.domain.orders import OrderState
 from src.execution.settings import ExecutionSettings
-from src.research.operate import SealedDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +55,7 @@ def _in_entry_window(now: datetime, session: date) -> bool:
 
 
 def rehearse_open(
-    decision: SealedDecision,
+    decision: TargetDecision,
     broker: object,
     store: object,
     *,
@@ -147,6 +147,25 @@ def rehearse_open(
     )
 
 
+_TERMINAL_STATES = frozenset({OrderState.FILLED, OrderState.CANCELED, OrderState.REJECTED})
+
+
+def verify_terminal_states(broker: object, store: object, session: date) -> bool:
+    """True when every order this project submitted for the session is terminal at the broker."""
+    ours = [
+        record
+        for record in store.records(session=session)  # type: ignore[attr-defined]
+        if record.state is not OrderState.REJECTED
+    ]
+    if not ours:
+        return False
+    broker_states = {
+        record.order_id: record.state
+        for record in broker.order_states(session)  # type: ignore[attr-defined]
+    }
+    return all(broker_states.get(record.reason) in _TERMINAL_STATES for record in ours)
+
+
 def _report_to_payload(report: RehearsalReport) -> dict[str, object]:
     return {
         "session": report.session.isoformat(),
@@ -156,6 +175,9 @@ def _report_to_payload(report: RehearsalReport) -> dict[str, object]:
         "duplicates_blocked": int(report.duplicates_blocked),
         "reconciled": bool(report.reconciled),
         "position_mismatches": list(report.position_mismatches),
+        "terminal_states_verified": bool(report.terminal_states_verified),
+        "duplicate_orders_absent": bool(report.duplicate_orders_absent),
+        "position_book_verified": bool(report.position_book_verified),
     }
 
 

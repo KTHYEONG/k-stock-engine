@@ -16,7 +16,7 @@ from src.execution.application.readiness import (
     SubmissionRequest,
 )
 from src.execution.application.rehearsal import RehearsalReport, rehearse_open, update_readiness
-from src.execution.domain.orders import OrderState, OrderStateRecord
+from src.execution.domain.orders import OrderSide, OrderState, OrderStateRecord
 from src.execution.domain.portfolio import PortfolioSnapshot, Position
 from src.research.operate import SealedDecision
 
@@ -258,3 +258,35 @@ def test_gate_stays_closed_for_live() -> None:
     gate = SubmissionGate(ReadinessEvidence())
     with pytest.raises(LiveExecutionNotReadyError):
         gate.authorize(SubmissionRequest(intent=intent, mode="live"))
+
+
+def _stored(order_id: str, odno: str, state: OrderState = OrderState.SUBMITTED) -> OrderStateRecord:
+    return OrderStateRecord(
+        order_id=order_id, intent_id=order_id, instrument_id="KRX:005930", asset_kind=AssetKind.STOCK,
+        side=OrderSide.BUY, state=state, submitted_quantity=10.0, reason=odno,
+    )
+
+
+class _StatesBroker:
+    def __init__(self, states: dict[str, OrderState]) -> None:
+        self._states = states
+
+    def order_states(self, session: date) -> list[OrderStateRecord]:
+        return [_stored(odno, odno, state) for odno, state in self._states.items()]
+
+
+def test_terminal_states_require_every_submitted_order_terminal(tmp_path: Path) -> None:
+    from src.execution.application.rehearsal import verify_terminal_states
+
+    session = date(2026, 10, 2)
+    store = _store(tmp_path)
+    store.save(_stored(f"{session.isoformat()}:a", "11"))
+    store.save(_stored(f"{session.isoformat()}:b", "12"))
+    store.save(_stored(f"{session.isoformat()}:c", "", OrderState.REJECTED))
+    done = _StatesBroker({"11": OrderState.FILLED, "12": OrderState.CANCELED})
+    assert verify_terminal_states(done, store, session) is True
+    open_order = _StatesBroker({"11": OrderState.FILLED, "12": OrderState.SUBMITTED})
+    assert verify_terminal_states(open_order, store, session) is False
+    assert verify_terminal_states(_StatesBroker({"11": OrderState.FILLED}), store, session) is False
+    assert verify_terminal_states(done, store, date(2026, 10, 5)) is False
+    store.close()

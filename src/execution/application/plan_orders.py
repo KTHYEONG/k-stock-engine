@@ -7,13 +7,13 @@ from datetime import datetime
 
 from src.core.instruments import AssetKind
 from src.core.time import KRX_TZ
+from src.execution.domain.decision import TargetDecision
 from src.execution.domain.intents import TradeIntent
 from src.execution.domain.portfolio import PortfolioSnapshot
-from src.research.operate import SealedDecision
 
 
 def plan_intents(
-    decision: SealedDecision,
+    decision: TargetDecision,
     snapshot: PortfolioSnapshot,
     *,
     nav_krw: int,
