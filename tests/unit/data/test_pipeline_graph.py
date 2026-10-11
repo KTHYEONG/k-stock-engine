@@ -802,6 +802,7 @@ def test_flow_collection_steps_fail_closed_when_not_dry_run(
 
     monkeypatch.setattr("src.integrations.kis.client.KisClient", _StubKisClient)
     monkeypatch.setattr("src.integrations.kis.client.KisCredentials", _StubKisCredentials)
+    monkeypatch.setattr("src.integrations.kis.build_pool_client", lambda *args, **kwargs: _StubKisClient())
     with pytest.raises(PITDataError, match="not registered"):
         pipeline_graph._run_ls_flow_collection_step(ctx, dry_run=False, emit=lambda payload: None)
     with pytest.raises(PITDataError, match="not registered"):
