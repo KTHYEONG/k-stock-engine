@@ -31,6 +31,7 @@ KNOWN_VIOLATIONS: frozenset[tuple[str, str]] = frozenset()
 # CLI composition roots wire domain services to configuration and provider adapters.
 COMPOSITION_ROOTS = {
     "src/execution/cli.py": frozenset({"config", "integrations", "research", "ops"}),
+    "src/execution/adapters/kis_broker.py": frozenset({"integrations"}),
 }
 
 

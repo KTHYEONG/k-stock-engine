@@ -113,3 +113,66 @@ def test_broker_rejection_becomes_rejected_record() -> None:
     record = broker.submit(_request())
     assert record.state is OrderState.REJECTED
     assert "halted" in record.reason
+
+
+def _ccld_row(odno: str, *, ord_qty: str, filled: str, remaining: str, cancelled: str = "N", side: str = "02") -> dict[str, str]:
+    return {
+        "odno": odno, "pdno": "005930", "ord_qty": ord_qty, "tot_ccld_qty": filled, "rmn_qty": remaining,
+        "cncl_yn": cancelled, "sll_buy_dvsn_cd": side, "avg_prvs": "70000",
+    }
+
+
+def test_reconcile_maps_daily_ccld_with_mock_tr() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_call(method: str, path: str, tr_id: str | None = None, **kwargs: object) -> dict[str, Any]:
+        seen.append({"path": path, "tr_id": tr_id, "params": kwargs["params"]})
+        return {
+            "rt_cd": "0",
+            "output1": [
+                _ccld_row("1", ord_qty="10", filled="10", remaining="0"),
+                _ccld_row("2", ord_qty="10", filled="4", remaining="6", side="01"),
+                _ccld_row("3", ord_qty="10", filled="0", remaining="0", cancelled="Y"),
+            ],
+            "ctx_area_nk100": "",
+        }
+
+    client = _client("vps", transport=fake_call)
+    broker = KisMockBroker(client, rules=_rules(), markets={}, session=date(2026, 10, 2))
+    records = broker.reconcile(broker.account)
+    assert [(r.order_id, r.state.value) for r in records] == [("1", "FILLED"), ("2", "SUBMITTED"), ("3", "CANCELED")]
+    assert records[1].side is OrderSide.SELL
+    assert records[1].filled_quantity == 4.0
+    assert seen[0]["tr_id"] == "VTTC0081R"
+    assert seen[0]["path"].endswith("/trading/inquire-daily-ccld")
+    assert seen[0]["params"]["INQR_STRT_DT"] == "20261002"
+    assert seen[0]["params"]["INQR_END_DT"] == "20261002"
+
+
+def test_reconcile_fails_closed_on_continuation_page() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    def fake_call(method: str, path: str, tr_id: str | None = None, **kwargs: object) -> dict[str, Any]:
+        return {"rt_cd": "0", "output1": [], "ctx_area_nk100": "more"}
+
+    client = _client("vps", transport=fake_call)
+    broker = KisMockBroker(client, rules=_rules(), markets={}, session=date(2026, 10, 2))
+    with pytest.raises(ProviderTerminalError):
+        broker.reconcile(broker.account)
+
+
+def test_reconcile_rejects_foreign_account() -> None:
+    client = _client("vps", transport=lambda **kwargs: {"rt_cd": "0", "output1": []})
+    broker = KisMockBroker(client, rules=_rules(), markets={}, session=date(2026, 10, 2))
+    with pytest.raises(ValueError, match="account"):
+        broker.reconcile("other")
+
+
+def test_daily_ccld_rejects_bad_session_and_malformed_rows() -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    client = _client("vps", transport=lambda **kwargs: {"rt_cd": "0", "output1": {"odno": "1"}})
+    with pytest.raises(ValueError, match="session"):
+        client.inquire_daily_ccld("2026-10-02")  # type: ignore[arg-type]
+    with pytest.raises(ProviderTerminalError):
+        client.inquire_daily_ccld(date(2026, 10, 2))

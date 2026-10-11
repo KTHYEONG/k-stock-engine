@@ -150,14 +150,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _mock_credentials() -> KisCredentials:
-    import os
-
+    from src.config.secrets import read_secret
     from src.integrations.kis.client import KisCredentials
 
-    app_key = os.environ.get("KIS_MOCK_APP_KEY", "").strip()
-    app_secret = os.environ.get("KIS_MOCK_APP_SECRET", "").strip()
-    account_raw = os.environ.get("KIS_MOCK_ACCOUNT_NO", "").strip()
-    env = os.environ.get("KIS_ENV", "vps").strip() or "vps"
+    app_key = read_secret("KIS_MOCK_APP_KEY", "").strip()
+    app_secret = read_secret("KIS_MOCK_APP_SECRET", "").strip()
+    account_raw = read_secret("KIS_MOCK_ACCOUNT_NO", "").strip()
+    env = read_secret("KIS_ENV", "vps").strip() or "vps"
     if not app_key or not app_secret or not account_raw:
         raise ValueError("mock keys are required: KIS_MOCK_APP_KEY/SECRET/ACCOUNT_NO")
     product = "01"
@@ -173,6 +172,18 @@ def _mock_credentials() -> KisCredentials:
     )
 
 
+def _previous_session(session: date) -> date | None:
+    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.time import KRX_TZ
+
+    earlier = [
+        day
+        for day in (item.astimezone(KRX_TZ).date() for item in xkrx_calendar_through(session).sessions)
+        if day < session
+    ]
+    return max(earlier) if earlier else None
+
+
 def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
     from datetime import datetime as _datetime
 
@@ -181,7 +192,12 @@ def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
     from src.core.time import KRX_TZ
     from src.execution.adapters.kis_broker import KisMockBroker
     from src.execution.adapters.sqlite_state_store import SqliteStateStore
-    from src.execution.application.rehearsal import RehearsalReport, rehearse_open, update_readiness
+    from src.execution.application.rehearsal import (
+        RehearsalReport,
+        rehearse_open,
+        update_readiness,
+        verify_terminal_states,
+    )
     from src.integrations.kis.client import KisClient
     from src.research.operate import read_chain
 
@@ -212,6 +228,8 @@ def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
             rebalance_band=float(args.rebalance_band),
             now=_datetime.now(KRX_TZ),
         )
+        previous = _previous_session(session)
+        previous_terminal = previous is not None and verify_terminal_states(broker, store, previous)
     finally:
         store.close()
     evidence_path = Path(args.evidence_path)
@@ -224,15 +242,20 @@ def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
             for row in payload.get("reports", []):
                 if str(row.get("session")) == report.session.isoformat():
                     continue
+                row_session = date.fromisoformat(str(row["session"]))
                 prior.append(
                     RehearsalReport(
-                        session=date.fromisoformat(str(row["session"])),
+                        session=row_session,
                         intents=int(row["intents"]),
                         submitted=int(row["submitted"]),
                         rejected=int(row["rejected"]),
                         duplicates_blocked=int(row["duplicates_blocked"]),
                         reconciled=bool(row["reconciled"]),
                         position_mismatches=tuple(row.get("position_mismatches", [])),
+                        terminal_states_verified=bool(row.get("terminal_states_verified", False))
+                        or (row_session == previous and previous_terminal),
+                        duplicate_orders_absent=bool(row.get("duplicate_orders_absent", False)),
+                        position_book_verified=bool(row.get("position_book_verified", False)),
                     )
                 )
     except (OSError, ValueError, KeyError):

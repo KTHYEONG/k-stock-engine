@@ -422,6 +422,45 @@ class KisClient:
             raise ProviderTerminalError(f"KIS inquire_balance output2 malformed: {payload}", provider="KIS", endpoint="inquire-balance")
         return o1 or [], o2[0] if o2 else {}
 
+    def inquire_daily_ccld(self, session: date) -> tuple[dict[str, Any], ...]:
+        """Orders and fills of one session (TR TTTC0081R / mock VTTC0081R); fails closed on a continued page."""
+        if not isinstance(session, date):
+            raise ValueError("session must be a date")
+        mock = self.creds.env.startswith("demo") or self.creds.env.startswith("v")
+        day = session.strftime("%Y%m%d")
+        payload = self._call(
+            method="GET",
+            path="/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr_id="VTTC0081R" if mock else "TTTC0081R",
+            params={
+                "CANO": self.creds.account_no,
+                "ACNT_PRDT_CD": self.creds.account_product_code,
+                "INQR_STRT_DT": day,
+                "INQR_END_DT": day,
+                "SLL_BUY_DVSN_CD": "00",
+                "PDNO": "",
+                "CCLD_DVSN": "00",
+                "INQR_DVSN": "01",
+                "INQR_DVSN_3": "00",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+                "EXCG_ID_DVSN_CD": "KRX",
+            },
+        )
+        rows = payload.get("output1", [])
+        if not isinstance(rows, list):
+            raise ProviderTerminalError(
+                "KIS inquire_daily_ccld output1 must be a list", provider="KIS", endpoint="inquire-daily-ccld"
+            )
+        if str(payload.get("ctx_area_nk100", "")).strip():
+            raise ProviderTerminalError(
+                "KIS inquire_daily_ccld has a continuation page", provider="KIS", endpoint="inquire-daily-ccld"
+            )
+        return tuple(item for item in rows if isinstance(item, dict))
+
     def place_order(
         self,
         symbol: str,
