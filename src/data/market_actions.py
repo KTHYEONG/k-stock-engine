@@ -26,6 +26,7 @@ from src.data.evidence_sources import KRX_DAILY_MARKET_SOURCE
 from src.data.jobs.kind import normalize_kind_title
 from src.data.kind_notices import (
     iter_kind_notices,
+    kind_covered_through,
     kind_source_digest,
     parse_kind_administrative_form,
     parse_kind_delisting_form,
@@ -388,6 +389,7 @@ def materialize_market_actions(
     bridge: Mapping[str, str],
     kind_keywords: Sequence[str],
     kind_coverage_start: date,
+    kind_max_stale_sessions: int,
     flag_cache: Path | None = None,
 ) -> Path:
     """Publish ``market_actions_<hash16>`` from three point-in-time channels: DART exchange
@@ -410,6 +412,7 @@ def materialize_market_actions(
         kind_coverage_start: First day of the KIND collection windows (the scope's evidence
             start). Window keys are anchored here exactly as the collector anchors them, so the
             coverage check addresses the same receipts the collector wrote.
+        kind_max_stale_sessions: Observed sessions KIND evidence may lag the horizon.
         flag_cache: Optional Parquet cache of per-session admin flags; sessions whose cached
             source matches the catalog are served without reading payloads.
 
@@ -417,22 +420,34 @@ def materialize_market_actions(
         The published dataset directory.
 
     Raises:
-        PITDataError: a KIND coverage gap, a missing KIND form body, or no certified
-            session opens after an announcement date.
+        PITDataError: a KIND coverage gap, KIND evidence staler than the budget, a missing
+            KIND form body, or no certified session opens after an announcement date.
     """
     if len(calendar.sessions) < 2:
         raise PITDataError("market actions require at least two certified sessions")
     flag_pages = _load_daily_flag_rows(catalog, calendar, flag_cache=flag_cache)
     covered_days = sorted(flag_pages)
-    # 달력은 다음 해 말까지 이어지므로 커버리지 기준일은 달력 끝이 아니라 실제 관측한 마지막 거래일이다.
-    if kind_keywords and not covered_days:
-        raise PITDataError("KIND coverage needs at least one daily-market page to anchor its horizon")
-    require_kind_coverage(
-        catalog,
-        keywords=kind_keywords,
-        start=kind_coverage_start,
-        through=covered_days[-1] if covered_days else kind_coverage_start,
-    )
+    kind_through: date | None = None
+    kind_stale = 0
+    if kind_keywords:
+        if not covered_days:
+            raise PITDataError("KIND coverage needs at least one daily-market page to anchor its horizon")
+        horizon = covered_days[-1]
+        kind_through = kind_covered_through(catalog, keywords=kind_keywords)
+        if kind_through is None:
+            raise PITDataError("no complete KIND search window for every keyword")
+        require_kind_coverage(
+            catalog,
+            keywords=kind_keywords,
+            start=kind_coverage_start,
+            through=min(kind_through, horizon),
+        )
+        kind_stale = sum(1 for day in covered_days if day > kind_through)
+        if kind_stale > kind_max_stale_sessions:
+            raise PITDataError(
+                f"KIND evidence is stale: covered through {kind_through.isoformat()}, "
+                f"{kind_stale} observed sessions beyond coverage exceeds budget {kind_max_stale_sessions}"
+            )
     rows: list[dict[str, Any]] = []
     unmapped_rows = 0
     for record in iter_disclosure_records(catalog):
@@ -651,22 +666,26 @@ def materialize_market_actions(
             ).hexdigest(),
         },
     )
+    details: dict[str, object] = {
+        "actions": sum(1 for row in rows if not row["cancellation"]),
+        "cancellations": sum(1 for row in rows if row["cancellation"]),
+        "administrative_designations": designations,
+        "administrative_releases": releases,
+        "unmapped_rows": unmapped_rows,
+        "kind_actions": kind_actions,
+        "kind_cancellations": kind_cancellations,
+        "kind_unresolved_rows": kind_unresolved_rows,
+        "kind_other_share_class": kind_other_share_class,
+        "kind_kosdaq_release_ignored": kind_kosdaq_release_ignored,
+    }
+    if kind_through is not None:
+        details["kind_covered_through"] = kind_through.isoformat()
+        details["kind_stale_sessions"] = kind_stale
     published = publish_dataset(
         layer_root=Path(silver_root),
         identity=identity,
         partitions={"part-00000.parquet": frame},
-        details={
-            "actions": sum(1 for row in rows if not row["cancellation"]),
-            "cancellations": sum(1 for row in rows if row["cancellation"]),
-            "administrative_designations": designations,
-            "administrative_releases": releases,
-            "unmapped_rows": unmapped_rows,
-            "kind_actions": kind_actions,
-            "kind_cancellations": kind_cancellations,
-            "kind_unresolved_rows": kind_unresolved_rows,
-            "kind_other_share_class": kind_other_share_class,
-            "kind_kosdaq_release_ignored": kind_kosdaq_release_ignored,
-        },
+        details=details,
     )
     _LOG.info(
         "[DATA] stage=market_actions actions=%d cancellations=%d kind_actions=%d "

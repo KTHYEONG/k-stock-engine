@@ -267,6 +267,7 @@ def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pub
         bridge=dict(mapping),
         kind_keywords=tuple(provider.kind.search_keywords),
         kind_coverage_start=ctx.runtime.scope.evidence_start,
+        kind_max_stale_sessions=provider.kind.max_stale_sessions,
         flag_cache=ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet",
     )
     return _published(path)

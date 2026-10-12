@@ -327,6 +327,7 @@ class KindPolicy(BaseModel):
         daily_limit: Ledger bound for one KST day.
         search_keywords: Title keywords searched per window; each keyword is its own window key.
         document_titles: Normalized titles (brackets and spaces removed) whose bodies are fetched.
+        max_stale_sessions: Observed sessions KIND evidence may lag the decision horizon.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -336,6 +337,7 @@ class KindPolicy(BaseModel):
     daily_limit: PositiveInt
     search_keywords: tuple[str, ...]
     document_titles: tuple[str, ...]
+    max_stale_sessions: NonNegativeInt
 
     @field_validator("search_keywords", "document_titles")
     @classmethod
