@@ -5,7 +5,7 @@ import os
 
 from src.config.errors import ConfigError
 
-__all__ = ["read_secret"]
+__all__ = ["environment_snapshot", "read_secret"]
 
 
 def read_secret(env_name: str, default: str | None = None) -> str:
@@ -23,3 +23,8 @@ def read_secret(env_name: str, default: str | None = None) -> str:
             return default
         raise ConfigError(f"secret {env_name} is not set (source ~/.quant_env.sh)")
     return value
+
+
+def environment_snapshot() -> dict[str, str]:
+    """Copy of the process environment for redaction scans; values must never be logged or echoed."""
+    return dict(os.environ)
