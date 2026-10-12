@@ -80,6 +80,7 @@ def test_alert_template_falls_back_to_shared() -> None:
     assert "--memory=256m" in start
     assert _flag(start, "--memory=") == _flag(start, "--memory-swap=")
     assert "--env-file %h/quant-secrets/k-stock-engine.env" in start
+    assert "--env-file %h/quant-secrets/kse-alert.env" in start
     assert "kis-data.env" not in start
     assert "src.ops.jobs alert" in start
     assert '--unit "$$0"' in start
@@ -167,3 +168,13 @@ def test_timer_calendars_parse_with_systemd() -> None:
              for line in path.read_text().splitlines() if line.startswith("OnCalendar=")]
     result = subprocess.run(["systemd-analyze", "calendar", *specs], capture_output=True, text=True, check=False)  # noqa: S603,S607
     assert result.returncode == 0, result.stderr
+
+
+def test_alert_credentials_reach_only_the_audit_and_alert_units() -> None:
+    holders = sorted(
+        path.name for path in SYSTEMD.glob("kse-*.service") if "quant-secrets/kse-alert.env" in path.read_text(encoding="utf-8")
+    )
+    assert holders == ["kse-alert@.service", "kse-daily-audit.service"]
+    installer = (SYSTEMD.parent / "install_systemd.sh").read_text(encoding="utf-8")
+    assert 'touch "${HOME}/quant-secrets/kse-alert.env"' in installer
+    assert 'chmod 600 "${HOME}/quant-secrets/kse-alert.env"' in installer
