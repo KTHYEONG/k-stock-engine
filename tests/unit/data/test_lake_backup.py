@@ -281,7 +281,7 @@ def _fake_rclone(monkeypatch: pytest.MonkeyPatch, responses: dict[str, tuple[int
 def test_rclone_store_reads_hash_and_transfers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     listing = json.dumps([{"Name": "seg-a.tar.zst", "Hashes": {"sha256": "ab"}}, {"Name": "nohash"}])
     calls = _fake_rclone(monkeypatch, {"lsjson": (0, listing, ""), "copyto": (0, "", "")})
-    store = RcloneStore("gdrive:lake/s/", rclone_bin="rc", hash_wait_s=0)
+    store = RcloneStore("gdrive:lake/s/", rclone_bin="rc")
     assert store.sha256("seg-a.tar.zst") == "ab"
     assert store.sha256("absent") is None
     with pytest.raises(BackupError, match="no sha256"):
@@ -308,24 +308,3 @@ def test_rclone_store_treats_missing_directory_as_absent_and_surfaces_errors(
     with pytest.raises(BackupError, match="upload failed"):
         RcloneStore("gdrive:lake/s").put(tmp_path / "a", "a")
 
-
-def test_rclone_store_waits_for_a_late_remote_hash(monkeypatch: pytest.MonkeyPatch) -> None:
-    pending = json.dumps([{"Name": "a", "Hashes": {}}])
-    ready = json.dumps([{"Name": "a", "Hashes": {"sha256": "ab"}}])
-    listings = iter([pending, pending, ready])
-
-    def run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(cmd, 0, next(listings), "")
-
-    monkeypatch.setattr(lb.subprocess, "run", run)
-    pauses: list[float] = []
-    assert RcloneStore("gdrive:lake/s", sleep=pauses.append).sha256("a") == "ab"
-    assert pauses == [2.0, 4.0]
-
-
-def test_rclone_store_gives_up_when_the_hash_never_appears(monkeypatch: pytest.MonkeyPatch) -> None:
-    _fake_rclone(monkeypatch, {"lsjson": (0, json.dumps([{"Name": "a"}]), "")})
-    pauses: list[float] = []
-    with pytest.raises(BackupError, match="no sha256"):
-        RcloneStore("gdrive:lake/s", hash_wait_s=10, sleep=pauses.append).sha256("a")
-    assert pauses == [2.0, 4.0, 8.0]

@@ -2,6 +2,8 @@
 FROM python:3.11-slim
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Debian's rclone 1.60 reports no sha256 for Drive objects, which fails the upload verification.
+COPY --from=rclone/rclone:1.75.1 /usr/local/bin/rclone /usr/local/bin/rclone
 
 WORKDIR /app
 
@@ -12,7 +14,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OMP_NUM_THREADS=2 \
     POLARS_MAX_THREADS=2
 
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 rclone \
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
