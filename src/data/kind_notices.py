@@ -29,6 +29,7 @@ __all__ = [
     "KindAdministrativeForm",
     "KindDelistingForm",
     "iter_kind_notices",
+    "kind_covered_through",
     "kind_source_digest",
     "parse_kind_administrative_form",
     "parse_kind_delisting_form",
@@ -329,6 +330,43 @@ def _window_complete(entry: ReceiptIndexEntry, *, key: str) -> bool:
     except PITDataError:
         return False
     return rows == reported_total
+
+
+def kind_covered_through(catalog: ReceiptCatalog, *, keywords: Sequence[str]) -> date | None:
+    """Latest day every keyword's answered, complete search window reaches; None when any keyword has none."""
+    if not keywords:
+        return None
+    minima: list[date] = []
+    for keyword in keywords:
+        candidates: list[tuple[date, str, ReceiptIndexEntry]] = []
+        prefix = f"{keyword}:"
+        for entry in catalog.entries(source=KIND_NOTICE_SEARCH_SOURCE):
+            key = entry.natural_key
+            if not key.startswith(prefix):
+                continue
+            window = key[len(prefix):]
+            parts = window.split("..")
+            if len(parts) != 2:
+                continue
+            try:
+                end = date.fromisoformat(parts[1])
+                date.fromisoformat(parts[0])
+            except ValueError:
+                continue
+            candidates.append((end, key, entry))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best: date | None = None
+        for end, key, entry in candidates:
+            if entry.status not in _ANSWERED:
+                continue
+            if not _window_complete(entry, key=key):
+                continue
+            best = end
+            break
+        if best is None:
+            return None
+        minima.append(best)
+    return min(minima)
 
 
 def require_kind_coverage(
