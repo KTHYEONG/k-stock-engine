@@ -1,6 +1,6 @@
 [Unit]
 Description=KSE evening collection (everything except KRX-derived nodes)
-OnFailure=kca-alert@%n.service
+OnFailure=kse-alert@%n.service
 
 [Service]
 Type=oneshot

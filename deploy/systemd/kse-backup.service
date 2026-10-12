@@ -1,6 +1,6 @@
 [Unit]
 Description=KSE offsite backup (Drive lake push, prune confirmed Bronze)
-OnFailure=kca-alert@%n.service
+OnFailure=kse-alert@%n.service
 
 [Service]
 Type=oneshot

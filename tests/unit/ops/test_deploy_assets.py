@@ -22,7 +22,7 @@ ALLOWED_MOUNT_PREFIXES = (
 
 
 def _services() -> list[Path]:
-    return sorted(SYSTEMD.glob("kse-*.service"))
+    return sorted(path for path in SYSTEMD.glob("kse-*.service") if "@" not in path.name)
 
 
 def _exec_start(text: str) -> str:
@@ -37,7 +37,7 @@ def test_units_are_safe_by_construction() -> None:
     for path in services:
         text = path.read_text(encoding="utf-8")
         assert "TimeoutStartSec=" in text
-        assert "OnFailure=kca-alert@%n.service" in text
+        assert "OnFailure=kse-alert@%n.service" in text
         assert "Type=oneshot" in text
         start = _exec_start(text)
         assert "--privileged" not in start
@@ -61,6 +61,38 @@ def test_units_are_safe_by_construction() -> None:
             assert start.startswith("ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock ")
             assert "--no-lock" in start
         assert f"ExecStopPost=-/usr/bin/docker rm -f {path.stem}" in text
+
+
+def test_alert_template_falls_back_to_shared() -> None:
+    path = SYSTEMD / "kse-alert@.service"
+    text = path.read_text(encoding="utf-8")
+    assert "OnFailure=kca-alert@%n.service" in text
+    assert "%i" in text
+    assert "Type=oneshot" in text
+    assert "TimeoutStartSec=5min" in text
+    assert "Environment=TZ=Asia/Seoul" in text
+    assert "WorkingDirectory=%h/k-stock-engine" in text
+    start = _exec_start(text)
+    assert start.startswith("ExecStart=/bin/sh -c ")
+    assert 'journalctl --user -u "$$0" -n 40 -o cat --no-pager' in start
+    assert "--rm -i" in start
+    assert "--name kse-alert-notify " in start
+    assert "--memory=256m" in start
+    assert _flag(start, "--memory=") == _flag(start, "--memory-swap=")
+    assert "--env-file %h/quant-secrets/k-stock-engine.env" in start
+    assert "kis-data.env" not in start
+    assert "src.ops.jobs alert" in start
+    assert '--unit "$$0"' in start
+    assert '--result "$$(systemctl --user show -p Result --value "$$0")"' in start
+    assert '--exit-status "$$(systemctl --user show -p ExecMainStatus --value "$$0")"' in start
+    assert start.rstrip().endswith("%i")
+    for token in _mounts(start):
+        assert token.startswith(ALLOWED_MOUNT_PREFIXES), f"{path.name}: {token}"
+    assert "k-closing-alpha" not in text
+    assert "kca-" not in start.replace("kca-alert@%n.service", "")
+    assert "ExecStopPost=-/usr/bin/docker rm -f kse-alert-notify" in text
+    for service in _services():
+        assert f"--name {service.stem} " not in start
 
 
 def _flag(start: str, name: str) -> str:
