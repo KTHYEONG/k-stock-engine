@@ -285,6 +285,7 @@ def _run_refresh(args: argparse.Namespace) -> Mapping[str, object]:
         "datasets": dict(report.datasets), "blocking_job": report.blocking_job,
         "decision_time": report.decision_time.isoformat(),
         "collection": [dict(step) for step in report.collection],
+        "degraded_jobs": list(report.degraded_jobs),
     }
     _LOG.info("[DATA] command=refresh_scope status=%s planned=%d built=%d",
               report.status, len(report.planned), len(report.built))
