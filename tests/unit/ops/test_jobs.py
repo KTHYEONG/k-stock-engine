@@ -823,3 +823,42 @@ def test_alert_best_effort_never_raises(tmp_path: Path, monkeypatch: pytest.Monk
     assert jobs.alert(tmp_path / "drain-fail", unit="kse-morning.service", result="failed",
                        exit_status="1", journal_tail="tail", now=_morning_now()) == 0
     assert len(sender.calls) == 1
+
+
+def _collect_report(blocking: str | None, degraded: tuple[str, ...]) -> SimpleNamespace:
+    return SimpleNamespace(blocking_job=blocking, degraded_jobs=degraded, planned=["a"], built=["a"])
+
+
+def test_collect_eve_degraded_exit_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ("kind_notice_search",)))
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_eve": "DEGRADED"}
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8"))
+    assert event["reason"] == "optional:kind_notice_search"
+    assert event["metrics"]["degraded_jobs"] == ["kind_notice_search"]
+    assert event["metrics"]["planned"] == event["metrics"]["built"] == 1
+    assert isinstance(event["metrics"]["peak_rss_mb"], float)
+
+
+@pytest.mark.parametrize("degraded", [(), ("kind_notice_search",)])
+def test_collect_eve_required_block_exit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degraded: tuple[str, ...],
+) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report("kis_investor_flow", degraded))
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_eve": "DEGRADED"}
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8"))
+    assert event["reason"] == "blocked on kis_investor_flow"
+    assert event["metrics"] == {"blocking_job": "kis_investor_flow", "degraded_jobs": list(degraded)}
+
+
+def test_collect_eve_clean_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_eve": "OK"}
