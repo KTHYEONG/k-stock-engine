@@ -101,6 +101,8 @@ daily_limit = 5000
 search_keywords = ["상장폐지", "정리매매", "관리종목"]
 # Exchange forms whose bodies carry dates or the share class the title lacks.
 document_titles = ["상장폐지", "관리종목지정", "관리종목지정해제"]
+# Number of observed sessions KIND evidence may lag the decision horizon before market actions refuse to build.
+max_stale_sessions = 5
 
 # Dividend decision plausibility gate. An implausible DPS is withheld, never repaired.
 [dividends]

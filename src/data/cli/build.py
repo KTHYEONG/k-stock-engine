@@ -443,6 +443,7 @@ def _run_market_actions(args: argparse.Namespace) -> Mapping[str, object]:
         bridge=dict(mapping),
         kind_keywords=tuple(provider.kind.search_keywords),
         kind_coverage_start=runtime.scope.evidence_start,
+        kind_max_stale_sessions=provider.kind.max_stale_sessions,
     )
     register_dataset(runtime, "market_actions", path.name)
     return {"dataset_id": path.name, "dataset_path": str(path)}

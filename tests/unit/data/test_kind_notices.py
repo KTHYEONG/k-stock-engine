@@ -11,6 +11,7 @@ import pytest
 from src.core.pit import PITDataError
 from src.data.kind_notices import (
     iter_kind_notices,
+    kind_covered_through,
     kind_source_digest,
     parse_kind_administrative_form,
     parse_kind_delisting_form,
@@ -562,3 +563,111 @@ def test_kosdaq_delisting_form_reads_its_liquidation_labels() -> None:
     assert form.liquidation_start == date(2021, 12, 1)
     assert form.liquidation_end == date(2021, 12, 9)
     assert form.delisting_date == date(2021, 12, 10)
+
+
+def test_covered_through_is_min_over_keywords(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    _publish_search(runtime, keyword="상장폐지", start="2026-10-01", end="2026-10-11",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+    _publish_search(runtime, keyword="정리매매", start="2026-10-01", end="2026-10-11",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+    _publish_search(runtime, keyword="관리종목", start="2026-10-01", end="2026-10-04",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+
+    assert kind_covered_through(
+        _catalog(runtime), keywords=("상장폐지", "정리매매", "관리종목")
+    ) == date(2026, 10, 4)
+
+
+def test_covered_through_none_when_keyword_missing(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    _publish_search(runtime, keyword="상장폐지", start="2026-10-01", end="2026-10-11",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+
+    assert kind_covered_through(
+        _catalog(runtime), keywords=("상장폐지", "정리매매")
+    ) is None
+    assert kind_covered_through(_catalog(runtime), keywords=()) is None
+
+
+def test_covered_through_ignores_incomplete_window(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    row = kind_row_html("20240101000001", "2024-01-02 15:30", "상장폐지", "005930", "유가증권시장본부")
+    _publish_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31",
+                    reported_total=1, pages=[kind_search_html([row], 1)])
+    _publish_search(runtime, keyword="상장폐지", start="2024-04-01", end="2024-06-30",
+                    reported_total=2, pages=[kind_search_html([row], 2)])
+
+    assert kind_covered_through(_catalog(runtime), keywords=("상장폐지",)) == date(2024, 3, 31)
+
+
+def test_covered_through_stops_before_reading_older_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.data.kind_notices as notices_module
+
+    runtime = _runtime(tmp_path)
+    _publish_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+    _publish_search(runtime, keyword="상장폐지", start="2024-04-01", end="2024-04-02",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+    catalog = _catalog(runtime)
+    older = catalog.latest(
+        source="kind_notice_search", natural_keys={"상장폐지:2024-01-01..2024-03-31"}
+    )["상장폐지:2024-01-01..2024-03-31"]
+    read_payload = notices_module.read_payload
+
+    def read_latest_only(path: Path) -> bytes:
+        assert path != Path(older.payload_path)
+        return read_payload(path)
+
+    monkeypatch.setattr(notices_module, "read_payload", read_latest_only)
+
+    assert kind_covered_through(catalog, keywords=("상장폐지",)) == date(2024, 4, 2)
+
+
+def test_covered_through_ignores_unparseable_keys(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    _publish_raw_search(runtime, key="상장폐지-malformed-key", raw=b'{"pages": []}')
+    _publish_raw_search(runtime, key="상장폐지:2024-04-01", raw=b'{"pages": []}')
+    _publish_raw_search(runtime, key="상장폐지:not-a-date..also-bad", raw=b'{"pages": []}')
+    _publish_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+
+    assert kind_covered_through(_catalog(runtime), keywords=("상장폐지",)) == date(2024, 3, 31)
+
+
+def test_covered_through_skips_unanswered_newest_window(tmp_path: Path) -> None:
+    from src.core.pit import EvidenceKind
+    from src.data.bronze import BronzeStore
+    from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptIndexEntry
+
+    runtime = _runtime(tmp_path)
+    _publish_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31",
+                    reported_total=0, pages=[kind_search_html([], 0)])
+    body = json.dumps(
+        {"keyword": "상장폐지", "start": "2024-04-01", "end": "2024-06-30",
+         "reported_total": 0, "pages": [kind_search_html([], 0)]},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    store = BronzeStore(runtime.workspace.bronze_root)
+    receipt = store.import_bytes(body, kind=EvidenceKind.DISCLOSURES, retrieved_at=RETRIEVED_AT, source_label="test")
+    _catalog(runtime).publish(
+        [
+            ReceiptIndexEntry(
+                source="kind_notice_search", natural_key="상장폐지:2024-04-01..2024-06-30",
+                as_of=date(2024, 6, 30), fiscal_period=None, status=EvidenceStatus.PROVIDER_ERROR,
+                content_hash=receipt.content_hash, retrieved_at=receipt.retrieved_at,
+                payload_path=receipt.payload_path,
+            )
+        ],
+        blobs=[
+            BlobEntry(
+                content_hash=receipt.content_hash, kind=EvidenceKind.DISCLOSURES,
+                source="kind_notice_search", usable=True, unusable_reason=None,
+                retrieved_at=receipt.retrieved_at, payload_path=receipt.payload_path,
+            )
+        ],
+    )
+
+    assert kind_covered_through(_catalog(runtime), keywords=("상장폐지",)) == date(2024, 3, 31)
