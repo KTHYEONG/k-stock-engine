@@ -277,14 +277,23 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
         _record(root, "collect_eve", "DEGRADED", today, moment, reason=type(exc).__name__)
         return 1
     blocking = getattr(report, "blocking_job", None)
+    degraded = list(getattr(report, "degraded_jobs", ()) or ())
     if blocking is not None:
         _record(
             root, "collect_eve", "DEGRADED", today, moment, reason=f"blocked on {blocking}"[:300],
-            metrics={"blocking_job": str(blocking)},
+            metrics={"blocking_job": str(blocking), "degraded_jobs": degraded},
         )
         return 1
     planned = list(getattr(report, "planned", ()))
     built = list(getattr(report, "built", ()))
+    if degraded:
+        _record(
+            root, "collect_eve", "DEGRADED", today, moment,
+            reason=f"optional:{','.join(degraded)}"[:300],
+            metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
+                      "peak_rss_mb": _peak_rss_mb()},
+        )
+        return 0
     _record(
         root, "collect_eve", "OK", today, moment,
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb()},
