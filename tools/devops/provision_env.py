@@ -27,6 +27,12 @@ def _allow_list() -> list[str]:
     return list(config["secret_keys"])
 
 
+def _optional_keys() -> list[str]:
+    """Return optional secret names in configuration order."""
+    config = tomllib.loads((REPO / "config" / "data" / "provision_env.toml").read_text(encoding="utf-8"))
+    return list(config.get("optional_keys", []))
+
+
 def _read_secret_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -36,6 +42,8 @@ def _read_secret_file(path: Path) -> dict[str, str]:
         key, _, value = stripped.partition("=")
         key = key.removeprefix("export ").strip()
         value = value.strip()
+        if value.startswith(("\"", "'")) and (len(value) < 2 or value[-1] != value[0]):
+            raise SystemExit(f"secret values must be single-line: {key}")
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\"", "'"):
             value = value[1:-1]
         if key:
@@ -43,13 +51,17 @@ def _read_secret_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _render_env(values: dict[str, str], allowed: list[str]) -> str:
+def _render_env(values: dict[str, str], allowed: list[str], optional: list[str] | None = None) -> str:
+    present_optional = list(optional) if optional is not None else _optional_keys()
     missing = [key for key in allowed if not values.get(key, "").strip()]
     if missing:
         raise SystemExit(f"missing keys in secret file: {', '.join(missing)}")
-    if any("\n" in values[key] or "\r" in values[key] for key in allowed):
+    rendered_optional = [key for key in present_optional if values.get(key, "").strip()]
+    checked = list(allowed) + [key for key in present_optional if key in values]
+    if any("\n" in values[key] or "\r" in values[key] for key in checked):
         raise SystemExit("secret values must be single-line")
     lines = [f"{key}={values[key]}" for key in allowed]
+    lines.extend(f"{key}={values[key]}" for key in rendered_optional)
     lines.extend(f"{key}={value}" for key, value in sorted(CODE_OWNED.items()))
     return "\n".join(lines) + "\n"
 
@@ -89,13 +101,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     allowed = _allow_list()
+    optional = _optional_keys()
     values = _read_secret_file(Path(args.secrets_file))
-    payload = _render_env(values, allowed)
+    payload = _render_env(values, allowed, optional)
+    rendered = list(allowed) + [key for key in optional if values.get(key, "").strip()]
     if args.dry_run:
-        sys.stdout.write(f"[SYS] provision_env dry-run keys={','.join(allowed)}\n")
+        sys.stdout.write(f"[SYS] provision_env dry-run keys={','.join(rendered)}\n")
         return 0
     _push_over_ssh(host=args.host, user=args.user, ssh_key=args.ssh_key, dest=args.dest, payload=payload,
-                   key_names=allowed)
+                   key_names=rendered)
     return 0
 
 

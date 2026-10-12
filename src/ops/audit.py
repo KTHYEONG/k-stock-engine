@@ -136,10 +136,11 @@ def _decision_issues(decisions_dir: Path, today: date) -> list[tuple[str, str]]:
     return []
 
 
-def run_daily_audit(data_root: Path, *, today: date, now: datetime) -> dict[str, object]:
+def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_alerts: int = 0) -> dict[str, object]:
     """Check the day's outcomes and artefacts, write the heartbeat, and return it."""
     root = Path(data_root)
     moment = now if now.tzinfo is not None else now.replace(tzinfo=KRX_TZ)
+    queued = undelivered_alerts if isinstance(undelivered_alerts, int) and not isinstance(undelivered_alerts, bool) and undelivered_alerts >= 0 else 0
     open_issues: list[dict[str, str]] = []
     if trading_day(today):
         day_kind = "trading"
@@ -187,7 +188,7 @@ def run_daily_audit(data_root: Path, *, today: date, now: datetime) -> dict[str,
         "severity": severity,
         "day_kind": day_kind,
         "snapshot_date": today.isoformat(),
-        "undelivered_alerts": 0,
+        "undelivered_alerts": queued,
         "open_issues": open_issues,
     }
     target = _heartbeat_path(root)

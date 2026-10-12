@@ -365,6 +365,7 @@ def drain_outbox(
     alerts_dir: Path,
     secret_values: Collection[str] = (),
     max_items: int = 20,
+    now: datetime | None = None,
 ) -> int:
     """Re-deliver queued messages oldest-first; returns the number delivered."""
     if sender is None or max_items <= 0:
@@ -400,7 +401,7 @@ def drain_outbox(
             break
         delivered += 1
         try:
-            _append_ledger(alerts_dir, datetime.now(KRX_TZ), key, subject)
+            _append_ledger(alerts_dir, now if now is not None else datetime.now(KRX_TZ), key, subject)
         except (OSError, ValueError, TypeError):
             _LOG.debug("[SYS] alert ledger append failed")
         try:
