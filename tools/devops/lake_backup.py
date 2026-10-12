@@ -28,7 +28,15 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from src.config.secrets import read_secret  # noqa: E402
-from src.data.lake_backup import BackupSource, LocalDirStore, RcloneStore, push, restore, verify  # noqa: E402
+from src.data.lake_backup import (  # noqa: E402
+    BackupError,
+    BackupSource,
+    LocalDirStore,
+    RcloneStore,
+    push,
+    restore,
+    verify,
+)
 
 DEFAULT_CONFIG = REPO / "config" / "data" / "lake_backup.toml"
 STATUS_PATH = REPO / "data" / "state" / "lake_backup_status.json"
@@ -51,6 +59,7 @@ def _sources(args: argparse.Namespace, config: dict) -> list[BackupSource]:
                 exclude=tuple(row.get("exclude", ())),
                 immutable=bool(row.get("immutable", False)),
                 segment_bytes=int(row.get("segment_mib", 256)) * 1024 * 1024,
+                optional=bool(row.get("optional", False)),
             )
         )
     missing = wanted - {s.name for s in out}
@@ -168,7 +177,11 @@ def _run_sources(
     for source in sources:
         work = None
         try:
-            if not source.root.is_dir():
+            if args.command == "push" and not source.root.is_dir():
+                if source.optional:
+                    results[source.name] = {"skipped": "root_missing"}
+                    log.info("[DATA] lake_backup command=push source=%s skipped=root_missing", source.name)
+                    continue
                 raise FileNotFoundError("backup source root is missing")
             store = _store(args, config, source.name)
             work_root = (args.data_root if args.data_root is not None else REPO / "data") / "state"
@@ -187,8 +200,11 @@ def _run_sources(
             log.info("[DATA] lake_backup command=%s source=%s result=%s", args.command, source.name, results[source.name])
         except Exception as exc:
             results[source.name] = {"error": type(exc).__name__}
-            log.error("[DATA] lake_backup command=%s source=%s error=%s", args.command, source.name, type(exc).__name__)
-            return 1
+            # Only BackupError text is logged: it is composed by this module; other exceptions may echo caller data.
+            detail = f" detail={exc}" if isinstance(exc, BackupError) else ""
+            log.error("[DATA] lake_backup command=%s source=%s error=%s%s", args.command, source.name,
+                      type(exc).__name__, detail)
+            rc = 1
         finally:
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
