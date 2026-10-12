@@ -10,6 +10,9 @@ mkdir -p "${HOME}/.cache/kis"
 chmod 700 "${HOME}/.cache/kis"
 touch "${HOME}/.cache/kis/.host-admission"
 mkdir -p "${HOME}/k-stock-engine/data" "${HOME}/k-stock-engine/logs"
+# Alert credentials live in their own 0600 file so only the audit and alert containers receive them.
+touch "${HOME}/quant-secrets/kse-alert.env"
+chmod 600 "${HOME}/quant-secrets/kse-alert.env"
 cp "${SRC_DIR}"/kse-*.timer "${SRC_DIR}"/kse-*.service "${DEST_DIR}/"
 
 systemctl --user daemon-reload
