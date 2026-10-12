@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
@@ -28,10 +29,14 @@ from src.ops.guards import (
 )
 from src.ops.run_outcome import record_run_outcome
 
+if TYPE_CHECKING:
+    from src.ops.alerts import AlertSender
+
 __all__ = [
     "EVENING_COLLECT_STEPS",
     "KRX_COLLECT_STEPS",
     "POLL_INTERVAL_S",
+    "alert",
     "audit",
     "backup",
     "collect_eve",
@@ -502,14 +507,82 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     return 0
 
 
+def _alerts_dir(data_root: Path) -> Path:
+    return Path(data_root) / "ops" / "alerts"
+
+
+def _heartbeat_open_issues(data_root: Path) -> list[dict[str, str]]:
+    from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
+
+    try:
+        payload = json.loads((Path(data_root) / AUDIT_HEARTBEAT_RELPATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("open_issues")
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"key": str(item.get("key", "")), "text": str(item.get("text", ""))}
+        for item in raw if isinstance(item, Mapping)
+    ]
+
+
+def _alert_sender() -> tuple[AlertSender | None, frozenset[str]]:
+    from src.ops.alerts import collect_secret_values, sender_from_env
+
+    return sender_from_env(), collect_secret_values(os.environ)
+
+
+def _drain_best_effort(
+    sender: AlertSender | None, alerts_dir: Path, secrets: frozenset[str], now: datetime,
+) -> None:
+    from src.ops.alerts import drain_outbox
+
+    try:
+        drain_outbox(sender=sender, alerts_dir=alerts_dir, secret_values=secrets, now=now)
+    except OSError:
+        _LOG.debug("[OPS] alert drain best-effort failed")
+
+
+def alert(data_root: Path, *, unit: str, result: str, exit_status: str, journal_tail: str, now: datetime) -> int:
+    """Deliver one unit-failure alert; 0 when sent or suppressed, 1 when it could only be queued."""
+    from src.ops.alerts import DispatchOutcome, build_unit_failure, dispatch, redact
+
+    root = Path(data_root)
+    moment = _aware(now)
+    alerts_dir = _alerts_dir(root)
+    issues = _heartbeat_open_issues(root) if unit == "kse-daily-audit.service" else []
+    sender, secrets = _alert_sender()
+    message = build_unit_failure(
+        unit, result=result, exit_status=exit_status, journal_tail=redact(journal_tail, secrets), now=moment,
+        open_issues=issues,
+    )
+    _drain_best_effort(sender, alerts_dir, secrets, moment)
+    outcome = dispatch(message, sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
+    return 0 if outcome in (DispatchOutcome.SENT, DispatchOutcome.SUPPRESSED) else 1
+
+
 def audit(data_root: Path, *, today: date, now: datetime) -> int:
-    """Run the daily audit and mirror its severity as the process exit code."""
-    heartbeat = run_daily_audit(Path(data_root), today=today, now=_aware(now))
-    severity = str(heartbeat.get("severity", "WARNING"))
+    """Run the daily audit and deliver its summary; 0 unless an open issue could not be delivered."""
+    from src.ops.alerts import DispatchOutcome, build_audit_summary, count_undelivered, dispatch
+
+    root = Path(data_root)
+    moment = _aware(now)
+    alerts_dir = _alerts_dir(root)
+    sender, secrets = _alert_sender()
+    _drain_best_effort(sender, alerts_dir, secrets, moment)
+    heartbeat = run_daily_audit(root, today=today, now=moment, undelivered_alerts=count_undelivered(alerts_dir))
+    message = build_audit_summary(heartbeat)
+    if message is None:
+        _LOG.info("[OPS] command=audit severity=%s issues=0", str(heartbeat.get("severity", "")))
+        return 0
+    outcome = dispatch(message, sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
     issues = heartbeat.get("open_issues")
     count = len(issues) if isinstance(issues, list) else 0
-    _LOG.info("[OPS] command=audit severity=%s issues=%d", severity, count)
-    return 0 if severity in ("OK", "HOLIDAY_SKIP") and count == 0 else 1
+    _LOG.info("[OPS] command=audit severity=%s issues=%d outcome=%s", str(heartbeat.get("severity", "")), count, outcome.name)
+    return 0 if outcome in (DispatchOutcome.SENT, DispatchOutcome.SUPPRESSED) else 1
 
 
 def weekly_report(data_root: Path, *, today: date, now: datetime) -> int:
@@ -546,6 +619,18 @@ def _default_data_root() -> Path:
     return Path(load_runtime_config().data_root)
 
 
+def _read_journal_tail(limit: int = 65536) -> str:
+    try:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        data = stream.read(limit)
+    except OSError:
+        return ""
+    raw = data.encode("utf-8", errors="replace") if isinstance(data, str) else bytes(data)
+    if len(raw) > limit:
+        raw = raw[:limit]
+    return raw.decode("utf-8", errors="replace")
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="src.ops.jobs")
     parser.add_argument("--data-root", type=Path, required=False, default=None)
@@ -557,6 +642,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     prune.add_argument("--no-lock", action="store_true")
     sub.add_parser("audit")
     sub.add_parser("weekly-report")
+    failure = sub.add_parser("alert")
+    failure.add_argument("--unit", required=True)
+    failure.add_argument("--result", default="unknown")
+    failure.add_argument("--exit-status", default="unknown")
     return parser.parse_args(argv)
 
 
@@ -577,6 +666,11 @@ def main(argv: list[str] | None = None) -> int:
         return audit(data_root, today=today, now=moment)
     if args.command == "weekly-report":
         return weekly_report(data_root, today=today, now=moment)
+    if args.command == "alert":
+        return alert(
+            data_root, unit=str(args.unit), result=str(args.result),
+            exit_status=str(args.exit_status), journal_tail=_read_journal_tail(), now=moment,
+        )
     raise SystemExit(f"unknown command {args.command}")  # pragma: no cover - argparse rejects unknown commands
 
 

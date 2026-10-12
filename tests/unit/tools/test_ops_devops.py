@@ -93,3 +93,59 @@ def test_provision_allowlist_and_stdin_only(tmp_path: Path, monkeypatch: pytest.
         provision_env._render_env(dict.fromkeys(allowed, "secret\nINJECTED=1"), allowed)
     with pytest.raises(SystemExit, match="missing keys"):
         provision_env._render_env({}, allowed)
+
+
+def test_provision_optional_alert_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    optional = provision_env._optional_keys()
+    assert optional == ["ALERT_GMAIL_USER", "ALERT_GMAIL_APP_PASSWORD", "ALERT_GMAIL_TO"]
+    allowed = provision_env._allow_list()
+    base = dict.fromkeys(allowed, "secret")
+    assert "ALERT_GMAIL_USER" not in provision_env._render_env(dict(base), allowed)
+    full = dict(base, ALERT_GMAIL_USER="u", ALERT_GMAIL_APP_PASSWORD="p", ALERT_GMAIL_TO="t")
+    payload = provision_env._render_env(dict(full), allowed)
+    assert "ALERT_GMAIL_USER=u\n" in payload
+    assert payload.index("ECOS_API=") < payload.index("ALERT_GMAIL_USER=")
+    assert payload.index("ALERT_GMAIL_TO=") < payload.index("KIS_POOL_SLOT=")
+    with pytest.raises(SystemExit, match="single-line"):
+        provision_env._render_env(dict(full, ALERT_GMAIL_TO="a\nb"), allowed)
+    with pytest.raises(SystemExit, match="single-line"):
+        provision_env._render_env(dict(full, ALERT_GMAIL_TO="\n"), allowed)
+    assert "ALERT_GMAIL_TO=" not in provision_env._render_env(dict(full, ALERT_GMAIL_TO=" "), allowed)
+    with pytest.raises(SystemExit, match="missing keys"):
+        provision_env._render_env({"ALERT_GMAIL_USER": "u"}, allowed)
+    config_dir = tmp_path / "config" / "data"
+    config_dir.mkdir(parents=True)
+    (config_dir / "provision_env.toml").write_text('secret_keys = ["REQUIRED"]\n')
+    monkeypatch.setattr(provision_env, "REPO", tmp_path)
+    assert provision_env._optional_keys() == []
+
+
+def test_provision_rejects_multiline_secret_file(tmp_path: Path) -> None:
+    source = tmp_path / "secrets.env"
+    source.write_text('ALERT_GMAIL_APP_PASSWORD="first\nsecond"\n')
+    with pytest.raises(SystemExit, match="single-line: ALERT_GMAIL_APP_PASSWORD"):
+        provision_env._read_secret_file(source)
+
+
+def test_provision_main_pushes_combined_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    allowed = provision_env._allow_list()
+    optional = provision_env._optional_keys()
+    values = dict.fromkeys(allowed + optional, "private-value")
+    source = tmp_path / "secrets.env"
+    source.write_text("\n".join(f"{key}={value}" for key, value in values.items()))
+    monkeypatch.setattr(sys, "argv", ["provision_env", "--secrets-file", str(source), "--host", "fixture"])
+
+    def push(**kwargs: object) -> None:
+        assert kwargs["key_names"] == allowed + optional
+        assert kwargs["payload"] == provision_env._render_env(values, allowed)
+        assert kwargs["dest"] == "/home/ubuntu/quant-secrets/k-stock-engine.env"
+
+    monkeypatch.setattr(provision_env, "_push_over_ssh", push)
+    assert provision_env.main() == 0
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--dry-run"])
+    assert provision_env.main() == 0
+    output = capsys.readouterr().out
+    assert "private-value" not in output
+    assert ",".join(allowed + optional) in output
