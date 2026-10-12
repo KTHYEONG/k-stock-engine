@@ -417,6 +417,7 @@ def test_kind_policy_rejects_empty_keyword_list() -> None:
             daily_limit=5000,
             search_keywords=[],
             document_titles=["상장폐지"],
+            max_stale_sessions=5,
         )
     with pytest.raises(pydantic.ValidationError):
         KindPolicy(
@@ -425,6 +426,7 @@ def test_kind_policy_rejects_empty_keyword_list() -> None:
             daily_limit=5000,
             search_keywords=["상장폐지", "  "],
             document_titles=["상장폐지"],
+            max_stale_sessions=5,
         )
 
 
@@ -462,6 +464,51 @@ def test_document_parser_rejects_bad_sample() -> None:
 
     with pytest.raises(pydantic.ValidationError):
         DocumentParserPolicy(trusted=False, min_precision=0.995, benchmark_sample=0)
+
+
+def test_kind_policy_loads_max_stale_sessions() -> None:
+    assert _policy().kind.max_stale_sessions == 5
+
+
+def test_kind_policy_accepts_zero_budget() -> None:
+    from src.config.providers import KindPolicy
+
+    values = _policy().kind.model_dump()
+    values["max_stale_sessions"] = 0
+    assert KindPolicy.model_validate(values).max_stale_sessions == 0
+
+
+def test_kind_policy_rejects_negative_budget() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import KindPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        KindPolicy(
+            circuit_threshold=3,
+            min_interval_seconds=1.0,
+            daily_limit=5000,
+            search_keywords=["상장폐지"],
+            document_titles=["상장폐지"],
+            max_stale_sessions=-1,
+        )
+
+
+def test_kind_policy_requires_budget() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import KindPolicy
+
+    with pytest.raises(pydantic.ValidationError):
+        KindPolicy(
+            circuit_threshold=3,
+            min_interval_seconds=1.0,
+            daily_limit=5000,
+            search_keywords=["상장폐지"],
+            document_titles=["상장폐지"],
+        )
 
 
 def test_kis_pool_admission_policy_loads() -> None:
