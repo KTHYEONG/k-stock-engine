@@ -868,7 +868,7 @@ def test_refresh_scope_command_collect_dry_run_and_blocked(
             ctx, collect=False, dry_run=True, emit=emit,
         ).__class__(
             decision_time=DECISION_TIME, status="blocked", planned=(), built=(),
-            datasets={}, blocking_job="krx_daily_market", collection=(),
+            datasets={}, blocking_job="krx_daily_market", collection=(), degraded_jobs=("kind_notice_search",),
         )
 
     monkeypatch.setattr(pipeline_graph, "refresh_scope", _blocked)
@@ -878,6 +878,7 @@ def test_refresh_scope_command_collect_dry_run_and_blocked(
         "--data-root", str(tmp_path / "data"),
         "--collect",
     ]) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["degraded_jobs"] == ["kind_notice_search"]
 
 
 def test_build_refresh_context_reads_superseded_receipts_from_state(tmp_path: Path) -> None:
@@ -1421,3 +1422,150 @@ def test_deferred_krx_nodes_are_not_scheduled(tmp_path: Path) -> None:
     plan = plan_refresh(replace(ctx, deferred_build_kinds=deferred))
     assert not deferred.intersection(node.kind for node in plan)
     assert "financial_facts" in {node.kind for node in plan}
+
+
+def _ok_step(name: str, status: str = "complete"):
+    def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        return CollectionStepReport(job=name, status=status, done=1, pending_left=0, requests_used=0)
+
+    return (name, _step)
+
+
+def test_optional_failure_does_not_block(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+    events: list[object] = []
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=events.append,
+        steps=(_ok_step("dart_disclosures"), _ok_step("kind_notice_search", "blocked"), _ok_step("ls_investor_flow")),
+    )
+    assert report.blocking_job is None
+    assert report.degraded_jobs == ("kind_notice_search",)
+    assert report.complete is True
+
+
+@pytest.mark.parametrize("job", ["kind_notice_search", "kind_notice_documents"])
+@pytest.mark.parametrize("error_type", [PITDataError, RuntimeError, OSError])
+def test_optional_exception_is_contained(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, job: str, error_type: type[Exception],
+) -> None:
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    ran: list[str] = []
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise error_type("kind 403")
+
+    def _after(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        ran.append("ls_investor_flow")
+        return CollectionStepReport(job="ls_investor_flow", status="complete", done=1, pending_left=0, requests_used=0)
+
+    events: list[object] = []
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=events.append,
+        steps=(_ok_step("dart_disclosures"), (job, _boom), ("ls_investor_flow", _after)),
+    )
+    assert ran == ["ls_investor_flow"]
+    assert report.steps[1] == CollectionStepReport(job, "failed", 0, 0, 0)
+    assert events[1] == {
+        "type": "collection", "job": job, "status": "failed",
+        "done": 0, "pending_left": 0, "requests_used": 0,
+    }
+    assert f"job={job} status=failed error={error_type.__name__}" in caplog.text
+    assert report.blocking_job is None
+    assert report.degraded_jobs == (job,)
+
+
+def test_required_exception_still_raises(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise PITDataError("ls down")
+
+    with pytest.raises(PITDataError, match="ls down"):
+        run_collection_jobs(
+            ctx, dry_run=False, emit=lambda payload: None,
+            steps=(_ok_step("dart_disclosures"), ("ls_investor_flow", _boom)),
+        )
+
+
+def test_required_block_still_blocks(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None,
+        steps=(_ok_step("dart_disclosures", "pending"), _ok_step("kind_notice_search", "blocked")),
+    )
+    assert report.blocking_job == "dart_disclosures"
+    assert report.degraded_jobs == ("kind_notice_search",)
+    assert report.complete is False
+
+
+def test_refresh_runs_kis_and_builds_when_kind_degraded(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+    kis_ran: list[str] = []
+
+    def _kis(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        kis_ran.append("kis_investor_flow")
+        return CollectionStepReport(job="kis_investor_flow", status="complete", done=1, pending_left=0, requests_used=0)
+
+    report = refresh_scope(
+        ctx, collect=True, dry_run=False, emit=lambda payload: None,
+        steps=(
+            _ok_step("dart_disclosures"), _ok_step("kind_notice_search", "blocked"),
+            _ok_step("kind_notice_documents"), _ok_step("ls_investor_flow"), ("kis_investor_flow", _kis),
+        ),
+    )
+    assert report.status == "complete"
+    assert report.built == EXPECTED_KINDS
+    assert kis_ran == ["kis_investor_flow"]
+    assert "kind_notice_search" in tuple(report.degraded_jobs)
+    assert report.blocking_job is None
+
+
+def test_optional_disclosure_coverage_exception_is_failed(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DisclosureCoverageError
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise DisclosureCoverageError("coverage gap", periods=("2025Q4",))
+
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None, steps=(("kind_notice_search", _boom),),
+    )
+    assert report.steps == (CollectionStepReport("kind_notice_search", "failed", 0, 0, 0),)
+    assert report.complete
+
+
+@pytest.mark.parametrize("has_kis", [False, True])
+@pytest.mark.parametrize("blocking", [None, "dart_disclosures", "kis_investor_flow"])
+def test_refresh_preserves_degradation_across_report_paths(
+    tmp_path: Path, has_kis: bool, blocking: str | None,
+) -> None:
+    ctx = _fixture_context(tmp_path)
+    steps = (
+        _ok_step("dart_disclosures", "pending" if blocking == "dart_disclosures" else "complete"),
+        _ok_step("kind_notice_search", "blocked"),
+        _ok_step("kind_notice_documents", "pending"),
+    )
+    if has_kis:
+        steps += (_ok_step("kis_investor_flow", "pending" if blocking == "kis_investor_flow" else "complete"),)
+    report = refresh_scope(ctx, collect=True, dry_run=False, emit=lambda payload: None, steps=steps)
+    expected_block = blocking if has_kis or blocking != "kis_investor_flow" else None
+    assert report.blocking_job == expected_block
+    assert report.status == ("blocked" if expected_block else "complete")
+    assert report.degraded_jobs == ("kind_notice_search", "kind_notice_documents")
+    assert [(step["job"], step["status"]) for step in report.collection if step["job"] in report.degraded_jobs] == [
+        ("kind_notice_search", "blocked"), ("kind_notice_documents", "pending"),
+    ]
+
+
+def test_keyboard_interrupt_propagates(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise KeyboardInterrupt("stop")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_collection_jobs(
+            ctx, dry_run=False, emit=lambda payload: None,
+            steps=(("kind_notice_search", _boom),),
+        )

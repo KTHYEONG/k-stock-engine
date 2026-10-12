@@ -79,6 +79,7 @@ class RefreshReport:
     datasets: Mapping[str, str]
     blocking_job: str | None
     collection: tuple[Mapping[str, object], ...]
+    degraded_jobs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,19 +98,32 @@ class CollectionReport:
     """Outcome of the collection phase gating a refresh."""
 
     steps: tuple[CollectionStepReport, ...]
+    optional: frozenset[str] = frozenset()
 
     @property
     def complete(self) -> bool:
-        """Whether every collection step reached ``complete``."""
-        return bool(self.steps) and all(step.status == "complete" for step in self.steps)
+        """Whether every required collection step reached ``complete``."""
+        return bool(self.steps) and all(
+            step.status == "complete" for step in self.steps if step.job not in self.optional
+        )
 
     @property
     def blocking_job(self) -> str | None:
-        """First step that did not reach ``complete``, if any."""
+        """First required step that did not reach ``complete``, if any."""
         for step in self.steps:
-            if step.status != "complete":
+            if step.status != "complete" and step.job not in self.optional:
                 return step.job
         return None
+
+    @property
+    def degraded_jobs(self) -> tuple[str, ...]:
+        """Optional steps that did not reach ``complete``, in step order."""
+        return tuple(
+            step.job for step in self.steps if step.status != "complete" and step.job in self.optional
+        )
+
+
+OPTIONAL_COLLECTION_JOBS: Final[frozenset[str]] = frozenset({"kind_notice_search", "kind_notice_documents"})
 
 
 def build_refresh_context(
@@ -1516,7 +1530,7 @@ def run_collection_jobs(
         except Exception as exc:
             from src.data.jobs.dart import DisclosureCoverageError
 
-            if isinstance(exc, DisclosureCoverageError):
+            if isinstance(exc, DisclosureCoverageError) and name not in OPTIONAL_COLLECTION_JOBS:
                 report = CollectionStepReport(
                     job=name, status="coverage_gap", done=0, pending_left=0, requests_used=0,
                 )
@@ -1537,6 +1551,27 @@ def run_collection_jobs(
                     report.job,
                     report.status,
                     ",".join(exc.periods),
+                )
+                reports.append(report)
+                continue
+            if name in OPTIONAL_COLLECTION_JOBS:
+                report = CollectionStepReport(
+                    job=name, status="failed", done=0, pending_left=0, requests_used=0,
+                )
+                emit(
+                    {
+                        "type": "collection",
+                        "job": report.job,
+                        "status": report.status,
+                        "done": report.done,
+                        "pending_left": report.pending_left,
+                        "requests_used": report.requests_used,
+                    }
+                )
+                _LOG.warning(
+                    "[DATA] stage=refresh_collect job=%s status=failed error=%s",
+                    report.job,
+                    type(exc).__name__,
                 )
                 reports.append(report)
                 continue
@@ -1561,7 +1596,7 @@ def run_collection_jobs(
             report.pending_left,
         )
         reports.append(report)
-    return CollectionReport(steps=tuple(reports))
+    return CollectionReport(steps=tuple(reports), optional=OPTIONAL_COLLECTION_JOBS)
 
 
 def _phase_split(plan: tuple[BuildNode, ...]) -> tuple[tuple[BuildNode, ...], tuple[BuildNode, ...]]:
@@ -1656,9 +1691,12 @@ def refresh_scope(
                     datasets=MappingProxyType({}),
                     blocking_job=collection.blocking_job,
                     collection=summaries,
+                    degraded_jobs=collection.degraded_jobs,
                 )
         report = run_refresh(ctx, dry_run=dry_run, emit=emit)
-        return replace(report, collection=summaries)
+        if dry_run or not collect:
+            return replace(report, collection=summaries)
+        return replace(report, collection=summaries, degraded_jobs=collection.degraded_jobs)
     pre_steps = tuple(item for item in resolved_steps if item[0] != "kis_investor_flow")
     kis_steps = tuple(item for item in resolved_steps if item[0] == "kis_investor_flow")
     if dry_run and collect:
@@ -1715,6 +1753,7 @@ def refresh_scope(
             datasets=MappingProxyType({}),
             blocking_job=pre_collection.blocking_job,
             collection=tuple(pre_summaries),
+            degraded_jobs=pre_collection.degraded_jobs,
         )
     plan = plan_refresh(ctx)
     planned_kinds = tuple(node.kind for node in plan)
@@ -1751,6 +1790,7 @@ def refresh_scope(
             datasets=MappingProxyType({kind: outcome.dataset_id for kind, outcome in built.items()}),
             blocking_job=kis_collection.blocking_job,
             collection=summaries,
+            degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
         )
     remaining = plan_refresh(ctx)
     _, second = _phase_split(remaining)
@@ -1769,10 +1809,12 @@ def refresh_scope(
         datasets=MappingProxyType({kind: outcome.dataset_id for kind, outcome in built.items()}),
         blocking_job=None,
         collection=summaries,
+        degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
     )
 
 
 __all__ = [
+    "OPTIONAL_COLLECTION_JOBS",
     "SCOPE_GRAPH",
     "BuildNode",
     "CollectionReport",
