@@ -11,8 +11,7 @@ import os
 import sqlite3
 import subprocess
 import tarfile
-import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -42,10 +41,6 @@ _CHUNK: Final = 1 << 20
 _ZSTD_LEVEL: Final = 10
 _SQLITE_SUFFIX: Final = ".sqlite3"
 _RCLONE_DIR_NOT_FOUND: Final = 3
-# Drive computes sha256 asynchronously for large uploads; the hash is absent for a short while after the transfer.
-_HASH_WAIT_S: Final = 120.0
-_HASH_POLL_FIRST_S: Final = 2.0
-_HASH_POLL_MAX_S: Final = 20.0
 
 
 class BackupError(RuntimeError):
@@ -128,15 +123,10 @@ class LocalDirStore:
 class RcloneStore:
     """rclone remote prefix such as ``gdrive:quant-lake/live/k-stock-engine/lake/bronze``."""
 
-    def __init__(
-        self, remote: str, *, rclone_bin: str = "rclone", timeout_s: int = 3600,
-        hash_wait_s: float = _HASH_WAIT_S, sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
+    def __init__(self, remote: str, *, rclone_bin: str = "rclone", timeout_s: int = 3600) -> None:
         self._remote = remote.rstrip("/")
         self._bin = rclone_bin
         self._timeout = timeout_s
-        self._hash_wait_s = hash_wait_s
-        self._sleep = sleep
 
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(  # noqa: S603
@@ -169,20 +159,13 @@ class RcloneStore:
             raise BackupError(f"rclone upload failed for {name}: {res.stderr.strip()[-300:]}")
 
     def sha256(self, name: str) -> str | None:
-        waited = 0.0
-        delay = _HASH_POLL_FIRST_S
-        while True:
-            row = self._stat(name)
-            if row is None:
-                return None
-            digest = (row.get("Hashes") or {}).get("sha256")
-            if digest:
-                return str(digest)
-            if waited >= self._hash_wait_s:
-                raise BackupError(f"remote reports no sha256 for {name} after {waited:.0f}s")
-            self._sleep(delay)
-            waited += delay
-            delay = min(delay * 2, _HASH_POLL_MAX_S)
+        row = self._stat(name)
+        if row is None:
+            return None
+        digest = (row.get("Hashes") or {}).get("sha256")
+        if not digest:
+            raise BackupError(f"remote reports no sha256 for {name}")
+        return str(digest)
 
 
 @dataclass(frozen=True, slots=True)
