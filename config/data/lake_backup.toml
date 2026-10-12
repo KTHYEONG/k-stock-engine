@@ -1,6 +1,8 @@
 # Raw-data backup to the shared Drive lake (content-addressed archives, deduplicated by sha256).
 remote = "gdrive:quant-lake/live/k-stock-engine/lake"
 
+# optional = true: the root may be absent on some hosts (VPS has no legacy trees, local has no ops); push skips it.
+
 # Bronze payloads are append-only: a path already in the remote index is never re-hashed.
 [[source]]
 name = "bronze"
@@ -26,6 +28,7 @@ exclude = ["research/cube/*", "research/market_cache/*", "research/scores/*", "d
 [[source]]
 name = "legacy_stocks"
 root = "data/bronze/stocks"
+optional = true
 immutable = true
 exclude = ["security_master/*"]
 segment_mib = 512
@@ -34,17 +37,20 @@ segment_mib = 512
 [[source]]
 name = "silver_provenance"
 root = "data/silver/stocks_provenance_20260911"
+optional = true
 immutable = true
 
 [[source]]
 name = "artifacts"
 root = "data/artifacts"
+optional = true
 exclude = ["*.tmp"]
 
 # Operations events, heartbeats and reports; mutable by design.
 [[source]]
 name = "ops"
 root = "data/ops"
+optional = true
 exclude = ["*.tmp"]
 
 # Derived releases are immutable once written.

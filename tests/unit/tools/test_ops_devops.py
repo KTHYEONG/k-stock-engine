@@ -35,6 +35,30 @@ def test_push_failure_records_status_and_carries_success(tmp_path: Path, monkeyp
     assert "sensitive-credential" not in status.read_text()
 
 
+def test_missing_roots_skip_when_optional_and_never_abort_later_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    (root / "bronze").mkdir(parents=True)
+    (root / "bronze" / "page.json").write_text("{}")
+    (root / "state").mkdir()
+    config = tmp_path / "backup.toml"
+    config.write_text(
+        'remote = "unused"\n'
+        '[[source]]\nname="needed"\nroot="data/needed"\n'
+        '[[source]]\nname="legacy"\nroot="data/legacy"\noptional=true\n'
+        '[[source]]\nname="bronze"\nroot="data/bronze"\n'
+    )
+    status = root / "state" / "status.json"
+    monkeypatch.setattr(sys, "argv", ["lake_backup", "push", "--config", str(config), "--data-root", str(root),
+                                     "--status", str(status), "--store-dir", str(tmp_path / "remote"), "--no-lock"])
+    assert backup_tool.main() == 1
+    sources = json.loads(status.read_text())["sources"]
+    assert sources["needed"] == {"error": "FileNotFoundError"}
+    assert sources["legacy"] == {"skipped": "root_missing"}
+    assert sources["bronze"]["stored"] == 1
+
+
 def test_shared_lock_timeout_is_75(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = tmp_path / "backup.toml"
     config.write_text('remote="unused"\n[[source]]\nname="bronze"\nroot="data/bronze"\n')
