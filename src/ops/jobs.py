@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import json
 import logging
-import os
 import subprocess
 import sys
 import tempfile
@@ -530,9 +529,10 @@ def _heartbeat_open_issues(data_root: Path) -> list[dict[str, str]]:
 
 
 def _alert_sender() -> tuple[AlertSender | None, frozenset[str]]:
+    from src.config.secrets import environment_snapshot
     from src.ops.alerts import collect_secret_values, sender_from_env
 
-    return sender_from_env(), collect_secret_values(os.environ)
+    return sender_from_env(), collect_secret_values(environment_snapshot())
 
 
 def _drain_best_effort(
