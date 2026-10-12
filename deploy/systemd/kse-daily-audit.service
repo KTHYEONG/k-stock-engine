@@ -1,6 +1,6 @@
 [Unit]
 Description=KSE daily audit (outcome and artefact check with heartbeat)
-OnFailure=kca-alert@%n.service
+OnFailure=kse-alert@%n.service
 
 [Service]
 Type=oneshot

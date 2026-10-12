@@ -251,3 +251,13 @@ def test_corrupt_events_still_write_warning_heartbeat(tmp_path: Path, monkeypatc
     assert any(issue["key"] == "events" for issue in result["open_issues"])
     status = _write_status(tmp_path, age_h=-1.0)
     assert _backup_issue(status, _morning()) == "backup timestamp is in the future"
+
+
+def test_heartbeat_carries_undelivered_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (_decision(DAY, 8, 31),))
+    _record_all_ok(tmp_path, _morning())
+    _write_status(tmp_path)
+    assert run_daily_audit(tmp_path, today=DAY, now=_morning(), undelivered_alerts=2)["undelivered_alerts"] == 2
+    assert run_daily_audit(tmp_path, today=DAY, now=_morning())["undelivered_alerts"] == 0
+    assert run_daily_audit(tmp_path, today=DAY, now=_morning(), undelivered_alerts=-1)["undelivered_alerts"] == 0

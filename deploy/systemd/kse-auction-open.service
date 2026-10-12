@@ -1,6 +1,6 @@
 [Unit]
 Description=KSE pre-open auction capture (research, no orders)
-OnFailure=kca-alert@%n.service
+OnFailure=kse-alert@%n.service
 
 [Service]
 Type=oneshot
