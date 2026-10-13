@@ -523,6 +523,13 @@ def _ensure_backup_failure_status(path: Path, moment: datetime) -> None:
     temporary.replace(path)
 
 
+def _failure_detail(exc: BaseException) -> str:
+    from src.config.secrets import environment_snapshot
+    from src.ops.alerts import collect_secret_values, redact
+
+    return redact(str(exc), collect_secret_values(environment_snapshot()))[:300]
+
+
 def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     """Push Bronze, catalog, state and ops to Drive, then pack and prune loose Bronze confirmed offsite."""
     root = Path(data_root)
@@ -538,13 +545,14 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
         sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
     except Exception as exc:
         _ensure_backup_failure_status(status_path, moment)
-        _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__)
+        _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
+                metrics={"detail": _failure_detail(exc)})
         return 1
     try:
         pruned = _prune_bronze(root, now=moment)
     except Exception as exc:
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
-                metrics={"sources": sorted(sources)})
+                metrics={"sources": sorted(sources), "detail": _failure_detail(exc)})
         return 1
     _record(root, "backup", "OK", run_date, moment,
             metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed"))})
