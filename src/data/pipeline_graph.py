@@ -1382,14 +1382,13 @@ def _run_kind_collection_step(
     ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
     """Run one KIND notice collection job without duplicating runner wiring."""
-    import os
-
     from src.config import load_provider_policy, load_runtime_config
+    from src.config.secrets import environment_snapshot
     from src.data.kind_relay import kind_transport
 
     runtime_config = load_runtime_config()
     provider = load_provider_policy(runtime_config)
-    if kind_transport(os.environ) == "relay":
+    if kind_transport(environment_snapshot()) == "relay":
         from src.data.kind_relay_import import import_relay_bundle
 
         relay = import_relay_bundle(
