@@ -1411,3 +1411,49 @@ def test_materialize_rejects_invalid_audit_policy(tmp_path: Path) -> None:
             gold_root=gold_root,
             policy=MarketPanelPolicy(max_unexplained_limitless_moves=-1),
         )
+
+
+def test_year_partitions_are_published_as_paths(tmp_path: Path, monkeypatch) -> None:
+    """Year slices and the exit table reach publication as spooled paths."""
+    import src.data.market_panel as panel_module
+
+    december = _sessions(date(2025, 12, 12), 20)
+    january = _sessions(date(2026, 1, 1), 3)
+    daily = {
+        session: [_drow(session, "005930", close=100 + index, change=0, trading_value=index + 1)]
+        for index, session in enumerate([*december, *january])
+    }
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    captured: dict[str, object] = {}
+    original = panel_module.publish_dataset
+
+    def _spy(*, layer_root, identity, partitions, details=None, checks=()):  # type: ignore[no-untyped-def]
+        captured.update(partitions)
+        return original(
+            layer_root=layer_root, identity=identity, partitions=partitions,
+            details=details, checks=checks,
+        )
+
+    monkeypatch.setattr(panel_module, "publish_dataset", _spy)
+    result = materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path, rules=RULES, gold_root=gold_root
+    )
+    assert result.years == (2025, 2026)
+    assert set(captured) == {"year=2025/part.parquet", "year=2026/part.parquet", "instrument_exits.parquet"}
+    assert all(isinstance(value, Path) for value in captured.values())
+
+
+def test_audit_failure_leaves_no_gold_or_staging_behind(tmp_path: Path) -> None:
+    """A limitless-move breach fails closed without gold output or staging residue."""
+    daily = _limitless_daily()
+    daily_path, universe_path, gold_root = _inputs(tmp_path, daily, _full_universe(daily))
+    actions_path = _publish_actions(tmp_path / "silver", [])
+    with pytest.raises(PITDataError):
+        materialize_market_panel(
+            daily_market_path=daily_path, universe_path=universe_path, rules=RULES,
+            gold_root=gold_root, market_actions_path=actions_path,
+        )
+    assert list((tmp_path / "gold").glob("market_panel_*")) == []
+    if gold_root.exists():
+        assert list(gold_root.glob(".market_panel_*.staging")) == []
+        assert list(gold_root.glob("market_panel_*")) == []
