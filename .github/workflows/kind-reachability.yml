@@ -1,0 +1,48 @@
+name: KIND reachability probe
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Probe KIND search from this runner
+        run: |
+          echo "egress_ip=$(curl -fsS https://api.ipify.org || echo unknown)"
+          uv run python - <<'PY'
+          import datetime as dt
+          import requests
+          from src.integrations.krx import kind as k
+
+          client = k.KindClient
+          form = client._search_form(None, "상장폐지", dt.date(2026, 10, 1), dt.date(2026, 10, 12), page_index=1)
+          for attempt in range(3):
+              try:
+                  resp = requests.post(
+                      f"{k._BASE_URL}/disclosure/details.do", data=form, headers=dict(k._HEADERS), timeout=30
+                  )
+                  body = resp.text
+                  print(
+                      f"attempt={attempt} status={resp.status_code} bytes={len(body)} "
+                      f"error_page={k._ERROR_MARKER in body} viewer_anchors={body.count('openDisclsViewer')}"
+                  )
+                  print("server=", resp.headers.get("Server"), "x-akamai=", resp.headers.get("X-Akamai-Transformed"))
+                  if resp.status_code == 200 and k._ERROR_MARKER not in body:
+                      break
+              except requests.RequestException as exc:
+                  print(f"attempt={attempt} exception={type(exc).__name__}: {exc}")
+          PY
