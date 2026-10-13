@@ -862,3 +862,75 @@ def test_collect_eve_clean_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
     assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
     assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_eve": "OK"}
+
+
+@pytest.mark.parametrize("degraded", [(), ("kind_notice_search",)])
+@pytest.mark.parametrize("fails", [False, True])
+def test_collect_eve_warm_cache_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degraded: tuple[str, ...], fails: bool,
+) -> None:
+    from src.data import pipeline_graph as graph
+    from src.data.runtime import resolve_data_runtime
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, degraded))
+    contexts: list[graph.RefreshContext] = []
+
+    def warm(ctx: graph.RefreshContext) -> int:
+        contexts.append(ctx)
+        if fails:
+            raise PITDataError("private payload details")
+        return 3
+
+    monkeypatch.setattr(graph, "warm_daily_flag_cache", warm)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert len(contexts) == 1
+    assert contexts[0].runtime == resolve_data_runtime(data_root=tmp_path)
+    assert contexts[0].decision_time == _morning_now()
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == ("DEGRADED" if fails or degraded else "OK")
+    assert event["reason"] == (
+        "optional:kind_notice_search" if degraded else "flag_cache_warm_failed" if fails else ""
+    )
+    assert event["metrics"].get("flag_cache_error") == ("PITDataError" if fails else None)
+    assert event["metrics"].get("flag_cache_sessions") == (None if fails else 3)
+    assert "private payload details" not in json.dumps(event)
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_collect_eve_guard_or_block_skips_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: bool,
+) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    if refused:
+        monkeypatch.setattr(jobs, "_guard_headroom", lambda root: GuardRefused("low memory"))
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report("dart_facts", ()))
+
+    def unexpected(ctx: object) -> int:
+        pytest.fail("warm must not run after a refused guard or blocked collection")
+
+    monkeypatch.setattr("src.data.pipeline_graph.warm_daily_flag_cache", unexpected)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
+
+
+@pytest.mark.parametrize("mode", ["sealed", "absent", "pit", "error", "shadow", "guard", "late"])
+def test_morning_records_peak_rss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    seal = datetime(2026, 10, 8, 9 if mode == "late" else 8, 31, tzinfo=KRX_TZ)
+    _morning_stubs(monkeypatch, [], seal)
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: mode != "absent")
+    monkeypatch.setattr(jobs, "_peak_rss_mb", lambda: 123.5)
+    if mode == "guard":
+        monkeypatch.setattr(jobs, "_guard_headroom", lambda root: GuardRefused("low memory"))
+    if mode in ("pit", "error", "shadow"):
+        def fail(*args: object, **kwargs: object) -> None:
+            raise (RuntimeError if mode == "error" else PITDataError)("phase failed")
+
+        monkeypatch.setattr(jobs, "_shadow_phase" if mode == "shadow" else "_build_all", fail)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == (0 if mode == "sealed" else 1)
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["peak_rss_mb"] == 123.5

@@ -21,6 +21,13 @@ ALLOWED_MOUNT_PREFIXES = (
 )
 
 
+def test_morning_timeout_is_within_late_seal_window() -> None:
+    text = (SYSTEMD / "kse-morning.service").read_text(encoding="utf-8")
+    assert "TimeoutStartSec=30min" in text
+    assert _flag(_exec_start(text), "--memory=") == "4g"
+    assert _flag(_exec_start(text), "--memory-swap=") == "4g"
+
+
 def _services() -> list[Path]:
     return sorted(path for path in SYSTEMD.glob("kse-*.service") if "@" not in path.name)
 
