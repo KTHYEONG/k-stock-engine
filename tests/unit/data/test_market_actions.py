@@ -1339,3 +1339,173 @@ def test_current_kind_matches_previous_behaviour(tmp_path: Path) -> None:
     assert manifest.details["kind_stale_sessions"] == 0
     assert manifest.details["kind_covered_through"] == "2024-04-02"
     assert read_dataset(path).collect().height == 0
+
+
+def test_flag_cache_roundtrip_is_content_identical(tmp_path: Path) -> None:
+    from src.data.market_actions import _read_flag_cache, _write_flag_cache
+
+    flags = {
+        date(2024, 1, 3): ("c" * 64, {"000660": True, "005930": False}),
+        date(2024, 1, 2): ("a" * 64, {}),
+        date(2024, 1, 4): ("b" * 64, {"000001": False}),
+    }
+    cache = tmp_path / "flags.parquet"
+    _write_flag_cache(cache, flags)
+    assert _read_flag_cache(cache) == flags
+    frame = pl.read_parquet(cache)
+    assert frame.schema == {
+        "session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean,
+    }
+
+
+def test_flag_cache_written_by_new_code_matches_legacy_layout(tmp_path: Path) -> None:
+    from src.data.market_actions import _write_flag_cache
+
+    day_a, day_b = date(2024, 1, 2), date(2024, 1, 3)
+    _write_flag_cache(
+        tmp_path / "flags.parquet",
+        {day_b: ("b" * 64, {"005930": True, "000660": False}), day_a: ("a" * 64, {})},
+    )
+    assert pl.read_parquet(tmp_path / "flags.parquet").to_dicts() == [
+        {"session": day_a, "source_hash": "a" * 64, "ticker": None, "flagged": False},
+        {"session": day_b, "source_hash": "b" * 64, "ticker": None, "flagged": False},
+        {"session": day_b, "source_hash": "b" * 64, "ticker": "000660", "flagged": False},
+        {"session": day_b, "source_hash": "b" * 64, "ticker": "005930", "flagged": True},
+    ]
+
+
+def _large_flag_input(n_sessions: int = 150, n_tickers: int = 3000) -> dict:
+    from datetime import timedelta
+
+    base = date(2024, 1, 2)
+    return {
+        base + timedelta(days=index): ("s" * 63 + f"{index % 16:01x}", {f"{ticker:06d}": ticker % 7 == 0 for ticker in range(n_tickers)})
+        for index in range(n_sessions)
+    }
+
+
+def test_flag_cache_write_memory_is_per_entry_bounded(tmp_path: Path) -> None:
+    import tracemalloc
+
+    from src.data.market_actions import _write_flag_cache
+
+    flags = _large_flag_input()
+    entries = sum(len(tickers) + 1 for _, tickers in flags.values())
+    tracemalloc.start()
+    try:
+        _write_flag_cache(tmp_path / "flags.parquet", flags)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak <= 120 * entries
+
+
+def test_flag_cache_read_memory_is_per_entry_bounded(tmp_path: Path) -> None:
+    import tracemalloc
+
+    from src.data.market_actions import _read_flag_cache, _write_flag_cache
+
+    flags = _large_flag_input()
+    entries = sum(len(tickers) + 1 for _, tickers in flags.values())
+    cache = tmp_path / "flags.parquet"
+    _write_flag_cache(cache, flags)
+    tracemalloc.start()
+    try:
+        assert _read_flag_cache(cache) == flags
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak <= 80 * entries
+
+
+def test_flag_cache_rejects_empty_frame_and_bad_hash(tmp_path: Path) -> None:
+    from src.data.market_actions import _read_flag_cache, _write_flag_cache
+
+    empty = tmp_path / "empty.parquet"
+    _write_flag_cache(empty, {})
+    assert _read_flag_cache(empty) == {}
+    sentinel_only = tmp_path / "sentinel.parquet"
+    _write_flag_cache(sentinel_only, {date(2024, 1, 2): ("a" * 64, {})})
+    assert _read_flag_cache(sentinel_only) == {date(2024, 1, 2): ("a" * 64, {})}
+    for index, bad_hash in enumerate((None, "")):
+        bad = tmp_path / f"bad-{index}.parquet"
+        pl.DataFrame(
+            [{"session": date(2024, 1, 2), "source_hash": bad_hash, "ticker": None, "flagged": False}],
+            schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
+            strict=False,
+        ).write_parquet(bad)
+        assert _read_flag_cache(bad) == {}
+    mistyped = tmp_path / "bad-dtype.parquet"
+    pl.DataFrame(
+        {"session": [date(2024, 1, 2)], "source_hash": [1], "ticker": [None], "flagged": [False]},
+        schema={"session": pl.Date, "source_hash": pl.Int64, "ticker": pl.String, "flagged": pl.Boolean},
+    ).write_parquet(mistyped)
+    assert _read_flag_cache(mistyped) == {}
+
+
+def test_cache_hit_does_not_copy_session_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    import src.data.market_actions as actions_module
+    from src.data.market_actions import _load_daily_flag_rows
+
+    runtime = _runtime(tmp_path)
+    day = date(2024, 1, 2)
+    _publish_daily(runtime, session=day, records=[{"ISU_SRT_CD": "000660", "SECT_TP_NM": ""}])
+    catalog = _catalog(runtime)
+    calendar = _calendar(day, date(2024, 1, 3))
+    cache = tmp_path / "flags.parquet"
+    first = _load_daily_flag_rows(catalog, calendar, flag_cache=cache)
+    mtime = os.stat(cache).st_mtime_ns
+    second = _load_daily_flag_rows(catalog, calendar, flag_cache=cache)
+    assert second == first
+    assert os.stat(cache).st_mtime_ns == mtime
+
+    entry = catalog.latest(source="krx_daily_market", natural_keys={day.isoformat()})[day.isoformat()]
+    inner = {"000660": True}
+    monkeypatch.setattr(
+        actions_module, "_read_flag_cache", lambda _path: {day: (entry.content_hash, inner)}
+    )
+    assert _load_daily_flag_rows(catalog, calendar, flag_cache=cache)[day] is inner
+
+
+@pytest.mark.parametrize("values", [[False, True, False], [-1, 0, None], ["", "yes", None]])
+def test_flag_cache_duplicate_tickers_preserve_legacy_truthiness(tmp_path: Path, values: list) -> None:
+    from src.data.market_actions import _read_flag_cache
+
+    day = date(2024, 1, 2)
+    uncovered = date(2024, 1, 3)
+    cache = tmp_path / "duplicates.parquet"
+    pl.DataFrame({
+        "session": [day, day, uncovered, day, day],
+        "source_hash": ["s"] * 5,
+        "ticker": [None, "000660", "005930", "000660", "000660"],
+        "flagged": [None, values[0], values[1], values[1], values[2]],
+    }).write_parquet(cache)
+    assert _read_flag_cache(cache) == {day: ("s", {"000660": True})}
+
+
+def test_flag_cache_parent_creation_fails_closed(tmp_path: Path) -> None:
+    from src.data.market_actions import _write_flag_cache
+
+    parent = tmp_path / "not-a-directory"
+    parent.write_bytes(b"retained")
+    with pytest.raises(PITDataError, match="cannot be written"):
+        _write_flag_cache(parent / "flags.parquet", {})
+    assert parent.read_bytes() == b"retained"
+
+
+def test_flag_cache_failed_replace_preserves_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.market_actions as actions_module
+
+    cache = tmp_path / "flags.parquet"
+    cache.write_bytes(b"previous-cache")
+
+    def fail_replace(source: str, target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(actions_module.os, "rename", fail_replace)
+    with pytest.raises(PITDataError, match="cannot be written"):
+        actions_module._write_flag_cache(cache, {date(2024, 1, 2): ("s", {"000660": True})})
+    assert cache.read_bytes() == b"previous-cache"
+    assert list(tmp_path.iterdir()) == [cache]
