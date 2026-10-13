@@ -42,6 +42,7 @@ def _provider_with_keywords(keywords: tuple[str, ...]):  # type: ignore[no-untyp
                 daily_limit=5000,
                 search_keywords=list(keywords),
                 document_titles=["상장폐지", "관리종목지정", "관리종목지정해제"],
+                max_stale_sessions=5,
             )
         }
     )
