@@ -103,6 +103,11 @@ search_keywords = ["상장폐지", "정리매매", "관리종목"]
 document_titles = ["상장폐지", "관리종목지정", "관리종목지정해제"]
 # Number of observed sessions KIND evidence may lag the decision horizon before market actions refuse to build.
 max_stale_sessions = 5
+relay_window_lookback_days = 14
+relay_document_lookback_days = 14
+relay_max_age_hours = 36
+relay_clock_skew_seconds = 300
+relay_attempts = 3
 
 # Dividend decision plausibility gate. An implausible DPS is withheld, never repaired.
 [dividends]
