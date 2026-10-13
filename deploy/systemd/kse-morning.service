@@ -6,6 +6,6 @@ OnFailure=kse-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/k-stock-engine
 Environment=TZ=Asia/Seoul
-TimeoutStartSec=40min
+TimeoutStartSec=30min
 ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kse-morning --user %U:%G -e HOME=/tmp -e _RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0 -e UV_CACHE_DIR=/tmp/uv-cache --memory=4g --memory-swap=4g --cpus=1.8 --env-file %h/quant-secrets/k-stock-engine.env --env-file %h/quant-secrets/kis-data.env -v %h/.cache/kis:/app/.cache/kis -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e BROKER_ADMISSION_CLASS=bulk -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.ops.jobs morning
 ExecStopPost=-/usr/bin/docker rm -f kse-morning

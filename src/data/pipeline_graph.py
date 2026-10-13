@@ -265,6 +265,18 @@ def _build_market_panel(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
     return _published(result.dataset_path)
 
 
+def _daily_flag_cache_path(ctx: RefreshContext) -> Path:
+    """Single cache location for per-session daily admin flags."""
+    return ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet"
+
+
+def warm_daily_flag_cache(ctx: RefreshContext) -> int:
+    """Populate the daily admin-flag cache from Bronze daily pages; returns covered session count."""
+    from src.data.market_actions import _load_daily_flag_rows
+
+    return len(_load_daily_flag_rows(ctx.catalog, _build_calendar(ctx), flag_cache=_daily_flag_cache_path(ctx)))
+
+
 def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver exchange market actions from disclosure titles and daily flags."""
     from src.config import load_provider_policy, load_runtime_config
@@ -282,7 +294,7 @@ def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pub
         kind_keywords=tuple(provider.kind.search_keywords),
         kind_coverage_start=ctx.runtime.scope.evidence_start,
         kind_max_stale_sessions=provider.kind.max_stale_sessions,
-        flag_cache=ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet",
+        flag_cache=_daily_flag_cache_path(ctx),
     )
     return _published(path)
 
@@ -1827,4 +1839,5 @@ __all__ = [
     "refresh_scope",
     "run_collection_jobs",
     "run_refresh",
+    "warm_daily_flag_cache",
 ]
