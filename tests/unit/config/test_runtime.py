@@ -6,6 +6,28 @@ from pathlib import Path
 import pytest
 
 
+def test_read_only_runtime_does_not_create_mutable_roots(tmp_path: Path) -> None:
+    from src.config.runtime import load_runtime_config
+
+    repo = Path(__file__).resolve().parents[3]
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    source = (repo / "config/runtime.toml").read_text()
+    import tomllib
+
+    for key, value in tomllib.loads(source).items():
+        if key not in {"data_root", "logs_root"}:
+            source = source.replace(f'"{value}"', f'"{repo / value}"')
+    target = config_dir / "runtime.toml"
+    target.write_text(source)
+    config = load_runtime_config(target, create_directories=False)
+    assert not config.data_root.exists()
+    assert not config.logs_root.exists()
+    load_runtime_config(target)
+    assert config.data_root.is_dir()
+    assert config.logs_root.is_dir()
+
+
 def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.config import load_runtime_config
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 
@@ -197,3 +198,44 @@ def test_collect_eve_unit_selects_relay_transport() -> None:
 def test_morning_unit_has_no_kind_transport() -> None:
     text = (SYSTEMD / "kse-morning.service").read_text(encoding="utf-8")
     assert "KSE_KIND_TRANSPORT" not in text
+
+
+def _relay_workflow() -> Path:
+    return REPO / ".github" / "workflows" / "kind-relay.yml"
+
+
+def _relay_text() -> str:
+    return _relay_workflow().read_text(encoding="utf-8")
+
+
+def test_kind_relay_workflow_schedule_and_permissions() -> None:
+    text = _relay_text()
+    assert "10 8 * * *" in text
+    assert "5 9 * * *" in text
+    assert "workflow_dispatch" in text
+    assert "src.ops.kind_relay" in text
+    match = re.search(r"^permissions:\n((?:[ \t]+.*\n)+)", text, re.MULTILINE)
+    assert match is not None
+    entries = re.findall(r"^\s+([A-Za-z0-9_-]+):\s*(\S+)", match.group(1), re.MULTILINE)
+    assert dict(entries) == {"contents": "read"}
+    assert "group: kind-relay" in text
+
+
+def test_kind_relay_workflow_never_uploads_artifacts() -> None:
+    text = _relay_text()
+    assert "upload-artifact" not in text
+    assert "actions/cache" not in text
+
+
+def test_kind_relay_workflow_uses_only_existing_secret_names() -> None:
+    text = _relay_text()
+    names = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text))
+    assert names
+    assert names <= {"TS_OAUTH_CLIENT_ID", "TS_OAUTH_SECRET", "SSH_PRIVATE_KEY", "HOST", "USERNAME"}
+
+
+def test_kind_relay_delivery_is_atomic() -> None:
+    text = _relay_text()
+    assert ".incoming" in text
+    assert re.search(r"mv -f \S*\.incoming \S*bundle\.json", text) is not None
+    assert text.index('"mkdir -p ~/k-stock-engine/data/state/kind_relay/inbox"') < text.index("          scp ")
