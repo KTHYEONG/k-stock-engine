@@ -44,7 +44,7 @@ def _resolve(root: Path, key: str, value: object) -> Path:
     return candidate if candidate.is_absolute() else root / candidate
 
 
-def load_runtime_config(path: Path | None = None) -> RuntimeConfig:
+def load_runtime_config(path: Path | None = None, *, create_directories: bool = True) -> RuntimeConfig:
     """Load ``config/runtime.toml`` and resolve every path to an absolute path.
 
     The repository root is the directory that holds ``config/runtime.toml``, found
@@ -79,6 +79,7 @@ def load_runtime_config(path: Path | None = None) -> RuntimeConfig:
             continue
         if not candidate.is_file():
             raise ConfigError(f"runtime config {key!r} does not exist: {candidate}")
-    for key in sorted(_MUTABLE_ROOTS):
-        resolved[key].mkdir(parents=True, exist_ok=True)
+    if create_directories:
+        for key in sorted(_MUTABLE_ROOTS):
+            resolved[key].mkdir(parents=True, exist_ok=True)
     return config
