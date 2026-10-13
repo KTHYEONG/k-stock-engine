@@ -178,34 +178,65 @@ def dataset_id_for(identity: DatasetIdentity) -> str:
     return f"{identity.kind}_{digest[:16]}"
 
 
+class PartitionSpool:
+    """Temporary on-disk holding area for partition frames awaiting publication; use as a context manager."""
+
+    def __init__(self, *, prefix: str = "partition-spool-") -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix=prefix)
+        self._root = Path(self._tmp.name)
+        self._paths: dict[str, Path] = {}
+        self._active = False
+
+    def __enter__(self) -> PartitionSpool:
+        self._active = True
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._active = False
+        try:
+            self._tmp.cleanup()
+        finally:
+            self._paths.clear()
+
+    @property
+    def directory(self) -> Path:
+        """Spool root directory holding staged partition files."""
+        return self._root
+
+    @property
+    def partitions(self) -> Mapping[str, Path]:
+        """Spooled partitions keyed by dataset-relative POSIX path."""
+        if not self._active:
+            raise PITDataError("spool partitions are only valid inside the context")
+        return MappingProxyType(self._paths)
+
+    def add(self, relative_path: str, frame: pl.DataFrame) -> int:
+        """Write one partition to the spool and return its row count; the frame is not retained."""
+        if not self._active:
+            raise PITDataError("spool add is only valid inside the context")
+        _validate_partition_path(relative_path)
+        if relative_path in self._paths:
+            raise PITDataError(f"duplicate spool partition path: {relative_path!r}")
+        target = self._root / PurePosixPath(relative_path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            frame.write_parquet(target)
+        except (OSError, pl.exceptions.PolarsError) as exc:
+            raise PITDataError(f"cannot spool dataset partition {relative_path!r}") from exc
+        rows = int(frame.height)
+        self._paths[relative_path] = target
+        return rows
+
+
 def publish_dataset(
     *,
     layer_root: Path,
     identity: DatasetIdentity,
-    partitions: Mapping[str, pl.DataFrame],
+    partitions: Mapping[str, pl.DataFrame | Path],
     checks: Sequence[DatasetCheck] = (),
     details: Mapping[str, object] | None = None,
 ) -> PublishedDataset:
-    """Atomically publish a manifest and all declared Parquet partitions.
-
-    The staged directory is a sibling of the final dataset directory. An
-    existing dataset is accepted only when its identity and partition table are
-    identical, making deterministic republication a true no-op.
-
-    Args:
-        layer_root: Silver or Gold directory receiving the dataset.
-        identity: Content-determining dataset identity.
-        partitions: Relative POSIX paths mapped to in-memory Parquet frames.
-        checks: Build-time quality gates recorded in the manifest.
-        details: Builder-specific counters excluded from dataset identity.
-
-    Returns:
-        The published dataset id, final path, and total row count.
-
-    Raises:
-        PITDataError: The identity or partition paths are invalid, a write
-            fails, or an existing target describes different content.
-    """
+    """Atomically publish frames or Parquet files; identical republication is a no-op."""
 
     root = Path(layer_root)
     dataset_id = dataset_id_for(identity)
@@ -219,21 +250,43 @@ def publish_dataset(
         total_rows = 0
         for relative_path in sorted(partitions):
             _validate_partition_path(relative_path)
-            frame = partitions[relative_path]
+            value = partitions[relative_path]
             output_path = staging / PurePosixPath(relative_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                frame.write_parquet(output_path)
-            except (OSError, pl.exceptions.PolarsError) as exc:
-                raise PITDataError(f"cannot write dataset partition {relative_path!r}") from exc
+            if isinstance(value, pl.DataFrame):
+                try:
+                    value.write_parquet(output_path)
+                except (OSError, pl.exceptions.PolarsError) as exc:
+                    raise PITDataError(f"cannot write dataset partition {relative_path!r}") from exc
+                rows = int(value.height)
+                sha256 = file_sha256(output_path)
+            elif isinstance(value, Path):
+                source = Path(value)
+                if not source.is_file():
+                    raise PITDataError(
+                        f"dataset partition source is missing or not a file: {relative_path!r}"
+                    )
+                try:
+                    shutil.copyfile(source, output_path)
+                except OSError as exc:
+                    raise PITDataError(f"cannot stage dataset partition {relative_path!r}") from exc
+                try:
+                    rows = int(pl.scan_parquet(output_path).select(pl.len()).collect().item())
+                except (OSError, pl.exceptions.PolarsError, TypeError, ValueError) as exc:
+                    raise PITDataError(
+                        f"unreadable dataset partition source: {relative_path!r}"
+                    ) from exc
+                sha256 = file_sha256(output_path)
+            else:
+                raise PITDataError(f"invalid dataset partition value: {relative_path!r}")
             entries.append(
                 DatasetPartition(
                     path=relative_path,
-                    rows=frame.height,
-                    sha256=file_sha256(output_path),
+                    rows=rows,
+                    sha256=sha256,
                 )
             )
-            total_rows += frame.height
+            total_rows += rows
 
         manifest = DatasetManifest(
             schema=SCHEMA_VERSION,
