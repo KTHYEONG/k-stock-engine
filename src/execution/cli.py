@@ -8,7 +8,7 @@ import logging
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -272,11 +272,31 @@ def _run_rehearse(args: argparse.Namespace) -> Mapping[str, object]:
     }
 
 
-def _scheduled_capture(args: argparse.Namespace) -> int:
+_DECISION_POLL_S = 15.0
+
+
+def _now() -> datetime:
     from src.core.time import KRX_TZ
+
+    return datetime.now(KRX_TZ)
+
+
+def _await_execution_decision(decisions_dir: Path, session: date, deadline: datetime) -> bool:
+    """Poll the sealed chain until it holds a decision for ``session`` or ``deadline`` passes."""
+    from src.research.operate import read_chain
+
+    while True:
+        if any(item.execution_session == session for item in read_chain(decisions_dir)):
+            return True
+        if _now() >= deadline:
+            return False
+        time.sleep(_DECISION_POLL_S)
+
+
+def _scheduled_capture(args: argparse.Namespace) -> int:
+    from src.core.time import KRX_TZ, OPEN_SNAPSHOT_OFFSETS_MIN
     from src.ops.guards import trading_day
     from src.ops.run_outcome import record_run_outcome
-    from src.research.operate import read_chain
 
     today = _today()
 
@@ -288,13 +308,14 @@ def _scheduled_capture(args: argparse.Namespace) -> int:
         record("SKIPPED", "non_trading_day")
         return 0
     try:
-        chain = read_chain(args.decisions_dir)
-        if not any(item.execution_session == today for item in chain):
-            record("NO_DECISION", "missing_execution_decision")
-            return 1
-        if _session_open(today) is None:
+        open_at = _session_open(today)
+        if open_at is None:
             record("SKIPPED", "non_regular_open")
             return 0
+        last_snapshot = open_at + timedelta(minutes=max(OPEN_SNAPSHOT_OFFSETS_MIN))
+        if not _await_execution_decision(args.decisions_dir, today, last_snapshot):
+            record("NO_DECISION", "missing_execution_decision")
+            return 1
         result = _run_auction_open(args)
         if result.get("unresolved"):
             record("DEGRADED", "unresolved_auction", result)

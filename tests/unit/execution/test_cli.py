@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -160,6 +160,7 @@ def test_today_and_closed_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, c
 
     monkeypatch.undo()
     assert cli._today() == datetime.now(KRX_TZ).date()
+    assert cli._now().tzinfo is not None
     monkeypatch.setattr(cli, "_today", lambda: date(2026, 10, 4))
     decision = SealedDecision(
         date(2026, 10, 1), date(2026, 10, 2), datetime(2026, 10, 1, 20, tzinfo=KRX_TZ),
@@ -182,7 +183,9 @@ def test_scheduled_capture_records_outcome(tmp_path, monkeypatch, scenario):  # 
     monkeypatch.setattr("src.research.operate.read_chain", lambda _: () if scenario == "missing" else (
         SimpleNamespace(execution_session=day),
     ))
-    monkeypatch.setattr(cli, "_session_open", lambda _: None if scenario == "late_open" else object())
+    open_at = datetime(2026, 10, 8, 9, 0, tzinfo=KRX_TZ)
+    monkeypatch.setattr(cli, "_session_open", lambda _: None if scenario == "late_open" else open_at)
+    monkeypatch.setattr(cli, "_now", lambda: open_at)
 
     def capture(args):  # type: ignore[no-untyped-def]
         if scenario == "error":
@@ -198,6 +201,45 @@ def test_scheduled_capture_records_outcome(tmp_path, monkeypatch, scenario):  # 
     assert load_run_outcomes(events, day) == {"auction_open": expected}
     assert rc == (1 if expected in ("NO_DECISION", "DEGRADED") else 0)
     assert "secret-value" not in (events / "2026-10" / "2026-10-08.jsonl").read_text()
+
+
+def test_scheduled_capture_waits_for_late_decision(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    from datetime import date, timedelta
+    from types import SimpleNamespace
+
+    from src.execution import cli
+    from src.ops.run_outcome import load_run_outcomes
+
+    day = date(2026, 10, 8)
+    open_at = datetime(2026, 10, 8, 9, 0, tzinfo=KRX_TZ)
+    clock = {"now": open_at - timedelta(minutes=20), "polls": 0}
+
+    def chain(_):  # type: ignore[no-untyped-def]
+        clock["polls"] += 1
+        return (SimpleNamespace(execution_session=day),) if clock["polls"] > 3 else ()
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(cli, "_today", lambda: day)
+    monkeypatch.setattr("src.ops.guards.trading_day", lambda _: True)
+    monkeypatch.setattr("src.research.operate.read_chain", chain)
+    monkeypatch.setattr(cli, "_session_open", lambda _: open_at)
+    monkeypatch.setattr(cli, "_now", lambda: clock["now"])
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    monkeypatch.setattr(cli, "_run_auction_open", lambda args: {"unresolved": []})
+    events = tmp_path / "events"
+    rc = cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path),
+                   "--out", str(tmp_path / "out.json"), "--events-root", str(events)])
+    assert rc == 0
+    assert load_run_outcomes(events, day) == {"auction_open": "OK"}
+    assert clock["polls"] == 4
+
+    clock.update(now=open_at - timedelta(minutes=20), polls=-10**6)
+    rc = cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path),
+                   "--out", str(tmp_path / "out.json"), "--events-root", str(events)])
+    assert rc == 1
+    assert clock["now"] >= open_at - timedelta(minutes=1)
 
 
 def test_rehearse_cli_success_and_missing_keys(tmp_path, monkeypatch, capsys):  # type: ignore[no-untyped-def]
