@@ -424,3 +424,333 @@ def test_job_health_checks_delegate_to_collector(tmp_path: Path) -> None:
 
     for spec in (KindNoticeSearchJob(), KindNoticeDocumentJob()):
         spec.health_check(ctx)
+
+
+def _window_payload(collector, *, keyword="상장폐지", start="2019-07-01", end="2019-09-30"):  # type: ignore[no-untyped-def]
+    from datetime import date
+
+    from src.data.jobs.kind import collect_search_window
+
+    return collect_search_window(
+        collector,
+        keyword=keyword,
+        start=date.fromisoformat(start),
+        end=date.fromisoformat(end),
+        today=date(2019, 10, 1),
+        retrieved_at=NOW,
+    )
+
+
+def test_collect_search_window_matches_job_payload(tmp_path: Path) -> None:
+    from src.data.jobs.kind import KindNoticeSearchJob
+
+    runtime = _runtime(tmp_path)
+    rows = _rows(2)
+    pages = {("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(rows, 2)}
+    collector = _FakeKindClient(pages=pages)
+    ctx = _ctx(runtime, _provider(), collector=collector)
+    (unit,) = [
+        unit for unit in KindNoticeSearchJob().pending(ctx)
+        if unit.natural_key == "상장폐지:2019-07-01..2019-09-30"
+    ]
+
+    (job_payload,) = KindNoticeSearchJob().fetch(ctx, [unit])
+    direct = _window_payload(collector)
+
+    assert direct.payload == job_payload.payload
+    assert (direct.natural_key, direct.as_of, direct.status) == (
+        job_payload.natural_key, job_payload.as_of, job_payload.status)
+
+
+def test_verify_search_accepts_complete_closed_and_open_windows() -> None:
+    from datetime import date
+
+    from src.data.jobs.kind import verify_search_payload
+
+    rows = _rows(2)
+    collector = _FakeKindClient(
+        pages={("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(rows, 2)})
+    verify_search_payload(_window_payload(collector), fetch_date=date(2019, 10, 1))
+
+    open_collector = _FakeKindClient(
+        pages={("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(rows, 2)})
+    open_payload = _window_payload(open_collector)
+    verify_search_payload(open_payload, fetch_date=date(2019, 9, 30))
+
+
+def test_verify_search_rejects_row_total_mismatch_even_when_open() -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.kind import collect_search_window, verify_search_payload
+
+    rows = _rows(1)
+    collector = _FakeKindClient(
+        pages={("상장폐지", "2026-07-01", "2026-09-24", 1): kind_search_html(rows, 2)})
+    payload = collect_search_window(
+        collector, keyword="상장폐지", start=date(2026, 7, 1), end=date(2026, 9, 24),
+        today=date(2026, 9, 24), retrieved_at=NOW,
+    )
+    with pytest.raises(PITDataError):
+        verify_search_payload(payload, fetch_date=date(2026, 9, 24))
+
+
+def test_verify_search_rejects_future_window_end() -> None:
+    from datetime import date
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.kind import verify_search_payload
+
+    collector = _FakeKindClient(
+        pages={("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(_rows(2), 2)})
+    payload = _window_payload(collector)
+    with pytest.raises(PITDataError):
+        verify_search_payload(payload, fetch_date=date(2019, 9, 29))
+
+
+def test_verify_search_rejects_duplicate_acptno_and_key_mismatch() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.kind import verify_search_payload
+
+    from datetime import date
+
+    dup_rows = [kind_row_html("20240101000001", "2024-01-02 15:30", "상장폐지", "005930", "유가증권시장본부")] * 2
+    dup_collector = _FakeKindClient(
+        pages={("상장폐지", "2026-07-01", "2026-09-24", 1): kind_search_html(dup_rows, 2)})
+    from src.data.jobs.kind import collect_search_window
+
+    dup_payload = collect_search_window(
+        dup_collector, keyword="상장폐지", start=date(2026, 7, 1), end=date(2026, 9, 24),
+        today=date(2026, 9, 24), retrieved_at=NOW,
+    )
+    with pytest.raises(PITDataError):
+        verify_search_payload(dup_payload, fetch_date=date(2026, 9, 24))
+
+    good = _window_payload(_FakeKindClient(
+        pages={("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(_rows(2), 2)}))
+    tampered = dataclasses.replace(good, natural_key="상장폐지:2019-07-01..2019-09-29")
+    with pytest.raises(PITDataError):
+        verify_search_payload(tampered, fetch_date=date(2019, 9, 30))
+
+
+def test_verify_document_rejects_identity_mismatch(tmp_path: Path) -> None:
+    import dataclasses
+    import json
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.kind import (
+        collect_notice_document,
+        kind_document_targets,
+        verify_document_payload,
+    )
+
+    runtime = _runtime(tmp_path)
+    ctx = _ctx(runtime, _provider())
+    rows = _target_rows()
+    _persist_search(ctx, keyword="상장폐지", start="2019-07-01", end="2019-09-30",
+                    reported_total=6, pages=[kind_search_html(rows, 6)])
+    (target,) = [row for row in kind_document_targets(ctx.catalog, _provider().kind)
+                 if row.acptno == "20240101000001"]
+    collector = _FakeKindClient(documents={"20240101000001": ("1234567", "68051.htm", "<html>x</html>")})
+    payload = collect_notice_document(collector, target, retrieved_at=NOW)
+    verify_document_payload(payload)
+
+    bad_key = dataclasses.replace(payload, natural_key="20000101000000")
+    with pytest.raises(PITDataError):
+        verify_document_payload(bad_key)
+
+    body = json.loads(payload.payload)
+    body["disclosed_at"] = "2024-01-03T15:30:00+09:00"
+    bad_date = dataclasses.replace(payload, payload=json.dumps(body).encode("utf-8"))
+    with pytest.raises(PITDataError):
+        verify_document_payload(bad_date)
+
+
+
+def test_select_document_targets_dedupes_and_filters(tmp_path: Path) -> None:
+    from src.data.jobs.kind import kind_document_targets, select_document_targets
+    from src.integrations.krx.kind import parse_kind_search_page
+
+    runtime = _runtime(tmp_path)
+    ctx = _ctx(runtime, _provider())
+    rows = _target_rows()
+    _persist_search(ctx, keyword="상장폐지", start="2019-07-01", end="2019-09-30",
+                    reported_total=6, pages=[kind_search_html(rows, 6)])
+    expected = kind_document_targets(ctx.catalog, _provider().kind)
+
+    parsed_rows = parse_kind_search_page(kind_search_html(rows, 6)).rows
+    doubled = list(parsed_rows) + list(parsed_rows)
+    selected = select_document_targets(doubled, _provider().kind)
+
+    assert [row.acptno for row in selected] == [row.acptno for row in expected]
+
+
+def test_verify_search_rejects_malformed_envelopes() -> None:
+    import dataclasses
+    from datetime import date
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE
+    from src.data.jobs.kind import verify_search_payload
+    from src.data.receipt_catalog import EvidenceStatus
+
+    good = _window_payload(_FakeKindClient(
+        pages={("상장폐지", "2019-07-01", "2019-09-30", 1): kind_search_html(_rows(2), 2)}))
+    fetch_date = date(2019, 9, 30)
+
+    with pytest.raises(PITDataError):
+        verify_search_payload(dataclasses.replace(good, source=KIND_NOTICE_DOCUMENT_SOURCE),
+                              fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(dataclasses.replace(good, payload=b"{broken"),
+                              fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(dataclasses.replace(good, payload=b"[1]"),
+                              fetch_date=fetch_date)
+
+    def _mutated(**overrides):  # type: ignore[no-untyped-def]
+        body = dict(json.loads(good.payload))
+        body.update(overrides)
+        return dataclasses.replace(good, payload=json.dumps(body).encode("utf-8"))
+
+    def _dropped(field):  # type: ignore[no-untyped-def]
+        body = dict(json.loads(good.payload))
+        del body[field]
+        return dataclasses.replace(good, payload=json.dumps(body).encode("utf-8"))
+
+    with pytest.raises(PITDataError):
+        verify_search_payload(_dropped("keyword"), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(keyword=""), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(start="bad-date"), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(start=20190701), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(start="2019-09-30", end="2019-07-01"),
+                              fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(reported_total=True), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(reported_total=-1), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(pages=[]), fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(_mutated(pages="nope"), fetch_date=fetch_date)
+    contradictory = _mutated(pages=[
+        kind_search_html(_rows(1), 1),
+        kind_search_html(_rows(1), 2),
+    ])
+    with pytest.raises(PITDataError, match="contradictory"):
+        verify_search_payload(contradictory, fetch_date=fetch_date)
+    with pytest.raises(PITDataError):
+        verify_search_payload(dataclasses.replace(good, as_of=date(2019, 9, 29)),
+                              fetch_date=fetch_date)
+    flipped = EvidenceStatus.EMPTY if good.status is EvidenceStatus.SUCCESS else EvidenceStatus.SUCCESS
+    with pytest.raises(PITDataError):
+        verify_search_payload(dataclasses.replace(good, status=flipped), fetch_date=fetch_date)
+
+
+def test_verify_document_rejects_malformed_envelopes() -> None:
+    import dataclasses
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.evidence_sources import KIND_NOTICE_SEARCH_SOURCE
+    from src.data.jobs.kind import collect_notice_document, verify_document_payload
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.integrations.krx.kind import KindNoticeRow
+    from zoneinfo import ZoneInfo
+
+    kst = ZoneInfo("Asia/Seoul")
+    row = KindNoticeRow(acptno="20240101000001",
+                        disclosed_at=datetime(2024, 1, 2, 15, 30, tzinfo=kst),
+                        company_code="00593", company_name="Co",
+                        title="상장폐지", submitter="유가증권시장본부")
+    collector = _FakeKindClient(documents={"20240101000001": ("1", "a.htm", "<html>x</html>")})
+    good = collect_notice_document(collector, row, retrieved_at=NOW)
+
+    with pytest.raises(PITDataError):
+        verify_document_payload(dataclasses.replace(good, source=KIND_NOTICE_SEARCH_SOURCE))
+    with pytest.raises(PITDataError):
+        verify_document_payload(dataclasses.replace(good, status=EvidenceStatus.EMPTY))
+    with pytest.raises(PITDataError):
+        verify_document_payload(dataclasses.replace(good, payload=b"{broken"))
+    with pytest.raises(PITDataError):
+        verify_document_payload(dataclasses.replace(good, payload=b"[1]"))
+
+    def _mutated(**overrides):  # type: ignore[no-untyped-def]
+        body = dict(json.loads(good.payload))
+        body.update(overrides)
+        return dataclasses.replace(good, payload=json.dumps(body).encode("utf-8"))
+
+    with pytest.raises(PITDataError):
+        verify_document_payload(_mutated(acptno=""))
+    with pytest.raises(PITDataError):
+        verify_document_payload(_mutated(html=""))
+    with pytest.raises(PITDataError):
+        verify_document_payload(_mutated(disclosed_at="bad-date"))
+    with pytest.raises(PITDataError):
+        verify_document_payload(_mutated(disclosed_at=None))
+
+
+def test_search_parse_failure_identifies_window() -> None:
+    from dataclasses import replace
+
+    from src.core.pit import PITDataError
+    from src.data.jobs.kind import verify_search_payload
+
+    good = _window_payload(_FakeKindClient())
+    body = json.loads(good.payload)
+    body["pages"] = ["<html>페이지 오류</html>"]
+    with pytest.raises(PITDataError) as error:
+        verify_search_payload(replace(good, payload=json.dumps(body).encode()), fetch_date=good.as_of)
+    assert good.natural_key in str(error.value)
+
+
+def test_direct_jobs_timestamp_receipts_after_collection(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    from src.data.jobs.kind import KindNoticeDocumentJob, KindNoticeSearchJob
+    from src.data.jobs.runner import JobUnit
+    from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE, KIND_NOTICE_SEARCH_SOURCE
+
+    moment = NOW
+
+    class AdvancingCollector(_FakeKindClient):
+        def search_page(self, keyword, start, end, *, page_index):  # type: ignore[no-untyped-def]
+            nonlocal moment
+            moment += timedelta(seconds=1)
+            return super().search_page(keyword, start, end, page_index=page_index)
+
+        def fetch_document(self, acptno):  # type: ignore[no-untyped-def]
+            nonlocal moment
+            moment += timedelta(seconds=3)
+            return super().fetch_document(acptno)
+
+    collector = AdvancingCollector(documents={"20240101000001": ("1", "a.htm", "<html>x</html>")})
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=collector, now=lambda: moment)
+    unit = JobUnit(source=KIND_NOTICE_SEARCH_SOURCE, natural_key="상장폐지:2019-07-01..2019-09-30",
+                   payload={"keyword": "상장폐지", "window_start": "2019-07-01", "window_end": "2019-09-30"},
+                   max_requests=20)
+    (search,) = KindNoticeSearchJob().fetch(ctx, [unit])
+    assert search.retrieved_at == NOW + timedelta(seconds=1)
+    _persist_search(ctx, keyword="상장폐지", start="2019-07-01", end="2019-09-30",
+                    reported_total=6, pages=[kind_search_html(_target_rows(), 6)])
+    unit = JobUnit(source=KIND_NOTICE_DOCUMENT_SOURCE, natural_key="20240101000001",
+                   payload={"acptno": "20240101000001"}, max_requests=3)
+    (document,) = KindNoticeDocumentJob().fetch(ctx, [unit])
+    assert document.retrieved_at == NOW + timedelta(seconds=4)
