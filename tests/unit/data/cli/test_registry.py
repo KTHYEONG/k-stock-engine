@@ -59,12 +59,13 @@ def test_exit_codes_follow_error_envelope(capsys, monkeypatch) -> None:
 
     from src.config.errors import ConfigError
     from src.core.pit import PITDataError
-    from src.data.cli import main
+    from src.data.cli import _ensure_registered, main
     from src.data.cli.common import CommandFailed
     from src.data.cli.registry import Command, register
     from src.data.cli import registry as registry_module
     from src.integrations.errors import ProviderError
 
+    _ensure_registered()
     saved = list(registry_module._COMMANDS)
     try:
         def add(name, error):
@@ -113,9 +114,11 @@ def test_duplicate_command_names_are_rejected() -> None:
     """Two registrations of one name fail, at registration and at parser build."""
     import pytest
 
+    from src.data.cli import _ensure_registered
     from src.data.cli import registry as registry_module
     from src.data.cli.registry import Command, build_parser, register
 
+    _ensure_registered()
     saved = list(registry_module._COMMANDS)
     try:
         register(Command(name="probe-dup", help="first",
