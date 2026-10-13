@@ -250,6 +250,26 @@ def test_backup_failure_removes_nothing(tmp_path: Path, monkeypatch: pytest.Monk
     assert backup(tmp_path, now=datetime(2026, 10, 8, 2, 30, tzinfo=KRX_TZ)) == 0
 
 
+def test_backup_failure_records_redacted_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_guard(monkeypatch)
+    monkeypatch.setenv("DRIVE_API_TOKEN", "s3cr3t-token-value")
+
+    def _fail(**kwargs: object) -> dict[str, object]:
+        raise PITDataError("lake backup push failed rc=1: auth s3cr3t-token-value rejected" + "x" * 500)
+
+    monkeypatch.setattr(jobs, "_push_backup_sources", _fail)
+    assert backup(tmp_path, now=_morning_now()) == 1
+    records = [
+        json.loads(line)
+        for path in (tmp_path / "ops" / "events").rglob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    detail = next(item for item in records if item["job"] == "backup")["metrics"]["detail"]
+    assert "rc=1" in detail
+    assert "s3cr3t-token-value" not in detail
+    assert len(detail) <= 300
+
+
 def test_pruning_is_gated_by_offsite_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.data.runtime import resolve_data_runtime
 
