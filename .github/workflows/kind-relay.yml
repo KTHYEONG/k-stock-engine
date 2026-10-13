@@ -1,0 +1,53 @@
+name: KIND relay producer
+
+on:
+  schedule:
+    - cron: "10 8 * * *"
+    - cron: "5 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Produce verified KIND bundle
+        run: uv run python -m src.ops.kind_relay produce --out "$RUNNER_TEMP/kind-bundle.json"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Deliver bundle to VPS inbox
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          HOST: ${{ secrets.HOST }}
+          REMOTE_USER: ${{ secrets.USERNAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/relay_key
+          chmod 600 ~/.ssh/relay_key
+          SSH_OPTS="-i $HOME/.ssh/relay_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/data/state/kind_relay/inbox"
+          scp $SSH_OPTS "$RUNNER_TEMP/kind-bundle.json" "$REMOTE_USER@$HOST:~/k-stock-engine/data/state/kind_relay/inbox/bundle.json.incoming"
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mv -f ~/k-stock-engine/data/state/kind_relay/inbox/bundle.json.incoming ~/k-stock-engine/data/state/kind_relay/inbox/bundle.json"
