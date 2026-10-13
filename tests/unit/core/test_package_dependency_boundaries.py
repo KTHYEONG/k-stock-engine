@@ -32,6 +32,7 @@ KNOWN_VIOLATIONS: frozenset[tuple[str, str]] = frozenset()
 COMPOSITION_ROOTS = {
     "src/execution/cli.py": frozenset({"config", "integrations", "research", "ops"}),
     "src/execution/adapters/kis_broker.py": frozenset({"integrations"}),
+    "src/ops/kind_relay.py": frozenset({"integrations"}),
 }
 
 
