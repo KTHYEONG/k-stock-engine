@@ -14,6 +14,7 @@ from pathlib import Path
 
 from src.config.providers import load_provider_policy
 from src.config.runtime import load_runtime_config
+from src.config.secrets import environment_snapshot
 from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE, KIND_NOTICE_SEARCH_SOURCE
 from src.data.kind_relay import decode_relay_bundle, encode_relay_bundle
 from src.data.kind_relay_producer import build_relay_bundle
@@ -38,6 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     out = Path(args.out)
     staged: Path | None = None
+    env = environment_snapshot()
     try:
         runtime_config = load_runtime_config(create_directories=False)
         provider = load_provider_policy(runtime_config)
@@ -53,8 +55,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evidence_start=scope.evidence_start,
                 now=datetime.now(UTC),
                 producer={
-                    "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-                    "commit": os.environ.get("GITHUB_SHA", ""),
+                    "run_id": env.get("GITHUB_RUN_ID", "local"),
+                    "commit": env.get("GITHUB_SHA", ""),
                 },
             )
         raw = encode_relay_bundle(bundle)
