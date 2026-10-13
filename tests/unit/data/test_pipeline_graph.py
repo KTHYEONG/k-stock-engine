@@ -1632,3 +1632,235 @@ def test_warm_daily_flags_propagates_errors(
     monkeypatch.setattr(graph, "_build_calendar", fail)
     with pytest.raises(error_type, match="calendar unavailable"):
         graph.warm_daily_flag_cache(ctx)
+
+
+def _fake_proc_root(tmp_path: Path, *, status: str | None) -> Path:
+    root = tmp_path / "proc"
+    (root / "self").mkdir(parents=True)
+    if status is not None:
+        (root / "self" / "status").write_text(status, encoding="utf-8")
+    return root
+
+
+def test_node_peak_parses_vmhwm(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status="Name:\tpython\nVmHWM:\t    2048 kB\nVmRSS:\t    1024 kB\n")
+    assert graph.node_peak_rss_mb(proc_root=root) == 2.0
+
+
+def test_node_peak_missing_field_is_none(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status="Name:\tpython\nVmRSS:\t    1024 kB\n")
+    assert graph.node_peak_rss_mb(proc_root=root) is None
+    assert graph.node_peak_rss_mb(proc_root=tmp_path / "no-proc") is None
+    assert graph.node_peak_rss_mb(proc_root=_fake_proc_root(tmp_path / "bare", status="VmHWM:\n")) is None
+    assert graph.node_peak_rss_mb(proc_root=_fake_proc_root(tmp_path / "bad", status="VmHWM:\t oops kB\n")) is None
+
+
+def test_reset_failure_is_swallowed(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = tmp_path / "proc-ro"
+    (root / "self" / "clear_refs").mkdir(parents=True)
+    assert graph.reset_peak_rss(proc_root=root) is False
+    assert graph.reset_peak_rss(proc_root=tmp_path / "no-proc") is False
+
+
+@pytest.mark.parametrize("value", ["nan kB", "inf kB", "-1 kB", "2048 MB", "2048", "9" * 400 + " kB"])
+def test_node_peak_rejects_invalid_measurements(tmp_path: Path, value: str) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status=f"VmHWM: {value}\n")
+    assert graph.node_peak_rss_mb(proc_root=root) is None
+
+
+def test_proc_metrics_swallow_invalid_paths() -> None:
+    from src.data import pipeline_graph as graph
+
+    root = Path("\0")
+    assert graph.node_peak_rss_mb(proc_root=root) is None
+    assert graph.reset_peak_rss(proc_root=root) is False
+
+
+def test_reset_writes_kernel_watermark_command(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status=None)
+    target = root / "self" / "clear_refs"
+    target.write_text("0", encoding="ascii")
+    assert graph.reset_peak_rss(proc_root=root) is True
+    assert target.read_bytes() == b"5"
+
+
+def test_report_carries_peaks_for_built_kinds_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import polars as pl
+
+    import src.data.pipeline_graph as graph
+    from src.data.datasets import DatasetIdentity, DatasetLayer, PublishedDataset, publish_dataset
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+    identity_a = DatasetIdentity(kind="a", layer=DatasetLayer.SILVER, policy_version="v1", inputs={}, params={})
+    published_a = publish_dataset(
+        layer_root=ctx.runtime.workspace.silver_root, identity=identity_a,
+        partitions={"part.parquet": pl.DataFrame({"a": [1]})},
+    )
+    ctx.registry.register("a", published_a.path.name)
+    identity_b = DatasetIdentity(kind="b", layer=DatasetLayer.SILVER, policy_version="v1", inputs={}, params={})
+
+    def _fake_build(inner_ctx: RefreshContext, inputs: object) -> PublishedDataset:
+        result = publish_dataset(
+            layer_root=inner_ctx.runtime.workspace.silver_root, identity=identity_b,
+            partitions={"part.parquet": pl.DataFrame({"b": [1]})},
+        )
+        return PublishedDataset(dataset_id=result.dataset_id, path=result.path, rows=result.rows)
+
+    patched = (
+        BuildNode(kind="a", inputs=(), bronze_sources=(), build=lambda c, i: pytest.fail("fresh node must not build")),
+        BuildNode(kind="b", inputs=(), bronze_sources=(), build=_fake_build),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(graph, "SCOPE_GRAPH", patched)
+    monkeypatch.setattr(graph, "_VALIDATED_GRAPH", patched)
+    monkeypatch.setitem(graph._PREVIEW_FNS, "a", lambda c: identity_a)
+    monkeypatch.setitem(graph._PREVIEW_FNS, "b", lambda c: identity_b)
+    monkeypatch.setattr(graph, "reset_peak_rss", lambda **k: True)
+    monkeypatch.setattr(graph, "node_peak_rss_mb", lambda **k: 7.5)
+    events: list[object] = []
+    report = graph.run_refresh(ctx, dry_run=False, emit=events.append)
+    assert report.built == ("b",)
+    assert dict(report.node_peak_rss_mb) == {"b": 7.5}
+    payloads = [item for item in events if isinstance(item, dict) and item.get("type") == "dataset"]
+    assert payloads[0]["peak_rss_mb"] == 7.5
+
+
+def test_unavailable_peak_omits_payload_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+    from src.data.datasets import PublishedDataset
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+    target = ctx.runtime.workspace.silver_root / "solo_ds"
+    target.mkdir(parents=True, exist_ok=True)
+    node = BuildNode(
+        kind="solo", inputs=(), bronze_sources=(),
+        build=lambda c, i: PublishedDataset(dataset_id="solo_ds", path=target, rows=1),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(graph, "_build_with_peak", lambda n, c, i: (n.build(c, i), None))
+    monkeypatch.setattr(graph, "verify_dataset", lambda path, known_ids=None: type("V", (), {"passed": True, "failures": []})())
+    events: list[object] = []
+    peaks: dict[str, float] = {}
+    graph._build_nodes(ctx, (node,), {}, {}, set(), events.append, peaks)
+    assert peaks == {}
+    assert events == [{"type": "dataset", "kind": "solo", "dataset_id": "solo_ds", "status": "built"}]
+
+
+def test_failed_build_records_no_peak(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+    monkeypatch.setattr(graph, "reset_peak_rss", lambda **k: True)
+
+    def _boom_peak(**kwargs: object) -> float:
+        pytest.fail("peak must not be read when the build raises")
+        return 0.0
+
+    monkeypatch.setattr(graph, "node_peak_rss_mb", _boom_peak)
+    events: list[object] = []
+    peaks: dict[str, float] = {}
+
+    def _boom(inner_ctx: RefreshContext, inputs: object) -> object:
+        raise PITDataError("boom")
+
+    with pytest.raises(PITDataError, match="boom"):
+        graph._build_nodes(
+            ctx,
+            (BuildNode(kind="x", inputs=(), bronze_sources=(), build=_boom),),  # type: ignore[arg-type]
+            {}, {}, set(), events.append, peaks,
+        )
+    assert peaks == {}
+    assert events == []
+
+
+@pytest.mark.parametrize("kis_status", ["complete", "budget_exhausted"])
+@pytest.mark.parametrize("reset_supported", [True, False])
+def test_evening_split_report_merges_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    kis_status: str, reset_supported: bool,
+) -> None:
+    import logging
+    from collections.abc import Mapping
+
+    import polars as pl
+
+    import src.data.pipeline_graph as graph
+    from src.data.datasets import DatasetIdentity, DatasetLayer, PublishedDataset, publish_dataset
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+    values = {"ordinary_universe": 7.5, "investor_flow_ls": 2.25, "investor_flow": 3.5}
+    calls: list[str] = []
+    current_kind = ""
+
+    def reset() -> bool:
+        calls.append("reset")
+        return reset_supported
+
+    def peak() -> float:
+        calls.append("read")
+        return values[current_kind]
+
+    def build(kind: str):
+        def run(inner_ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
+            nonlocal current_kind
+            current_kind = kind
+            calls.append(f"build:{kind}")
+            result = publish_dataset(
+                layer_root=inner_ctx.runtime.workspace.silver_root,
+                identity=identities[kind],
+                partitions={"part.parquet": pl.DataFrame({"value": [1]})},
+            )
+            return PublishedDataset(dataset_id=result.dataset_id, path=result.path, rows=result.rows)
+
+        return run
+
+    identities = {
+        kind: DatasetIdentity(kind=kind, layer=DatasetLayer.SILVER, policy_version="v1", inputs={}, params={})
+        for kind in values
+    }
+    nodes = tuple(BuildNode(kind=kind, inputs=(), bronze_sources=(), build=build(kind)) for kind in values)
+    monkeypatch.setattr(graph, "_VALIDATED_GRAPH", nodes)
+    for kind in values:
+        monkeypatch.setitem(graph._PREVIEW_FNS, kind, lambda c, kind=kind: identities[kind])
+    monkeypatch.setattr(graph, "reset_peak_rss", reset)
+    monkeypatch.setattr(graph, "node_peak_rss_mb", peak)
+
+    def collect_ls(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        calls.append("collect:ls")
+        return CollectionStepReport("ls_investor_flow", "complete", 1, 0, 0)
+
+    def collect_kis(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        assert inner_ctx.registry.require("investor_flow_ls")
+        calls.append("collect:kis")
+        return CollectionStepReport("kis_investor_flow", kis_status, 1, 0, 0)
+
+    events: list[Mapping[str, object]] = []
+    with caplog.at_level(logging.INFO, logger=graph.__name__):
+        report = graph.refresh_scope(
+            ctx, collect=True, dry_run=False, emit=events.append,
+            steps=(("ls_investor_flow", collect_ls), ("kis_investor_flow", collect_kis)),
+        )
+    expected = values if kis_status == "complete" else {kind: values[kind] for kind in tuple(values)[:2]}
+    assert report.status == ("complete" if kis_status == "complete" else "blocked")
+    assert report.built == tuple(expected)
+    assert dict(report.node_peak_rss_mb) == expected
+    assert set(ctx.registry.snapshot()) == set(expected)
+    assert calls == [
+        "collect:ls", "reset", "build:ordinary_universe", "read",
+        "reset", "build:investor_flow_ls", "read", "collect:kis",
+        *(["reset", "build:investor_flow", "read"] if kis_status == "complete" else []),
+    ]
+    payloads = [item for item in events if item["type"] == "dataset"]
+    assert {item["kind"]: item["peak_rss_mb"] for item in payloads} == expected
+    for payload in payloads:
+        assert list(payload) == ["type", "kind", "dataset_id", "status", "peak_rss_mb"]
+    for kind, mb in expected.items():
+        assert f"kind={kind} dataset={report.datasets[kind]} status=built peak_rss_mb={int(mb)}" in caplog.text
