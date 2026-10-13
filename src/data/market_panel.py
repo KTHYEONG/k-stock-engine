@@ -21,6 +21,7 @@ from src.core.time import KRX_TZ
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
+    PartitionSpool,
     dataset_partition_paths,
     dataset_reference,
     load_manifest,
@@ -622,7 +623,6 @@ def materialize_market_panel(
             delisting_block_max_sessions=policy.delisting_block_max_sessions,
         )
     daily_files = [str(daily_by_session[session]) for session in calendar]
-    partitions: dict[str, pl.DataFrame] = {}
     partition_details: list[dict[str, object]] = []
     corporate_action_rows = 0
     gap_rows = 0
@@ -748,91 +748,94 @@ def materialize_market_panel(
             _LOG.info("[DATA] stage=market_panel bucket=%d/%d rows=%d", bucket + 1, instrument_buckets, frame.height)
 
         years = sorted({session.year for session in calendar})
-        for year in years:
-            year_frame = (
-                pl.scan_parquet(str(shard_dir / "bucket=*.parquet"))
-                .filter(pl.col("session").dt.year() == year)
-                .collect()
-                .sort(["session", "instrument_id"])
-                .select(list(_SCHEMA))
-            )
-            relative_path = f"year={year}/part.parquet"
-            partitions[relative_path] = year_frame
-            partition_details.append({"year": year, "rows": year_frame.height})
-            _LOG.info("[DATA] stage=market_panel year=%d rows=%d", year, year_frame.height)
+        with PartitionSpool() as spool:
+            for year in years:
+                year_frame = (
+                    pl.scan_parquet(str(shard_dir / "bucket=*.parquet"))
+                    .filter(pl.col("session").dt.year() == year)
+                    .collect()
+                    .sort(["session", "instrument_id"])
+                    .select(list(_SCHEMA))
+                )
+                relative_path = f"year={year}/part.parquet"
+                rows = spool.add(relative_path, year_frame)
+                partition_details.append({"year": year, "rows": rows})
+                _LOG.info("[DATA] stage=market_panel year=%d rows=%d", year, rows)
+                del year_frame
 
-    exits = [
-        {
-            "instrument_id": instrument_id,
-            "last_session": calendar[position],
-            "last_close": close,
-            "last_volume": volume,
-            "exit_kind": "halted_exit" if volume == 0 else "traded_exit",
-        }
-        for instrument_id, (position, close, volume) in sorted(last_obs.items())
-        if position < len(calendar) - 1
-    ]
-    exits_frame = (
-        pl.DataFrame(exits, schema=_EXITS_SCHEMA).sort("instrument_id")
-        if exits
-        else pl.DataFrame([], schema=_EXITS_SCHEMA)
-    )
-    partitions["instrument_exits.parquet"] = exits_frame
-    exits_traded = int(exits_frame.filter(pl.col("exit_kind") == "traded_exit").height)
-    exits_halted = int(exits_frame.filter(pl.col("exit_kind") == "halted_exit").height)
-    if market_actions_path is None:
-        audit_detail: object = "not_audited"
-        unexplained = 0
-    else:
-        ordered = sorted(audit_candidates, key=lambda item: (str(item["session"]), str(item["instrument_id"])))
-        unexplained = len(ordered)
-        samples = [
-            {"instrument_id": item["instrument_id"], "session": item["session"], "move": item["move"]}
-            for item in ordered[:20]
-        ]
-        audit_detail = {
-            "threshold": threshold_value,
-            "max_allowed": max_allowed,
-            "unexplained": unexplained,
-            "samples": samples,
-        }
-        if unexplained > max_allowed:
-            preview = "; ".join(
-                f"{item['instrument_id']}@{item['session']}:{float(item['move']):.4f}"
-                for item in ordered[:5]
+            exits = [
+                {
+                    "instrument_id": instrument_id,
+                    "last_session": calendar[position],
+                    "last_close": close,
+                    "last_volume": volume,
+                    "exit_kind": "halted_exit" if volume == 0 else "traded_exit",
+                }
+                for instrument_id, (position, close, volume) in sorted(last_obs.items())
+                if position < len(calendar) - 1
+            ]
+            exits_frame = (
+                pl.DataFrame(exits, schema=_EXITS_SCHEMA).sort("instrument_id")
+                if exits
+                else pl.DataFrame([], schema=_EXITS_SCHEMA)
             )
-            raise PITDataError(
-                f"unexplained limitless moves {unexplained} exceed {max_allowed}: {preview}"
+            exits_rows = spool.add("instrument_exits.parquet", exits_frame)
+            exits_traded = int(exits_frame.filter(pl.col("exit_kind") == "traded_exit").height)
+            exits_halted = int(exits_frame.filter(pl.col("exit_kind") == "halted_exit").height)
+            del exits_frame
+            if market_actions_path is None:
+                audit_detail: object = "not_audited"
+                unexplained = 0
+            else:
+                ordered = sorted(audit_candidates, key=lambda item: (str(item["session"]), str(item["instrument_id"])))
+                unexplained = len(ordered)
+                samples = [
+                    {"instrument_id": item["instrument_id"], "session": item["session"], "move": item["move"]}
+                    for item in ordered[:20]
+                ]
+                audit_detail = {
+                    "threshold": threshold_value,
+                    "max_allowed": max_allowed,
+                    "unexplained": unexplained,
+                    "samples": samples,
+                }
+                if unexplained > max_allowed:
+                    preview = "; ".join(
+                        f"{item['instrument_id']}@{item['session']}:{float(item['move']):.4f}"
+                        for item in ordered[:5]
+                    )
+                    raise PITDataError(
+                        f"unexplained limitless moves {unexplained} exceed {max_allowed}: {preview}"
+                    )
+            details = {
+                "years": years,
+                "daily_market_dataset_id": daily_id,
+                "universe_dataset_id": universe_id,
+                "corporate_action_rows": corporate_action_rows,
+                "gap_rows": gap_rows,
+                "limit_inapplicable_rows": limit_inapplicable_rows,
+                "open_at_upper_rows": open_at_upper_rows,
+                "open_at_lower_rows": open_at_lower_rows,
+                "entry_blocked_rows": entry_blocked_rows,
+                "market_actions_dataset_id": Path(market_actions_path).name if market_actions_path is not None else None,
+                "exits_traded": exits_traded,
+                "exits_halted": exits_halted,
+                "exits": {
+                    "path": "instrument_exits.parquet",
+                    "rows": exits_rows,
+                    "decision_safe": False,
+                },
+                "dividends": "not_integrated",
+                "exits_decision_safe": False,
+                "limitless_move_audit": audit_detail,
+                "partitions": partition_details,
+            }
+            published = publish_dataset(
+                layer_root=Path(gold_root),
+                identity=identity,
+                partitions=dict(spool.partitions),
+                details=details,
             )
-    details = {
-        "years": years,
-        "daily_market_dataset_id": daily_id,
-        "universe_dataset_id": universe_id,
-        "corporate_action_rows": corporate_action_rows,
-        "gap_rows": gap_rows,
-        "limit_inapplicable_rows": limit_inapplicable_rows,
-        "open_at_upper_rows": open_at_upper_rows,
-        "open_at_lower_rows": open_at_lower_rows,
-        "entry_blocked_rows": entry_blocked_rows,
-        "market_actions_dataset_id": Path(market_actions_path).name if market_actions_path is not None else None,
-        "exits_traded": exits_traded,
-        "exits_halted": exits_halted,
-        "exits": {
-            "path": "instrument_exits.parquet",
-            "rows": exits_frame.height,
-            "decision_safe": False,
-        },
-        "dividends": "not_integrated",
-        "exits_decision_safe": False,
-        "limitless_move_audit": audit_detail,
-        "partitions": partition_details,
-    }
-    published = publish_dataset(
-        layer_root=Path(gold_root),
-        identity=identity,
-        partitions=partitions,
-        details=details,
-    )
     return MarketPanelResult(
         dataset_path=published.path,
         dataset_id=published.dataset_id,
