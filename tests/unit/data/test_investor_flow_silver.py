@@ -388,3 +388,110 @@ def test_packed_bronze_builds_identical_flow(tmp_path: Path) -> None:
     ] == [
         (partition.path, partition.sha256) for partition in load_manifest(second.dataset_path).partitions
     ]
+
+
+def test_multi_year_build_publishes_paths_not_frames(tmp_path: Path, monkeypatch) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    sessions = (date(2025, 12, 29), date(2025, 12, 30), date(2026, 1, 2), date(2026, 1, 5))
+    bronze_root = tmp_path / "bronze"
+    universe_root = tmp_path / "silver"
+    silver_root = tmp_path / "silver"
+    publish_dataset(
+        layer_root=universe_root,
+        identity=DatasetIdentity(
+            kind="ordinary_universe",
+            layer=DatasetLayer.SILVER,
+            policy_version="krx-ordinary-equity-v1",
+            inputs={},
+            params={"calendar": ",".join(day.isoformat() for day in sessions)},
+        ),
+        partitions={
+            f"session={day.isoformat()}/part.parquet": pl.DataFrame(
+                {"session": [day], "instrument_id": ["KRX:005930"], "ticker": ["005930"], "eligible": [True]}
+            )
+            for day in sessions
+        },
+    )
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload(
+            "005930",
+            [_row("20251229"), _row("20251230"), _row("20260102"), _row("20260105")],
+            start="2025-12-29", end="2026-01-05",
+        ),
+    )
+    import src.data.investor_flow_silver as flow_module
+
+    captured: dict[str, object] = {}
+    original = flow_module.publish_dataset
+
+    def _spy(*, layer_root, identity, partitions, details=None, checks=()):  # type: ignore[no-untyped-def]
+        captured.update(partitions)
+        return original(
+            layer_root=layer_root, identity=identity, partitions=partitions,
+            details=details, checks=checks,
+        )
+
+    monkeypatch.setattr(flow_module, "publish_dataset", _spy)
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    from src.data.datasets import load_manifest
+
+    assert result.rows == 3
+    assert set(captured) == {"year=2025/part.parquet", "year=2026/part.parquet"}
+    assert all(isinstance(value, Path) for value in captured.values())
+    manifest = load_manifest(result.dataset_path)
+    assert [(part.path, part.rows) for part in manifest.partitions] == [
+        ("year=2025/part.parquet", 2), ("year=2026/part.parquet", 1),
+    ]
+    assert dict(manifest.details) == {
+        "universe_dataset_id": next(universe_root.glob("ordinary_universe_*")).name,
+        "partitions": [{"year": 2025, "rows": 2}, {"year": 2026, "rows": 1}],
+        "raw_pages": 1,
+        "conflict_cells": 0,
+        "identity_violation_cells": 0,
+        "identity_violation_keys": [],
+        "unavailable_tail_cells": 1,
+        "retail_exceeds_volume_rows": 0,
+        "dateless_rows": 0,
+        "tickers": 1,
+    }
+
+
+def test_rebuild_is_republish_noop(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"),
+    )
+    first = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    before = {
+        path.relative_to(first.dataset_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in first.dataset_path.rglob("*") if path.is_file()
+    }
+    second = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    assert second.dataset_id == first.dataset_id
+    assert second.dataset_path == first.dataset_path
+    assert {
+        path.relative_to(second.dataset_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in second.dataset_path.rglob("*") if path.is_file()
+    } == before
+
+
+def test_all_rows_outside_query_range_publishes_empty(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20260306")], start="2026-03-04", end="2026-03-05"),
+    )
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
+    )
+    assert result.rows == 0
