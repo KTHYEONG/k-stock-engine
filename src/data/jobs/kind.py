@@ -12,9 +12,11 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 
 from src.config.providers import KindPolicy, ProviderPolicy
 from src.core.pit import EvidenceKind, PITDataError
@@ -25,7 +27,7 @@ from src.data.payload_store import read_payload
 from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog, ReceiptIndexEntry
 from src.data.runtime import DataRuntime
 from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRawPayload
-from src.integrations.krx.kind import KindClient, KindNoticeRow, parse_kind_search_page
+from src.integrations.krx.kind import KindClient, KindNoticeDocument, KindNoticeRow, parse_kind_search_page
 from src.integrations.quota import ProviderQuotaStateStore
 
 __all__ = [
@@ -33,10 +35,16 @@ __all__ = [
     "KIND_JOBS",
     "KindNoticeDocumentJob",
     "KindNoticeSearchJob",
+    "KindPageCollector",
     "build_kind_job_context",
+    "collect_notice_document",
+    "collect_search_window",
     "kind_document_targets",
     "normalize_kind_title",
     "resolve_kind_job",
+    "select_document_targets",
+    "verify_document_payload",
+    "verify_search_payload",
 ]
 
 KIND_CHUNK_SIZE = 5
@@ -146,6 +154,201 @@ def _search_payload(
     )
 
 
+class KindPageCollector(Protocol):
+    """Minimal KIND surface shared by direct collection and the relay."""
+
+    def search_page(self, keyword: str, start: date, end: date, *, page_index: int) -> str: ...
+    def fetch_document(self, acptno: str) -> KindNoticeDocument: ...
+
+
+def collect_search_window(
+    collector: KindPageCollector,
+    *,
+    keyword: str,
+    start: date,
+    end: date,
+    today: date,
+    retrieved_at: datetime,
+) -> ScopedRawPayload:
+    """Fetch and validate every page of one keyword window; returns the receipt payload."""
+    key = _window_key(keyword, start, end)
+    first_html = collector.search_page(keyword, start, end, page_index=1)
+    first = parse_kind_search_page(first_html)
+    reported_total = first.reported_total
+    need = max(1, -(-reported_total // 100))
+    if need > _SEARCH_MAX_PAGES:
+        raise PITDataError(
+            f"KIND search window {key} needs {need} pages"
+            f" over the bound {_SEARCH_MAX_PAGES}; refusing to truncate"
+        )
+    pages = [first_html]
+    pages.extend(
+        collector.search_page(keyword, start, end, page_index=page_index)
+        for page_index in range(2, need + 1)
+    )
+    parsed = [parse_kind_search_page(page) for page in pages]
+    if end < today:
+        expected = parsed[0].reported_total
+        if any(page.reported_total != expected for page in parsed):
+            raise PITDataError(f"KIND search window {key} declares contradictory totals")
+        rows = [row for page in parsed for row in page.rows]
+        if len(rows) != reported_total:
+            raise PITDataError(
+                f"KIND search window {key} is incomplete:"
+                f" rows={len(rows)} reported_total={reported_total}"
+            )
+        seen: set[str] = set()
+        for row in rows:
+            if row.acptno in seen:
+                raise PITDataError(f"KIND search window {key} carries duplicate {row.acptno}")
+            seen.add(row.acptno)
+    return _search_payload(
+        keyword=keyword,
+        start=start,
+        end=end,
+        reported_total=reported_total,
+        pages=pages,
+        retrieved_at=retrieved_at,
+    )
+
+
+def collect_notice_document(
+    collector: KindPageCollector, row: KindNoticeRow, *, retrieved_at: datetime
+) -> ScopedRawPayload:
+    """Fetch one exchange notice body and return its receipt payload."""
+    document = collector.fetch_document(row.acptno)
+    body = json.dumps(
+        {
+            "acptno": document.acptno,
+            "doc_no": document.doc_no,
+            "template": document.template,
+            "html": document.html,
+            "disclosed_at": row.disclosed_at.isoformat(),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return ScopedRawPayload(
+        kind=EvidenceKind.DISCLOSURES,
+        source=KIND_NOTICE_DOCUMENT_SOURCE,
+        natural_key=row.acptno,
+        as_of=row.disclosed_at.date(),
+        fiscal_period=None,
+        status=EvidenceStatus.SUCCESS,
+        payload=body,
+        retrieved_at=retrieved_at,
+        source_label=f"kind:document:{row.acptno}",
+    )
+
+
+def verify_search_payload(payload: ScopedRawPayload, *, fetch_date: date) -> None:
+    """Re-derive a stored search window's integrity from its own pages; raises PITDataError."""
+    key = payload.natural_key
+    if payload.source != KIND_NOTICE_SEARCH_SOURCE:
+        raise PITDataError(f"KIND search payload {key} has source {payload.source!r}")
+    try:
+        document = json.loads(payload.payload)
+    except ValueError as exc:
+        raise PITDataError(f"KIND search payload {key} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise PITDataError(f"KIND search payload {key} is not a JSON object")
+    for field in ("keyword", "start", "end", "reported_total", "pages"):
+        if field not in document:
+            raise PITDataError(f"KIND search payload {key} is missing {field!r}")
+    keyword = document["keyword"]
+    start_raw = document["start"]
+    end_raw = document["end"]
+    reported_total = document["reported_total"]
+    pages = document["pages"]
+    if not isinstance(keyword, str) or not keyword:
+        raise PITDataError(f"KIND search payload {key} has invalid keyword")
+    try:
+        start = date.fromisoformat(start_raw) if isinstance(start_raw, str) else None
+        end = date.fromisoformat(end_raw) if isinstance(end_raw, str) else None
+    except ValueError as exc:
+        raise PITDataError(f"KIND search payload {key} has invalid start/end") from exc
+    if start is None or end is None:
+        raise PITDataError(f"KIND search payload {key} has invalid start/end")
+    if start > end:
+        raise PITDataError(f"KIND search payload {key} has start after end")
+    if isinstance(reported_total, bool) or not isinstance(reported_total, int) or reported_total < 0:
+        raise PITDataError(f"KIND search payload {key} has invalid reported_total")
+    if not isinstance(pages, list) or not pages or not all(isinstance(page, str) for page in pages):
+        raise PITDataError(f"KIND search payload {key} has invalid pages")
+    if key != _window_key(keyword, start, end):
+        raise PITDataError(f"KIND search payload {key} has natural_key mismatch")
+    if payload.as_of != end:
+        raise PITDataError(f"KIND search payload {key} has as_of mismatch")
+    expected_status = EvidenceStatus.EMPTY if reported_total == 0 else EvidenceStatus.SUCCESS
+    if payload.status is not expected_status:
+        raise PITDataError(f"KIND search payload {key} has status mismatch")
+    if end > fetch_date:
+        raise PITDataError(f"KIND search payload {key} ends after fetch_date")
+    try:
+        parsed = [parse_kind_search_page(page) for page in pages]
+    except PITDataError as exc:
+        raise PITDataError(f"KIND search payload {key} has invalid pages: {exc}") from exc
+    if any(page.reported_total != reported_total for page in parsed):
+        raise PITDataError(f"KIND search payload {key} declares contradictory totals")
+    rows = [row for page in parsed for row in page.rows]
+    if len(rows) != reported_total:
+        raise PITDataError(
+            f"KIND search payload {key} is incomplete: rows={len(rows)} reported_total={reported_total}"
+        )
+    seen: set[str] = set()
+    for row in rows:
+        if row.acptno in seen:
+            raise PITDataError(f"KIND search payload {key} carries duplicate {row.acptno}")
+        seen.add(row.acptno)
+
+
+def verify_document_payload(payload: ScopedRawPayload) -> None:
+    """Check a stored notice body's envelope and temporal identity; raises PITDataError."""
+    key = payload.natural_key
+    if payload.source != KIND_NOTICE_DOCUMENT_SOURCE:
+        raise PITDataError(f"KIND document payload {key} has source {payload.source!r}")
+    if payload.status is not EvidenceStatus.SUCCESS:
+        raise PITDataError(f"KIND document payload {key} has status {payload.status.value!r}")
+    try:
+        document = json.loads(payload.payload)
+    except ValueError as exc:
+        raise PITDataError(f"KIND document payload {key} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise PITDataError(f"KIND document payload {key} is not a JSON object")
+    acptno = document.get("acptno")
+    html = document.get("html")
+    disclosed_raw = document.get("disclosed_at")
+    if not isinstance(acptno, str) or not acptno:
+        raise PITDataError(f"KIND document payload {key} has invalid acptno")
+    if not isinstance(html, str) or not html:
+        raise PITDataError(f"KIND document payload {key} has invalid html")
+    if not isinstance(disclosed_raw, str):
+        raise PITDataError(f"KIND document payload {key} has invalid disclosed_at")
+    try:
+        disclosed_at = datetime.fromisoformat(disclosed_raw)
+    except ValueError as exc:
+        raise PITDataError(f"KIND document payload {key} has invalid disclosed_at") from exc
+    if key != acptno:
+        raise PITDataError(f"KIND document payload {key} has natural_key mismatch")
+    if payload.as_of != disclosed_at.date():
+        raise PITDataError(f"KIND document payload {key} has as_of mismatch")
+
+
+def select_document_targets(
+    rows: Iterable[KindNoticeRow], policy: KindPolicy
+) -> tuple[KindNoticeRow, ...]:
+    """Exchange-filed rows whose normalized title is in ``document_titles``, first row per ``acptno``."""
+    wanted = {normalize_kind_title(title) for title in policy.document_titles}
+    seen: dict[str, KindNoticeRow] = {}
+    for row in rows:
+        if not row.submitter.endswith("시장본부"):
+            continue
+        if normalize_kind_title(row.title) not in wanted:
+            continue
+        seen.setdefault(row.acptno, row)
+    return tuple(seen.values())
+
+
 class KindNoticeSearchJob:
     """Quarterly KIND title-keyword windows from the scope's evidence start.
 
@@ -196,56 +399,24 @@ class KindNoticeSearchJob:
         return units
 
     def fetch(self, ctx: JobContext, units: Sequence[JobUnit]) -> Sequence[ScopedRawPayload]:
-        today = _kst_today(ctx.now())
+        started_at = ctx.now()
+        today = _kst_today(started_at)
         out: list[ScopedRawPayload] = []
         for unit in units:
             keyword = unit.payload["keyword"]
             w_start = date.fromisoformat(unit.payload["window_start"])
             w_end = date.fromisoformat(unit.payload["window_end"])
-            first_html = ctx.collector.search_page(keyword, w_start, w_end, page_index=1)
-            first = parse_kind_search_page(first_html)
-            reported_total = first.reported_total
-            need = max(1, -(-reported_total // 100))
-            if need > _SEARCH_MAX_PAGES:
-                raise PITDataError(
-                    f"KIND search window {unit.natural_key} needs {need} pages"
-                    f" over the bound {_SEARCH_MAX_PAGES}; refusing to truncate"
-                )
-            pages = [first_html]
-            pages.extend(
-                ctx.collector.search_page(keyword, w_start, w_end, page_index=page_index)
-                for page_index in range(2, need + 1)
-            )
-            parsed = [parse_kind_search_page(page) for page in pages]
-            if w_end < today:
-                expected = parsed[0].reported_total
-                if any(page.reported_total != expected for page in parsed):
-                    raise PITDataError(
-                        f"KIND search window {unit.natural_key} declares contradictory totals"
-                    )
-                rows = [row for page in parsed for row in page.rows]
-                if len(rows) != reported_total:
-                    raise PITDataError(
-                        f"KIND search window {unit.natural_key} is incomplete:"
-                        f" rows={len(rows)} reported_total={reported_total}"
-                    )
-                seen: set[str] = set()
-                for row in rows:
-                    if row.acptno in seen:
-                        raise PITDataError(
-                            f"KIND search window {unit.natural_key} carries duplicate {row.acptno}"
-                        )
-                    seen.add(row.acptno)
             out.append(
-                _search_payload(
+                collect_search_window(
+                    ctx.collector,
                     keyword=keyword,
                     start=w_start,
                     end=w_end,
-                    reported_total=reported_total,
-                    pages=pages,
-                    retrieved_at=ctx.now(),
+                    today=today,
+                    retrieved_at=started_at,
                 )
             )
+            out[-1] = replace(out[-1], retrieved_at=ctx.now())
         return out
 
     def health_check(self, ctx: JobContext) -> None:
@@ -258,21 +429,12 @@ def kind_document_targets(catalog: ReceiptCatalog, policy: KindPolicy) -> tuple[
     Raises:
         PITDataError: a stored search page is unreadable, fails its hash, or does not parse.
     """
-    wanted = {normalize_kind_title(title) for title in policy.document_titles}
     rows: list[KindNoticeRow] = []
     for entry in catalog.entries(source=KIND_NOTICE_SEARCH_SOURCE):
         document = _read_search_document(entry.content_hash, Path(entry.payload_path))
         for page in _search_pages(document, label=entry.natural_key):
             rows.extend(parse_kind_search_page(page).rows)
-    targets = [
-        row
-        for row in rows
-        if row.submitter.endswith("시장본부") and normalize_kind_title(row.title) in wanted
-    ]
-    seen: dict[str, KindNoticeRow] = {}
-    for row in targets:
-        seen.setdefault(row.acptno, row)
-    return tuple(seen.values())
+    return select_document_targets(rows, policy)
 
 
 class KindNoticeDocumentJob:
@@ -305,31 +467,8 @@ class KindNoticeDocumentJob:
             row = targets.get(acptno)
             if row is None:
                 raise PITDataError(f"KIND document target {acptno} has no search row")
-            document = ctx.collector.fetch_document(acptno)
-            body = json.dumps(
-                {
-                    "acptno": document.acptno,
-                    "doc_no": document.doc_no,
-                    "template": document.template,
-                    "html": document.html,
-                    "disclosed_at": row.disclosed_at.isoformat(),
-                },
-                sort_keys=True,
-                ensure_ascii=False,
-            ).encode("utf-8")
-            out.append(
-                ScopedRawPayload(
-                    kind=EvidenceKind.DISCLOSURES,
-                    source=KIND_NOTICE_DOCUMENT_SOURCE,
-                    natural_key=acptno,
-                    as_of=row.disclosed_at.date(),
-                    fiscal_period=None,
-                    status=EvidenceStatus.SUCCESS,
-                    payload=body,
-                    retrieved_at=ctx.now(),
-                    source_label=f"kind:document:{acptno}",
-                )
-            )
+            payload = collect_notice_document(ctx.collector, row, retrieved_at=row.disclosed_at)
+            out.append(replace(payload, retrieved_at=ctx.now()))
         return out
 
     def health_check(self, ctx: JobContext) -> None:

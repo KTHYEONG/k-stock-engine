@@ -511,6 +511,30 @@ def test_kind_policy_requires_budget() -> None:
         )
 
 
+def test_kind_policy_relay_fields_default_and_load() -> None:
+    provider = _policy()
+
+    assert (
+        provider.kind.relay_window_lookback_days,
+        provider.kind.relay_document_lookback_days,
+        provider.kind.relay_max_age_hours,
+        provider.kind.relay_clock_skew_seconds,
+        provider.kind.relay_attempts,
+    ) == (14, 14, 36, 300, 3)
+
+
+def test_kind_policy_relay_fields_reject_non_positive() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import KindPolicy
+
+    values = _policy().kind.model_dump()
+    values["relay_max_age_hours"] = 0
+    with pytest.raises(pydantic.ValidationError):
+        KindPolicy.model_validate(values)
+
+
 def test_kis_pool_admission_policy_loads() -> None:
     import pydantic
     import pytest
