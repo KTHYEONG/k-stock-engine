@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
@@ -237,7 +238,7 @@ def _load_daily_flag_rows(
             continue
         hit = cached.get(day)
         if hit is not None and hit[0] == entry.content_hash:
-            by_session[day] = dict(hit[1])
+            by_session[day] = hit[1]
             continue
         dirty = True
         try:
@@ -278,51 +279,70 @@ def _load_daily_flag_rows(
 
 
 def _read_flag_cache(path: Path) -> dict[date, tuple[str, dict[str, bool]]]:
-    """Cached per-session flags, or empty when the cache is missing or unreadable."""
+    """Cached per-session flags; empty when missing, unreadable or inconsistent."""
     try:
         frame = pl.read_parquet(path)
     except Exception:
         return {}
     if not {"session", "source_hash", "ticker", "flagged"}.issubset(set(frame.columns)):
         return {}
-    cached: dict[date, tuple[str, dict[str, bool]]] = {}
-    covered: set[date] = set()
-    for row in frame.iter_rows(named=True):
-        session = row.get("session")
-        source = row.get("source_hash")
-        if not isinstance(session, date) or not isinstance(source, str) or not source:
-            return {}
-        if session not in cached:
-            cached[session] = (source, {})
-        elif cached[session][0] != source:
-            return {}
-        ticker = row.get("ticker")
-        if ticker is None:
-            covered.add(session)
+    if frame.height == 0:
+        return {}
+    frame = frame.select(["session", "source_hash", "ticker", "flagged"])
+    session_dtype = frame["session"].dtype
+    if frame["session"].null_count() > 0 or (
+        session_dtype.base_type() not in (pl.Date, pl.Datetime)
+    ):
+        return {}
+    if frame["source_hash"].null_count() > 0 or frame["source_hash"].dtype != pl.String:
+        return {}
+    if bool((frame["source_hash"].str.len_bytes() == 0).any()):
+        return {}
+    stats = frame.group_by("session").agg(
+        pl.col("source_hash").n_unique().alias("_nhash"),
+        pl.col("source_hash").first().alias("_shash"),
+        pl.col("ticker").is_null().any().alias("_covered"),
+    )
+    if bool((stats["_nhash"] > 1).any()):
+        return {}
+    covered_rows = stats.filter(pl.col("_covered"))
+    if covered_rows.height == 0:
+        return {}
+    hash_map = dict(zip(covered_rows["session"].to_list(), covered_rows["_shash"].to_list(), strict=True))
+    cached: dict[date, tuple[str, dict[str, bool]]] = {
+        session: (str(source), {}) for session, source in hash_map.items()
+    }
+    data = frame.filter(pl.col("ticker").is_not_null())
+    if data.height == 0:
+        return cached
+    for part in data.partition_by("session", maintain_order=True):
+        session = part["session"][0]
+        bucket = cached.get(session)
+        if bucket is None:
             continue
-        flags = cached[session][1]
-        flags[str(ticker)] = flags.get(str(ticker), False) or bool(row.get("flagged"))
-    return {session: value for session, value in cached.items() if session in covered}
+        target = bucket[1]
+        for ticker, flagged in zip(part["ticker"].to_list(), part["flagged"].to_list(), strict=True):
+            key = sys.intern(str(ticker))
+            target[key] = target.get(key, False) or bool(flagged)
+    return cached
 
 
 def _write_flag_cache(path: Path, flags: dict[date, tuple[str, dict[str, bool]]]) -> None:
-    """Atomically rewrite the per-session flag cache."""
+    """Atomically rewrite the per-session flag cache; raises PITDataError when unwritable."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, object]] = []
+    frames: list[pl.DataFrame] = []
     for session in sorted(flags):
         source_hash, tickers = flags[session]
-        rows.append({"session": session, "source_hash": source_hash, "ticker": None, "flagged": False})
-        rows.extend(
-            {"session": session, "source_hash": source_hash, "ticker": ticker, "flagged": bool(tickers[ticker])}
-            for ticker in sorted(tickers)
-        )
+        keys = sorted(tickers)
+        n = len(keys) + 1
+        session_col = pl.repeat(session, n, dtype=pl.Date, eager=True).alias("session")
+        source_col = pl.repeat(source_hash, n, dtype=pl.String, eager=True).alias("source_hash")
+        ticker_col = pl.Series("ticker", [None, *keys], dtype=pl.String)
+        flagged_col = pl.Series("flagged", [False, *(bool(tickers[key]) for key in keys)], dtype=pl.Boolean)
+        frames.append(pl.DataFrame([session_col, source_col, ticker_col, flagged_col]))
     frame = (
-        pl.DataFrame(
-            rows,
-            schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
-        )
-        if rows
+        pl.concat(frames, how="vertical", rechunk=True)
+        if frames
         else pl.DataFrame(
             [],
             schema={"session": pl.Date, "source_hash": pl.String, "ticker": pl.String, "flagged": pl.Boolean},
@@ -331,6 +351,7 @@ def _write_flag_cache(path: Path, flags: dict[date, tuple[str, dict[str, bool]]]
     fd = -1
     tmp_name = ""
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
         os.close(fd)
         frame.write_parquet(tmp_name)
