@@ -20,6 +20,7 @@ from src.core.time import KRX_TZ
 from src.data.datasets import (
     DatasetIdentity,
     DatasetLayer,
+    PartitionSpool,
     dataset_reference,
     publish_dataset,
     resolve_bronze_digest,
@@ -253,7 +254,6 @@ def materialize_investor_flow_silver(
     dateless_rows = 0
     parsed_pages = 0
     parsed_rows = 0
-    partitions: dict[str, pl.DataFrame] = {}
     partition_details: list[dict[str, object]] = []
     conflict_cells = 0
     unavailable_tail_cells = 0
@@ -316,89 +316,93 @@ def materialize_investor_flow_silver(
             schema={"session": pl.Date, "available_session": pl.Date},
         )
         shards = sorted(shard_dir.glob("shard-*.parquet"))
-        for year in sorted({session.year for session in calendar}):
-            if not shards:
-                continue
-            cells = (
-                pl.scan_parquet(shards)
-                .filter(pl.col("session").dt.year() == year)
-                .collect()
-                .join(violations, on=["session", "ticker"], how="anti")
-            )
-            grouped = (
-                cells.sort("source_hash")
-                .group_by(["session", "ticker"], maintain_order=True)
-                .agg(pl.struct(list(_GROUP_CODES)).n_unique().alias("_distinct"), pl.all().first())
-            )
-            conflict_cells += grouped.filter(pl.col("_distinct") > 1).height
-            resolved = grouped.filter(pl.col("_distinct") == 1).join(
-                availability, on="session", how="left"
-            )
-            unavailable_tail_cells += resolved.filter(pl.col("available_session").is_null()).height
-            resolved = resolved.filter(pl.col("available_session").is_not_null())
-            retail_exceeds_volume_rows += resolved.filter(
-                pl.col("tjj0008").abs() > pl.col("ls_volume")
-            ).height
-            part = resolved.select(
-                "session",
-                pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
-                "ticker",
-                pl.lit("LS").alias("provider"),
-                pl.col("tjj0008").alias("individual_net_shares"),
-                pl.col("tjj0016").alias("foreign_net_shares"),
-                pl.col("tjj0018").alias("institution_net_shares"),
-                pl.col("tjj0017").alias("other_net_shares"),
-                *(pl.col(column.removesuffix("_net_shares")).alias(column) for column in _SUBGROUP_COLUMNS),
-                "ls_close",
-                "ls_volume",
-                "ls_value_mkrw",
-                pl.col("available_session")
-                .dt.combine(policy.available_time)
-                .dt.replace_time_zone(str(KRX_TZ))
-                .alias("available_at"),
-                "source_hash",
-                pl.lit(REVISION).alias("policy_version"),
-            ).cast(pl.Schema(_SCHEMA)).sort(["session", "ticker"])
-            if part.height == 0:
-                continue
-            relative_path = f"year={year}/part.parquet"
-            partitions[relative_path] = part
-            partition_details.append({"year": year, "rows": part.height})
-            total_rows += part.height
-            tickers.update(part["ticker"].unique().to_list())
+        with PartitionSpool() as spool:
+            for year in sorted({session.year for session in calendar}):
+                if not shards:
+                    continue
+                cells = (
+                    pl.scan_parquet(shards)
+                    .filter(pl.col("session").dt.year() == year)
+                    .collect()
+                    .join(violations, on=["session", "ticker"], how="anti")
+                )
+                grouped = (
+                    cells.sort("source_hash")
+                    .group_by(["session", "ticker"], maintain_order=True)
+                    .agg(pl.struct(list(_GROUP_CODES)).n_unique().alias("_distinct"), pl.all().first())
+                )
+                conflict_cells += grouped.filter(pl.col("_distinct") > 1).height
+                resolved = grouped.filter(pl.col("_distinct") == 1).join(
+                    availability, on="session", how="left"
+                )
+                unavailable_tail_cells += resolved.filter(pl.col("available_session").is_null()).height
+                resolved = resolved.filter(pl.col("available_session").is_not_null())
+                retail_exceeds_volume_rows += resolved.filter(
+                    pl.col("tjj0008").abs() > pl.col("ls_volume")
+                ).height
+                part = resolved.select(
+                    "session",
+                    pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
+                    "ticker",
+                    pl.lit("LS").alias("provider"),
+                    pl.col("tjj0008").alias("individual_net_shares"),
+                    pl.col("tjj0016").alias("foreign_net_shares"),
+                    pl.col("tjj0018").alias("institution_net_shares"),
+                    pl.col("tjj0017").alias("other_net_shares"),
+                    *(pl.col(column.removesuffix("_net_shares")).alias(column) for column in _SUBGROUP_COLUMNS),
+                    "ls_close",
+                    "ls_volume",
+                    "ls_value_mkrw",
+                    pl.col("available_session")
+                    .dt.combine(policy.available_time)
+                    .dt.replace_time_zone(str(KRX_TZ))
+                    .alias("available_at"),
+                    "source_hash",
+                    pl.lit(REVISION).alias("policy_version"),
+                ).cast(pl.Schema(_SCHEMA)).sort(["session", "ticker"])
+                if part.height == 0:
+                    del cells, grouped, resolved, part
+                    continue
+                relative_path = f"year={year}/part.parquet"
+                del cells, grouped, resolved
+                rows = spool.add(relative_path, part)
+                partition_details.append({"year": year, "rows": rows})
+                total_rows += rows
+                tickers.update(part["ticker"].unique().to_list())
+                del part
 
-    flow_digest = resolve_bronze_digest(
-        bronze_flow_digest,
-        bronze_page_hashes,
-        label="LS investor-flow Bronze source",
-    )
-    identity = DatasetIdentity(
-        kind="investor_flow_ls",
-        layer=DatasetLayer.SILVER,
-        policy_version=REVISION,
-        inputs={"universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"), "bronze_flow": flow_digest},
-        params={
-            "available_session_lag": policy.available_session_lag,
-            "available_time": policy.available_time.isoformat(),
-        },
-    )
-    published = publish_dataset(
-        layer_root=Path(silver_root),
-        identity=identity,
-        partitions=partitions,
-        details={
-            "universe_dataset_id": universe_dataset_id,
-            "partitions": partition_details,
-            "raw_pages": len(raw_hashes),
-            "conflict_cells": conflict_cells,
-            "identity_violation_cells": len(violation_keys),
-            "identity_violation_keys": sorted(f"{day}:{ticker}" for day, ticker in violation_keys),
-            "unavailable_tail_cells": unavailable_tail_cells,
-            "retail_exceeds_volume_rows": retail_exceeds_volume_rows,
-            "dateless_rows": dateless_rows,
-            "tickers": len(tickers),
-        },
-    )
+            flow_digest = resolve_bronze_digest(
+                bronze_flow_digest,
+                bronze_page_hashes,
+                label="LS investor-flow Bronze source",
+            )
+            identity = DatasetIdentity(
+                kind="investor_flow_ls",
+                layer=DatasetLayer.SILVER,
+                policy_version=REVISION,
+                inputs={"universe": dataset_reference(universe_dataset_id, kind="ordinary_universe"), "bronze_flow": flow_digest},
+                params={
+                    "available_session_lag": policy.available_session_lag,
+                    "available_time": policy.available_time.isoformat(),
+                },
+            )
+            published = publish_dataset(
+                layer_root=Path(silver_root),
+                identity=identity,
+                partitions=dict(spool.partitions),
+                details={
+                    "universe_dataset_id": universe_dataset_id,
+                    "partitions": partition_details,
+                    "raw_pages": len(raw_hashes),
+                    "conflict_cells": conflict_cells,
+                    "identity_violation_cells": len(violation_keys),
+                    "identity_violation_keys": sorted(f"{day}:{ticker}" for day, ticker in violation_keys),
+                    "unavailable_tail_cells": unavailable_tail_cells,
+                    "retail_exceeds_volume_rows": retail_exceeds_volume_rows,
+                    "dateless_rows": dateless_rows,
+                    "tickers": len(tickers),
+                },
+            )
     return InvestorFlowSilverResult(
         dataset_path=published.path,
         dataset_id=published.dataset_id,
