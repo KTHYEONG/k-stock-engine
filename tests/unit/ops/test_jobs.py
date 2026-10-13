@@ -934,3 +934,44 @@ def test_morning_records_peak_rss(
     assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == (0 if mode == "sealed" else 1)
     event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
     assert event["metrics"]["peak_rss_mb"] == 123.5
+
+
+def _report_with_peaks(peaks: object) -> SimpleNamespace:
+    return SimpleNamespace(blocking_job=None, degraded_jobs=(), planned=["a"], built=["a"],
+                           node_peak_rss_mb=peaks)
+
+
+def test_collect_eve_records_node_peaks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _report_with_peaks({"x": 12.34, "y": 5.678}))
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["node_peak_rss_mb"] == {"x": 12.3, "y": 5.7}
+
+
+def test_morning_records_node_peaks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **k: _report_with_peaks({"x": 9.876}))
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["node_peak_rss_mb"] == {"x": 9.9}
+
+
+def test_report_without_peaks_records_empty_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(
+        jobs, "_run_refresh", lambda *a, **k: SimpleNamespace(blocking_job=None, degraded_jobs=(), planned=[], built=[]),
+    )
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["node_peak_rss_mb"] == {}
+    assert event["outcome"] == "OK"
+
+
+def test_node_peak_metrics_ignores_malformed_reports() -> None:
+    assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb=["not-a-mapping"])) == {}
+    assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb={"x": "bad"})) == {}

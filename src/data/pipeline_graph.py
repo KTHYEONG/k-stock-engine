@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -34,6 +35,58 @@ from src.data.runtime import DataRuntime
 _LOG = logging.getLogger(__name__)
 
 _NON_STALENESS_PARAMS: Final = frozenset({"decision_time"})
+
+
+def node_peak_rss_mb(*, proc_root: Path = Path("/proc")) -> float | None:
+    """Peak resident set in MB since the last reset."""
+    try:
+        text = (Path(proc_root) / "self" / "status").read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            match = re.fullmatch(r"VmHWM:\s+([0-9]+)\s+kB\s*", line)
+            if match is not None:
+                return float(int(match[1])) / 1024.0
+    except (OSError, ValueError, OverflowError):
+        return None
+    return None
+
+
+def reset_peak_rss(*, proc_root: Path = Path("/proc")) -> bool:
+    """Reset the kernel peak-RSS watermark; False when unsupported."""
+    try:
+        (Path(proc_root) / "self" / "clear_refs").write_text("5", encoding="ascii")
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _build_with_peak(
+    node: BuildNode, ctx: RefreshContext, inputs: Mapping[str, str]
+) -> tuple[PublishedDataset, float | None]:
+    """Reset the watermark, run one node build, then read its peak."""
+    reset_peak_rss()
+    outcome = node.build(ctx, inputs)
+    return outcome, node_peak_rss_mb()
+
+
+def _dataset_payload(kind: str, dataset_id: str, peak: float | None) -> Mapping[str, object]:
+    """Dataset progress event, carrying the peak only when available."""
+    payload: dict[str, object] = {"type": "dataset", "kind": kind, "dataset_id": dataset_id, "status": "built"}
+    if peak is not None:
+        payload["peak_rss_mb"] = peak
+    return payload
+
+
+def _log_build(kind: str, dataset_id: str, peak: float | None) -> None:
+    """Emit the refresh_build line, carrying the peak only when available."""
+    if peak is not None:
+        _LOG.info(
+            "[DATA] stage=refresh_build kind=%s dataset=%s status=built peak_rss_mb=%d",
+            kind,
+            dataset_id,
+            int(peak),
+        )
+    else:
+        _LOG.info("[DATA] stage=refresh_build kind=%s dataset=%s status=built", kind, dataset_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +133,7 @@ class RefreshReport:
     blocking_job: str | None
     collection: tuple[Mapping[str, object], ...]
     degraded_jobs: tuple[str, ...] = ()
+    node_peak_rss_mb: Mapping[str, float] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1219,6 +1273,7 @@ def run_refresh(
         )
     snapshot = dict(ctx.registry.snapshot())
     built: dict[str, PublishedDataset] = {}
+    peaks: dict[str, float] = {}
     known = _disk_dataset_ids(ctx, set(snapshot.values()))
     for node in plan:
         try:
@@ -1228,14 +1283,16 @@ def run_refresh(
             }
         except KeyError as exc:
             raise PITDataError(f"refresh input is not registered: {exc}") from exc
-        outcome = node.build(ctx, MappingProxyType(resolved))
+        outcome, peak = _build_with_peak(node, ctx, MappingProxyType(resolved))
         verification = verify_dataset(outcome.path, known_ids=known.__contains__)
         if not verification.passed:
             raise PITDataError(f"refresh verification failed for {node.kind}: {'; '.join(verification.failures)}")
         built[node.kind] = outcome
         known.add(outcome.dataset_id)
-        emit({"type": "dataset", "kind": node.kind, "dataset_id": outcome.dataset_id, "status": "built"})
-        _LOG.info("[DATA] stage=refresh_build kind=%s dataset=%s status=built", node.kind, outcome.dataset_id)
+        if peak is not None:
+            peaks[node.kind] = peak
+        emit(_dataset_payload(node.kind, outcome.dataset_id, peak))
+        _log_build(node.kind, outcome.dataset_id, peak)
     if built:
         ctx.registry.register_many({kind: outcome.dataset_id for kind, outcome in built.items()})
     return RefreshReport(
@@ -1246,6 +1303,7 @@ def run_refresh(
         datasets=MappingProxyType({kind: outcome.dataset_id for kind, outcome in built.items()}),
         blocking_job=None,
         collection=(),
+        node_peak_rss_mb=MappingProxyType(dict(peaks)),
     )
 
 
@@ -1631,8 +1689,10 @@ def _build_nodes(
     built: dict[str, PublishedDataset],
     known: set[str],
     emit: Callable[[Mapping[str, object]], None],
-) -> None:
+    peaks: dict[str, float] | None = None,
+) -> dict[str, float]:
     """Build one ordered subset, verifying each and emitting progress."""
+    owned: dict[str, float] = {} if peaks is None else peaks
     for node in nodes:
         try:
             resolved = {
@@ -1641,14 +1701,17 @@ def _build_nodes(
             }
         except KeyError as exc:
             raise PITDataError(f"refresh input is not registered: {exc}") from exc
-        outcome = node.build(ctx, MappingProxyType(resolved))
+        outcome, peak = _build_with_peak(node, ctx, MappingProxyType(resolved))
         verification = verify_dataset(outcome.path, known_ids=known.__contains__)
         if not verification.passed:
             raise PITDataError(f"refresh verification failed for {node.kind}: {'; '.join(verification.failures)}")
         built[node.kind] = outcome
         known.add(outcome.dataset_id)
-        emit({"type": "dataset", "kind": node.kind, "dataset_id": outcome.dataset_id, "status": "built"})
-        _LOG.info("[DATA] stage=refresh_build kind=%s dataset=%s status=built", node.kind, outcome.dataset_id)
+        if peak is not None:
+            owned[node.kind] = peak
+        emit(_dataset_payload(node.kind, outcome.dataset_id, peak))
+        _log_build(node.kind, outcome.dataset_id, peak)
+    return owned
 
 
 def refresh_scope(
@@ -1775,8 +1838,9 @@ def refresh_scope(
     first, _ = _phase_split(plan)
     snapshot = dict(ctx.registry.snapshot())
     built: dict[str, PublishedDataset] = {}
+    peaks: dict[str, float] = {}
     known = _disk_dataset_ids(ctx, set(snapshot.values()))
-    _build_nodes(ctx, first, snapshot, built, known, emit)
+    _build_nodes(ctx, first, snapshot, built, known, emit, peaks)
     if built:
         ctx.registry.register_many({kind: outcome.dataset_id for kind, outcome in built.items()})
         snapshot = dict(ctx.registry.snapshot())
@@ -1803,12 +1867,13 @@ def refresh_scope(
             blocking_job=kis_collection.blocking_job,
             collection=summaries,
             degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
+            node_peak_rss_mb=MappingProxyType(dict(peaks)),
         )
     remaining = plan_refresh(ctx)
     _, second = _phase_split(remaining)
     # Nodes already built in the first phase are registered, so the fresh plan
     # only contains what is still stale; build exactly that remainder.
-    _build_nodes(ctx, second, snapshot, built, known, emit)
+    _build_nodes(ctx, second, snapshot, built, known, emit, peaks)
     if second:
         ctx.registry.register_many(
             {node.kind: built[node.kind].dataset_id for node in second if node.kind in built}
@@ -1822,6 +1887,7 @@ def refresh_scope(
         blocking_job=None,
         collection=summaries,
         degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
+        node_peak_rss_mb=MappingProxyType(dict(peaks)),
     )
 
 
@@ -1835,8 +1901,10 @@ __all__ = [
     "RefreshContext",
     "RefreshReport",
     "build_refresh_context",
+    "node_peak_rss_mb",
     "plan_refresh",
     "refresh_scope",
+    "reset_peak_rss",
     "run_collection_jobs",
     "run_refresh",
     "warm_daily_flag_cache",
