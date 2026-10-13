@@ -286,17 +286,34 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
         return 1
     planned = list(getattr(report, "planned", ()))
     built = list(getattr(report, "built", ()))
+    from src.data.pipeline_graph import build_refresh_context, warm_daily_flag_cache
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        warm_ctx = build_refresh_context(resolve_data_runtime(data_root=root), decision_time=moment)
+        warm_metrics: dict[str, object] = {"flag_cache_sessions": int(warm_daily_flag_cache(warm_ctx))}
+        warm_error: str | None = None
+    except Exception as exc:
+        warm_metrics = {"flag_cache_error": type(exc).__name__}
+        warm_error = type(exc).__name__
     if degraded:
         _record(
             root, "collect_eve", "DEGRADED", today, moment,
             reason=f"optional:{','.join(degraded)}"[:300],
             metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
-                      "peak_rss_mb": _peak_rss_mb()},
+                      "peak_rss_mb": _peak_rss_mb(), **warm_metrics},
+        )
+        return 0
+    if warm_error is not None:
+        _record(
+            root, "collect_eve", "DEGRADED", today, moment, reason="flag_cache_warm_failed",
+            metrics={"planned": len(planned), "built": len(built),
+                      "peak_rss_mb": _peak_rss_mb(), **warm_metrics},
         )
         return 0
     _record(
         root, "collect_eve", "OK", today, moment,
-        metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb()},
+        metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(), **warm_metrics},
     )
     return 0
 
@@ -310,7 +327,8 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     refused = _guard_headroom(root)
     if refused is not None:
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason=str(refused)[:300],
-                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
+                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb,
+                         "peak_rss_mb": _peak_rss_mb()})
         return 1
     try:
         data_session = _previous_session(today)
@@ -329,7 +347,7 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     if not waited:
         _record(
             root, "morning", "NO_DECISION", today, _aware(now()), reason="krx_absent_at_deadline",
-            metrics={"data_session": data_session.isoformat(), "wait_s": wait_s},
+            metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb()},
         )
         return 1
     phase = "build"
@@ -350,11 +368,11 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     except PITDataError as exc:
         outcome = "DEGRADED" if phase == "shadow" else "NO_DECISION"
         _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__,
-                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s})
+                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb()})
         return 1
     except Exception as exc:
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
-                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s})
+                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb()})
         return 1
     elapsed_s = time.monotonic() - started
     metrics: dict[str, object] = {

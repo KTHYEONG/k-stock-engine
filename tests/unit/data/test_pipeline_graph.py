@@ -1569,3 +1569,66 @@ def test_keyboard_interrupt_propagates(tmp_path: Path) -> None:
             ctx, dry_run=False, emit=lambda payload: None,
             steps=(("kind_notice_search", _boom),),
         )
+
+
+def test_warm_daily_flags_fills_and_reuses_shared_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from src.core.time import KRX_TZ, SessionCalendar
+    from src.data import market_actions, pipeline_graph as graph
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+    days = (date(2025, 12, 1), date(2025, 12, 2), date(2025, 12, 3))
+    calendar = SessionCalendar(tuple(datetime(day.year, day.month, day.day, 9, tzinfo=KRX_TZ) for day in days))
+    monkeypatch.setattr(graph, "_build_calendar", lambda ctx: calendar)
+    ctx.runtime.workspace.bronze_root.mkdir(parents=True, exist_ok=True)
+    for day in days:
+        payload = ctx.runtime.workspace.bronze_root / f"daily-{day}.json"
+        payload.write_text(json.dumps({"records": [{
+            "ISU_CD": "005930", "SECT_TP_NM": "일반" if day == days[0] else "관리종목(소속부없음)",
+        }]}))
+        _publish_catalog_entry(
+            ctx.catalog, source="krx_daily_market", key=day.isoformat(), as_of=day,
+            payload_path=payload, retrieved_at=DECISION_TIME,
+        )
+    bronze_before = {path: path.read_bytes() for path in ctx.runtime.workspace.bronze_root.rglob("*") if path.is_file()}
+    assert graph.warm_daily_flag_cache(ctx) == 3
+    cache = ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet"
+    assert cache.is_file()
+    assert list(ctx.runtime.workspace.silver_root.iterdir()) == []
+    assert dict(ctx.registry.snapshot()) == {}
+    assert bronze_before == {path: path.read_bytes() for path in ctx.runtime.workspace.bronze_root.rglob("*") if path.is_file()}
+    stamp = cache.stat().st_mtime_ns
+
+    def unexpected_parse(path: Path) -> bytes:
+        pytest.fail("covered daily payload must be served from the warmed cache")
+
+    monkeypatch.setattr(market_actions, "read_payload", unexpected_parse)
+    assert graph.warm_daily_flag_cache(ctx) == 3
+    assert cache.stat().st_mtime_ns == stamp
+    monkeypatch.setattr("src.data.jobs.universe.read_corp_code_bridge", lambda catalog: ({}, "bridge"))
+    monkeypatch.setattr("src.config.load_provider_policy", lambda config: SimpleNamespace(
+        kind=SimpleNamespace(search_keywords=(), max_stale_sessions=0),
+    ))
+    built = graph._build_market_actions(ctx, {})
+    assert built.path.is_dir()
+    assert built.rows == 1
+    assert cache.stat().st_mtime_ns == stamp
+
+
+@pytest.mark.parametrize("error_type", [PITDataError, OSError])
+def test_warm_daily_flags_propagates_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+) -> None:
+    from src.data import pipeline_graph as graph
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path), decision_time=DECISION_TIME)
+
+    def fail(ctx: RefreshContext) -> object:
+        raise error_type("calendar unavailable")
+
+    monkeypatch.setattr(graph, "_build_calendar", fail)
+    with pytest.raises(error_type, match="calendar unavailable"):
+        graph.warm_daily_flag_cache(ctx)
