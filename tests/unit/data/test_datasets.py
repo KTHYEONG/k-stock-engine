@@ -796,3 +796,213 @@ def test_dataset_check_validation_rejects_invalid_gate_shapes(tmp_path: Path) ->
     for checks in invalid_checks:
         with pytest.raises(PITDataError):
             publish_dataset(layer_root=tmp_path / "silver", identity=identity, partitions={"part.parquet": _frame()}, checks=checks)
+
+
+def test_spooled_partition_is_byte_identical_to_frame(tmp_path: Path) -> None:
+    from src.data.datasets import PartitionSpool
+
+    frames = {
+        "year=2024/part.parquet": _frame(1),
+        "year=2025/part.parquet": _frame(2).with_columns(pl.lit(date(2025, 1, 2)).alias("session")),
+    }
+    identity = _identity(kind="daily_market", layer=DatasetLayer.SILVER)
+    direct = publish_dataset(
+        layer_root=tmp_path / "direct", identity=identity, partitions=dict(frames)
+    )
+    with PartitionSpool() as spool:
+        for relative_path, frame in frames.items():
+            assert spool.add(relative_path, frame) == frame.height
+        spooled = publish_dataset(
+            layer_root=tmp_path / "spooled", identity=identity, partitions=dict(spool.partitions)
+        )
+    assert spooled.dataset_id == direct.dataset_id
+    assert load_manifest(spooled.path).partitions == load_manifest(direct.path).partitions
+
+
+def test_mixed_frame_and_path_partitions_publish(tmp_path: Path) -> None:
+    from src.data.datasets import PartitionSpool
+
+    identity = _identity(kind="daily_market", layer=DatasetLayer.SILVER)
+    with PartitionSpool() as spool:
+        spool.add("b/part.parquet", _frame(2))
+        spooled = dict(spool.partitions)
+        published = publish_dataset(
+            layer_root=tmp_path / "silver",
+            identity=identity,
+            partitions={"a/part.parquet": _frame(1), "b/part.parquet": spooled["b/part.parquet"]},
+        )
+    manifest = load_manifest(published.path)
+    assert [p.path for p in manifest.partitions] == ["a/part.parquet", "b/part.parquet"]
+    assert manifest.rows == 2
+    assert verify_dataset(published.path, known_ids=lambda _dataset_id: True).passed
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "directory"])
+def test_missing_path_partition_fails_closed(tmp_path: Path, source_kind: str) -> None:
+    layer_root = tmp_path / "silver"
+    source = tmp_path / "nope.parquet"
+    if source_kind == "directory":
+        source.mkdir()
+    with pytest.raises(PITDataError, match=r"missing/part\.parquet"):
+        publish_dataset(
+            layer_root=layer_root,
+            identity=_identity(kind="daily_market", layer=DatasetLayer.SILVER),
+            partitions={"a/part.parquet": _frame(), "missing/part.parquet": source},
+        )
+    assert not any(layer_root.iterdir())
+
+
+def test_zero_row_spooled_partition_is_hashed_and_readable(tmp_path: Path) -> None:
+    from src.data.datasets import PartitionSpool
+
+    empty = pl.DataFrame(
+        {"instrument_id": pl.Series([], dtype=pl.String), "value": pl.Series([], dtype=pl.Int64)}
+    )
+    with PartitionSpool() as spool:
+        assert spool.add("empty.parquet", empty) == 0
+        published = publish_dataset(
+            layer_root=tmp_path / "silver",
+            identity=_identity(kind="daily_market", layer=DatasetLayer.SILVER),
+            partitions=dict(spool.partitions),
+        )
+    manifest = load_manifest(published.path)
+    assert manifest.partitions[0].rows == 0
+    assert len(manifest.partitions[0].sha256) == 64
+    assert read_dataset(published.path).collect().height == 0
+
+
+def test_spool_rejects_escaping_and_duplicate_paths() -> None:
+    from src.data.datasets import PartitionSpool
+
+    with PartitionSpool() as spool:
+        outside = spool.directory.parent / f"{spool.directory.name}-escape.parquet"
+        with pytest.raises(PITDataError, match="partition path"):
+            spool.add(f"../{outside.name}", _frame())
+        assert not outside.exists()
+        assert not any(spool.directory.iterdir())
+        spool.add("a/part.parquet", _frame())
+        before = spool.partitions["a/part.parquet"].read_bytes()
+        with pytest.raises(PITDataError, match="duplicate spool partition"):
+            spool.add("a/part.parquet", _frame(2))
+        assert spool.partitions["a/part.parquet"].read_bytes() == before
+
+
+def test_spool_directory_removed_on_error(tmp_path: Path) -> None:
+    from src.data.datasets import PartitionSpool
+
+    spool = PartitionSpool()
+    captured: list[Path] = []
+
+    def _boom() -> None:
+        with spool:
+            spool.add("a/part.parquet", _frame())
+            captured.append(spool.directory)
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _boom()
+    assert len(captured) == 1
+    assert not captured[0].exists()
+    with pytest.raises(PITDataError):
+        _ = spool.partitions
+
+
+def test_spooled_republish_is_noop(tmp_path: Path) -> None:
+    from src.data.datasets import PartitionSpool
+
+    identity = _identity(kind="daily_market", layer=DatasetLayer.SILVER)
+    with PartitionSpool() as spool:
+        spool.add("part.parquet", _frame())
+        published = publish_dataset(
+            layer_root=tmp_path / "silver", identity=identity, partitions=dict(spool.partitions)
+        )
+    before = _file_state(published.path)
+    with PartitionSpool() as spool:
+        spool.add("part.parquet", _frame())
+        repeated = publish_dataset(
+            layer_root=tmp_path / "silver", identity=identity, partitions=dict(spool.partitions)
+        )
+    assert repeated == published
+    assert _file_state(published.path) == before
+
+
+def test_spool_and_path_error_branches(tmp_path: Path, monkeypatch) -> None:
+    from typing import cast
+
+    import src.data.datasets as dataset_module
+    from src.data.datasets import PartitionSpool
+
+    exited = PartitionSpool()
+    with exited:
+        pass
+    with pytest.raises(PITDataError, match="only valid inside"):
+        exited.add("a/part.parquet", _frame())
+
+    with PartitionSpool() as spool:
+        monkeypatch.setattr(
+            pl.DataFrame, "write_parquet", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk"))
+        )
+        with pytest.raises(PITDataError, match="cannot spool"):
+            spool.add("a/part.parquet", _frame())
+        monkeypatch.undo()
+
+    identity = _identity(kind="daily_market", layer=DatasetLayer.SILVER)
+    with PartitionSpool() as spool:
+        spool.add("ok.parquet", _frame())
+        staged = dict(spool.partitions)
+        monkeypatch.setattr(
+            dataset_module.shutil, "copyfile", lambda *_args: (_ for _ in ()).throw(OSError("copy"))
+        )
+        with pytest.raises(PITDataError, match="cannot stage"):
+            publish_dataset(
+                layer_root=tmp_path / "copy-fail", identity=identity, partitions=staged
+            )
+        monkeypatch.undo()
+
+    bogus = tmp_path / "bogus.parquet"
+    bogus.write_bytes(b"not parquet")
+    with pytest.raises(PITDataError, match="unreadable"):
+        publish_dataset(
+            layer_root=tmp_path / "unreadable-src",
+            identity=identity,
+            partitions={"bogus.parquet": bogus},
+        )
+    with pytest.raises(PITDataError, match="invalid dataset partition value"):
+        publish_dataset(
+            layer_root=tmp_path / "bad-value",
+            identity=identity,
+            partitions=cast("dict[str, pl.DataFrame | Path]", {"bad.parquet": 123}),
+        )
+
+
+def test_spool_parent_collision_preserves_written_partition() -> None:
+    from src.data.datasets import PartitionSpool
+
+    with PartitionSpool() as spool:
+        spool.add("part.parquet", _frame())
+        before = spool.partitions["part.parquet"].read_bytes()
+        with pytest.raises(PITDataError, match=r"part\.parquet/nested\.parquet"):
+            spool.add("part.parquet/nested.parquet", _frame(2))
+        assert set(spool.partitions) == {"part.parquet"}
+        assert spool.partitions["part.parquet"].read_bytes() == before
+
+
+def test_spool_releases_frame_and_publication_owns_a_copy(tmp_path: Path) -> None:
+    import weakref
+
+    from src.data.datasets import PartitionSpool
+
+    with PartitionSpool() as spool:
+        frame = _frame()
+        reference = weakref.ref(frame)
+        spool.add("part.parquet", frame)
+        del frame
+        assert reference() is None
+        source = spool.partitions["part.parquet"]
+        published = publish_dataset(
+            layer_root=tmp_path / "silver", identity=_identity(), partitions=spool.partitions,
+        )
+        source.write_bytes(b"changed after publication")
+        assert verify_dataset(published.path, known_ids=lambda _dataset_id: True).passed
+    assert not source.exists()
+    assert read_dataset(published.path).collect().equals(_frame())
