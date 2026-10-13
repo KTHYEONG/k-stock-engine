@@ -238,4 +238,17 @@ def test_kind_relay_delivery_is_atomic() -> None:
     text = _relay_text()
     assert ".incoming" in text
     assert re.search(r"mv -f \S*\.incoming \S*bundle\.json", text) is not None
-    assert text.index('"mkdir -p ~/k-stock-engine/data/state/kind_relay/inbox"') < text.index("          scp ")
+    assert text.index('"mkdir -p ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox"') < text.index("          scp ")
+
+
+def test_kind_relay_delivery_path_matches_importer_inbox() -> None:
+    from src.config.runtime import load_runtime_config
+    from src.data.kind_relay_import import relay_inbox_path
+    from src.data.research_scope import load_research_scope
+    from src.data.workspace import build_workspace
+
+    config = load_runtime_config(create_directories=False)
+    scope = load_research_scope(config.default_scope)
+    root = Path("/data")
+    inbox = relay_inbox_path(build_workspace(data_root=root, scope=scope).state_root).parent
+    assert f"~/k-stock-engine/data/{inbox.relative_to(root).as_posix()}" in _relay_text()
