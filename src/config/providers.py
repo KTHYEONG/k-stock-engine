@@ -328,6 +328,11 @@ class KindPolicy(BaseModel):
         search_keywords: Title keywords searched per window; each keyword is its own window key.
         document_titles: Normalized titles (brackets and spaces removed) whose bodies are fetched.
         max_stale_sessions: Observed sessions KIND evidence may lag the decision horizon.
+        relay_window_lookback_days: Closed windows ending within this many days are re-fetched.
+        relay_document_lookback_days: Notices disclosed within this many days get bodies fetched.
+        relay_max_age_hours: A bundle older than this is refused.
+        relay_clock_skew_seconds: Tolerated producer-clock lead over the importer clock.
+        relay_attempts: Producer retries for one inconsistent window.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -338,6 +343,11 @@ class KindPolicy(BaseModel):
     search_keywords: tuple[str, ...]
     document_titles: tuple[str, ...]
     max_stale_sessions: NonNegativeInt
+    relay_window_lookback_days: PositiveInt = 14
+    relay_document_lookback_days: PositiveInt = 14
+    relay_max_age_hours: PositiveInt = 36
+    relay_clock_skew_seconds: NonNegativeInt = 300
+    relay_attempts: PositiveInt = 3
 
     @field_validator("search_keywords", "document_titles")
     @classmethod
