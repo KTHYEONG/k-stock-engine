@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pytest
 
 S1 = date(2024, 1, 2)
 S2 = date(2024, 1, 3)
@@ -311,3 +312,251 @@ def test_union_read_input_boundaries_and_empty_sides(tmp_path: Path, monkeypatch
         silver_root=silver,
     )
     assert only_ls.rows == 1
+
+
+def _write_yearly_dataset(directory: Path, rows_by_year: dict[int, list[dict[str, Any]]]) -> Path:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    kind = "investor_flow_ls" if "ls" in directory.name and "kis" not in directory.name else "investor_flow_kis_supplement"
+    return publish_dataset(
+        layer_root=directory.parent,
+        identity=DatasetIdentity(
+            kind=kind,
+            layer=DatasetLayer.SILVER,
+            policy_version="test-v1",
+            inputs={},
+            params={},
+        ),
+        partitions={
+            f"year={year}/part.parquet": pl.DataFrame(rows)
+            for year, rows in rows_by_year.items()
+        },
+    ).path
+
+
+def test_earliest_conflict_key_is_reported(tmp_path: Path) -> None:
+    """Conflicts in several years report the earliest key and publish nothing."""
+    import pytest
+
+    from src.core.pit import PITDataError
+
+    early = date(2021, 1, 4)
+    late = date(2023, 6, 1)
+    silver = tmp_path / "silver"
+    ls_path = _write_yearly_dataset(
+        silver / "investor_flow_ls_test",
+        {
+            2020: [_ls_row(date(2020, 1, 2), "000009", (10, -4, -3, -3))],
+            2021: [_ls_row(early, "000001", (100, -60, -30, -10))],
+            2023: [_ls_row(late, "000002", (10, -4, -3, -3))],
+        },
+    )
+    kis_path = _write_yearly_dataset(
+        silver / "investor_flow_kis_supplement_test",
+        {
+            2021: [_common_row("KIS", early, "000001", (50, -30, -10, -10))],
+            2023: [_common_row("KIS", late, "000002", (5, -3, -1, -1))],
+        },
+    )
+    before = {entry.name for entry in silver.iterdir()}
+    with pytest.raises(PITDataError, match=r"session=datetime.date\(2021, 1, 4\) ticker='000001'"):
+        _materialize(ls_path, kis_path, silver)
+    assert {entry.name for entry in silver.iterdir()} == before
+
+
+def test_year_partitions_are_published_as_paths(tmp_path: Path, monkeypatch) -> None:
+    """Per-year union slices reach publication as spooled paths."""
+    import src.data.investor_flow_union as union_module
+
+    silver = tmp_path / "silver"
+    ls_path = _write_yearly_dataset(
+        silver / "investor_flow_ls_test",
+        {
+            2021: [_ls_row(date(2021, 1, 4), "000001", (100, -60, -30, -10))],
+            2023: [_ls_row(date(2023, 6, 1), "000002", (10, -4, -3, -3))],
+        },
+    )
+    kis_path = _write_yearly_dataset(
+        silver / "investor_flow_kis_supplement_test",
+        {2022: [_common_row("KIS", date(2022, 3, 1), "000003", (50, -30, -10, -10))]},
+    )
+    captured: dict[str, object] = {}
+    original = union_module.publish_dataset
+
+    def _spy(*, layer_root, identity, partitions, details=None, checks=()):  # type: ignore[no-untyped-def]
+        captured.update(partitions)
+        return original(
+            layer_root=layer_root, identity=identity, partitions=partitions,
+            details=details, checks=checks,
+        )
+
+    monkeypatch.setattr(union_module, "publish_dataset", _spy)
+    result = _materialize(ls_path, kis_path, silver)
+    assert result.rows == 3
+    assert set(captured) == {"year=2021/part.parquet", "year=2022/part.parquet", "year=2023/part.parquet"}
+    assert all(isinstance(value, Path) for value in captured.values())
+
+
+def test_one_empty_input_passes_through_with_schema(tmp_path: Path) -> None:
+    """An empty KIS side passes LS rows through with the union schema intact."""
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    silver = tmp_path / "silver"
+    ls_path = _write_yearly_dataset(
+        silver / "investor_flow_ls_test",
+        {
+            2021: [_ls_row(date(2021, 1, 4), "000001", (100, -60, -30, -10))],
+            2023: [_ls_row(date(2023, 6, 1), "000002", (10, -4, -3, -3))],
+        },
+    )
+    empty_kis = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_kis_supplement", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    result = _materialize(ls_path, empty_kis.path, silver)
+    assert result.rows == 2
+    frame = _output_frame(result.dataset_path).sort("session", "ticker")
+    assert tuple(frame.columns) == EXPECTED_COLUMNS
+    assert frame["provider"].to_list() == ["LS", "LS"]
+
+
+def test_both_empty_publishes_no_partitions(tmp_path: Path) -> None:
+    """Two empty inputs publish a dataset with zero partitions."""
+    from src.data.datasets import DatasetIdentity, DatasetLayer, load_manifest, publish_dataset
+    from src.data.investor_flow_union import _read_input
+
+    silver = tmp_path / "silver"
+    empty_ls = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_ls", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    empty_kis = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_kis_supplement", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={},
+    )
+    result = _materialize(empty_ls.path, empty_kis.path, silver)
+    assert result.rows == 0
+    assert result.rows == _read_input(empty_ls.path, "ls", expected_kind="investor_flow_ls")[1].height
+    assert list(result.dataset_path.glob("year=*/part.parquet")) == []
+    assert load_manifest(result.dataset_path).partitions == ()
+
+
+def test_streaming_input_boundaries(tmp_path: Path, monkeypatch) -> None:
+    """Path-only input probing validates kind and surfaces unreadable years."""
+    import pytest
+
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.investor_flow_union import _input_paths, _read_year, _years_of
+    from src.core.pit import PITDataError
+    import src.data.investor_flow_union as union_module
+
+    silver = tmp_path / "silver"
+    ls_path = _write_yearly_dataset(
+        silver / "investor_flow_ls_test",
+        {2024: [_ls_row(S1, "000001", (100, -60, -30, -10))]},
+    )
+    monkeypatch.setattr(union_module, "load_manifest", lambda _path: (_ for _ in ()).throw(PITDataError("bad")))
+    assert _input_paths(ls_path, "ls", expected_kind="investor_flow_ls")[0] == ls_path.name
+    monkeypatch.undo()
+
+    wrong = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("market_panel", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={"part.parquet": pl.DataFrame({"session": [S1], "ticker": ["000001"]})},
+    )
+    with pytest.raises(PITDataError, match="kind"):
+        _input_paths(wrong.path, "ls", expected_kind="investor_flow_ls")
+
+    _, paths = _input_paths(ls_path, "ls", expected_kind="investor_flow_ls")
+    monkeypatch.setattr(
+        union_module.pl, "scan_parquet", lambda *_args, **_kwargs: (_ for _ in ()).throw(pl.exceptions.PolarsError("bad"))
+    )
+    with pytest.raises(PITDataError, match="partitions"):
+        _years_of(paths, ls_path, "ls")
+    with pytest.raises(PITDataError, match="partitions"):
+        _read_year(paths, 2024, ls_path, "ls")
+    monkeypatch.undo()
+
+
+def test_union_bytes_match_whole_history_semantics(tmp_path: Path) -> None:
+    from polars.testing import assert_frame_equal
+
+    from src.data.datasets import load_manifest
+    from src.data.investor_flow_union import _read_input
+
+    ls_rows = [
+        _ls_row(date(year, 12, 31), ticker, (100, -60, -30, -10))
+        for year in (2023, 2021, 2022)
+        for ticker in ("000003", "000001")
+    ]
+    kis_rows = [
+        _common_row("KIS", date(year, 12, 31), "000002", (50, -30, -10, -10))
+        for year in (2022, 2023, 2021)
+    ]
+    ls_path, kis_path, silver = _write_inputs(tmp_path, ls_rows, kis_rows)
+    ls_frame = _read_input(ls_path, "ls", expected_kind="investor_flow_ls")[1]
+    kis_frame = _read_input(kis_path, "kis", expected_kind="investor_flow_kis_supplement")[1]
+    expected = pl.concat([ls_frame, kis_frame]).sort(["session", "ticker"])
+    result = _materialize(ls_path, kis_path, silver)
+    manifest = load_manifest(result.dataset_path)
+    assert result.rows == expected.height
+    assert [(part.path, part.rows) for part in manifest.partitions] == [
+        (f"year={year}/part.parquet", 3) for year in (2021, 2022, 2023)
+    ]
+    assert manifest.details["partitions"] == [
+        {"path": f"year={year}/part.parquet", "rows": 3} for year in (2021, 2022, 2023)
+    ]
+    for year in (2021, 2022, 2023):
+        part = expected.filter(pl.col("session").dt.year() == year)
+        baseline = tmp_path / f"baseline-{year}.parquet"
+        part.write_parquet(baseline)
+        output = result.dataset_path / f"year={year}/part.parquet"
+        assert_frame_equal(pl.read_parquet(output), part)
+        assert output.read_bytes() == baseline.read_bytes()
+
+
+def test_string_sessions_preserve_schema_cast(tmp_path: Path) -> None:
+    row = _ls_row(S1, "000001", (100, -60, -30, -10))
+    row["session"] = S1.isoformat()
+    silver = tmp_path / "silver"
+    ls_path = _write_dataset(silver / "investor_flow_ls_test", [row])
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    kis_path = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_kis_supplement", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions={},
+    ).path
+    result = _materialize(ls_path, kis_path, silver)
+    assert _output_frame(result.dataset_path)["session"].to_list() == [S1]
+
+
+@pytest.mark.parametrize("case", ["empty-missing-columns", "null-session", "invalid-session"])
+def test_invalid_input_fails_before_publication(tmp_path: Path, case: str) -> None:
+    from src.core.pit import PITDataError
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    silver = tmp_path / "silver"
+    if case == "empty-missing-columns":
+        frame = pl.DataFrame(schema={"session": pl.Date})
+    else:
+        row = _ls_row(S1, "000001", (100, -60, -30, -10))
+        row["session"] = None if case == "null-session" else "invalid"
+        frame = pl.DataFrame([row]).with_columns(pl.col("session").cast(pl.String))
+    ls_path = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_ls", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions={"part.parquet": frame},
+    ).path
+    kis_path = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("investor_flow_kis_supplement", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions={},
+    ).path
+    before = set(silver.iterdir())
+    with pytest.raises(PITDataError, match="partitions"):
+        _materialize(ls_path, kis_path, silver)
+    assert set(silver.iterdir()) == before
