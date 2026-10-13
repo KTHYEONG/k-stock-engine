@@ -1864,3 +1864,87 @@ def test_evening_split_report_merges_phases(
         assert list(payload) == ["type", "kind", "dataset_id", "status", "peak_rss_mb"]
     for kind, mb in expected.items():
         assert f"kind={kind} dataset={report.datasets[kind]} status=built peak_rss_mb={int(mb)}" in caplog.text
+
+
+def test_kind_step_uses_relay_when_env_selects_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.data.kind_relay_import as relay_import
+    import src.integrations.krx.kind as kind_module
+    from src.data.kind_relay_import import RelayImportReport
+    from src.data.pipeline_graph import _run_kind_collection_step
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    monkeypatch.setenv("KSE_KIND_TRANSPORT", "relay")
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_import(*, runtime, provider, job, now, dry_run):  # type: ignore[no-untyped-def]
+        calls.append((job, dry_run))
+        return RelayImportReport(
+            job=job, status="complete", imported=2, unchanged=1,
+            rejected=0, pending_left=0, fetched_at=now,
+        )
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("KindClient must not be constructed in relay mode")
+
+    monkeypatch.setattr(relay_import, "import_relay_bundle", _fake_import)
+    monkeypatch.setattr(kind_module, "build_scoped_kind_client", _boom)
+    events: list[object] = []
+    report = _run_kind_collection_step(ctx, "kind_notice_search", dry_run=False, emit=events.append)
+
+    assert calls == [("kind_notice_search", False)]
+    assert report == CollectionStepReport("kind_notice_search", "complete", 3, 0, 0)
+    (event,) = [item for item in events if isinstance(item, dict) and item.get("type") == "collection"]
+    assert (event["imported"], event["unchanged"], event["rejected"]) == (2, 1, 0)
+    assert isinstance(event["fetched_at"], str)
+
+
+def test_kind_step_direct_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.kind_relay_import as relay_import
+    import src.integrations.krx.kind as kind_module
+    from src.data.pipeline_graph import _run_kind_collection_step
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    monkeypatch.delenv("KSE_KIND_TRANSPORT", raising=False)
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("relay importer must not run on the direct path")
+
+    def _client_boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("no live client is built for a dry run")
+
+    monkeypatch.setattr(relay_import, "import_relay_bundle", _boom)
+    monkeypatch.setattr(kind_module, "build_scoped_kind_client", _client_boom)
+    events: list[object] = []
+    report = _run_kind_collection_step(ctx, "kind_notice_search", dry_run=True, emit=events.append)
+
+    assert report.job == "kind_notice_search"
+    assert report.status == "dry_run"
+    assert report.requests_used == 0
+
+
+def test_invalid_transport_degrades_not_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data import pipeline_graph as graph
+
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    monkeypatch.setenv("KSE_KIND_TRANSPORT", "bogus")
+    steps = (
+        (
+            "kind_notice_search",
+            lambda inner_ctx, *, dry_run, emit: graph._run_kind_collection_step(
+                inner_ctx, "kind_notice_search", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "kind_notice_documents",
+            lambda inner_ctx, *, dry_run, emit: graph._run_kind_collection_step(
+                inner_ctx, "kind_notice_documents", dry_run=dry_run, emit=emit
+            ),
+        ),
+    )
+    report = run_collection_jobs(ctx, dry_run=False, emit=lambda payload: None, steps=steps)
+
+    assert [step.status for step in report.steps] == ["failed", "failed"]
+    assert report.blocking_job is None
+    assert report.degraded_jobs == ("kind_notice_search", "kind_notice_documents")
