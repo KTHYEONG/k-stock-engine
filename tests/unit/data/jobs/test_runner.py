@@ -67,6 +67,7 @@ def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  
             daily_limit=5000,
             search_keywords=("상장폐지",),
             document_titles=("상장폐지",),
+            max_stale_sessions=5,
         ),
     )
 
