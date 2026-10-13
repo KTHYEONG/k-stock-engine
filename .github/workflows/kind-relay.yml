@@ -48,6 +48,6 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/relay_key
           chmod 600 ~/.ssh/relay_key
           SSH_OPTS="-i $HOME/.ssh/relay_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
-          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/data/state/kind_relay/inbox"
-          scp $SSH_OPTS "$RUNNER_TEMP/kind-bundle.json" "$REMOTE_USER@$HOST:~/k-stock-engine/data/state/kind_relay/inbox/bundle.json.incoming"
-          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mv -f ~/k-stock-engine/data/state/kind_relay/inbox/bundle.json.incoming ~/k-stock-engine/data/state/kind_relay/inbox/bundle.json"
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox"
+          scp $SSH_OPTS "$RUNNER_TEMP/kind-bundle.json" "$REMOTE_USER@$HOST:~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json.incoming"
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mv -f ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json.incoming ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json"
