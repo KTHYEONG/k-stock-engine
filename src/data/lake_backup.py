@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
-import io
 import json
 import logging
+import mmap
 import os
+import shutil
 import sqlite3
 import subprocess
 import tarfile
+import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -37,6 +39,7 @@ _LOG = logging.getLogger(__name__)
 INDEX_NAME: Final = "index.jsonl.zst"
 MANIFEST_NAME: Final = "MANIFEST.json"
 _CHUNK: Final = 1 << 20
+_INDEX_CHUNK: Final = 8 * 1024 * 1024
 # Level 10 stores sampled Bronze payloads 38% smaller than level 1 at ~90 MB/s; 15 gains 5% more at 14 MB/s.
 _ZSTD_LEVEL: Final = 10
 _SQLITE_SUFFIX: Final = ".sqlite3"
@@ -53,7 +56,7 @@ class BackupSource:
 
     immutable: paths never change once written, so a path already in the index is skipped without hashing.
     optional: the root may legitimately be absent on a host; a push then reports the source as skipped.
-    segment_bytes: raw-byte cap per archive; one archive is built in memory, so this bounds peak RAM.
+    segment_bytes: raw-byte cap per archive.
     """
 
     name: str
@@ -105,14 +108,14 @@ class LocalDirStore:
         src = self._root / name
         if not src.is_file():
             return False
-        dest.write_bytes(src.read_bytes())
+        shutil.copyfile(src, dest)
         return True
 
     def put(self, src: Path, name: str) -> None:
         target = self._root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".part")
-        tmp.write_bytes(src.read_bytes())
+        shutil.copyfile(src, tmp)
         os.replace(tmp, target)
 
     def sha256(self, name: str) -> str | None:
@@ -216,13 +219,108 @@ def _materialize(source: BackupSource, rel: str, workdir: Path) -> Path:
     return snapshot
 
 
+_ENTRY_FIELDS: Final = frozenset({"path", "sha256", "size", "archive", "member"})
+
+
+def _validate_index_line(line: bytes, lineno: int) -> None:
+    try:
+        obj = json.loads(line)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BackupError(f"index line {lineno} is not valid JSON: {exc}") from exc
+    if not isinstance(obj, dict) or obj.keys() != _ENTRY_FIELDS:
+        raise BackupError(f"index line {lineno} has invalid _Entry fields")
+    if (
+        not all(isinstance(obj[key], str) for key in ("path", "sha256", "archive", "member"))
+        or type(obj["size"]) is not int
+        or obj["size"] < 0
+        or len(obj["sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in obj["sha256"])
+    ):
+        raise BackupError(f"index line {lineno} has invalid _Entry values")
+
+
+def _iter_index_lines(local: Path) -> Iterator[bytes]:
+    """Yield non-empty JSONL lines of a zstd index file in file order without materialising the payload."""
+    carry = bytearray()
+    lineno = 0
+    with pa.OSFile(str(local), "rb") as raw, pa.CompressedInputStream(raw, "zstd") as stream:
+        while True:
+            chunk = stream.read(_INDEX_CHUNK)
+            if not chunk:
+                break
+            carry.extend(chunk)
+            del chunk
+            start = 0
+            while True:
+                nl = carry.find(b"\n", start)
+                if nl < 0:
+                    break
+                lineno += 1
+                line = bytes(carry[start:nl])
+                start = nl + 1
+                if not line.strip():
+                    continue
+                _validate_index_line(line, lineno)
+                yield line
+            del carry[:start]
+        if carry.strip():
+            lineno += 1
+            line = bytes(carry)
+            _validate_index_line(line, lineno)
+            yield line
+
+
 def _load_index(store: RemoteStore, workdir: Path) -> list[_Entry]:
     local = workdir / INDEX_NAME
     if not store.fetch(INDEX_NAME, local):
         return []
-    with pa.OSFile(str(local), "rb") as raw, pa.CompressedInputStream(raw, "zstd") as stream:
-        data = stream.read()
-    return [_Entry(**json.loads(line)) for line in bytes(data).splitlines() if line]
+    return [_Entry(**json.loads(line)) for line in _iter_index_lines(local)]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexSummary:
+    """Compact view of an index: latest (sha256, size) per path, first location per sha256, totals."""
+
+    by_path: dict[str, tuple[bytes, int]]
+    hashes: set[bytes]
+    index_local: Path | None
+    files: int
+    raw_bytes: int
+
+
+def _summarize_index(store: RemoteStore, workdir: Path) -> _IndexSummary:
+    """Download and stream the index once; an absent index yields an empty summary."""
+    local = workdir / INDEX_NAME
+    if not store.fetch(INDEX_NAME, local):
+        return _IndexSummary({}, set(), None, 0, 0)
+    by_path: dict[str, tuple[bytes, int]] = {}
+    hashes: set[bytes] = set()
+    for line in _iter_index_lines(local):
+        obj = json.loads(line)
+        digest = bytes.fromhex(obj["sha256"])
+        hashes.add(digest)
+        by_path[obj["path"]] = (digest, int(obj["size"]))
+    return _IndexSummary(by_path, hashes, local, len(by_path), sum(size for _, size in by_path.values()))
+
+
+def _resolve_first_locations(summary: _IndexSummary, wanted: set[bytes]) -> dict[bytes, tuple[str, str]]:
+    """First (archive, member) per sha256 for the requested hashes via a second streaming pass."""
+    found: dict[bytes, tuple[str, str]] = {}
+    if not wanted:
+        return found
+    if summary.index_local is None:
+        raise BackupError("index has no location for referenced sha256")
+    for line in _iter_index_lines(summary.index_local):
+        obj = json.loads(line)
+        digest = bytes.fromhex(obj["sha256"])
+        if digest in wanted and digest not in found:
+            found[digest] = (obj["archive"], obj["member"])
+            if len(found) == len(wanted):
+                break
+    missing = wanted - found.keys()
+    if missing:
+        raise BackupError(f"index has no location for {len(missing)} referenced sha256")
+    return found
 
 
 def _load_manifest(store: RemoteStore, workdir: Path, source_name: str) -> dict[str, Any]:
@@ -234,15 +332,53 @@ def _load_manifest(store: RemoteStore, workdir: Path, source_name: str) -> dict[
 
 
 def _save_state(
-    store: RemoteStore, workdir: Path, entries: Sequence[_Entry], manifest: dict[str, Any], now: datetime
+    store: RemoteStore,
+    workdir: Path,
+    summary: _IndexSummary,
+    new_entries: Sequence[_Entry],
+    manifest: dict[str, Any],
+    now: datetime,
 ) -> None:
-    lines = b"".join(json.dumps(asdict(entry), sort_keys=True).encode() + b"\n" for entry in entries)
     index_path = workdir / INDEX_NAME
-    index_path.write_bytes(pa.Codec("zstd", compression_level=_ZSTD_LEVEL).compress(lines, asbytes=True))
-    latest = {entry.path: entry for entry in entries}
+    tmp_raw = workdir / (INDEX_NAME + ".raw.tmp")
+    last_byte = b"\n"
+    try:
+        with tmp_raw.open("wb") as out:
+            if summary.index_local is not None:
+                with (
+                    pa.OSFile(str(summary.index_local), "rb") as raw,
+                    pa.CompressedInputStream(raw, "zstd") as stream,
+                ):
+                    while chunk := stream.read(_INDEX_CHUNK):
+                        out.write(chunk)
+                        last_byte = chunk[-1:]
+            if last_byte != b"\n":
+                out.write(b"\n")
+            for entry in new_entries:
+                out.write(json.dumps(asdict(entry), sort_keys=True).encode() + b"\n")
+        with (
+            tmp_raw.open("rb") as handle,
+            mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped,
+        ):
+            _compress_mapped(mapped, index_path)
+    finally:
+        tmp_raw.unlink(missing_ok=True)
+    latest: dict[str, int] = {}
+    files, raw_bytes = summary.files, summary.raw_bytes
+    for entry in new_entries:
+        previous = latest.get(entry.path)
+        if previous is None:
+            known = summary.by_path.get(entry.path)
+            if known is None:
+                files += 1
+                previous = 0
+            else:
+                previous = known[1]
+        raw_bytes += entry.size - previous
+        latest[entry.path] = entry.size
     manifest["updated_at"] = now.isoformat()
-    manifest["files"] = len(latest)
-    manifest["raw_bytes"] = sum(entry.size for entry in latest.values())
+    manifest["files"] = files
+    manifest["raw_bytes"] = raw_bytes
     manifest_path = workdir / MANIFEST_NAME
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=1), encoding="utf-8")
     store.put(index_path, INDEX_NAME)
@@ -258,12 +394,40 @@ def _normalized(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
+def _discard_mapped_pages(mapped: mmap.mmap, stop: threading.Event) -> None:
+    while not stop.wait(0.02):
+        # Read-only file pages can be faulted back without changing the codec's input bytes.
+        mapped.madvise(mmap.MADV_DONTNEED)
+
+
+def _compress_mapped(mapped: mmap.mmap, dest: Path) -> None:
+    """Compress a read-only file map while bounding its resident input pages."""
+    stop = threading.Event()
+    reclaimer = threading.Thread(target=_discard_mapped_pages, args=(mapped, stop))
+    reclaimer.start()
+    try:
+        compressed = pa.Codec("zstd", compression_level=_ZSTD_LEVEL).compress(mapped)
+        with dest.open("wb") as out:
+            out.write(compressed)
+    finally:
+        stop.set()
+        reclaimer.join()
+
+
 def _write_archive(members: Sequence[tuple[str, Path]], dest: Path) -> None:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as tar:
-        for member, path in members:
-            tar.add(str(path), arcname=member, recursive=False, filter=_normalized)
-    dest.write_bytes(pa.Codec("zstd", compression_level=_ZSTD_LEVEL).compress(buffer.getbuffer(), asbytes=True))
+    """Build a normalized tar on disk and compress its memory map."""
+    tmp = dest.parent / (dest.name + ".part.tar")
+    try:
+        with tarfile.open(name=str(tmp), mode="w") as tar:
+            for member, path in members:
+                tar.add(str(path), arcname=member, recursive=False, filter=_normalized)
+        with (
+            tmp.open("rb") as handle,
+            mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped,
+        ):
+            _compress_mapped(mapped, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _upload_verified(store: RemoteStore, local: Path, name: str) -> str:
@@ -299,28 +463,25 @@ def _segments(pending: Sequence[_Pending], cap: int) -> Iterator[list[_Pending]]
 
 
 def _scan(
-    source: BackupSource, workdir: Path, entries: Sequence[_Entry]
-) -> tuple[int, list[_Pending], list[_Entry], list[_Pending]]:
-    """Scanned count, files to store, references to stored content, and in-run duplicates of files to store."""
-    by_path = {entry.path: entry for entry in entries}
-    by_hash = {entry.sha256: entry for entry in reversed(entries)}
+    source: BackupSource, workdir: Path, summary: _IndexSummary
+) -> tuple[int, list[_Pending], list[_Pending], list[_Pending]]:
+    """Return scanned count, pending files, stored-content references, and in-run duplicates."""
     pending: list[_Pending] = []
     queued: set[str] = set()
-    refs: list[_Entry] = []
+    refs: list[_Pending] = []
     duplicates: list[_Pending] = []
     scanned = 0
     for rel in _iter_files(source):
         scanned += 1
-        known = by_path.get(rel)
+        known = summary.by_path.get(rel)
         if known is not None and source.immutable:
             continue
         path = _materialize(source, rel, workdir)
         item = _Pending(rel, path, _file_sha256(path), path.stat().st_size)
-        if known is not None and known.sha256 == item.sha256:
+        if known is not None and known[0] == bytes.fromhex(item.sha256):
             continue
-        stored = by_hash.get(item.sha256)
-        if stored is not None:
-            refs.append(_Entry(rel, item.sha256, item.size, stored.archive, stored.member))
+        if bytes.fromhex(item.sha256) in summary.hashes:
+            refs.append(item)
         elif item.sha256 in queued:
             duplicates.append(item)
         else:
@@ -339,12 +500,21 @@ def push(source: BackupSource, store: RemoteStore, workdir: Path, *, now: dateti
         BackupError: a remote archive hash differs from the local one, or a store operation fails.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    entries = _load_index(store, workdir)
+    summary = _summarize_index(store, workdir)
     manifest = _load_manifest(store, workdir, source.name)
-    scanned, pending, refs, duplicates = _scan(source, workdir, entries)
+    scanned, pending, ref_pendings, duplicates = _scan(source, workdir, summary)
+    changed_paths = {item.rel for item in (*pending, *ref_pendings, *duplicates)}
+    summary = _IndexSummary(
+        {path: value for path, value in summary.by_path.items() if path in changed_paths},
+        set(),
+        summary.index_local,
+        summary.files,
+        summary.raw_bytes,
+    )
     stored_bytes = 0
     archives = 0
     placed: dict[str, _Entry] = {}
+    placed_ordered: list[_Entry] = []
     for batch in _segments(pending, source.segment_bytes):
         key = hashlib.sha256("\n".join(item.sha256 for item in batch).encode()).hexdigest()[:16]
         name = f"seg-{key}.tar.zst"
@@ -360,22 +530,29 @@ def push(source: BackupSource, store: RemoteStore, workdir: Path, *, now: dateti
             "raw_bytes": sum(item.size for item in batch),
         }
         for item in batch:
-            placed[item.sha256] = _Entry(item.rel, item.sha256, item.size, name, item.rel)
-        entries.extend(placed[item.sha256] for item in batch)
+            entry = _Entry(item.rel, item.sha256, item.size, name, item.rel)
+            placed[item.sha256] = entry
+            placed_ordered.append(entry)
         stored_bytes += size
         archives += 1
         _LOG.info("[DATA] lake_backup source=%s archive=%s files=%d bytes=%d", source.name, name, len(batch), size)
-    refs.extend(
-        _Entry(item.rel, item.sha256, item.size, placed[item.sha256].archive, placed[item.sha256].member)
-        for item in duplicates
-    )
-    entries.extend(refs)
-    if pending or refs:
-        _save_state(store, workdir, entries, manifest, now)
+    ref_entries: list[_Entry] = []
+    if ref_pendings:
+        locations = _resolve_first_locations(summary, {bytes.fromhex(item.sha256) for item in ref_pendings})
+        for item in ref_pendings:
+            archive, member = locations[bytes.fromhex(item.sha256)]
+            ref_entries.append(_Entry(item.rel, item.sha256, item.size, archive, member))
+    dup_entries: list[_Entry] = []
+    for item in duplicates:
+        loc = placed[item.sha256]
+        dup_entries.append(_Entry(item.rel, item.sha256, item.size, loc.archive, loc.member))
+    new_entries = [*placed_ordered, *ref_entries, *dup_entries]
+    if new_entries:
+        _save_state(store, workdir, summary, new_entries, manifest, now)
     return PushReport(
         scanned=scanned,
         stored=len(pending),
-        referenced=len(refs),
+        referenced=len(ref_entries) + len(dup_entries),
         archives=archives,
         raw_bytes=sum(item.size for item in pending),
         stored_bytes=stored_bytes,
