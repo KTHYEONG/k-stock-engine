@@ -1382,14 +1382,50 @@ def _run_kind_collection_step(
     ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
     """Run one KIND notice collection job without duplicating runner wiring."""
+    import os
+
     from src.config import load_provider_policy, load_runtime_config
+    from src.data.kind_relay import kind_transport
+
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    if kind_transport(os.environ) == "relay":
+        from src.data.kind_relay_import import import_relay_bundle
+
+        relay = import_relay_bundle(
+            runtime=ctx.runtime, provider=provider, job=job_name,
+            now=datetime.now(UTC), dry_run=dry_run,
+        )
+        emit(
+            {
+                "type": "collection",
+                "job": job_name,
+                "status": relay.status,
+                "fetched_at": relay.fetched_at.isoformat() if relay.fetched_at is not None else None,
+                "imported": relay.imported,
+                "unchanged": relay.unchanged,
+                "rejected": relay.rejected,
+                "pending_left": relay.pending_left,
+                "requests_used": 0,
+            }
+        )
+        _LOG.info(
+            "[DATA] stage=refresh_collect job=%s status=%s imported=%d unchanged=%d rejected=%d",
+            job_name,
+            relay.status,
+            relay.imported,
+            relay.unchanged,
+            relay.rejected,
+        )
+        return CollectionStepReport(
+            job=job_name, status=relay.status, done=relay.imported + relay.unchanged,
+            pending_left=relay.pending_left, requests_used=0,
+        )
     from src.data.jobs.kind import KIND_CHUNK_SIZE, build_kind_job_context, resolve_kind_job
     from src.data.jobs.runner import run_job
     from src.integrations.krx.kind import build_scoped_kind_client
     from src.integrations.quota import ProviderQuotaStateStore
 
-    runtime_config = load_runtime_config()
-    provider = load_provider_policy(runtime_config)
     collector = None
     if not dry_run:  # pragma: no cover - live provider path
         collector = build_scoped_kind_client(

@@ -185,3 +185,15 @@ def test_alert_credentials_reach_only_the_audit_and_alert_units() -> None:
     installer = (SYSTEMD.parent / "install_systemd.sh").read_text(encoding="utf-8")
     assert 'touch "${HOME}/quant-secrets/kse-alert.env"' in installer
     assert 'chmod 600 "${HOME}/quant-secrets/kse-alert.env"' in installer
+
+
+def test_collect_eve_unit_selects_relay_transport() -> None:
+    text = (SYSTEMD / "kse-collect-eve.service").read_text(encoding="utf-8")
+    start = _exec_start(text)
+    assert "-e KSE_KIND_TRANSPORT=relay" in start
+    assert _flag(start, "--memory=") == "3g"
+
+
+def test_morning_unit_has_no_kind_transport() -> None:
+    text = (SYSTEMD / "kse-morning.service").read_text(encoding="utf-8")
+    assert "KSE_KIND_TRANSPORT" not in text
