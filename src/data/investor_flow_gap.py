@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -61,6 +62,22 @@ def _read_verified_partitions(
     return dataset_dir.name, [str(path) for path in paths]
 
 
+def _coverage_frame(ls_files: Sequence[str]) -> pl.DataFrame:
+    """Unique (session: Date, ticker: String) cells present in the LS partitions that carry both columns."""
+    frames: list[pl.DataFrame] = []
+    for file_path in ls_files:
+        if not {"session", "ticker"}.issubset(pl.read_parquet_schema(file_path)):
+            continue
+        frames.append(
+            pl.read_parquet(file_path, columns=["session", "ticker"])
+            .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String))
+            .unique()
+        )
+    if not frames:
+        raise PITDataError("LS flow has no dense partitions")
+    return pl.concat(frames, how="vertical_relaxed").unique()
+
+
 def compute_missing_investor_flow_cells(
     *, targets: FlowTargets, ls_flow_silver_path: Path
 ) -> MissingInvestorFlowCells:
@@ -92,18 +109,7 @@ def compute_missing_investor_flow_cells(
             pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String)
         ).unique()
     )
-    ls_frames: list[pl.DataFrame] = []
-    for file_path in ls_files:
-        candidate = pl.read_parquet(file_path)
-        if {"session", "ticker"}.issubset(candidate.columns):
-            ls_frames.append(candidate)
-    if not ls_frames:
-        raise PITDataError("LS flow has no dense partitions")
-    coverage = (
-        pl.concat(ls_frames, how="vertical_relaxed")
-        .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String))
-        .unique()
-    )
+    coverage = _coverage_frame(ls_files)
     missing = requirement.join(coverage, on=["session", "ticker"], how="anti").sort(["ticker", "session"])
     grouped = missing.group_by("ticker", maintain_order=True).agg(pl.col("session").sort().alias("sessions"))
     symbols = tuple(
