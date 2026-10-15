@@ -1043,6 +1043,38 @@ def test_ls_preview_uses_catalog_digest(tmp_path: Path) -> None:
     assert identity.inputs["bronze_flow"] == ctx.catalog.blob_digest(source="ls_investor_flow")
 
 
+def test_ls_parse_cache_prunes_only_after_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.investor_flow_silver as flow
+    import src.data.pipeline_graph as graph
+    from src.data.parse_cache import ParseCache
+
+    ctx = _fixture_context(tmp_path)
+    universe = graph._build_ordinary_universe(ctx, {})
+    inputs = {"ordinary_universe": universe.dataset_id}
+    cache_path = graph._parse_cache_path(ctx, "ls_investor_flow")
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=flow.parse_fingerprint()) as cache:
+        cache.put_many({"retired": {"value": 1}})
+
+    original_publish = flow.publish_dataset
+
+    def fail_publish(**kwargs: object) -> None:
+        raise PITDataError("publication failed")
+
+    monkeypatch.setattr(flow, "publish_dataset", fail_publish)
+    with pytest.raises(PITDataError, match="publication failed"):
+        graph._build_investor_flow_ls(ctx, inputs)
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=flow.parse_fingerprint()) as cache:
+        assert cache.get_many(["retired"]) == {"retired": {"value": 1}}
+
+    monkeypatch.setattr(flow, "publish_dataset", original_publish)
+    result = graph._build_investor_flow_ls(ctx, inputs)
+    assert result.path.is_dir()
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=flow.parse_fingerprint()) as cache:
+        assert cache.get_many(["retired"]) == {}
+        hashes = [blob.content_hash for blob in ctx.catalog.blobs(source="ls_investor_flow")]
+        assert set(cache.get_many(hashes)) == set(hashes)
+
+
 def test_build_nodes_and_phase_helpers_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import src.data.pipeline_graph as pipeline_graph
     from src.data.datasets import PublishedDataset

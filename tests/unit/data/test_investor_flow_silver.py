@@ -495,3 +495,356 @@ def test_all_rows_outside_query_range_publishes_empty(tmp_path: Path) -> None:
         catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1
     )
     assert result.rows == 0
+
+
+def _seed_pages(catalog: ReceiptCatalog, bronze_root: Path, count: int) -> list[str]:
+    digests: list[str] = []
+    for idx in range(count):
+        symbol = f"{100000 + idx:06d}"
+        digests.append(
+            _seed_blob(
+                catalog, bronze_root,
+                _ls_payload(symbol, [_row("20260304"), _row("20260305")], start="2026-03-04", end="2026-03-06"),
+            )
+        )
+    return digests
+
+
+def _manifest_details(dataset_path: Path) -> dict[str, object]:
+    return dict(json.loads((dataset_path / "manifest.json").read_text(encoding="utf-8")).get("details", {}))
+
+
+def test_cold_warm_partial_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.datasets as datasets
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 6, tzinfo=UTC).astimezone(tz)
+
+    monkeypatch.setattr(datasets, "datetime", FixedDatetime)
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    _seed_pages(catalog, bronze_root, 4)
+    silver_cold = tmp_path / "silver-cold"
+    silver_empty = tmp_path / "silver-empty"
+    silver_warm = tmp_path / "silver-warm"
+    silver_partial = tmp_path / "silver-partial"
+    for path in (silver_cold, silver_empty, silver_warm, silver_partial):
+        _write_universe(path)
+    cold = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_cold, workers=1
+    )
+    cache_path = tmp_path / "parse.sqlite"
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        empty = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_empty, workers=1, parse_cache=cache
+        )
+        warmed = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1, parse_cache=cache
+        )
+        hashes = [blob.content_hash for blob in catalog.blobs(source="ls_investor_flow", usable=True)]
+        cache.prune(set(hashes[:2]))
+        partial = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_partial, workers=1, parse_cache=cache
+        )
+    assert cold.dataset_id == empty.dataset_id == warmed.dataset_id == partial.dataset_id
+    expected_files = {
+        path.relative_to(cold.dataset_path): path.read_bytes()
+        for path in cold.dataset_path.rglob("*") if path.is_file()
+    }
+    for result in (empty, warmed, partial):
+        assert {
+            path.relative_to(result.dataset_path): path.read_bytes()
+            for path in result.dataset_path.rglob("*") if path.is_file()
+        } == expected_files
+        assert result.raw_pages == cold.raw_pages == 4
+
+
+def test_warm_run_does_not_read_bronze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.investor_flow_silver as flow_module
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    _seed_pages(catalog, bronze_root, 2)
+    silver_a = tmp_path / "silver-a"
+    silver_b = tmp_path / "silver-b"
+    _write_universe(silver_a)
+    _write_universe(silver_b)
+    cache_path = tmp_path / "parse.sqlite"
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        first = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_a, workers=1, parse_cache=cache
+        )
+
+        def _boom(path: Path) -> bytes:
+            raise AssertionError("bronze must not be read on full hit")
+
+        monkeypatch.setattr(flow_module, "read_payload", _boom)
+        second = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_b, workers=1, parse_cache=cache
+        )
+    assert first.dataset_id == second.dataset_id
+
+
+def test_cache_cold_path_still_fail_closed(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    digest = _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"),
+    )
+    (bronze_root / "investor_flow" / digest / "payload.json").write_bytes(b"tampered")
+    with ParseCache(tmp_path / "parse.sqlite", namespace="n", fingerprint=parse_fingerprint()) as cache:
+        with pytest.raises(PITDataError):
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1, parse_cache=cache
+            )
+        assert cache.get_many([digest]) == {}
+
+
+def test_calendar_guard_on_hit(tmp_path: Path) -> None:
+    import polars as pl
+
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20260306")], start="2026-03-06", end="2026-03-06"),
+    )
+    silver_warm = tmp_path / "silver-warm"
+    _write_universe(silver_warm)
+    with ParseCache(tmp_path / "parse.sqlite", namespace="n", fingerprint=parse_fingerprint()) as cache:
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1, parse_cache=cache
+        )
+        narrow_sessions = (date(2026, 3, 4), date(2026, 3, 5))
+        narrow_root = tmp_path / "silver-narrow"
+        publish_dataset(
+            layer_root=narrow_root,
+            identity=DatasetIdentity(
+                kind="ordinary_universe", layer=DatasetLayer.SILVER, policy_version="krx-ordinary-equity-v1",
+                inputs={}, params={"calendar": ",".join(day.isoformat() for day in narrow_sessions)},
+            ),
+            partitions={
+                f"session={day.isoformat()}/part.parquet": pl.DataFrame(
+                    {"session": [day], "instrument_id": ["KRX:005930"], "ticker": ["005930"], "eligible": [True]}
+                )
+                for day in narrow_sessions
+            },
+        )
+        with pytest.raises(PITDataError, match="outside certified calendar"):
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=narrow_root, silver_root=tmp_path / "silver-fail",
+                workers=1, parse_cache=cache,
+            )
+
+
+def test_identity_violations_preserved_cold_vs_warm(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    bad = _row("20260304", tjj0000="-99")
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [bad, _row("20260305")], start="2026-03-04", end="2026-03-06"),
+    )
+    silver_cold = tmp_path / "silver-cold"
+    silver_warm = tmp_path / "silver-warm"
+    silver_warm2 = tmp_path / "silver-warm2"
+    for path in (silver_cold, silver_warm, silver_warm2):
+        _write_universe(path)
+    cold = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_cold, workers=1
+    )
+    with ParseCache(tmp_path / "parse.sqlite", namespace="n", fingerprint=parse_fingerprint()) as cache:
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1, parse_cache=cache
+        )
+        warm = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm2, workers=1, parse_cache=cache
+        )
+    assert cold.dataset_id == warm.dataset_id
+    assert _manifest_details(cold.dataset_path)["identity_violation_keys"] == _manifest_details(
+        warm.dataset_path
+    )["identity_violation_keys"]
+
+
+def test_order_independence_of_catalog_tail(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    _seed_pages(catalog, bronze_root, 3)
+    silver_seed = tmp_path / "silver-seed"
+    _write_universe(silver_seed)
+    with ParseCache(tmp_path / "parse.sqlite", namespace="n", fingerprint=parse_fingerprint()) as cache:
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_seed, workers=1, parse_cache=cache
+        )
+        previous_hashes = [blob.content_hash for blob in catalog.blobs(source="ls_investor_flow")]
+        for index in range(100):
+            digest = _seed_blob(
+                catalog, bronze_root,
+                _ls_payload(f"{200000 + index:06d}", [_row("20260304")], start="2026-03-04", end="2026-03-06"),
+            )
+            if previous_hashes[0] < digest < previous_hashes[-1]:
+                break
+        else:
+            pytest.fail("fixture must add a page inside the existing hash order")
+        assert len(list(catalog.blobs(source="ls_investor_flow"))) > len(previous_hashes)
+        silver_warm = tmp_path / "silver-warm"
+        silver_cold = tmp_path / "silver-cold"
+        _write_universe(silver_warm)
+        _write_universe(silver_cold)
+        warm = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1, parse_cache=cache
+        )
+        cold = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_cold, workers=1
+        )
+    assert warm.dataset_id == cold.dataset_id
+
+
+def test_corrupted_cache_value_reparses(tmp_path: Path) -> None:
+    import json as _json
+    import sqlite3
+    import zlib
+
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _roots(tmp_path)
+    _seed_pages(catalog, bronze_root, 2)
+    silver_seed = tmp_path / "silver-seed"
+    silver_warm = tmp_path / "silver-warm"
+    silver_cold = tmp_path / "silver-cold"
+    for path in (silver_seed, silver_warm, silver_cold):
+        _write_universe(path)
+    cache_path = tmp_path / "parse.sqlite"
+    with ParseCache(cache_path, namespace="n", fingerprint=parse_fingerprint()) as cache:
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_seed, workers=1, parse_cache=cache
+        )
+    connection = sqlite3.connect(str(cache_path))
+    try:
+        row = connection.execute("SELECT content_hash, value FROM entries LIMIT 1").fetchone()
+        assert row is not None
+        target, blob = row
+        value = _json.loads(zlib.decompress(blob))
+        value["cells"][0][1] = value["cells"][0][1][:5]
+        connection.execute(
+            "UPDATE entries SET value=? WHERE content_hash=?", (zlib.compress(_json.dumps(value).encode()), target)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with ParseCache(cache_path, namespace="n", fingerprint=parse_fingerprint()) as cache:
+        warm = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1, parse_cache=cache
+        )
+    cold = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_cold, workers=1
+    )
+    assert warm.dataset_id == cold.dataset_id
+
+
+def test_encode_decode_round_trip_preserves_types_and_order() -> None:
+    from src.data.investor_flow_silver import _decode_page, _encode_page
+
+    sessions = frozenset(SESSIONS)
+    cells = [
+        (date(2026, 3, 4), tuple(range(15)), 50000, 10000, 500),
+        (date(2026, 3, 5), tuple([-x for x in range(15)]), 1, 2, 3),
+    ]
+    violations = [date(2026, 3, 6)]
+    symbol, (out_cells, out_dateless, out_violations) = _decode_page(
+        _encode_page("005930", (cells, 2, violations)), sessions, page_label="label"
+    )
+    assert symbol == "005930"
+    assert out_cells == cells
+    assert all(type(session) is date for session, _, _, _, _ in out_cells)
+    assert all(type(amount) is int for _, groups, _, _, _ in out_cells for amount in groups)
+    assert out_dateless == 2
+    assert out_violations == violations
+
+
+def test_decode_rejects_malformed_shapes() -> None:
+    from src.data.investor_flow_silver import _decode_page
+
+    sessions = frozenset(SESSIONS)
+    good_cells = [[date(2026, 3, 4).toordinal(), list(range(15)), 1, 2, 3]]
+    base = {"symbol": "005930", "dateless": 0, "violations": [], "cells": good_cells}
+    malformed = [
+        None, [], "x",
+        dict(base, symbol=""), dict(base, symbol=1), dict(base, symbol=True),
+        dict(base, dateless=-1), dict(base, dateless=True), dict(base, dateless="0"),
+        dict(base, violations={}), dict(base, cells={}),
+        dict(base, violations=["x"]), dict(base, violations=[True]),
+        dict(base, violations=[999999999]),
+        dict(base, cells=[["x", list(range(15)), 1, 2, 3]]),
+        dict(base, cells=[[date(2026, 3, 4).toordinal(), list(range(5)), 1, 2, 3]]),
+        dict(base, cells=[[date(2026, 3, 4).toordinal(), [1] * 14 + ["x"], 1, 2, 3]]),
+        dict(base, cells=[[date(2026, 3, 4).toordinal(), list(range(15)), 1.5, 2, 3]]),
+        dict(base, cells=[[999999999, list(range(15)), 1, 2, 3]]),
+        dict(base, cells=[["short"]]),
+    ]
+    for value in malformed:
+        with pytest.raises((TypeError, ValueError)):
+            _decode_page(value, sessions, page_label="p")
+
+
+def test_decode_calendar_guard_for_violation_and_cell() -> None:
+    from src.data.investor_flow_silver import _decode_page
+
+    sessions = frozenset({date(2026, 3, 4)})
+    with pytest.raises(PITDataError, match="outside certified calendar"):
+        _decode_page(
+            {"symbol": "s", "dateless": 0, "violations": [date(2026, 3, 5).toordinal()], "cells": []},
+            sessions, page_label="p",
+        )
+    with pytest.raises(PITDataError, match="outside certified calendar"):
+        _decode_page(
+            {"symbol": "s", "dateless": 0, "violations": [],
+             "cells": [[date(2026, 3, 5).toordinal(), [0] * 15, 1, 2, 3]]},
+            sessions, page_label="p",
+        )
+
+
+def test_parse_fingerprint_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.investor_flow_silver as flow_module
+
+    monkeypatch.setattr(flow_module, "_PARSE_FINGERPRINT", None)
+    first = flow_module.parse_fingerprint()
+    assert first == flow_module._PARSE_FINGERPRINT
+    assert flow_module.parse_fingerprint() == first
+
+
+def test_malformed_hit_is_reparsed_before_calendar_validation(tmp_path: Path) -> None:
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, silver_root, catalog = _roots(tmp_path)
+    digest = _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20260304")], start="2026-03-04", end="2026-03-06"),
+    )
+    with ParseCache(tmp_path / "parse.sqlite", namespace="n", fingerprint="f") as cache:
+        cache.put_many({digest: {
+            "symbol": "005930", "dateless": 0,
+            "violations": [date(2026, 3, 7).toordinal()],
+            "cells": [[date(2026, 3, 4).toordinal(), [0], 1, 2, 3]],
+        }})
+        result = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root,
+            workers=1, parse_cache=cache,
+        )
+        assert result.rows == 1
+        assert cache.get_many([digest])[digest]["violations"] == []
