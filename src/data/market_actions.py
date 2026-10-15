@@ -36,6 +36,7 @@ from src.data.kind_notices import (
 )
 from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
+from src.data.session_index import SessionIndex
 
 __all__ = [
     "MarketActionKind",
@@ -204,12 +205,12 @@ def market_actions_dataset_inputs(
     }
 
 
-def _resolve_available_at(announced_on: date, *, calendar: SessionCalendar) -> datetime:
+def _resolve_available_at(announced_on: date, *, index: SessionIndex) -> datetime:
     """Return the open of the first session after the announcement date."""
-    for session in calendar.sessions:
-        if session.astimezone(KRX_TZ).date() > announced_on:
-            return session
-    raise PITDataError(f"no certified session open after announcement date {announced_on.isoformat()}")
+    position = index.count_on_or_before_date(announced_on)
+    if position >= len(index.sessions):
+        raise PITDataError(f"no certified session open after announcement date {announced_on.isoformat()}")
+    return index.sessions[position]
 
 
 def _load_daily_flag_rows(
@@ -364,13 +365,13 @@ def _write_flag_cache(path: Path, flags: dict[date, tuple[str, dict[str, bool]]]
         raise PITDataError(f"daily flag cache cannot be written: {target}") from exc
 
 
-def _resolve_kind_available_at(disclosed_at: datetime, *, calendar: SessionCalendar) -> datetime:
+def _resolve_kind_available_at(disclosed_at: datetime, *, index: SessionIndex) -> datetime:
     """Return the open of the first certified session strictly after ``disclosed_at``."""
     moment = disclosed_at if disclosed_at.tzinfo is not None else disclosed_at.replace(tzinfo=KRX_TZ)
-    for session in calendar.sessions:
-        if session > moment:
-            return session
-    raise PITDataError(f"no certified session open after KIND notice at {disclosed_at.isoformat()}")
+    position = index.count_on_or_before_instant(moment)
+    if position >= len(index.sessions):
+        raise PITDataError(f"no certified session open after KIND notice at {disclosed_at.isoformat()}")
+    return index.sessions[position]
 
 
 _KOSDAQ_DESK = "코스닥시장본부"
@@ -446,6 +447,7 @@ def materialize_market_actions(
     """
     if len(calendar.sessions) < 2:
         raise PITDataError("market actions require at least two certified sessions")
+    index = SessionIndex.from_calendar(calendar)
     flag_pages = _load_daily_flag_rows(catalog, calendar, flag_cache=flag_cache)
     covered_days = sorted(flag_pages)
     kind_through: date | None = None
@@ -491,7 +493,7 @@ def materialize_market_actions(
                 "source": "dart",
                 "rcept_no": record.rcept_no,
                 "announced_on": record.rcept_dt,
-                "available_at": _resolve_available_at(record.rcept_dt, calendar=calendar),
+                "available_at": _resolve_available_at(record.rcept_dt, index=index),
                 "effective_start": None,
                 "effective_end": None,
                 "cancellation": cancellation,
@@ -510,7 +512,7 @@ def materialize_market_actions(
         if not notice.submitter.endswith("시장본부") or not notice.company_code:
             continue
         announced_on = notice.disclosed_at.astimezone(KRX_TZ).date()
-        available_at = _resolve_kind_available_at(notice.disclosed_at, calendar=calendar)
+        available_at = _resolve_kind_available_at(notice.disclosed_at, index=index)
         rcept_no = f"KIND-{notice.acptno}"
         normalized = normalize_kind_title(notice.title)
         if normalized == "상장폐지":
@@ -637,7 +639,7 @@ def materialize_market_actions(
                         "source": "krx_flag",
                         "rcept_no": f"KRX-SECT-{ticker}-{day.isoformat()}",
                         "announced_on": day,
-                        "available_at": _resolve_available_at(day, calendar=calendar),
+                        "available_at": _resolve_available_at(day, index=index),
                         "effective_start": day,
                         "effective_end": None,
                         "cancellation": False,
@@ -654,7 +656,7 @@ def materialize_market_actions(
                         "source": "krx_flag",
                         "rcept_no": f"KRX-SECT-{ticker}-{day.isoformat()}",
                         "announced_on": day,
-                        "available_at": _resolve_available_at(day, calendar=calendar),
+                        "available_at": _resolve_available_at(day, index=index),
                         "effective_start": day,
                         "effective_end": None,
                         "cancellation": False,
