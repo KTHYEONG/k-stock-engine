@@ -177,7 +177,13 @@ class CollectionReport:
         )
 
 
-OPTIONAL_COLLECTION_JOBS: Final[frozenset[str]] = frozenset({"kind_notice_search", "kind_notice_documents"})
+OPTIONAL_COLLECTION_JOBS: Final[frozenset[str]] = frozenset({
+    "kind_notice_search",
+    "kind_notice_documents",
+    "dbsec_ticker_master",
+    "dbsec_daily_chart",
+    "dbsec_closing_bar",
+})
 
 
 def build_refresh_context(
@@ -1410,6 +1416,39 @@ def _run_krx_collection_step(
     )
 
 
+def _run_dbsec_collection_step(
+    ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
+) -> CollectionStepReport:
+    """Run one DB Securities fallback collection job without duplicating runner wiring."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.jobs.dbsec import build_dbsec_job_context, resolve_dbsec_job
+    from src.data.jobs.runner import run_job
+    from src.integrations.dbsec.client import build_scoped_dbsec_client
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    collector = None
+    if not dry_run:  # pragma: no cover - live provider path
+        collector = build_scoped_dbsec_client(
+            policy=provider.dbsec,
+            quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
+        )
+    job_ctx = build_dbsec_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
+    report = run_job(
+        resolve_dbsec_job(job_name),
+        job_ctx,
+        chunk_size=int(provider.dbsec.chunk_units),
+        max_chunks=None,
+        dry_run=dry_run,
+        emit=emit,
+    )
+    return CollectionStepReport(
+        job=job_name, status=report.status, done=report.done,
+        pending_left=report.pending_left, requests_used=report.requests_used,
+    )
+
+
 def _run_kind_collection_step(
     ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
@@ -1649,6 +1688,24 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
         ),
         ("ls_investor_flow", _run_ls_flow_collection_step),
         ("kis_investor_flow", _run_kis_flow_collection_step),
+        (
+            "dbsec_ticker_master",
+            lambda ctx, *, dry_run, emit: _run_dbsec_collection_step(
+                ctx, "dbsec_ticker_master", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "dbsec_daily_chart",
+            lambda ctx, *, dry_run, emit: _run_dbsec_collection_step(
+                ctx, "dbsec_daily_chart", dry_run=dry_run, emit=emit
+            ),
+        ),
+        (
+            "dbsec_closing_bar",
+            lambda ctx, *, dry_run, emit: _run_dbsec_collection_step(
+                ctx, "dbsec_closing_bar", dry_run=dry_run, emit=emit
+            ),
+        ),
     )
 
 

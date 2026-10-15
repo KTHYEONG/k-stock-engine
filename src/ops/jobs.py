@@ -32,12 +32,14 @@ if TYPE_CHECKING:
     from src.ops.alerts import AlertSender
 
 __all__ = [
+    "DBSEC_COLLECT_STEPS",
     "EVENING_COLLECT_STEPS",
     "KRX_COLLECT_STEPS",
     "POLL_INTERVAL_S",
     "alert",
     "audit",
     "backup",
+    "collect_dbsec",
     "collect_eve",
     "main",
     "morning",
@@ -67,6 +69,9 @@ KRX_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
         "krx_trend_series",
         "krx_cash_series",
     }
+)
+DBSEC_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
+    {"dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"}
 )
 POLL_INTERVAL_S: Final = 60.0
 
@@ -328,6 +333,41 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(),
                  "node_peak_rss_mb": node_peaks, **warm_metrics},
     )
+    return 0
+
+
+def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
+    """Collect DB Securities fallback evidence only; returns the process exit code."""
+    from src.data.pipeline_graph import _default_collection_steps, build_refresh_context, run_collection_jobs
+    from src.data.runtime import resolve_data_runtime
+
+    root = Path(data_root)
+    moment = _aware(now)
+    if not trading_day(today):
+        _record(root, "collect_dbsec", "SKIPPED", today, moment, reason="non_trading_day")
+        return 0
+    try:
+        runtime = resolve_data_runtime(data_root=root)
+        ctx = build_refresh_context(runtime, decision_time=moment)
+        steps = tuple(step for step in _default_collection_steps() if step[0] in DBSEC_COLLECT_STEPS)
+        report = run_collection_jobs(
+            ctx, dry_run=False, emit=lambda payload: _LOG.debug("refresh %s", dict(payload)), steps=steps,
+        )
+    except Exception as exc:
+        _record(root, "collect_dbsec", "DEGRADED", today, moment, reason=type(exc).__name__)
+        return 1
+    metrics = {
+        step.job: {"done": step.done, "pending_left": step.pending_left, "requests_used": step.requests_used}
+        for step in report.steps
+    }
+    failed = [step.job for step in report.steps if step.status == "failed"]
+    if failed:
+        _record(
+            root, "collect_dbsec", "DEGRADED", today, moment,
+            reason=f"failed:{','.join(failed)}"[:300], metrics=metrics,
+        )
+        return 0
+    _record(root, "collect_dbsec", "OK", today, moment, metrics=metrics)
     return 0
 
 
@@ -690,6 +730,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--date", type=str, required=False, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("collect-eve")
+    sub.add_parser("collect-dbsec")
     sub.add_parser("morning")
     prune = sub.add_parser("backup")
     prune.add_argument("--no-lock", action="store_true")
@@ -711,6 +752,8 @@ def main(argv: list[str] | None = None) -> int:
     moment = datetime.now(KRX_TZ)
     if args.command == "collect-eve":
         return collect_eve(data_root, today=today, now=moment)
+    if args.command == "collect-dbsec":
+        return collect_dbsec(data_root, today=today, now=moment)
     if args.command == "morning":
         return morning(data_root, today=today, now=lambda: datetime.now(KRX_TZ), sleep=time.sleep)
     if args.command == "backup":
