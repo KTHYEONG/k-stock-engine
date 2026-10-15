@@ -18,6 +18,7 @@ ALLOWED_MOUNT_PREFIXES = (
     "%h/k-stock-engine/data:",
     "%h/k-stock-engine/logs:",
     "%h/.cache/kis:",
+    "%h/.cache/dbsec:",
     "%h/.config/rclone:",
 )
 
@@ -41,7 +42,7 @@ def _exec_start(text: str) -> str:
 
 def test_units_are_safe_by_construction() -> None:
     services = _services()
-    assert len(services) == 6
+    assert len(services) == 7
     for path in services:
         text = path.read_text(encoding="utf-8")
         assert "TimeoutStartSec=" in text
@@ -139,7 +140,7 @@ def _in_window(mark: tuple[int, int], window: tuple[tuple[int, int], tuple[int, 
 
 def test_timers_avoid_sibling_windows() -> None:
     timers = sorted(SYSTEMD.glob("kse-*.timer"))
-    assert len(timers) == 6
+    assert len(timers) == 7
     for path in timers:
         for mark in _calendars(path):
             assert mark not in DRIVE_SLOTS, f"{path.name}: {mark}"
