@@ -47,7 +47,8 @@ _SUBGROUP_COLUMNS: tuple[str, ...] = (
     "tjj0010_net_shares",
     "tjj0011_net_shares",
 )
-_PAGE_BATCH = 1000
+# pool.map submits a whole batch eagerly; parsed pages buffer until consumed, so this bounds peak RSS.
+_PAGE_BATCH = 100
 _SHARD_SCHEMA: dict[str, Any] = {
     "session": pl.Date,
     "ticker": pl.String,
