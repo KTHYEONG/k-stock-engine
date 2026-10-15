@@ -8,6 +8,8 @@ DEST_DIR="${HOME}/.config/systemd/user"
 mkdir -p "${DEST_DIR}"
 mkdir -p "${HOME}/.cache/kis"
 chmod 700 "${HOME}/.cache/kis"
+mkdir -p "${HOME}/.cache/dbsec"
+chmod 700 "${HOME}/.cache/dbsec"
 touch "${HOME}/.cache/kis/.host-admission"
 mkdir -p "${HOME}/k-stock-engine/data" "${HOME}/k-stock-engine/logs"
 # Alert credentials live in their own 0600 file so only the audit and alert containers receive them.
@@ -19,6 +21,7 @@ systemctl --user daemon-reload
 
 systemctl --user enable --now \
   kse-collect-eve.timer \
+  kse-collect-dbsec.timer \
   kse-backup.timer \
   kse-morning.timer \
   kse-auction-open.timer \

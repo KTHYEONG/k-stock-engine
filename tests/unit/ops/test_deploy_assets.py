@@ -253,3 +253,12 @@ def test_kind_relay_delivery_path_matches_importer_inbox() -> None:
     root = Path("/data")
     inbox = relay_inbox_path(build_workspace(data_root=root, scope=scope).state_root).parent
     assert f"~/k-stock-engine/data/{inbox.relative_to(root).as_posix()}" in _relay_text()
+
+
+def test_dbsec_collection_waits_for_collect_eve_and_is_enabled() -> None:
+    service = (SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8")
+    assert "ExecStartPre=" in service
+    assert "kse-collect-eve.service" in service.split("ExecStartPre=", 1)[1].splitlines()[0]
+    installer = (REPO / "deploy" / "install_systemd.sh").read_text(encoding="utf-8")
+    assert "kse-collect-dbsec.timer" in installer
+    assert '.cache/dbsec"' in installer
