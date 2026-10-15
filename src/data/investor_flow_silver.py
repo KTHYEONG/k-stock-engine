@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 
@@ -26,6 +27,7 @@ from src.data.datasets import (
     resolve_bronze_digest,
     universe_sessions,
 )
+from src.data.parse_cache import ParseCache, source_fingerprint
 from src.data.payload_store import read_payload
 from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 
@@ -213,6 +215,94 @@ def _parse_blob(entry: BlobEntry, sessions: frozenset[date]) -> tuple[str, str, 
     return (page_hash, symbol, (cells, dateless_rows, violations))
 
 
+_PageContent = tuple[list[tuple[date, tuple[int, ...], int, int, int]], int, list[date]]
+
+_PARSE_FINGERPRINT: str | None = None
+
+
+def parse_fingerprint() -> str:
+    """Fingerprint of this module's source for parse-cache invalidation."""
+    global _PARSE_FINGERPRINT
+    if _PARSE_FINGERPRINT is None:
+        _PARSE_FINGERPRINT = source_fingerprint(sys.modules[__name__])
+    return _PARSE_FINGERPRINT
+
+
+def _encode_page(symbol: str, content: _PageContent) -> dict[str, Any]:
+    """Encode one parsed page into JSON-native form."""
+    cells, dateless_rows, violations = content
+    return {
+        "symbol": symbol,
+        "dateless": dateless_rows,
+        "violations": [day.toordinal() for day in violations],
+        "cells": [
+            [session.toordinal(), list(groups), close, volume, value]
+            for session, groups, close, volume, value in cells
+        ],
+    }
+
+
+def _is_plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _decode_page(value: Any, sessions: frozenset[date], *, page_label: str) -> tuple[str, _PageContent]:
+    """Rebuild parse tuples from cached JSON; calendar breaches fail closed."""
+    _ = page_label
+    if not isinstance(value, dict):
+        raise TypeError("cached page must be an object")
+    symbol = value.get("symbol")
+    dateless = value.get("dateless")
+    raw_violations = value.get("violations")
+    raw_cells = value.get("cells")
+    if not isinstance(symbol, str) or not symbol:
+        raise TypeError("cached page symbol is malformed")
+    if not _is_plain_int(dateless):
+        raise TypeError("cached page dateless is malformed")
+    dateless_int: int = cast(int, dateless)
+    if dateless_int < 0:
+        raise TypeError("cached page dateless is malformed")
+    if not isinstance(raw_violations, list) or not isinstance(raw_cells, list):
+        raise TypeError("cached page shape is malformed")
+    violations: list[date] = []
+    for ordinal in raw_violations:
+        if not _is_plain_int(ordinal):
+            raise TypeError("cached violation session is malformed")
+        ordinal_int: int = ordinal
+        try:
+            day = date.fromordinal(ordinal_int)
+        except ValueError as exc:
+            raise TypeError("cached violation session is malformed") from exc
+        violations.append(day)
+    cells: list[tuple[date, tuple[int, ...], int, int, int]] = []
+    for row in raw_cells:
+        if not isinstance(row, list) or len(row) != 5:
+            raise TypeError("cached cell is malformed")
+        ordinal, groups, close, volume, amount = row
+        if not _is_plain_int(ordinal):
+            raise TypeError("cached cell session is malformed")
+        ordinal_int = int(ordinal)
+        if not isinstance(groups, list) or len(groups) != len(_GROUP_CODES):
+            raise TypeError("cached cell groups are malformed")
+        if any(not _is_plain_int(item) for item in groups):
+            raise TypeError("cached cell groups are malformed")
+        group_ints: tuple[int, ...] = tuple(int(item) for item in groups)
+        if not _is_plain_int(close) or not _is_plain_int(volume) or not _is_plain_int(amount):
+            raise TypeError("cached cell quote is malformed")
+        close_int: int = close
+        volume_int: int = volume
+        amount_int: int = amount
+        try:
+            session = date.fromordinal(ordinal_int)
+        except ValueError as exc:
+            raise TypeError("cached cell session is malformed") from exc
+        cells.append((session, group_ints, close_int, volume_int, amount_int))
+    for session in [*(cell[0] for cell in cells), *violations]:
+        if session not in sessions:
+            raise PITDataError(f"LS investor flow session outside certified calendar: {session}")
+    return (symbol, (cells, dateless_int, violations))
+
+
 def materialize_investor_flow_silver(
     *,
     catalog: ReceiptCatalog,
@@ -222,6 +312,7 @@ def materialize_investor_flow_silver(
     workers: int = 4,
     universe_dataset_id: str | None = None,
     bronze_flow_digest: str | None = None,
+    parse_cache: ParseCache | None = None,
 ) -> InvestorFlowSilverResult:
     """Build an immutable Silver investor-flow dataset from catalog LS blobs."""
 
@@ -267,16 +358,62 @@ def materialize_investor_flow_silver(
             for offset in range(0, len(blobs), _PAGE_BATCH):
                 batch = blobs[offset : offset + _PAGE_BATCH]
                 columns: dict[str, list[Any]] = {name: [] for name in _SHARD_SCHEMA}
-                for page_hash, symbol, content in pool.map(
-                    _parse_blob, batch, [session_set] * len(batch)
-                ):
+                ordered: list[tuple[str, str, _PageContent]] = []
+                cache_hits = 0
+                if parse_cache is None:
+                    parsed_batch: list[tuple[str, str, _PageContent]] = list(
+                        pool.map(_parse_blob, batch, [session_set] * len(batch))
+                    )
+                    ordered = parsed_batch
+                else:
+                    cached_raw = parse_cache.get_many([blob.content_hash for blob in batch])
+                    hit_by_hash: dict[str, tuple[str, _PageContent]] = {}
+                    miss_unique: list[BlobEntry] = []
+                    miss_seen: set[str] = set()
+                    for blob in batch:
+                        raw_value = cached_raw.get(blob.content_hash)
+                        if raw_value is None:
+                            if blob.content_hash not in miss_seen:
+                                miss_seen.add(blob.content_hash)
+                                miss_unique.append(blob)
+                            continue
+                        try:
+                            hit_by_hash[blob.content_hash] = _decode_page(
+                                raw_value, session_set, page_label=blob.content_hash
+                            )
+                        except PITDataError:
+                            raise
+                        except Exception:
+                            if blob.content_hash not in miss_seen:
+                                miss_seen.add(blob.content_hash)
+                                miss_unique.append(blob)
+                    miss_by_hash: dict[str, tuple[str, _PageContent]] = {}
+                    fresh: dict[str, dict[str, Any]] = {}
+                    if miss_unique:
+                        for page_hash, symbol, content in pool.map(
+                            _parse_blob, miss_unique, [session_set] * len(miss_unique)
+                        ):
+                            typed_content = content
+                            miss_by_hash[page_hash] = (symbol, typed_content)
+                            fresh[page_hash] = _encode_page(symbol, typed_content)
+                    for blob in batch:
+                        if blob.content_hash in hit_by_hash:
+                            symbol, content = hit_by_hash[blob.content_hash]
+                            ordered.append((blob.content_hash, symbol, content))
+                            cache_hits += 1
+                        else:
+                            symbol, content = miss_by_hash[blob.content_hash]
+                            ordered.append((blob.content_hash, symbol, content))
+                    if fresh:
+                        parse_cache.put_many(fresh)
+                for page_hash, symbol, content in ordered:
                     parsed_pages += 1
                     bronze_page_hashes.append(page_hash)
                     raw_hashes.append(page_hash)
-                    cells, page_dateless, page_violations = content
+                    page_cells, page_dateless, page_violations = content
                     dateless_rows += page_dateless
                     violation_keys.update((day.isoformat(), symbol) for day in page_violations)
-                    for session, groups, close, volume, value in cells:
+                    for session, groups, close, volume, value in page_cells:
                         columns["session"].append(session)
                         columns["ticker"].append(symbol)
                         for code, amount in zip(_GROUP_CODES, groups, strict=True):
@@ -285,17 +422,26 @@ def materialize_investor_flow_silver(
                         columns["ls_volume"].append(volume)
                         columns["ls_value_mkrw"].append(value)
                         columns["source_hash"].append(page_hash)
-                    parsed_rows += len(cells)
+                    parsed_rows += len(page_cells)
                 if columns["session"]:
                     pl.DataFrame(columns, schema=_SHARD_SCHEMA).write_parquet(
                         shard_dir / f"shard-{offset:07d}.parquet"
                     )
-                _LOG.info(
-                    "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d",
-                    parsed_pages,
-                    len(blobs),
-                    parsed_rows,
-                )
+                if parse_cache is None:
+                    _LOG.info(
+                        "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d",
+                        parsed_pages,
+                        len(blobs),
+                        parsed_rows,
+                    )
+                else:
+                    _LOG.info(
+                        "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d cache_hits=%d",
+                        parsed_pages,
+                        len(blobs),
+                        parsed_rows,
+                        cache_hits,
+                    )
 
         violations = pl.DataFrame(
             {
