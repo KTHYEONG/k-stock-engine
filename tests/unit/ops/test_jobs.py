@@ -598,7 +598,7 @@ def _healthy_audit_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1), execution_session=DAY,
                                       sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),),
     )
-    for job_name in ("collect_eve", "morning", "auction_open", "backup"):
+    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open", "backup"):
         record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
     _write_backup_status(tmp_path)
 
@@ -678,7 +678,7 @@ def test_audit_warning_delivered_exits_zero(tmp_path: Path, monkeypatch: pytest.
                         lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
                                                       execution_session=DAY,
                                                       sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "morning", "auction_open"):
+    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
         record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
     _write_backup_status(tmp_path, stale=True)
     sender = _AlertRecorder()
@@ -697,7 +697,7 @@ def test_audit_warning_undeliverable_exits_one(tmp_path: Path, monkeypatch: pyte
                         lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
                                                       execution_session=DAY,
                                                       sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "morning", "auction_open"):
+    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
         record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
     _write_backup_status(tmp_path, stale=True)
     _alert_sender(monkeypatch, None)
@@ -727,7 +727,7 @@ def test_repeat_audit_same_day_is_silent(tmp_path: Path, monkeypatch: pytest.Mon
                         lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
                                                       execution_session=DAY,
                                                       sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "morning", "auction_open"):
+    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
         record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
     _write_backup_status(tmp_path, stale=True)
     sender = _AlertRecorder()
