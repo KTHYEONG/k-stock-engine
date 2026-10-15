@@ -14,6 +14,7 @@ _FAKE_SOURCE = "dart_disclosures"
 
 
 def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  # type: ignore[no-untyped-def]
+    from src.config import load_provider_policy, load_runtime_config
     from src.config.providers import (
         DartKeyPolicy, DartPolicy, KindPolicy, KisPolicy, KrxPolicy, LsPolicy, ProviderPolicy,
     )
@@ -61,6 +62,7 @@ def _provider(*, budget=1000, reserve=10, windows=(), threshold=3, batch=500):  
             min_interval_seconds=1.05,
             daily_limit=10000,
         ),
+        dbsec=load_provider_policy(load_runtime_config()).dbsec,
         kind=KindPolicy(
             circuit_threshold=3,
             min_interval_seconds=1.0,
