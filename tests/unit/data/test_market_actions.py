@@ -1509,3 +1509,93 @@ def test_flag_cache_failed_replace_preserves_existing_file(tmp_path: Path, monke
         actions_module._write_flag_cache(cache, {date(2024, 1, 2): ("s", {"000660": True})})
     assert cache.read_bytes() == b"previous-cache"
     assert list(tmp_path.iterdir()) == [cache]
+
+
+def _legacy_available_at(announced_on: date, calendar: SessionCalendar) -> datetime:  # type: ignore[no-untyped-def]
+    for session in calendar.sessions:
+        if session.astimezone(KRX_TZ).date() > announced_on:
+            return session
+    raise PITDataError("no certified session open after announcement date")
+
+
+def _legacy_kind_available_at(disclosed_at: datetime, calendar: SessionCalendar) -> datetime:  # type: ignore[no-untyped-def]
+    moment = disclosed_at if disclosed_at.tzinfo is not None else disclosed_at.replace(tzinfo=KRX_TZ)
+    for session in calendar.sessions:
+        if session > moment:
+            return session
+    raise PITDataError("no certified session open after KIND notice")
+
+
+def test_resolvers_match_legacy_oracle() -> None:
+    import random as _random
+    from datetime import timedelta
+
+    from src.data.market_actions import _resolve_available_at, _resolve_kind_available_at
+    from src.data.session_index import SessionIndex
+
+    rng = _random.Random(20240103)  # noqa: S311 - deterministic test fixture, not crypto
+    for _ in range(20):
+        cursor = datetime(2024, 1, 2, 9, 0, tzinfo=KRX_TZ)
+        sessions = []
+        for _ in range(rng.randint(2, 10)):
+            sessions.append(cursor)
+            cursor = cursor + timedelta(days=rng.choice([1, 2, 3, 5]))
+        calendar = SessionCalendar(tuple(sessions))
+        index = SessionIndex.from_calendar(calendar)
+        session_dates = [s.astimezone(KRX_TZ).date() for s in sessions]
+        candidates = {min(session_dates) - timedelta(days=2), max(session_dates) + timedelta(days=2)}
+        for day in session_dates:
+            candidates.update({day, day - timedelta(days=1), day + timedelta(days=1)})
+        for day in candidates:
+            try:
+                expected = _legacy_available_at(day, calendar)
+            except PITDataError:
+                with pytest.raises(PITDataError):
+                    _resolve_available_at(day, index=index)
+            else:
+                assert _resolve_available_at(day, index=index) == expected
+        moments: list[datetime] = []
+        for session in sessions:
+            moments.extend(
+                [
+                    session,
+                    session - timedelta(minutes=1),
+                    session + timedelta(minutes=1),
+                    session.replace(tzinfo=None),
+                ]
+            )
+        for moment in moments:
+            try:
+                expected = _legacy_kind_available_at(moment, calendar)
+            except PITDataError:
+                with pytest.raises(PITDataError):
+                    _resolve_kind_available_at(moment, index=index)
+            else:
+                assert _resolve_kind_available_at(moment, index=index) == expected
+
+
+def test_past_last_session_fails_closed() -> None:
+    from src.data.market_actions import _resolve_available_at
+    from src.data.session_index import SessionIndex
+
+    index = SessionIndex.from_calendar(_calendar(date(2024, 1, 2), date(2024, 1, 3)))
+    with pytest.raises(PITDataError, match="no certified session open after announcement date"):
+        _resolve_available_at(date(2024, 1, 3), index=index)
+
+
+def test_materialised_dataset_id_unchanged(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    _publish_window(
+        runtime, key="I003:2024-01-01..2024-01-31",
+        records=[
+            _record("20240102000001", rcept_dt="20240102", report_nm="상장폐지결정"),
+            _record("20240102000002", rcept_dt="20240102", report_nm="현금배당 결정"),
+        ],
+    )
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)),
+        bridge=_bridge(),
+        kind_keywords=(), kind_max_stale_sessions=5, kind_coverage_start=date(2024, 1, 2),
+    )
+    assert load_manifest(path).dataset_id == "market_actions_9dc417301c11e282"

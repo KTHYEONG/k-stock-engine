@@ -27,6 +27,7 @@ from src.data.datasets import (
 from src.data.evidence_sources import DIVIDEND_DECISION_SOURCE
 from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
+from src.data.session_index import SessionIndex
 from src.integrations.dart.dividend_decision import (
     DividendDecision,
     UndecidedRecordDateError,
@@ -267,20 +268,14 @@ def _load_market_reference(
     return reference
 
 
-def _session_dates(calendar: SessionCalendar) -> list[date]:
-    return [session.astimezone(KRX_TZ).date() for session in calendar.sessions]
-
-
-def _resolve_ex_session(record_date: date, *, calendar: SessionCalendar) -> date:
-    dates = _session_dates(calendar)
-    at_or_before = [day for day in dates if day <= record_date]
-    if not at_or_before:
+def _resolve_ex_session(record_date: date, *, index: SessionIndex) -> date:
+    n = index.count_on_or_before_date(record_date)
+    if n == 0:
         raise PITDataError(f"no certified session on or before record date {record_date.isoformat()}")
-    record_session = max(at_or_before)
-    index = dates.index(record_session)
-    if index == 0:
+    record_session = index.dates[n - 1]
+    if n == 1:
         raise PITDataError(f"no prior certified session before record session {record_session.isoformat()}")
-    return dates[index - 1]
+    return index.dates[n - 2]
 
 
 def _add_months(day: date, months: int) -> date:
@@ -301,15 +296,18 @@ def _estimate_pay_date(decision: DividendDecision) -> tuple[date, str] | None:
     return None
 
 
-def _resolve_pay_session(pay_date: date, *, calendar: SessionCalendar) -> date:
-    return max(day for day in _session_dates(calendar) if day <= pay_date)
+def _resolve_pay_session(pay_date: date, *, index: SessionIndex) -> date:
+    n = index.count_on_or_before_date(pay_date)
+    if n == 0:
+        raise ValueError("max() arg is an empty sequence")
+    return index.dates[n - 1]
 
 
-def _resolve_available_at(received_on: date, *, calendar: SessionCalendar) -> datetime:
-    for session in calendar.sessions:
-        if session.astimezone(KRX_TZ).date() > received_on:
-            return session
-    raise PITDataError(f"no certified session open after receipt date {received_on.isoformat()}")
+def _resolve_available_at(received_on: date, *, index: SessionIndex) -> datetime:
+    position = index.count_on_or_before_date(received_on)
+    if position >= len(index.sessions):
+        raise PITDataError(f"no certified session open after receipt date {received_on.isoformat()}")
+    return index.sessions[position]
 
 
 def materialize_dividend_events(
@@ -359,7 +357,7 @@ def materialize_dividend_events(
         parsed, correction_window_days=active_policy.correction_window_days
     )
     market = _load_market_reference(daily_market_path)
-    session_dates = _session_dates(calendar)
+    index = SessionIndex.from_calendar(calendar)
 
     rows: list[dict[str, Any]] = []
     quarantine: list[DividendQuarantine] = []
@@ -385,11 +383,11 @@ def materialize_dividend_events(
             continue
         if pay_source != "declared":
             estimated_pay_rows += 1
-        ex_session = _resolve_ex_session(decision.record_date, calendar=calendar)
+        ex_session = _resolve_ex_session(decision.record_date, index=index)
         reason: str | None = None
         if market is not None:
-            position = session_dates.index(ex_session)
-            reference_session = session_dates[position - 1] if position > 0 else None
+            position = index.position_of_date(ex_session)
+            reference_session = index.dates[position - 1] if position > 0 else None
             if reference_session is None:
                 close, shares = None, None
             else:
@@ -413,11 +411,11 @@ def materialize_dividend_events(
                 "ticker": ticker,
                 "record_date": decision.record_date,
                 "ex_session": ex_session,
-                "pay_session": _resolve_pay_session(pay_date, calendar=calendar),
+                "pay_session": _resolve_pay_session(pay_date, index=index),
                 "dps_krw": decision.dps_common_krw,
                 "pay_date_source": pay_source,
                 "rcept_no": decision.rcept_no,
-                "available_at": _resolve_available_at(decision.received_on, calendar=calendar),
+                "available_at": _resolve_available_at(decision.received_on, index=index),
                 "policy_version": REVISION,
             }
         )
