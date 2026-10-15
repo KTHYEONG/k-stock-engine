@@ -541,3 +541,132 @@ def test_host_pacer_rejects_non_positive_interval(tmp_path) -> None:
         HostPacer(tmp_path / "pacer.json", min_interval_seconds=0)
     with pytest.raises(ValueError, match="min_interval_seconds"):
         HostPacer(tmp_path / "pacer.json", min_interval_seconds=-0.5)
+
+
+def test_error_classify_retries_vendor_throttle_on_403() -> None:
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderRetryableError
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(status_code=403, headers={}, json=lambda: {})
+        return _ok_response()
+
+    def _hook(_response) -> None:
+        raise ProviderRetryableError("throttled", provider="TEST", endpoint="ep")
+
+    transport = _transport(session=SimpleNamespace(post=fake_post), sleep=lambda _s: None)
+
+    assert transport.post("ep", {}, error_classify=_hook).status_code == 200
+    assert calls["n"] == 2
+
+
+def test_error_classify_pass_through_keeps_4xx_terminal() -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderTerminalError
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=403, headers={}, json=lambda: {})
+
+    transport = _transport(session=SimpleNamespace(post=fake_post), sleep=lambda _s: None)
+
+    with pytest.raises(ProviderTerminalError):
+        transport.post("ep", {}, error_classify=lambda _r: None)
+    assert calls["n"] == 1
+
+
+def test_error_classify_absent_preserves_existing_behavior() -> None:
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(status_code=500, headers={}, json=lambda: {})
+        return _ok_response()
+
+    transport = _transport(session=SimpleNamespace(post=fake_post), sleep=lambda _s: None)
+
+    assert transport.post("ep", {}).status_code == 200
+    assert calls["n"] == 2
+
+
+def test_error_classify_exhausts_attempts() -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.transport import RetryPolicy
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=403, headers={}, json=lambda: {})
+
+    def _hook(_response) -> None:
+        raise ProviderRetryableError("throttled", provider="TEST", endpoint="ep")
+
+    transport = _transport(
+        session=SimpleNamespace(post=fake_post),
+        sleep=lambda _s: None,
+        retry=RetryPolicy(max_attempts=3),
+    )
+
+    with pytest.raises(ProviderRetryableError):
+        transport.post("ep", {}, error_classify=_hook)
+    assert calls["n"] == 3
+
+
+def test_error_classify_terminal_propagates_unchanged() -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderTerminalError
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=403, headers={}, json=lambda: {})
+
+    def _hook(_response) -> None:
+        raise ProviderTerminalError("denied", provider="TEST", endpoint="ep")
+
+    transport = _transport(session=SimpleNamespace(post=fake_post), sleep=lambda _s: None)
+
+    with pytest.raises(ProviderTerminalError, match="denied"):
+        transport.post("ep", {}, error_classify=_hook)
+    assert calls["n"] == 1
+
+
+def test_error_classify_quota_propagates_unchanged() -> None:
+    import pytest
+    from types import SimpleNamespace
+
+    from src.integrations.errors import ProviderQuotaExhaustedError
+
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        return SimpleNamespace(status_code=500, headers={}, json=lambda: {})
+
+    def _hook(_response) -> None:
+        raise ProviderQuotaExhaustedError("quota", provider="TEST", endpoint="ep")
+
+    transport = _transport(session=SimpleNamespace(post=fake_post), sleep=lambda _s: None)
+
+    with pytest.raises(ProviderQuotaExhaustedError):
+        transport.post("ep", {}, error_classify=_hook)
+    assert calls["n"] == 1

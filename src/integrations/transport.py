@@ -236,6 +236,7 @@ class HttpTransport:
         form_body: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         classify: ClassifyHook | None = None,
+        error_classify: ClassifyHook | None = None,
     ) -> requests.Response:
         url = f"{self._base_url}/{endpoint.lstrip('/')}"
         last_error: ProviderRetryableError | None = None
@@ -293,6 +294,16 @@ class HttpTransport:
                         raise
                 return response
             retry_after = parse_retry_after((getattr(response, "headers", None) or {}).get("Retry-After"))
+            if error_classify is not None:
+                try:
+                    error_classify(response)
+                except ProviderRetryableError:
+                    if attempt + 1 >= self._retry.max_attempts:
+                        raise
+                    self._sleep_before_retry(attempt=attempt, retry_after=None)
+                    continue
+                except (ProviderTerminalError, ProviderQuotaExhaustedError):
+                    raise
             if response.status_code in self._retry.retry_statuses:
                 if response.status_code == 429 and self._quota is not None:
                     with contextlib.suppress(ProviderQuotaExhaustedError):
@@ -327,9 +338,12 @@ class HttpTransport:
         *,
         headers: Mapping[str, str] | None = None,
         classify: ClassifyHook | None = None,
+        error_classify: ClassifyHook | None = None,
     ) -> requests.Response:
         """Send one ledgered GET with bounded retries."""
-        return self._send("GET", endpoint, params=params, headers=headers, classify=classify)
+        return self._send(
+            "GET", endpoint, params=params, headers=headers, classify=classify, error_classify=error_classify
+        )
 
     def post(
         self,
@@ -338,9 +352,17 @@ class HttpTransport:
         *,
         headers: Mapping[str, str] | None = None,
         classify: ClassifyHook | None = None,
+        error_classify: ClassifyHook | None = None,
     ) -> requests.Response:
         """Send one ledgered POST with bounded retries."""
-        return self._send("POST", endpoint, json_body=json_body, headers=headers, classify=classify)
+        return self._send(
+            "POST",
+            endpoint,
+            json_body=json_body,
+            headers=headers,
+            classify=classify,
+            error_classify=error_classify,
+        )
 
     def post_form(
         self,
@@ -349,9 +371,17 @@ class HttpTransport:
         *,
         headers: Mapping[str, str] | None = None,
         classify: ClassifyHook | None = None,
+        error_classify: ClassifyHook | None = None,
     ) -> requests.Response:
         """Send one ledgered form-encoded POST with bounded retries."""
-        return self._send("POST", endpoint, form_body=form, headers=headers, classify=classify)
+        return self._send(
+            "POST",
+            endpoint,
+            form_body=form,
+            headers=headers,
+            classify=classify,
+            error_classify=error_classify,
+        )
 
 
 class TokenCache:
