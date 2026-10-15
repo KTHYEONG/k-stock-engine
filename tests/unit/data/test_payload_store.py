@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,15 @@ from src.data.payload_store import (
     pack_loose,
     payload_exists,
     read_payload,
+    release_payload_readers,
 )
+
+
+@pytest.fixture(autouse=True)
+def _release_readers() -> Iterator[None]:
+    release_payload_readers()
+    yield
+    release_payload_readers()
 
 
 def _bronze(tmp_path: Path) -> Path:
@@ -434,3 +443,259 @@ def test_malformed_index_offsets_are_not_readable(tmp_path: Path) -> None:
     with sqlite3.connect(root / PACK_DIR_NAME / "index.sqlite3") as connection:
         connection.execute("UPDATE members SET offset='invalid'")
     assert not payload_exists(path)
+
+
+def test_index_replaced_mid_process_finds_new_member(tmp_path: Path) -> None:
+    import sqlite3
+
+    import src.data.payload_store as store_module
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        first = _loose(root, "daily_market", "first.json", b"first" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        assert read_payload(first) == b"first" * 200
+        db_path = root / PACK_DIR_NAME / "index.sqlite3"
+        readers = store_module._reader_cache()
+        old_conn, _, _ = readers[str(db_path)]
+        second = _loose(root, "daily_market", "second.json", b"second" * 200)
+        db_path.unlink()
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        assert read_payload(second) == b"second" * 200
+        with pytest.raises(sqlite3.ProgrammingError):
+            old_conn.execute("SELECT 1")
+    finally:
+        release_payload_readers()
+
+
+def test_concurrent_writer_visible_without_release(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.data.payload_store as store_module
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        first = _loose(root, "daily_market", "first.json", b"first" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        assert read_payload(first) == b"first" * 200
+        second = _loose(root, "daily_market", "second.json", b"second" * 200)
+        second.unlink()
+        with pytest.raises(PayloadMissingError, match="Bronze payload is missing"):
+            read_payload(second)
+        reader = store_module._reader_cache()[str(root / PACK_DIR_NAME / "index.sqlite3")][0]
+        assert not reader.in_transaction
+        second.write_bytes(b"second" * 200)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_pack_in_process, root).result()
+        assert read_payload(second) == b"second" * 200
+        assert store_module._reader_cache()[str(root / PACK_DIR_NAME / "index.sqlite3")][0] is reader
+        assert not reader.in_transaction
+    finally:
+        release_payload_readers()
+
+
+def test_one_connection_per_thread_and_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3 as sqlite3_module
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock, get_ident
+
+    import src.data.payload_store as store_module
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        path = _loose(root, "daily_market", "payload.json", b"body" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        release_payload_readers()
+        real_connect = sqlite3_module.connect
+        calls: list[int] = []
+        lock = Lock()
+        barrier = Barrier(3)
+
+        def _counted(*args: object, **kwargs: object) -> sqlite3_module.Connection:
+            with lock:
+                calls.append(get_ident())
+            return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store_module.sqlite3, "connect", _counted)
+
+        def _read_many(_: int) -> bytes:
+            barrier.wait(timeout=10)
+            try:
+                for _ in range(5):
+                    assert read_payload(path) == b"body" * 200
+                return b"ok"
+            finally:
+                release_payload_readers()
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(_read_many, range(3)))
+        assert results == [b"ok", b"ok", b"ok"]
+        assert len(calls) == len(set(calls)) == 3
+    finally:
+        release_payload_readers()
+
+
+def test_outside_root_error_preserved(tmp_path: Path) -> None:
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        _loose(root, "daily_market", "payload.json", b"body")
+        outside = tmp_path / "elsewhere" / "payload.json"
+        with pytest.raises(PayloadMissingError) as first_exc:
+            read_payload(outside)
+        with pytest.raises(PayloadMissingError) as second_exc:
+            read_payload(outside)
+        expected = f"Bronze file is outside any Bronze root: {outside}"
+        assert str(first_exc.value) == str(second_exc.value) == expected
+    finally:
+        release_payload_readers()
+
+
+def test_release_reclaims_connections(tmp_path: Path) -> None:
+    import sqlite3
+
+    import src.data.payload_store as store_module
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        path = _loose(root, "daily_market", "payload.json", b"body" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        assert read_payload(path) == b"body" * 200
+        assert len(store_module._reader_cache()) >= 1
+        old_connection = store_module._reader_cache()[str(root / PACK_DIR_NAME / "index.sqlite3")][0]
+        release_payload_readers()
+        assert len(store_module._reader_cache()) == 0
+        assert not store_module._root_cache()
+        assert not store_module._pack_path_cache()
+        with pytest.raises(sqlite3.ProgrammingError):
+            old_connection.execute("SELECT 1")
+        assert read_payload(path) == b"body" * 200
+    finally:
+        release_payload_readers()
+
+
+def test_bronze_root_for_caches_per_thread(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.payload_store import _bronze_root_for
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        path = _loose(root, "daily_market", "payload.json", b"body")
+        assert _bronze_root_for(path) == root.resolve()
+        with monkeypatch.context() as patch:
+            def _unexpected_resolve(self: Path, strict: bool = False) -> Path:
+                pytest.fail("cached root discovery must not resolve paths")
+
+            patch.setattr(Path, "resolve", _unexpected_resolve)
+            assert _bronze_root_for(path) == root
+    finally:
+        release_payload_readers()
+
+
+def test_lookup_with_directory_index_fails_closed(tmp_path: Path) -> None:
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        path = _loose(root, "daily_market", "payload.json", b"body" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        assert read_payload(path) == b"body" * 200
+        release_payload_readers()
+        (root / PACK_DIR_NAME / "index.sqlite3").unlink()
+        (root / PACK_DIR_NAME / "index.sqlite3").mkdir()
+        with pytest.raises(PayloadMissingError):
+            read_payload(path)
+    finally:
+        release_payload_readers()
+
+
+def test_lookup_connect_failure_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3 as sqlite3_module
+
+    import src.data.payload_store as store_module
+
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        path = _loose(root, "daily_market", "payload.json", b"body" * 200)
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        release_payload_readers()
+
+        def _broken(*args: object, **kwargs: object) -> sqlite3_module.Connection:
+            raise sqlite3_module.OperationalError("locked")
+
+        monkeypatch.setattr(store_module.sqlite3, "connect", _broken)
+        with pytest.raises(PayloadMissingError):
+            read_payload(path)
+    finally:
+        release_payload_readers()
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_symlinked_payload_outside_root_rejected(tmp_path: Path, warm_cache: bool) -> None:
+    release_payload_readers()
+    try:
+        root = _bronze(tmp_path)
+        sibling = _loose(root, "daily_market", "sibling.json", b"sibling" * 100)
+        if warm_cache:
+            assert read_payload(sibling) == b"sibling" * 100
+        outside = tmp_path / "outside.json"
+        outside.write_bytes(b"outside")
+        link = sibling.parent / "link.json"
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(outside)
+        with pytest.raises(PayloadMissingError, match="outside its Bronze root"):
+            read_payload(link)
+    finally:
+        release_payload_readers()
+
+
+def test_relative_paths_follow_current_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = []
+    for name in ("first", "second"):
+        base = tmp_path / name
+        root = _bronze(base)
+        path = root / "daily_market" / "payload.json"
+        path.parent.mkdir()
+        path.write_bytes(name.encode())
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+        roots.append(base)
+    for base in roots:
+        monkeypatch.chdir(base)
+        assert read_payload(Path("bronze/daily_market/payload.json")) == base.name.encode()
+
+
+def test_symlinked_loose_payload_uses_its_parent_bronze_root(tmp_path: Path) -> None:
+    root = _bronze(tmp_path)
+    target = root / "target.json"
+    target.write_bytes(b"target")
+    link = root / "daily_market" / "payload.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    assert read_payload(link) == b"target"
+
+
+def test_warm_payload_read_resolves_candidate_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _bronze(tmp_path)
+    path = _loose(root, "daily_market", "payload.json", b"body" * 200)
+    pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True)
+    assert read_payload(path) == b"body" * 200
+    calls: list[Path] = []
+    real_resolve = Path.resolve
+
+    def _counted(self: Path, strict: bool = False) -> Path:
+        calls.append(self)
+        return real_resolve(self, strict=strict)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "resolve", _counted)
+        assert read_payload(path) == b"body" * 200
+    assert calls == [path]

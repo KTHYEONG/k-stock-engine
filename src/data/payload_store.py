@@ -5,6 +5,8 @@ import fcntl
 import hashlib
 import os
 import sqlite3
+import stat
+import threading
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,32 @@ _PACK_CAP_BYTES: Final = 256 * 1024 * 1024
 _INDEX_NAME: Final = "index.sqlite3"
 
 _CODEC: Final = pa.Codec("zstd", compression_level=10)
+
+_thread_state = threading.local()
+
+
+def _root_cache() -> dict[str, Path]:
+    cache = getattr(_thread_state, "root_cache", None)
+    if cache is None:
+        cache = {}
+        _thread_state.root_cache = cache
+    return cache
+
+
+def _pack_path_cache() -> dict[tuple[str, str], Path]:
+    cache = getattr(_thread_state, "pack_cache", None)
+    if cache is None:
+        cache = {}
+        _thread_state.pack_cache = cache
+    return cache
+
+
+def _reader_cache() -> dict[str, tuple[sqlite3.Connection, int, int]]:
+    cache = getattr(_thread_state, "readers", None)
+    if cache is None:
+        cache = {}
+        _thread_state.readers = cache
+    return cache
 
 
 class PayloadMissingError(PITDataError):
@@ -36,11 +64,32 @@ class PackReport:
 
 def _bronze_root_for(path: Path) -> Path:
     candidate = path if path.is_dir() else path.parent
+    key = os.path.join(os.getcwd(), str(candidate))
+    cache = _root_cache()
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     current = candidate.resolve()
     for ancestor in (current, *current.parents):
         if (ancestor / "catalog").is_dir():
+            cache[key] = ancestor
             return ancestor
     raise PayloadMissingError(f"Bronze file is outside any Bronze root: {path}")
+
+
+def release_payload_readers() -> None:
+    """Close this thread's cached index connections and clear its path caches."""
+    readers = getattr(_thread_state, "readers", None)
+    if readers:
+        for connection, _, _ in readers.values():
+            connection.close()
+        readers.clear()
+    root_cache = getattr(_thread_state, "root_cache", None)
+    if root_cache is not None:
+        root_cache.clear()
+    pack_cache = getattr(_thread_state, "pack_cache", None)
+    if pack_cache is not None:
+        pack_cache.clear()
 
 
 def _index_path(bronze_root: Path) -> Path:
@@ -70,17 +119,36 @@ def _rel_posix(bronze_root: Path, path: Path) -> str:
 
 def _lookup(bronze_root: Path, rel_path: str) -> tuple[str, int, int, int] | None:
     db_path = _index_path(bronze_root)
-    if not db_path.is_file():
-        return None
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=30.0)
-        try:
-            row = connection.execute(
-                "SELECT pack, offset, length, raw_size FROM members WHERE rel_path = ?",
-                (rel_path,),
-            ).fetchone()
-        finally:
+        file_stat = db_path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        return None
+    db_key = str(db_path)
+    readers = _reader_cache()
+    cached = readers.get(db_key)
+    if cached is not None:
+        connection, dev, ino = cached
+        if dev != file_stat.st_dev or ino != file_stat.st_ino:
             connection.close()
+            del readers[db_key]
+            cached = None
+    if cached is None:
+        try:
+            connection = sqlite3.connect(
+                f"{db_path.as_uri()}?mode=ro", uri=True, timeout=30.0, isolation_level=None
+            )
+        except sqlite3.Error:
+            return None
+        readers[db_key] = (connection, file_stat.st_dev, file_stat.st_ino)
+    else:
+        connection = cached[0]
+    try:
+        row = connection.execute(
+            "SELECT pack, offset, length, raw_size FROM members WHERE rel_path = ?",
+            (rel_path,),
+        ).fetchone()
     except sqlite3.Error:
         return None
     if row is None:
@@ -95,7 +163,11 @@ def read_payload(path: Path) -> bytes:
     """Bytes of a Bronze file under a scope's bronze root, from the loose file or its pack; raises PayloadMissingError."""
     candidate = Path(path)
     bronze_root = _bronze_root_for(candidate)
-    rel_path = _rel_posix(bronze_root, candidate)
+    try:
+        resolved = candidate.resolve()
+        rel_path = resolved.relative_to(bronze_root).as_posix()
+    except (OSError, ValueError) as exc:
+        raise PayloadMissingError(f"Bronze file is outside its Bronze root: {path}") from exc
     try:
         loose = candidate.read_bytes()
     except FileNotFoundError:
@@ -112,7 +184,12 @@ def _read_packed(bronze_root: Path, rel_path: str) -> bytes:
     if found is None:
         raise PayloadMissingError(f"Bronze payload is missing: {rel_path}")
     pack_rel, offset, length, raw_size = found
-    pack_path = (bronze_root / pack_rel).resolve()
+    pack_cache = _pack_path_cache()
+    pack_key = (str(bronze_root), pack_rel)
+    pack_path = pack_cache.get(pack_key)
+    if pack_path is None:
+        pack_path = (bronze_root / pack_rel).resolve()
+        pack_cache[pack_key] = pack_path
     if not pack_path.is_relative_to(bronze_root / PACK_DIR_NAME) or min(offset, length, raw_size) < 0:
         raise PayloadMissingError(f"invalid Bronze pack member: {rel_path}")
     try:
