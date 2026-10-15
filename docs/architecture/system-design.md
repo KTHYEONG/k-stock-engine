@@ -78,35 +78,38 @@ flowchart TD
 ```
 
 ### 2.1 외부 연동 브로커 및 공급자 규격
-* **DART 전자공시**: HTTPS REST 기반. 일 16,000건 안전 예산, 5 req/s 스로틀링(최소 간격 0.2s)으로 공인 IP 차단을 원천 방어.
-* **한국투자증권(KIS)**: 전역 18.0 req/s 공유 리미터, 24시간 유효 디스크 토큰(0600 권한 격리 및 원자적 갱신).
-* **LS증권**: 1.05초 단위 상호 배제 락(Lock)을 적용하여 동시성 1 및 ~0.95 req/s의 엄격한 순차 호출 강제.
-* **키움증권 (REST NEXT)**: TR당 5.0 req/s 동적 토큰 버킷, 64-bit Linux 네이티브 HTTPS 통신.
-* **토스증권**: 그룹별 독립 토큰 버킷 운용 (시세 15/s, 차트 20/s, 실주문 10/s, 순위 5/s).
+* **OpenDART 전자공시**: HTTPS REST 기반. 일일 16,000건 안전 예산, 5 req/s 스로틀링(최소 간격 0.2s)으로 공인 IP 차단을 원천 방어.
+* **KRX 정보데이터시스템 & KIND**: 일별 정규장 시세 및 KOSPI 시장조치 통지 수집. 비공식 KIND 엔드포인트는 독립 릴레이 프로듀서(`kind_relay_producer`)로 격리 후 단방향 인박스로 수신(1 req/s 페이싱).
+* **LS증권 OpenAPI**: 1.05초 단위 상호 배제 락(Lock)을 적용하여 동시성 1 및 ~0.95 req/s의 엄격한 순차 호출 강제 (`rsp_cd: IGW00201` 차단 방지). 일별 투자자 수급(`t1405`) 1차 원천.
+* **한국투자증권 (KIS)**: 호스트 전역 18.0 req/s 공유 리미터(`HostPacedLimiter`, `.host-admission` 공유 파일 락), 24시간 유효 디스크 토큰(`0600` 권한 격리 및 원자적 갱신). 장전 시초가 호가 수집(`FHKST01010200`) 및 실계좌 주문 집행(`TTTC0802U`).
 
 ---
 
-## 3. 24/7 State Machine & Orchestration Lifecycle
+## 3. 24/7 State Machine & Systemd Automation Lifecycle
 
-엔진은 24시간 무인 가동을 전제로 상태 전이를 수행하며, 이상 징후 발생 시 Fail-Closed 원칙에 따라 신규 주문을 차단합니다.
+엔진은 systemd 타이머 및 프로세스 러너(`src.ops.jobs`)에 의해 24시간 완전 무인 가동되며, 이상 징후 발생 시 Fail-Closed 원칙에 따라 신규 주문을 차단하고 텔레그램 경보를 발송합니다.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PRE_MARKET_READY: 08시 00분 영업일 확인 및 캘린더 검증
-    PRE_MARKET_READY --> INTRADAY_EXECUTION: 09시 00분 장개시 및 시가 단일가 집행
-    INTRADAY_EXECUTION --> POST_MARKET_INGESTION: 15시 40분 장마감 후 원시 시세 수급 수집
-    POST_MARKET_INGESTION --> NIGHTLY_SETTLEMENT: 17시 00분 Point-in-Time 정규화 및 Parquet 변환
-    NIGHTLY_SETTLEMENT --> PRE_MARKET_READY: 18시 00분 T+2 원장 정산 및 야간 백테스트 완료
+    [*] --> MORNING_SEAL: 08시 32분 kse-morning (영업일 판별 및 결정 체인 봉인)
+    MORNING_SEAL --> AUCTION_CAPTURE: 08시 39분 30초 kse-auction-open (장전 10호가/예상체결 캡처)
+    AUCTION_CAPTURE --> OPEN_EXECUTION: 09시 00분 장개시 (T+1 시가 단일가 및 매도 우선 체결)
+    OPEN_EXECUTION --> EVENING_COLLECT: 18시 30분 kse-collect-eve (시세·수급·공시 수집 & Silver 정규화)
+    EVENING_COLLECT --> DAILY_AUDIT: 21시 40분 kse-daily-audit (시계열 불변식 전수 감사)
+    DAILY_AUDIT --> OFFSITE_BACKUP: 02시 30분 kse-backup (Google Drive 원자적 백업)
+    OFFSITE_BACKUP --> MORNING_SEAL: 익일 루틴 순환
 
-    INTRADAY_EXECUTION --> FAIL_CLOSED_HALT: 원장 불일치 또는 쿼터 초과 오류 감지
+    OPEN_EXECUTION --> FAIL_CLOSED_HALT: 원장 불일치, 쿼터 고갈, 잔고 부족 감지
     FAIL_CLOSED_HALT --> [*]: 신규 주문 즉시 중단 및 포지션 동결
 ```
 
-### 3.1 4단계 라이프사이클 상세 규약
-1. **08:00 ~ 08:50 [PRE_MARKET_READY]**: KRX 영업일 확인, 관리종목/환기종목/우선주를 유니버스에서 배제하고 전일 18:00 기준 확정된 팩터 데이터를 동결.
-2. **09:00 ~ 09:30 [INTRADAY_EXECUTION]**: 전일 종가 기반으로 산출된 목표 포트폴리오를 T+1 시가 단일가(Open-Auction)로 집행. 매도 주문을 매수 주문보다 항상 먼저 체결하여 예수금 초과를 차단.
-3. **15:40 ~ 17:00 [POST_MARKET_INGESTION]**: 당일 확정 종가, 거래대금, 투자자별(외인/기관/개인) 순매수 수급 데이터를 수신하여 불변 원시 저널(Bronze)에 적재.
-4. **17:00 ~ 21:00 [NIGHTLY_SETTLEMENT]**: DART 공시 시각을 반영한 Silver 레이어 재구성, T+2 결제 대금 정산, 밀집 Gold 패널 생성 및 전략 백테스트 성과 측정.
+### 3.1 6단계 라이프사이클 상세 규약
+1. **08:32 KST [kse-morning.service]**: KRX 영업일 판별, 우선주/관리종목/환기종목 배제 유니버스 확정, 전일 확정 팩터 기반 목표 포트폴리오 산출 및 당일 결정 체인 봉인 (`decisions/YYYY-MM-DD.json`).
+2. **08:39:30 KST [kse-auction-open.service]**: 당일 결정 체인 봉인 확인 후 상위 후보군의 10단계 호가 및 시초가 단일가 예상 체결가/체결량 스냅샷 수집. (ADR-014 순차 의존성 보장).
+3. **09:00 ~ 09:30 KST [OPEN_EXECUTION]**: 전일 목표 포트폴리오를 T+1 시가 단일가(Open-Auction)로 집행. 매도 주문을 매수 주문보다 항상 먼저 체결(`_submission_order`)하여 T+2 예수금 초과 및 미수금을 원천 차단.
+4. **18:30 KST [kse-collect-eve.service]**: KRX 일봉, LS/KIS 투자자 수급, DART 공시/재무제표, KIND 릴레이 번들 수신. Bronze 불변 저널 적재 후 Silver Point-in-Time Parquet 데이터셋으로 정규화.
+5. **21:40 KST [kse-daily-audit.service]**: 12개 무결성 검증 규칙(결측치 0, 단조 증가, 시계열 연속성, 카탈로그 동기화) 전수 실행. 위반 시 즉시 장애 보고서 생성 및 알림 발송.
+6. **02:30 KST [kse-backup.service]**: 호스트 전역 공유 락 획득 후 변경된 세그먼트만을 Google Drive 원격 저장소로 $O(1)$ 대사 백업. (주간 토요일 10:30 KST에는 주간 운영 리포트 `kse-weekly-report.service` 가동).
 
 ---
 
@@ -223,3 +226,16 @@ uv run python -m src.research champion --sync-file  # 저장된 spec_json을 con
 | Champion | `none` | `promote --spec <PATH> --bootstrap`으로 최초 등록, 이후 승격은 저장된 판정(`challenge`)이 있을 때만 |
 | Challenger | `unevaluated` | 같은 세션에서 페어드 블록 부트스트랩 Δg와 이웃 평탄부로 판정 |
 | Forward evidence | `out of scope` | 라이브 매매 시작 시 스펙 01과 함께 재개 |
+
+---
+
+## 7. Related Architecture Documentation
+
+* **Architecture Decision Records (ADR)**: [engineering-decisions.md](file:///home/kth/k-stock-engine/docs/architecture/engineering-decisions.md) — 9대 핵심 기술 의사결정, 기각된 대안 및 트레이드오프.
+* **Multi-Broker OpenAPI Master Spec**: [api_master.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/api_master.md) — 4대 프로바이더 쿼터, 레이트 리미트, 동시성 락 마스터 명세.
+* **KIS Integration Spec**: [broker_kis.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/broker_kis.md) — 호스트 전역 공유 리미터(`HostPacedLimiter`) 및 장전 경매 수집.
+* **LS Securities Spec**: [broker_ls.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/broker_ls.md) — 1.05s 단일 뮤텍스 락 및 투자자 수급(`t1405`).
+* **OpenDART Spec**: [provider_dart.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/provider_dart.md) — 16,000 req/day 쿼터 원장 및 Point-in-Time 재무 데이터.
+* **KRX KIND Relay Spec**: [provider_kind.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/provider_kind.md) — KOSPI 시장조치 공시 릴레이 번들 수집 및 인박스 파이프라인.
+* **VPS Daily Automation Audit Runbook**: [vps-checklist.md](file:///home/kth/k-stock-engine/docs/vps-checklist.md) — 24/7 무인 자동화 운영 및 일일 감사 런북.
+
