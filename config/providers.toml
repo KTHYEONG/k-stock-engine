@@ -121,6 +121,11 @@ chunk_units = 50
 equity_market_names = ["거래소", "코스닥"]
 # A session's master snapshot may be taken until this time on the next session day.
 master_valid_until_kst = "08:00"
+# Shadow reconciliation of DB evidence against KRX daily-market Silver (report only).
+reconcile_min_match_rate = 0.999
+reconcile_min_coverage = 0.995
+reconcile_ready_sessions = 20
+reconcile_sample_limit = 20
 
 [kind]
 circuit_threshold = 3

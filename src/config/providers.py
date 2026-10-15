@@ -340,6 +340,10 @@ class DbsecPolicy(BaseModel):
     chunk_units: PositiveInt
     equity_market_names: tuple[str, ...]
     master_valid_until_kst: str
+    reconcile_min_match_rate: float
+    reconcile_min_coverage: float
+    reconcile_ready_sessions: PositiveInt
+    reconcile_sample_limit: PositiveInt
 
     @field_validator("app_key_env", "app_secret_env", "token_cache_dir_env")
     @classmethod
@@ -370,6 +374,13 @@ class DbsecPolicy(BaseModel):
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(value)):
             raise ValueError(f"invalid KST time {value!r}: expected HH:MM")
         return str(value)
+
+    @field_validator("reconcile_min_match_rate", "reconcile_min_coverage")
+    @classmethod
+    def _check_reconcile_rate(cls, value: float) -> float:
+        if not 0 < float(value) <= 1:
+            raise ValueError(f"invalid reconcile rate {value!r}: must be in (0, 1]")
+        return float(value)
 
     @field_validator("closing_bar_count")
     @classmethod

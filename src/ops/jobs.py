@@ -29,6 +29,9 @@ from src.ops.guards import (
 from src.ops.run_outcome import record_run_outcome
 
 if TYPE_CHECKING:
+    import polars as pl
+
+    from src.data.runtime import DataRuntime
     from src.ops.alerts import AlertSender
 
 __all__ = [
@@ -336,6 +339,106 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     return 0
 
 
+def _silver_session_frame(silver_root: Path, dataset_id: str, session: date) -> pl.DataFrame | None:
+    import polars as pl
+
+    part = Path(silver_root) / dataset_id / f"session={session.isoformat()}" / "part.parquet"
+    try:
+        if part.is_file() and not part.is_symlink():
+            return pl.read_parquet(part)
+    except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
+        raise PITDataError(f"unreadable daily-market partition for {session.isoformat()}") from exc
+    return None
+
+
+def _reconcile_dbsec_sessions(
+    runtime: DataRuntime, *, now: datetime,
+) -> tuple[list[dict[str, object]], bool]:
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data import dbsec_reconcile as reconcile
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.evidence_sources import (
+        DBSEC_CLOSING_BAR_SOURCE,
+        DBSEC_DAILY_CHART_SOURCE,
+        DBSEC_TICKER_MASTER_SOURCE,
+    )
+    from src.data.jobs import dbsec as dbsec_jobs
+    from src.data.payload_store import read_payload
+    from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
+
+    provider = load_provider_policy(load_runtime_config())
+    policy = provider.dbsec
+    workspace = runtime.workspace
+    catalog = ReceiptCatalog(workspace.bronze_root / "catalog")
+    sessions = dbsec_jobs.dbsec_final_sessions(
+        now=now,
+        final_time_kst=datetime.strptime(policy.session_final_time_kst, "%H:%M").time(),
+        lookback=int(policy.lookback_sessions),
+    )
+    report_root = workspace.state_root / "dbsec_reconcile"
+    try:
+        dataset_id = DatasetRegistry(workspace.state_root).require("daily_market")
+    except PITDataError:
+        dataset_id = None
+    entries: list[dict[str, object]] = []
+    for day in sessions:
+        if (report_root / f"{day.isoformat()}.json").exists():
+            continue
+        master = catalog.latest(
+            source=DBSEC_TICKER_MASTER_SOURCE, natural_keys={day.isoformat()}
+        ).get(day.isoformat())
+        if master is None or master.status is not EvidenceStatus.SUCCESS:
+            continue
+        krx = _silver_session_frame(workspace.silver_root, dataset_id, day) if dataset_id is not None else None
+        if krx is None or krx.height == 0:
+            continue
+        tickers = dbsec_jobs.dbsec_master_tickers(
+            read_payload(Path(master.payload_path)),
+            market_names=policy.equity_market_names,
+        )
+        # A report is never rewritten, so a session whose bar collection is unfinished must wait rather
+        # than freeze an absent receipt as a permanent FAIL; EMPTY receipts are answers and do not defer.
+        keys = {f"{day.isoformat()}:{ticker}" for ticker in tickers}
+        answered = (EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY)
+        if any(
+            {key for key, entry in catalog.latest(source=source, natural_keys=keys).items() if entry.status in answered}
+            != keys
+            for source in (DBSEC_DAILY_CHART_SOURCE, DBSEC_CLOSING_BAR_SOURCE)
+        ):
+            continue
+        report = reconcile.reconcile_session(
+            session=day,
+            krx=krx,
+            db=reconcile.load_dbsec_session_rows(catalog, day, tickers),
+            min_match_rate=float(policy.reconcile_min_match_rate),
+            min_coverage=float(policy.reconcile_min_coverage),
+            sample_limit=int(policy.reconcile_sample_limit),
+        )
+        reconcile.write_reconciliation(report, root=report_root)
+        entries.append(
+            {
+                "session": day.isoformat(),
+                "verdict": report.verdict.value,
+                "coverage": report.coverage,
+                "close_match_rate": report.close_match_rate,
+                "volume_match_rate": report.volume_match_rate,
+            }
+        )
+        _LOG.info(
+            "[DATA] stage=dbsec_reconcile session=%s verdict=%s coverage=%.6f close=%.6f volume=%.6f missing_close=%d",
+            day.isoformat(),
+            report.verdict.value,
+            report.coverage,
+            report.close_match_rate,
+            report.volume_match_rate,
+            report.missing_closing_bar,
+        )
+    history = reconcile.read_reconciliation_history(report_root)
+    return entries, reconcile.fallback_readiness(
+        history, ready_sessions=int(policy.reconcile_ready_sessions)
+    )
+
+
 def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
     """Collect DB Securities fallback evidence only; returns the process exit code."""
     from src.data.pipeline_graph import _default_collection_steps, build_refresh_context, run_collection_jobs
@@ -361,13 +464,23 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
         for step in report.steps
     }
     failed = [step.job for step in report.steps if step.status == "failed"]
+    try:
+        reconciled, fallback_ready = _reconcile_dbsec_sessions(runtime, now=moment)
+    except Exception as exc:
+        _record(
+            root, "collect_dbsec", "DEGRADED", today, moment,
+            reason=f"reconcile:{type(exc).__name__}"[:300],
+            metrics={**metrics, "reconciled": [], "fallback_ready": False},
+        )
+        return 0
+    reconcile_metrics: dict[str, object] = {"reconciled": reconciled, "fallback_ready": fallback_ready}
     if failed:
         _record(
             root, "collect_dbsec", "DEGRADED", today, moment,
-            reason=f"failed:{','.join(failed)}"[:300], metrics=metrics,
+            reason=f"failed:{','.join(failed)}"[:300], metrics={**metrics, **reconcile_metrics},
         )
         return 0
-    _record(root, "collect_dbsec", "OK", today, moment, metrics=metrics)
+    _record(root, "collect_dbsec", "OK", today, moment, metrics={**metrics, **reconcile_metrics})
     return 0
 
 
