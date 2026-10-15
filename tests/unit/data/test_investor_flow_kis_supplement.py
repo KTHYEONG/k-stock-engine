@@ -345,3 +345,181 @@ def test_packed_bronze_builds_identical_supplement(tmp_path: Path) -> None:
     ] == [
         (partition.path, partition.sha256) for partition in load_manifest(second.dataset_path).partitions
     ]
+
+
+def _materialize_with_cache(root: Path, catalog: ReceiptCatalog, targets: object, ls_path: Path, cache) -> object:
+    from src.data.investor_flow_kis_supplement import materialize_investor_flow_kis_supplement
+
+    return materialize_investor_flow_kis_supplement(
+        catalog=catalog, targets=targets, ls_flow_silver_path=ls_path,
+        silver_root=root / "silver", parse_cache=cache,
+    )
+
+
+def test_kis_parse_cache_cold_warm_partial_parity(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest
+    from src.data.investor_flow_kis_supplement import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    _seed_kis(catalog, bronze, "000001", S1, [_kis_row(S1, "7", "-3", "-3", "-1")])
+    targets = _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001")])
+    cold = _materialize(tmp_path, catalog, targets, ls_path)
+    assert cold.filled_cells == 1
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        empty = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert empty.dataset_id == cold.dataset_id  # type: ignore[attr-defined]
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        warm = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert warm.dataset_id == cold.dataset_id  # type: ignore[attr-defined]
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        hashes = [blob.content_hash for blob in catalog.blobs(source="kis_investor_flow", usable=True)]
+        stored = cache.get_many(hashes)
+        assert stored
+        victim = hashes[0]
+        conn_path = cache_path
+        import sqlite3
+
+        conn = sqlite3.connect(str(conn_path))
+        conn.execute("DELETE FROM entries WHERE content_hash = ?", (victim,))
+        conn.commit()
+        conn.close()
+        partial = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert partial.dataset_id == cold.dataset_id  # type: ignore[attr-defined]
+    for result in (empty, warm, partial):
+        manifest = load_manifest(result.dataset_path)
+        assert manifest.details == load_manifest(cold.dataset_path).details
+        assert manifest.partitions == load_manifest(cold.dataset_path).partitions
+
+
+def test_kis_parse_cache_calendar_growth_invalidates_and_oc_never_parsed(tmp_path: Path) -> None:
+    from src.data.investor_flow_kis_supplement import _decode_page, _encode_page, parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    rows = [_kis_row(S4, "not-a-number", "0", "0", "0"), _kis_row(S2, "100", "-60", "-30", "-10")]
+    _seed_kis(catalog, bronze, "000001", S2, rows)
+    targets = _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001")])
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        first = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert first.filled_cells == 1  # type: ignore[attr-defined]
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        second = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert second.dataset_id == first.dataset_id  # type: ignore[attr-defined]
+    encoded = _encode_page("000001", [(S2, (100, -60, -30, -10))], [S4])
+    try:
+        _decode_page(encoded, frozenset([S1, S2, S3]))
+    except Exception as exc:
+        raise AssertionError("valid calendar must decode") from exc
+    for sessions in (frozenset([S1, S3]), frozenset([S1, S2, S3, S4])):
+        try:
+            _decode_page(encoded, sessions)
+        except Exception:  # noqa: S110, S112 - stale calendar is an expected miss
+            continue
+        raise AssertionError("stale calendar must be a miss")
+
+
+def test_kis_parse_cache_warm_avoids_bronze_and_preserves_tiebreak(tmp_path: Path, monkeypatch) -> None:
+    from src.data import investor_flow_kis_supplement as module
+    from src.data.investor_flow_kis_supplement import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "10", "-4", "-4", "-2")])
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "20", "-8", "-8", "-4")])
+    targets = _targets(uni_id, daily_id, [(S2, "000001")])
+    cold = _materialize(tmp_path, catalog, targets, ls_path)
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    def _boom(path):  # type: ignore[no-untyped-def]
+        raise AssertionError("bronze must not be read on a warm hit")
+    monkeypatch.setattr(module, "read_payload", _boom)
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        warm = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert warm.dataset_id == cold.dataset_id  # type: ignore[attr-defined]
+    assert warm.filled_cells == cold.filled_cells  # type: ignore[attr-defined]
+
+
+def test_kis_decode_page_rejects_malformed_values() -> None:
+    import pytest
+
+    from src.data.investor_flow_kis_supplement import _decode_page
+
+    sessions = frozenset([S1, S2, S3])
+    bad_values = [
+        [],
+        {"symbol": "", "rows": [], "oc": []},
+        {"symbol": "000001", "rows": {}, "oc": []},
+        {"symbol": "000001", "rows": [{}], "oc": []},
+        {"symbol": "000001", "rows": [[True, [1, 2, 3, 4]]], "oc": []},
+        {"symbol": "000001", "rows": [[S1.toordinal(), [1, 2, 3]]], "oc": []},
+        {"symbol": "000001", "rows": [[S1.toordinal(), [1, True, 3, 4]]], "oc": []},
+        {"symbol": "000001", "rows": [[0, [1, 2, 3, 4]]], "oc": []},
+        {"symbol": "000001", "rows": [], "oc": [True]},
+        {"symbol": "000001", "rows": [], "oc": [0]},
+    ]
+    for value in bad_values:
+        with pytest.raises((TypeError, ValueError)):
+            _decode_page(value, sessions)
+
+
+def test_kis_parse_cache_corrupt_entry_falls_back_to_cold(tmp_path: Path) -> None:
+    from src.data.investor_flow_kis_supplement import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    targets = _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001")])
+    cold = _materialize(tmp_path, catalog, targets, ls_path)
+    cache_path = tmp_path / "cache.sqlite"
+    blob_hash = next(catalog.blobs(source="kis_investor_flow", usable=True)).content_hash
+    with ParseCache(cache_path, namespace="kis_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        cache.put_many({blob_hash: {"symbol": "", "rows": "corrupt", "oc": []}})
+        rebuilt = _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+    assert rebuilt.dataset_id == cold.dataset_id  # type: ignore[attr-defined]
+
+
+def test_calendar_growth_reparses_cached_page(tmp_path: Path, monkeypatch) -> None:
+    from src.data import investor_flow_kis_supplement as module
+    from src.data.datasets import load_manifest
+    from src.data.parse_cache import ParseCache
+
+    cells = [(day, "000001") for day in (S1, S2, S3, S4)]
+    uni_id, daily_id = _write_universe_daily(tmp_path, cells)
+    ls_path = _write_ls(tmp_path, [])
+    catalog = ReceiptCatalog(tmp_path / "bronze" / "catalog")
+    digest = _seed_kis(catalog, tmp_path / "bronze", "000001", S3, [
+        _kis_row(S2, "100", "-60", "-30", "-10"),
+        _kis_row(S3, "200", "-120", "-60", "-20"),
+    ])
+    targets = _targets(uni_id, daily_id, cells)
+    with ParseCache(tmp_path / "cache.sqlite", namespace="kis", fingerprint=module.parse_fingerprint()) as cache:
+        monkeypatch.setattr(module, "_load_daily_calendar", lambda _: (S1, S2, S4))
+        _materialize_with_cache(tmp_path, catalog, targets, ls_path, cache)
+        assert cache.get_many([digest])[digest]["oc"] == [S3.toordinal()]
+        monkeypatch.setattr(module, "_load_daily_calendar", lambda _: (S1, S2, S3, S4))
+        grown = _materialize_with_cache(tmp_path / "grown", catalog, targets, ls_path, cache)
+        assert cache.get_many([digest])[digest]["oc"] == []
+        cold = _materialize(tmp_path / "cold", catalog, targets, ls_path)
+        assert grown.filled_cells == cold.filled_cells == 2
+        grown_manifest = load_manifest(grown.dataset_path)
+        cold_manifest = load_manifest(cold.dataset_path)
+        assert grown_manifest.dataset_id == cold_manifest.dataset_id
+        assert grown_manifest.details == cold_manifest.details
+        assert grown_manifest.partitions == cold_manifest.partitions

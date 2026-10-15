@@ -369,18 +369,26 @@ def _build_market_actions(ctx: RefreshContext, inputs: Mapping[str, str]) -> Pub
 def _build_investor_flow_kis_supplement(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build the provider-tagged KIS supplement for the resolved LS gap."""
     from src.data.flow_targets import investor_flow_targets_from_ids
-    from src.data.investor_flow_kis_supplement import materialize_investor_flow_kis_supplement
+    from src.data.investor_flow_kis_supplement import materialize_investor_flow_kis_supplement, parse_fingerprint
+    from src.data.parse_cache import ParseCache
 
     runtime = ctx.runtime
     targets = investor_flow_targets_from_ids(
         runtime.workspace.silver_root, inputs["ordinary_universe"], inputs["daily_market"]
     )
-    result = materialize_investor_flow_kis_supplement(
-        catalog=ctx.catalog,
-        targets=targets,
-        ls_flow_silver_path=runtime.workspace.silver_root / inputs["investor_flow_ls"],
-        silver_root=runtime.workspace.silver_root,
-    )
+    with ParseCache(
+        _parse_cache_path(ctx, "kis_investor_flow"),
+        namespace="kis_investor_flow-v1",
+        fingerprint=parse_fingerprint(),
+    ) as cache:
+        result = materialize_investor_flow_kis_supplement(
+            catalog=ctx.catalog,
+            targets=targets,
+            ls_flow_silver_path=runtime.workspace.silver_root / inputs["investor_flow_ls"],
+            silver_root=runtime.workspace.silver_root,
+            parse_cache=cache,
+        )
+        cache.prune({blob.content_hash for blob in ctx.catalog.blobs(source="kis_investor_flow", usable=True)})
     return _published(result.dataset_path)
 
 
@@ -449,17 +457,28 @@ def _build_financial_quality(ctx: RefreshContext, inputs: Mapping[str, str]) -> 
 def _build_dividend_events(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver cash-dividend events from dated decision filings."""
     from src.config import load_provider_policy, load_runtime_config
-    from src.data.dividend_events import materialize_dividend_events
+    from src.data.dividend_events import materialize_dividend_events, parse_fingerprint
+    from src.data.evidence_sources import DIVIDEND_DECISION_SOURCE
+    from src.data.parse_cache import ParseCache
 
     runtime = ctx.runtime
     policy = load_provider_policy(load_runtime_config()).dividends
-    path = materialize_dividend_events(
-        catalog=ctx.catalog,
-        silver_root=runtime.workspace.silver_root,
-        calendar=_build_calendar(ctx),
-        daily_market_path=runtime.workspace.silver_root / inputs["daily_market"],
-        policy=policy,
-    )
+    with ParseCache(
+        _parse_cache_path(ctx, "dividend_decision"),
+        namespace="dividend_decision-v1",
+        fingerprint=parse_fingerprint(),
+    ) as cache:
+        path = materialize_dividend_events(
+            catalog=ctx.catalog,
+            silver_root=runtime.workspace.silver_root,
+            calendar=_build_calendar(ctx),
+            daily_market_path=runtime.workspace.silver_root / inputs["daily_market"],
+            policy=policy,
+            parse_cache=cache,
+        )
+        cache.prune(
+            {blob.content_hash for blob in ctx.catalog.blobs(source=DIVIDEND_DECISION_SOURCE, usable=True)}
+        )
     return _published(path)
 
 
