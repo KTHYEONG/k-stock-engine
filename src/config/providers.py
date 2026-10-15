@@ -15,6 +15,7 @@ from src.config.runtime import RuntimeConfig
 __all__ = [
     "DartKeyPolicy",
     "DartPolicy",
+    "DbsecPolicy",
     "DisclosureFilter",
     "DividendPlausibilityPolicy",
     "DocumentParserPolicy",
@@ -318,6 +319,53 @@ class LsPolicy(BaseModel):
         return value
 
 
+class DbsecPolicy(BaseModel):
+    """DB Securities credential env names, host pacing intervals and response-code classes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    app_key_env: str
+    app_secret_env: str
+    circuit_threshold: PositiveInt
+    daily_limit: PositiveInt
+    app_min_interval_seconds: PositiveFloat
+    scope_min_interval_seconds: dict[Literal["chart", "quote_master"], PositiveFloat]
+    token_min_interval_seconds: PositiveFloat
+    token_cache_dir_env: str
+    retryable_rsp_codes: tuple[str, ...]
+    auth_rsp_codes: tuple[str, ...]
+
+    @field_validator("app_key_env", "app_secret_env", "token_cache_dir_env")
+    @classmethod
+    def _check_env_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("DB env names must be non-empty")
+        return value
+
+    @field_validator("scope_min_interval_seconds")
+    @classmethod
+    def _check_scopes(
+        cls, value: dict[Literal["chart", "quote_master"], PositiveFloat]
+    ) -> dict[Literal["chart", "quote_master"], PositiveFloat]:
+        if set(value) != {"chart", "quote_master"}:
+            raise ValueError("scope_min_interval_seconds must declare chart and quote_master")
+        return value
+
+    @field_validator("token_min_interval_seconds")
+    @classmethod
+    def _check_token_interval(cls, value: float) -> float:
+        if float(value) < 60.0:
+            raise ValueError(f"invalid token_min_interval_seconds {value!r}: must be >= 60.0")
+        return float(value)
+
+    @model_validator(mode="after")
+    def _check_code_classes(self) -> DbsecPolicy:
+        overlap = set(self.retryable_rsp_codes) & set(self.auth_rsp_codes)
+        if overlap:
+            raise ValueError(f"retryable and auth rsp codes overlap: {sorted(overlap)}")
+        return self
+
+
 class KindPolicy(BaseModel):
     """KIND collection policy: pacing, ledger bound and the notice vocabulary to search.
 
@@ -390,6 +438,7 @@ class ProviderPolicy(BaseModel):
     kis: KisPolicy
     krx: KrxPolicy
     ls: LsPolicy
+    dbsec: DbsecPolicy
     kind: KindPolicy
     dividends: DividendPlausibilityPolicy = DividendPlausibilityPolicy()
     earnings_releases: EarningsReleasePolicy = EarningsReleasePolicy()
@@ -423,7 +472,7 @@ class ProviderPolicy(BaseModel):
         """Return the safety limits the job runner enforces for one provider.
 
         Args:
-            provider: ``"dart"``, ``"kis"``, ``"krx"``, ``"ls"`` or ``"kind"``.
+            provider: ``"dart"``, ``"kis"``, ``"krx"``, ``"ls"``, ``"dbsec"`` or ``"kind"``.
             key_env: DART key selecting its budget and reserve; the default
                 key applies when omitted. The DART ``quota_provider`` is a
                 ``"DART"`` placeholder here: the per-key ledger name depends on
@@ -467,6 +516,14 @@ class ProviderPolicy(BaseModel):
                 daily_budget=self.ls.daily_limit,
                 daily_reserve=0,
                 circuit_threshold=self.ls.circuit_threshold,
+                avoid_windows_kst=(),
+            )
+        if name == "dbsec":
+            return RunnerPolicy(
+                quota_provider="DBSEC",
+                daily_budget=self.dbsec.daily_limit,
+                daily_reserve=0,
+                circuit_threshold=self.dbsec.circuit_threshold,
                 avoid_windows_kst=(),
             )
         if name == "kind":

@@ -92,6 +92,24 @@ daily_limit = 10000
 # LS business-level "try later" response codes (rsp_cd exact match); anything else is terminal.
 retryable_rsp_codes = ["IGW00201"]
 
+[dbsec]
+app_key_env = "DB_APP_KEY"
+app_secret_env = "DB_APP_SECRET"
+circuit_threshold = 3
+# Planning bound only: DB publishes no daily cap, measured/declared 2026-10-15.
+daily_limit = 50000
+# Vendor app-wide 20 TPS, measured/declared 2026-10-15.
+app_min_interval_seconds = 0.05
+# Vendor: charts 4 TPS, JCODES 3 TPS, measured/declared 2026-10-15.
+scope_min_interval_seconds = { chart = 0.25, quote_master = 0.34 }
+# Vendor token issuance 1 per minute, measured/declared 2026-10-15.
+token_min_interval_seconds = 61.0
+token_cache_dir_env = "DBSEC_TOKEN_CACHE_DIR"
+# Vendor business-level "try later" response codes (rsp_cd exact match), measured/declared 2026-10-15.
+retryable_rsp_codes = ["IGW00201", "IGW00001", "IGW00002", "IGW50011", "IGW50012"]
+# Vendor auth response codes requiring a token refresh, measured/declared 2026-10-15.
+auth_rsp_codes = ["IGW00121", "IGW00123"]
+
 [kind]
 circuit_threshold = 3
 # Public web service without a published rate policy: stay at one request per second.
