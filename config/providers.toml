@@ -109,6 +109,18 @@ token_cache_dir_env = "DBSEC_TOKEN_CACHE_DIR"
 retryable_rsp_codes = ["IGW00201", "IGW00001", "IGW00002", "IGW50011", "IGW50012"]
 # Vendor auth response codes requiring a token refresh, measured/declared 2026-10-15.
 auth_rsp_codes = ["IGW00121", "IGW00123"]
+# DB intraday data for a session is final only after the 20:00 after-market close.
+session_final_time_kst = "20:10"
+# Newest DB-final sessions collected per run.
+lookback_sessions = 5
+# 1-minute J bars fetched per ticker; covers 20:00 back past 15:30 under extended hours.
+closing_bar_count = 400
+# Bronze units persisted per runner chunk.
+chunk_units = 50
+# JCODES divisions kept as equities; ETF/ETN/KONEX excluded.
+equity_market_names = ["거래소", "코스닥"]
+# A session's master snapshot may be taken until this time on the next session day.
+master_valid_until_kst = "08:00"
 
 [kind]
 circuit_threshold = 3

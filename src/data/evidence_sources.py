@@ -23,6 +23,9 @@ __all__ = [
     "DART_DISCLOSURES_SOURCE",
     "DART_DISCLOSURE_WINDOWS_SOURCE",
     "DART_DOCUMENT_SOURCE",
+    "DBSEC_CLOSING_BAR_SOURCE",
+    "DBSEC_DAILY_CHART_SOURCE",
+    "DBSEC_TICKER_MASTER_SOURCE",
     "DIVIDEND_DECISION_SOURCE",
     "EARNINGS_RELEASE_SOURCE",
     "FINANCIAL_FACTS_SOURCE",
@@ -65,6 +68,9 @@ DART_CORP_CODES_SOURCE = "dart_corp_codes"
 DART_DOCUMENT_SOURCE = "dart_documents"
 KIND_NOTICE_SEARCH_SOURCE = "kind_notice_search"
 KIND_NOTICE_DOCUMENT_SOURCE = "kind_notice_documents"
+DBSEC_TICKER_MASTER_SOURCE = "dbsec_ticker_master"
+DBSEC_DAILY_CHART_SOURCE = "dbsec_daily_chart"
+DBSEC_CLOSING_BAR_SOURCE = "dbsec_closing_bar"
 
 _CANONICAL_SEPARATORS = (",", ":")
 _IDENTITY_FIELDS = ("envelope", "provider", "endpoint")
@@ -317,6 +323,36 @@ SOURCE_CONTRACTS: Final[Mapping[str, SourceContract]] = {
             coverage=CoverageShape.KEYED,
             row_fields=frozenset(),
             query_fields=frozenset(),
+        ),
+        SourceContract(
+            source=DBSEC_TICKER_MASTER_SOURCE,
+            kind=EvidenceKind.SECURITY_MASTER,
+            provider="DBSEC",
+            endpoints=frozenset({"stock-ticker"}),
+            envelope=EnvelopeFormat.RAW_ROWS_V1,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset({"Iscd", "StndIscd", "KorIsnm", "MrktClsCode", "MrktClsName"}),
+            query_fields=frozenset({"market_div", "session"}),
+        ),
+        SourceContract(
+            source=DBSEC_DAILY_CHART_SOURCE,
+            kind=EvidenceKind.DAILY_MARKET,
+            provider="DBSEC",
+            endpoints=frozenset({"kr-chart/day"}),
+            envelope=EnvelopeFormat.RAW_ROWS_V1,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset({"Date", "Oprc", "Hprc", "Lprc", "Prpr", "AcmlVol"}),
+            query_fields=frozenset({"ticker", "session", "adjusted"}),
+        ),
+        SourceContract(
+            source=DBSEC_CLOSING_BAR_SOURCE,
+            kind=EvidenceKind.DAILY_MARKET,
+            provider="DBSEC",
+            endpoints=frozenset({"kr-chart/min"}),
+            envelope=EnvelopeFormat.RAW_ROWS_V1,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset({"Date", "Hour", "Oprc", "Hprc", "Lprc", "Prpr", "CntgVol"}),
+            query_fields=frozenset({"ticker", "session", "bar_count", "row_filter"}),
         ),
     )
 }

@@ -579,7 +579,7 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 14
+    assert len(report.collection) == 17
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
         "earnings_releases",
@@ -587,6 +587,7 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
         "krx_hedge_series", "krx_trend_series", "krx_cash_series",
         "kind_notice_search", "kind_notice_documents",
         "ls_investor_flow", "kis_investor_flow",
+        "dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar",
     }
 
 
@@ -1980,3 +1981,36 @@ def test_invalid_transport_degrades_not_blocks(tmp_path: Path, monkeypatch: pyte
     assert [step.status for step in report.steps] == ["failed", "failed"]
     assert report.blocking_job is None
     assert report.degraded_jobs == ("kind_notice_search", "kind_notice_documents")
+
+
+def test_dbsec_failure_is_optional(tmp_path: Path) -> None:
+    from src.integrations.errors import ProviderTerminalError
+
+    ctx = _fixture_context(tmp_path)
+    ran: list[str] = []
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise ProviderTerminalError("DBSEC down", provider="DBSEC", endpoint="kr-chart/min")
+
+    def _after(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        ran.append("kis_investor_flow")
+        return CollectionStepReport(job="kis_investor_flow", status="complete", done=1, pending_left=0, requests_used=0)
+
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None,
+        steps=(_ok_step("dart_disclosures"), ("dbsec_closing_bar", _boom), ("kis_investor_flow", _after)),
+    )
+
+    assert ran == ["kis_investor_flow"]
+    assert report.steps[1].status == "failed"
+    assert report.blocking_job is None
+    assert report.degraded_jobs == ("dbsec_closing_bar",)
+
+
+def test_default_collection_steps_end_with_dbsec_in_registry_order(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    names = [name for name, _ in graph._default_collection_steps()]
+
+    assert names[-3:] == ["dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"]
+    assert "dbsec_ticker_master" in graph.OPTIONAL_COLLECTION_JOBS

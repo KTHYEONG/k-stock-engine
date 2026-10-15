@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE DB Securities fallback collection (Mon-Fri 20:20 KST)
+OnFailure=kse-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=90min
+ExecStart=/usr/bin/docker run --rm --log-opt max-size=10m --log-opt max-file=3 --name kse-collect-dbsec --user %U:%G -e HOME=/tmp -e _RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0 -e UV_CACHE_DIR=/tmp/uv-cache --memory=1g --memory-swap=1g --cpus=0.5 --env-file %h/quant-secrets/k-stock-engine.env -v %h/.cache/dbsec:/app/.cache/dbsec -e DBSEC_TOKEN_CACHE_DIR=/app/.cache/dbsec -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.ops.jobs collect-dbsec
+ExecStopPost=-/usr/bin/docker rm -f kse-collect-dbsec

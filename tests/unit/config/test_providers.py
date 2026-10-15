@@ -618,3 +618,50 @@ def test_dbsec_policy_rejects_blank_env_name() -> None:
     values["app_key_env"] = "   "
     with pytest.raises(pydantic.ValidationError):
         DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_loads_collection_schedule_from_repo_toml() -> None:
+    provider = _policy()
+
+    assert provider.dbsec.session_final_time_kst == "20:10"
+    assert provider.dbsec.lookback_sessions == 5
+    assert provider.dbsec.closing_bar_count == 400
+    assert provider.dbsec.chunk_units == 50
+    assert tuple(provider.dbsec.equity_market_names) == ("거래소", "코스닥")
+    assert provider.dbsec.master_valid_until_kst == "08:00"
+
+
+def test_dbsec_policy_rejects_invalid_final_time() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["session_final_time_kst"] = "25:00"
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_rejects_closing_bar_count_over_vendor_cap() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["closing_bar_count"] = 2001
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_rejects_blank_equity_market_names() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["equity_market_names"] = ["거래소", "  "]
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
