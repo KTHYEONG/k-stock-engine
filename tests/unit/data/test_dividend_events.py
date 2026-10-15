@@ -36,7 +36,7 @@ def _archive() -> bytes:
     </table>"""
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
-        archive.writestr("document.xml", html)
+        archive.writestr(zipfile.ZipInfo("document.xml", (2024, 1, 2, 0, 0, 0)), html)
     return output.getvalue()
 
 
@@ -818,3 +818,103 @@ def test_packed_bronze_builds_identical_dividend_events(tmp_path: Path) -> None:
     ] == [
         (partition.path, partition.sha256) for partition in load_manifest(second).partitions
     ]
+
+
+def _random_calendar(rng, n: int) -> SessionCalendar:  # type: ignore[no-untyped-def]
+    from datetime import timedelta
+
+    cursor = datetime(2024, 1, 2, 9, tzinfo=KRX_TZ)
+    sessions = []
+    for _ in range(n):
+        sessions.append(cursor)
+        cursor = cursor + timedelta(days=rng.choice([1, 2, 3, 5]))
+    return SessionCalendar(tuple(sessions))
+
+
+def _legacy_ex(record: date, calendar: SessionCalendar) -> date:  # type: ignore[no-untyped-def]
+    dates = [s.astimezone(KRX_TZ).date() for s in calendar.sessions]
+    at_or_before = [d for d in dates if d <= record]
+    if not at_or_before:
+        raise PITDataError(f"no certified session on or before record date {record.isoformat()}")
+    record_session = max(at_or_before)
+    position = dates.index(record_session)
+    if position == 0:
+        raise PITDataError(f"no prior certified session before record session {record_session.isoformat()}")
+    return dates[position - 1]
+
+
+def _legacy_pay(pay: date, calendar: SessionCalendar) -> date:  # type: ignore[no-untyped-def]
+    return max(d for d in [s.astimezone(KRX_TZ).date() for s in calendar.sessions] if d <= pay)
+
+
+def _legacy_available(received: date, calendar: SessionCalendar) -> datetime:  # type: ignore[no-untyped-def]
+    for session in calendar.sessions:
+        if session.astimezone(KRX_TZ).date() > received:
+            return session
+    raise PITDataError(f"no certified session open after receipt date {received.isoformat()}")
+
+
+def test_resolvers_match_legacy_oracle() -> None:
+    import random as _random
+    import re
+    from datetime import timedelta
+
+    from src.data.dividend_events import (
+        _resolve_available_at,
+        _resolve_ex_session,
+        _resolve_pay_session,
+    )
+    from src.data.session_index import SessionIndex
+
+    rng = _random.Random(20240102)  # noqa: S311 - deterministic test fixture, not crypto
+    for _ in range(20):
+        calendar = _random_calendar(rng, rng.randint(2, 10))
+        index = SessionIndex.from_calendar(calendar)
+        probe_dates = {s.astimezone(KRX_TZ).date() for s in calendar.sessions}
+        first, last = min(probe_dates), max(probe_dates)
+        candidates = {first - timedelta(days=2), last + timedelta(days=2)}
+        for day in list(probe_dates):
+            candidates.update({day, day - timedelta(days=1), day + timedelta(days=1)})
+        for day in candidates:
+            for new, legacy in (
+                (_resolve_ex_session, _legacy_ex),
+                (_resolve_pay_session, _legacy_pay),
+                (_resolve_available_at, _legacy_available),
+            ):
+                try:
+                    expected = legacy(day, calendar)
+                except (PITDataError, ValueError) as exc:
+                    with pytest.raises(type(exc), match=f"^{re.escape(str(exc))}$"):
+                        new(day, index=index)
+                else:
+                    assert new(day, index=index) == expected
+
+
+def test_first_session_record_date_has_no_prior_session() -> None:
+    from src.data.dividend_events import _resolve_ex_session
+    from src.data.session_index import SessionIndex
+
+    index = SessionIndex.from_calendar(_calendar())
+    with pytest.raises(PITDataError, match="no prior certified session"):
+        _resolve_ex_session(date(2024, 1, 2), index=index)
+
+
+def test_materialised_dataset_id_unchanged(tmp_path: Path) -> None:
+    from src.data.datasets import load_manifest, read_dataset
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    first = materialize_dividend_events(
+        catalog=catalog, silver_root=tmp_path / "silver-a", calendar=_calendar()
+    )
+    second = materialize_dividend_events(
+        catalog=catalog, silver_root=tmp_path / "silver-b", calendar=_calendar()
+    )
+    manifest = load_manifest(first)
+    assert manifest.dataset_id == "dividend_events_8df7bb9ec0727bfc"
+    assert [(part.path, part.sha256) for part in manifest.partitions] == [
+        ("part-00000.parquet", "ef30f9e17d14df688c6ec6b5efe1ce04bec8a1d2c1f09f89378075f0f9e8cfdb")
+    ]
+    assert load_manifest(first).dataset_id == load_manifest(second).dataset_id
+    assert read_dataset(first).collect().to_dicts() == read_dataset(second).collect().to_dicts()
