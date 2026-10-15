@@ -848,3 +848,9 @@ def test_malformed_hit_is_reparsed_before_calendar_validation(tmp_path: Path) ->
         )
         assert result.rows == 1
         assert cache.get_many([digest])[digest]["violations"] == []
+
+
+def test_page_batch_bounds_parse_read_ahead() -> None:
+    from src.data import investor_flow_silver
+
+    assert investor_flow_silver._PAGE_BATCH <= 100
