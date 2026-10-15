@@ -8,6 +8,7 @@ from calendar import monthrange as calendar_monthrange
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,9 @@ from src.data.datasets import (
     read_dataset,
 )
 from src.data.evidence_sources import DIVIDEND_DECISION_SOURCE
+from src.data.parse_cache import ParseCache, source_fingerprint
 from src.data.payload_store import read_payload
-from src.data.receipt_catalog import ReceiptCatalog
+from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
 from src.data.session_index import SessionIndex
 from src.integrations.dart.dividend_decision import (
     DividendDecision,
@@ -63,31 +65,37 @@ def _load_corp_bridge(catalog: ReceiptCatalog) -> dict[str, str]:
 def _iter_decision_envelopes(catalog: ReceiptCatalog) -> list[dict[str, Any]]:
     envelopes: list[dict[str, Any]] = []
     for blob in catalog.blobs(source=DIVIDEND_DECISION_SOURCE, usable=True):
-        path = Path(blob.payload_path)
-        try:
-            raw = read_payload(path)
-        except (OSError, PITDataError) as exc:
-            raise PITDataError(f"dividend-decision Bronze payload is unreadable: {path}") from exc
-        if hashlib.sha256(raw).hexdigest() != blob.content_hash:
-            raise PITDataError(f"dividend-decision Bronze hash mismatch: {path}")
-        if raw.lstrip()[:2] == b"PK":
-            continue
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if "archive_b64" not in payload or "rcept_no" not in payload:
-            continue
-        try:
-            archive = base64.b64decode(str(payload["archive_b64"]), validate=True)
-        except (ValueError, TypeError):
-            continue
-        if b"<status>014</status>" in archive[:600]:
-            continue
-        envelopes.append(payload)
+        payload = _read_decision_envelope(blob)
+        if payload is not None:
+            envelopes.append(payload)
     return envelopes
+
+
+def _read_decision_envelope(blob: BlobEntry) -> dict[str, Any] | None:
+    path = Path(blob.payload_path)
+    try:
+        raw = read_payload(path)
+    except (OSError, PITDataError) as exc:
+        raise PITDataError(f"dividend-decision Bronze payload is unreadable: {path}") from exc
+    if hashlib.sha256(raw).hexdigest() != blob.content_hash:
+        raise PITDataError(f"dividend-decision Bronze hash mismatch: {path}")
+    if raw.lstrip()[:2] == b"PK":
+        return None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "archive_b64" not in payload or "rcept_no" not in payload:
+        return None
+    try:
+        archive = base64.b64decode(str(payload["archive_b64"]), validate=True)
+    except (ValueError, TypeError):
+        return None
+    if b"<status>014</status>" in archive[:600]:
+        return None
+    return payload
 
 
 def _decision_from_envelope(payload: dict[str, Any]) -> DividendDecision:
@@ -105,6 +113,173 @@ def _decision_from_envelope(payload: dict[str, Any]) -> DividendDecision:
         received_on=received_on,
         report_nm=str(payload.get("report_nm", "") or ""),
     )
+
+
+def _envelope_digest(envelope: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+_PARSE_FINGERPRINT: str | None = None
+
+
+def parse_fingerprint() -> str:
+    """Fingerprint of dividend parsing sources for parse-cache invalidation."""
+    global _PARSE_FINGERPRINT
+    if _PARSE_FINGERPRINT is None:
+        import src.data.dividend_events as _events
+        import src.integrations.dart.dividend_decision as _decision_module
+        import src.integrations.dart.html_tables as _tables_module
+
+        _PARSE_FINGERPRINT = source_fingerprint(_events, _decision_module, _tables_module)
+    return _PARSE_FINGERPRINT
+
+
+def _encode_decision(decision: DividendDecision) -> dict[str, Any]:
+    """Encode one decision into JSON-native form."""
+    return {
+        "rcept_no": decision.rcept_no,
+        "corp_code": decision.corp_code,
+        "received_on": decision.received_on.isoformat(),
+        "record_date": decision.record_date.isoformat(),
+        "pay_date": decision.pay_date.isoformat() if decision.pay_date is not None else None,
+        "dps_common_krw": decision.dps_common_krw,
+        "is_correction": decision.is_correction,
+        "agm_date": decision.agm_date.isoformat() if decision.agm_date is not None else None,
+        "dividend_kind": decision.dividend_kind,
+        "total_krw": decision.total_krw,
+        "market_yield_pct": str(decision.market_yield_pct) if decision.market_yield_pct is not None else None,
+    }
+
+
+def _decode_decision(value: Any) -> DividendDecision:
+    """Rebuild a decision from cached JSON."""
+    if not isinstance(value, dict):
+        raise TypeError("cached decision must be an object")
+    rcept_no = value.get("rcept_no")
+    corp_code = value.get("corp_code")
+    if not isinstance(rcept_no, str) or not isinstance(corp_code, str):
+        raise TypeError("cached decision identity is malformed")
+    try:
+        received_on = date.fromisoformat(str(value.get("received_on")))
+        record_date = date.fromisoformat(str(value.get("record_date")))
+    except (ValueError, TypeError) as exc:
+        raise TypeError("cached decision dates are malformed") from exc
+    pay_raw = value.get("pay_date")
+    agm_raw = value.get("agm_date")
+    try:
+        pay_date = None if pay_raw is None else date.fromisoformat(str(pay_raw))
+        agm_date = None if agm_raw is None else date.fromisoformat(str(agm_raw))
+    except (ValueError, TypeError) as exc:
+        raise TypeError("cached decision optional dates are malformed") from exc
+    dps = value.get("dps_common_krw")
+    if not isinstance(dps, int) or isinstance(dps, bool):
+        raise TypeError("cached decision dps is malformed")
+    is_correction = value.get("is_correction")
+    if not isinstance(is_correction, bool):
+        raise TypeError("cached decision correction flag is malformed")
+    kind = value.get("dividend_kind")
+    if kind is not None and not isinstance(kind, str):
+        raise TypeError("cached decision kind is malformed")
+    total = value.get("total_krw")
+    if total is not None and (not isinstance(total, int) or isinstance(total, bool)):
+        raise TypeError("cached decision total is malformed")
+    yield_raw = value.get("market_yield_pct")
+    market_yield: Decimal | None = None
+    if yield_raw is not None:
+        if not isinstance(yield_raw, str):
+            raise TypeError("cached decision yield is malformed")
+        try:
+            market_yield = Decimal(yield_raw)
+        except InvalidOperation as exc:
+            raise TypeError("cached decision yield is malformed") from exc
+    return DividendDecision(
+        rcept_no=rcept_no,
+        corp_code=corp_code,
+        received_on=received_on,
+        record_date=record_date,
+        pay_date=pay_date,
+        dps_common_krw=dps,
+        is_correction=is_correction,
+        agm_date=agm_date,
+        dividend_kind=kind,
+        total_krw=total,
+        market_yield_pct=market_yield,
+    )
+
+
+def _decode_cached_blob(value: Any) -> tuple[str, str | None, DividendDecision | None]:
+    """Decode one cached blob entry into (kind, digest, decision)."""
+    if not isinstance(value, dict):
+        raise TypeError("cached blob must be an object")
+    if value.get("skip") is True:
+        return ("skip", None, None)
+    digest = value.get("digest")
+    if not isinstance(digest, str) or not digest:
+        raise TypeError("cached blob digest is malformed")
+    if value.get("undated") is True:
+        return ("undated", digest, None)
+    if "decision" not in value:
+        raise TypeError("cached blob shape is malformed")
+    return ("decision", digest, _decode_decision(value.get("decision")))
+
+
+def _parse_decision_blob(blob: BlobEntry) -> dict[str, Any]:
+    payload = _read_decision_envelope(blob)
+    if payload is None:
+        return {"skip": True}
+    digest = _envelope_digest(payload)
+    try:
+        decision = _decision_from_envelope(payload)
+    except UndecidedRecordDateError:
+        return {"digest": digest, "undated": True}
+    return {"digest": digest, "decision": _encode_decision(decision)}
+
+
+def _resolve_decision_blobs(
+    catalog: ReceiptCatalog, *, cache: ParseCache | None
+) -> tuple[list[DividendDecision], list[str], int]:
+    """Per Bronze blob: decision (or undated flag), envelope digest; returns (decisions, envelope_digests, undated_count)."""
+    blobs = list(catalog.blobs(source=DIVIDEND_DECISION_SOURCE, usable=True))
+    decisions: list[DividendDecision] = []
+    digests: list[str] = []
+    undated = 0
+    cached_raw: dict[str, Any] = {}
+    if cache is not None:
+        cached_raw = cache.get_many([blob.content_hash for blob in blobs])
+    fresh: dict[str, Any] = {}
+    for blob in blobs:
+        raw_value = cached_raw.get(blob.content_hash) if cache is not None else None
+        if raw_value is not None:
+            try:
+                kind, digest, decision = _decode_cached_blob(raw_value)
+            except Exception:
+                raw_value = None
+            else:
+                if kind == "skip":
+                    continue
+                if kind == "undated" and digest is not None:
+                    undated += 1
+                    digests.append(digest)
+                    continue
+                if kind == "decision" and digest is not None and decision is not None:
+                    decisions.append(decision)
+                    digests.append(digest)
+                    continue
+        encoded = _parse_decision_blob(blob)
+        kind, digest, decision = _decode_cached_blob(encoded)
+        if cache is not None:
+            fresh[blob.content_hash] = encoded
+        if digest is not None:
+            digests.append(digest)
+        if kind == "undated":
+            undated += 1
+        if decision is not None:
+            decisions.append(decision)
+    if cache is not None and fresh:
+        cache.put_many(fresh)
+    return (decisions, digests, undated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +492,7 @@ def materialize_dividend_events(
     calendar: SessionCalendar,
     daily_market_path: Path | None = None,
     policy: DividendPlausibilityPolicy | None = None,
+    parse_cache: ParseCache | None = None,
 ) -> Path:
     """Build and publish ``dividend_events_<hash16>`` from decision filings.
 
@@ -337,22 +513,7 @@ def materialize_dividend_events(
         _, bridge_receipt_hash = _read_bridge(catalog)
     except PITDataError:  # pragma: no cover - missing bridge preview fallback
         bridge_receipt_hash = ""
-    envelopes = _iter_decision_envelopes(catalog)
-    envelope_hashes = [
-        hashlib.sha256(
-            json.dumps(envelope, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
-        ).hexdigest()
-        for envelope in envelopes
-    ]
-    parsed: list[DividendDecision] = []
-    undated_record_rows = 0
-    for envelope in envelopes:
-        try:
-            decision = _decision_from_envelope(envelope)
-        except UndecidedRecordDateError:
-            undated_record_rows += 1
-            continue
-        parsed.append(decision)
+    parsed, envelope_hashes, undated_record_rows = _resolve_decision_blobs(catalog, cache=parse_cache)
     kept, superseded = resolve_dividend_decisions(
         parsed, correction_window_days=active_policy.correction_window_days
     )

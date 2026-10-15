@@ -918,3 +918,330 @@ def test_materialised_dataset_id_unchanged(tmp_path: Path) -> None:
     ]
     assert load_manifest(first).dataset_id == load_manifest(second).dataset_id
     assert read_dataset(first).collect().to_dicts() == read_dataset(second).collect().to_dicts()
+
+
+def test_dividend_parse_cache_cold_warm_parity_and_digest(tmp_path: Path, monkeypatch) -> None:
+    import hashlib as _hashlib
+    import json as _json
+
+    import src.data.dividend_events as module
+    from src.data.dividend_events import _iter_decision_envelopes, parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    cold = materialize_dividend_events(
+        catalog=catalog, silver_root=tmp_path / "silver-cold", calendar=_calendar()
+    )
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        empty = module.materialize_dividend_events(
+            catalog=catalog, silver_root=tmp_path / "silver-empty", calendar=_calendar(), parse_cache=cache,
+        )
+    from src.data.datasets import load_manifest as _load
+
+    assert _load(empty).dataset_id == _load(cold).dataset_id
+    envelopes = _iter_decision_envelopes(catalog)
+    expected = [
+        _hashlib.sha256(
+            _json.dumps(item, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+        for item in envelopes
+    ]
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        decisions, digests, undated = module._resolve_decision_blobs(catalog, cache=cache)
+    assert digests == expected
+    assert undated == 0
+    assert len(decisions) == 1
+    calls = {"count": 0}
+    original = module._decision_from_envelope
+
+    def _boom(payload):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return original(payload)
+
+    monkeypatch.setattr(module, "_decision_from_envelope", _boom)
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        warm = module.materialize_dividend_events(
+            catalog=catalog, silver_root=tmp_path / "silver-warm", calendar=_calendar(), parse_cache=cache,
+        )
+    assert _load(warm).dataset_id == _load(cold).dataset_id
+    assert calls["count"] == 0
+
+
+def test_dividend_parse_cache_fingerprint_change_misses_and_error_not_cached(tmp_path: Path) -> None:
+    import src.data.dividend_events as module
+    from src.core.pit import EvidenceKind, PITDataError
+    from src.data.dividend_events import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        module.materialize_dividend_events(
+            catalog=catalog, silver_root=tmp_path / "silver-a", calendar=_calendar(), parse_cache=cache,
+        )
+    with ParseCache(cache_path, namespace="other-fingerprint", fingerprint="deadbeef") as other:
+        decisions, digests, _ = module._resolve_decision_blobs(catalog, cache=other)
+    assert len(decisions) == 1
+    assert len(digests) == 1
+
+    bad_raw = b"not a zip"
+    bad_envelope = {
+        "corp_code": "00126380",
+        "rcept_no": "20240102000002",
+        "received_on": "2024-01-02",
+        "archive_b64": base64.b64encode(bad_raw).decode(),
+    }
+    good_hashes = {blob.content_hash for blob in catalog.blobs(source="opendart:dividend_decision", usable=True)}
+    _publish_blob(
+        bronze, kind_dir="corporate_actions", raw=json.dumps(bad_envelope).encode(),
+        kind=EvidenceKind.CORPORATE_ACTIONS,
+        source="opendart:dividend_decision", receipt_key="20240102000002",
+    )
+    catalog = _catalog_for(bronze)
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        for _ in range(2):
+            with pytest.raises(PITDataError):
+                module.materialize_dividend_events(
+                    catalog=catalog, silver_root=tmp_path / "silver-bad", calendar=_calendar(),
+                    parse_cache=cache,
+                )
+        blobs = list(catalog.blobs(source="opendart:dividend_decision", usable=True))
+        assert len(blobs) == 2
+        bad_hashes = {blob.content_hash for blob in blobs} - good_hashes
+        assert len(bad_hashes) == 1
+        stored = cache.get_many(sorted(bad_hashes))
+        assert dict(stored) == {}
+
+
+def test_dividend_decision_round_trip_preserves_decimal_exponent() -> None:
+    from datetime import date
+    from decimal import Decimal
+
+    from src.data.dividend_events import _decode_decision, _encode_decision
+    from src.integrations.dart.dividend_decision import DividendDecision
+
+    decision = DividendDecision(
+        rcept_no="20240102000001", corp_code="00126380", received_on=date(2024, 1, 2),
+        record_date=date(2024, 1, 5), pay_date=None, dps_common_krw=100, is_correction=False,
+        agm_date=None, dividend_kind="결산배당", total_krw=None, market_yield_pct=Decimal("0.35"),
+    )
+    restored = _decode_decision(_encode_decision(decision))
+    assert restored == decision
+    assert str(restored.market_yield_pct) == "0.35"
+
+
+def test_dividend_decode_rejects_malformed_values() -> None:
+    from src.data.dividend_events import _decode_cached_blob, _decode_decision
+
+    good = {
+        "rcept_no": "20240102000001", "corp_code": "00126380",
+        "received_on": "2024-01-02", "record_date": "2024-01-05",
+        "pay_date": None, "dps_common_krw": 100, "is_correction": False,
+        "agm_date": None, "dividend_kind": "결산배당", "total_krw": None,
+        "market_yield_pct": None,
+    }
+    bad_decisions = [
+        [],
+        {**good, "rcept_no": 1},
+        {**good, "received_on": "not-a-date"},
+        {**good, "pay_date": "not-a-date"},
+        {**good, "dps_common_krw": True},
+        {**good, "is_correction": 1},
+        {**good, "dividend_kind": 1},
+        {**good, "total_krw": True},
+        {**good, "market_yield_pct": 1.5},
+        {**good, "market_yield_pct": "not-a-decimal"},
+    ]
+    for value in bad_decisions:
+        with pytest.raises((TypeError, ValueError)):
+            _decode_decision(value)
+    bad_blobs = [
+        [],
+        {"skip": False},
+        {"digest": "abc"},
+        {"digest": ""},
+    ]
+    for value in bad_blobs:
+        with pytest.raises((TypeError, ValueError)):
+            _decode_cached_blob(value)
+    assert _decode_cached_blob({"skip": True})[0] == "skip"
+    assert _decode_cached_blob({"digest": "abc", "undated": True})[0] == "undated"
+
+
+def test_dividend_resolver_skips_cover_cold_and_hit_paths(tmp_path: Path, monkeypatch) -> None:
+    from src.core.pit import EvidenceKind
+    from src.data.dividend_events import _resolve_decision_blobs, parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    raws = [
+        b"PK\x03\x04zip-payload",
+        b"not json",
+        b"[1, 2]",
+        json.dumps({"foo": 1}).encode(),
+        json.dumps({"rcept_no": "r1", "archive_b64": "%%%"}).encode(),
+        json.dumps({
+            "rcept_no": "r2",
+            "archive_b64": base64.b64encode(b"<status>014</status>").decode(),
+        }).encode(),
+    ]
+    for index, raw in enumerate(raws):
+        _publish_blob(
+            bronze, kind_dir="corporate_actions", raw=raw, kind=EvidenceKind.CORPORATE_ACTIONS,
+            source="opendart:dividend_decision", receipt_key=f"skip-{index}",
+        )
+    catalog = _catalog_for(bronze)
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        decisions, digests, undated = _resolve_decision_blobs(catalog, cache=cache)
+    assert decisions == []
+    assert digests == []
+    assert undated == 0
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        import src.data.dividend_events as module
+
+        monkeypatch.setattr(module, "read_payload", lambda _path: (_ for _ in ()).throw(OSError("closed")))
+        decisions, digests, undated = _resolve_decision_blobs(catalog, cache=cache)
+    assert decisions == []
+    assert digests == []
+    assert undated == 0
+
+
+def test_dividend_resolver_hit_paths_and_read_failures(tmp_path: Path, monkeypatch) -> None:
+    import src.data.dividend_events as module
+    from src.core.pit import PITDataError
+    from src.data.dividend_events import _resolve_decision_blobs, parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    blob_hash = next(catalog.blobs(source="opendart:dividend_decision", usable=True)).content_hash
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        cache.put_many({blob_hash: {"bogus": 1}})
+        decisions, digests, undated = _resolve_decision_blobs(catalog, cache=cache)
+    assert len(decisions) == 1
+    assert len(digests) == 1
+    assert undated == 0
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        cache.put_many({blob_hash: {"digest": "deadbeef", "undated": True}})
+        decisions, digests, undated = _resolve_decision_blobs(catalog, cache=cache)
+    assert decisions == []
+    assert digests == ["deadbeef"]
+    assert undated == 1
+    with ParseCache(cache_path, namespace="other", fingerprint="x") as cache:
+        monkeypatch.setattr(module, "read_payload", lambda _path: (_ for _ in ()).throw(OSError("closed")))
+        with pytest.raises(PITDataError, match="unreadable"):
+            _resolve_decision_blobs(catalog, cache=cache)
+    monkeypatch.undo()
+    payload = next((bronze / "corporate_actions").glob("*/payload.json"))
+    payload.write_bytes(payload.read_bytes() + b"tampered")
+    with pytest.raises(PITDataError, match="hash mismatch"):
+        _resolve_decision_blobs(catalog, cache=None)
+
+
+def test_dividend_resolver_caches_undated_cold(tmp_path: Path, monkeypatch) -> None:
+    import src.data.dividend_events as module
+    from src.data.dividend_events import _resolve_decision_blobs, parse_fingerprint
+    from src.data.parse_cache import ParseCache
+    from src.integrations.dart.dividend_decision import UndecidedRecordDateError
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+
+    def _undated(_payload):  # type: ignore[no-untyped-def]
+        raise UndecidedRecordDateError("undated")
+
+    monkeypatch.setattr(module, "_decision_from_envelope", _undated)
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        decisions, digests, undated = _resolve_decision_blobs(catalog, cache=cache)
+    assert decisions == []
+    assert len(digests) == 1
+    assert undated == 1
+    with ParseCache(cache_path, namespace="dividend_decision-v1", fingerprint=parse_fingerprint()) as cache:
+        hashes = [blob.content_hash for blob in catalog.blobs(
+            source="opendart:dividend_decision", usable=True)]
+        stored = cache.get_many(hashes)
+    assert list(stored.values()) == [{"digest": digests[0], "undated": True}]
+
+
+def test_dividend_publication_bytes_match_partial_and_warm_cache(tmp_path: Path, monkeypatch) -> None:
+    from src.core.pit import EvidenceKind
+    from src.data import dividend_events as module
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    for receipt, title in (("20240102000002", "[기재정정]현금ㆍ현물배당결정"),):
+        envelope = {
+            "corp_code": "00126380", "rcept_no": receipt, "received_on": "2024-01-02",
+            "archive_b64": base64.b64encode(_archive()).decode(), "report_nm": title,
+        }
+        _publish_blob(
+            bronze, kind_dir="corporate_actions", raw=json.dumps(envelope).encode(),
+            kind=EvidenceKind.CORPORATE_ACTIONS, source="opendart:dividend_decision", receipt_key=receipt,
+        )
+    catalog = _catalog_for(bronze)
+    cold = materialize_dividend_events(catalog=catalog, silver_root=tmp_path / "cold", calendar=_calendar())
+
+    def snapshot(path: Path) -> dict[str, bytes]:
+        files = {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
+        manifest = json.loads(files["manifest.json"])
+        manifest.pop("created_at")
+        files["manifest.json"] = json.dumps(manifest, sort_keys=True).encode()
+        return files
+
+    expected = snapshot(cold)
+    with ParseCache(tmp_path / "cache.sqlite", namespace="dividend", fingerprint=module.parse_fingerprint()) as cache:
+        for label in ("empty", "partial", "warm"):
+            if label == "partial":
+                hashes = [blob.content_hash for blob in catalog.blobs(source="opendart:dividend_decision")]
+                cache.prune({hashes[0]})
+            if label == "warm":
+                def fail_read(_path):
+                    raise AssertionError("warm resolver read Bronze")
+
+                monkeypatch.setattr(module, "read_payload", fail_read)
+            path = materialize_dividend_events(
+                catalog=catalog, silver_root=tmp_path / label, calendar=_calendar(), parse_cache=cache,
+            )
+            assert snapshot(path) == expected
+
+
+@pytest.mark.parametrize("dependency", [
+    "src.data.dividend_events",
+    "src.integrations.dart.dividend_decision",
+    "src.integrations.dart.html_tables",
+])
+def test_dividend_source_change_invalidates_cache(tmp_path: Path, monkeypatch, dependency: str) -> None:
+    import importlib
+
+    from src.data import dividend_events as module
+    from src.data.parse_cache import ParseCache
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    catalog = _catalog_for(bronze)
+    monkeypatch.setattr(module, "_PARSE_FINGERPRINT", None)
+    fingerprint = module.parse_fingerprint()
+    cache_path = tmp_path / "cache.sqlite"
+    with ParseCache(cache_path, namespace="dividend", fingerprint=fingerprint) as cache:
+        expected = module._resolve_decision_blobs(catalog, cache=cache)
+    changed_source = tmp_path / "changed.py"
+    changed_source.write_text("# Changed parser source\n", encoding="utf-8")
+    monkeypatch.setattr(importlib.import_module(dependency), "__file__", str(changed_source))
+    monkeypatch.setattr(module, "_PARSE_FINGERPRINT", None)
+    changed_fingerprint = module.parse_fingerprint()
+    assert changed_fingerprint != fingerprint
+    hashes = [blob.content_hash for blob in catalog.blobs(source="opendart:dividend_decision")]
+    with ParseCache(cache_path, namespace="dividend", fingerprint=changed_fingerprint) as cache:
+        assert cache.get_many(hashes) == {}
+        assert module._resolve_decision_blobs(catalog, cache=cache) == expected
