@@ -562,3 +562,59 @@ def test_kis_pool_admission_policy_loads() -> None:
             pool_slot=5,
             admission_class="ultra",  # type: ignore[arg-type]
         )
+
+
+def test_dbsec_policy_loads_from_repo_toml() -> None:
+    provider = _policy()
+
+    assert provider.dbsec.app_key_env == "DB_APP_KEY"
+    assert provider.runner("dbsec").quota_provider == "DBSEC"
+
+
+def test_dbsec_policy_rejects_token_interval_below_one_minute() -> None:
+    import pydantic
+    import pytest
+
+    from src.config import ConfigError
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["token_min_interval_seconds"] = 30
+    with pytest.raises((pydantic.ValidationError, ValueError, ConfigError)):
+        DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_rejects_missing_scope() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["scope_min_interval_seconds"] = {"quote_master": 0.34}
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_rejects_overlapping_code_classes() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["retryable_rsp_codes"] = (*values["retryable_rsp_codes"], "IGW00121")
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_policy_rejects_blank_env_name() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    values = _policy().dbsec.model_dump()
+    values["app_key_env"] = "   "
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(values)
