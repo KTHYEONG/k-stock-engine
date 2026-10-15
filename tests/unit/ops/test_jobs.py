@@ -1095,3 +1095,252 @@ def test_collect_dbsec_cli_dispatches(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert main(["--data-root", str(tmp_path), "--date", "2026-10-08", "collect-dbsec"]) == 0
     assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "OK"}
+
+
+_S1 = date(2026, 10, 6)
+_S2 = date(2026, 10, 7)
+_RECONCILE_TICKERS = ("005930", "000660")
+
+
+def _reconcile_bronze(tmp_path: Path) -> Path:
+    bronze = tmp_path / "reconcile-bronze"
+    (bronze / "catalog").mkdir(parents=True, exist_ok=True)
+    return bronze
+
+
+def _stage_dbsec_session(bronze: Path, session: date, tickers: tuple[str, ...]) -> dict[tuple[str, str], SimpleNamespace]:
+    import json as _json
+
+    from src.data.receipt_catalog import EvidenceStatus
+
+    entries: dict[tuple[str, str], SimpleNamespace] = {}
+    master = {"rows": [
+        {"Iscd": ticker, "StndIscd": f"KR7{ticker}003", "KorIsnm": ticker,
+         "MrktClsCode": "STK", "MrktClsName": "거래소"}
+        for ticker in tickers
+    ]}
+    master_path = bronze / f"master-{session.isoformat()}.json"
+    master_path.write_text(_json.dumps(master), encoding="utf-8")
+    entries[("dbsec_ticker_master", session.isoformat())] = SimpleNamespace(
+        status=EvidenceStatus.SUCCESS, payload_path=master_path,
+    )
+    for ticker in tickers:
+        stamp = session.strftime("%Y%m%d")
+        daily = {"rows": [{"Date": stamp, "Oprc": "100", "Hprc": "110", "Lprc": "90",
+                           "Prpr": "105", "AcmlVol": "1000"}]}
+        bar = {"rows": [{"Date": stamp, "Hour": "153000", "Oprc": "100", "Hprc": "110",
+                         "Lprc": "90", "Prpr": "105", "CntgVol": "10"}]}
+        daily_path = bronze / f"daily-{session.isoformat()}-{ticker}.json"
+        bar_path = bronze / f"bar-{session.isoformat()}-{ticker}.json"
+        daily_path.write_text(_json.dumps(daily), encoding="utf-8")
+        bar_path.write_text(_json.dumps(bar), encoding="utf-8")
+        entries[("dbsec_daily_chart", f"{session.isoformat()}:{ticker}")] = SimpleNamespace(
+            status=EvidenceStatus.SUCCESS, payload_path=daily_path,
+        )
+        entries[("dbsec_closing_bar", f"{session.isoformat()}:{ticker}")] = SimpleNamespace(
+            status=EvidenceStatus.SUCCESS, payload_path=bar_path,
+        )
+    return entries
+
+
+def _stub_reconcile_sources(
+    monkeypatch: pytest.MonkeyPatch, entries: dict[tuple[str, str], SimpleNamespace], silver: dict[str, object],
+) -> None:
+    import src.data.jobs.dbsec as dbsec_jobs
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.receipt_catalog import ReceiptCatalog
+
+    ordered = sorted({key[1].split(":")[0] for key in entries})
+    monkeypatch.setattr(
+        dbsec_jobs, "dbsec_final_sessions",
+        lambda **kwargs: tuple(date.fromisoformat(day) for day in ordered),
+    )
+    monkeypatch.setattr(DatasetRegistry, "require", lambda self, kind: "daily_market_test")
+
+    def _latest(self: object, *, source: str, natural_keys: set[str]) -> dict[str, SimpleNamespace]:
+        return {key: entries[(source, key)] for key in natural_keys if (source, key) in entries}
+
+    monkeypatch.setattr(ReceiptCatalog, "latest", _latest)
+    monkeypatch.setattr(jobs, "_silver_session_frame", lambda root, dataset_id, session: silver.get(session.isoformat()))
+
+
+def _reconcile_krx_frame() -> object:
+    import polars as pl
+
+    return pl.DataFrame(
+        [
+            {"ticker": ticker, "market": "KOSPI", "open": 100, "high": 110, "low": 90,
+             "close": 105, "volume": 1000, "price_state": "tradable"}
+            for ticker in _RECONCILE_TICKERS
+        ],
+        schema={
+            "ticker": pl.String, "market": pl.String, "open": pl.Int64, "high": pl.Int64,
+            "low": pl.Int64, "close": pl.Int64, "volume": pl.Int64, "price_state": pl.String,
+        },
+    )
+
+
+def test_silver_session_frame_reads_partition_layouts(tmp_path: Path) -> None:
+    import polars as pl
+
+    frame = pl.DataFrame(
+        [{"ticker": "005930", "close": 105}],
+        schema={"ticker": pl.String, "close": pl.Int64},
+    )
+    direct = tmp_path / "silver" / "daily_market_test" / "session=2026-10-06"
+    direct.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(direct / "part.parquet")
+
+    assert jobs._silver_session_frame(tmp_path / "silver", "daily_market_test", _S1).equals(frame)
+    assert jobs._silver_session_frame(tmp_path / "silver", "daily_market_test", _S2) is None
+    assert jobs._silver_session_frame(tmp_path / "missing", "daily_market_test", _S1) is None
+
+    corrupt = tmp_path / "silver" / "daily_market_test" / "session=2026-10-07"
+    corrupt.mkdir(parents=True, exist_ok=True)
+    (corrupt / "part.parquet").write_bytes(b"not a parquet file")
+    with pytest.raises(PITDataError):
+        jobs._silver_session_frame(tmp_path / "silver", "daily_market_test", _S2)
+
+
+def _collect_dbsec_event(tmp_path: Path) -> dict[str, object]:
+    target = tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl"
+    events = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return next(event for event in events if event["job"] == "collect_dbsec")
+
+
+def _reconcile_root(tmp_path: Path) -> Path:
+    from src.data.runtime import resolve_data_runtime
+
+    return resolve_data_runtime(data_root=tmp_path).workspace.state_root / "dbsec_reconcile"
+
+
+def test_collect_dbsec_reconciles_sessions_with_krx_silver_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs",
+        lambda *a, **k: _dbsec_ok_report(("dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar")),
+    )
+    bronze = _reconcile_bronze(tmp_path)
+    entries = {
+        **_stage_dbsec_session(bronze, _S1, _RECONCILE_TICKERS),
+        **_stage_dbsec_session(bronze, _S2, _RECONCILE_TICKERS),
+    }
+    _stub_reconcile_sources(monkeypatch, entries, {_S1.isoformat(): _reconcile_krx_frame()})
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    root = _reconcile_root(tmp_path)
+    assert sorted(path.name for path in root.glob("*.json")) == [f"{_S1.isoformat()}.json"]
+    event = _collect_dbsec_event(tmp_path)
+    assert event["outcome"] == "OK"
+    (row,) = event["metrics"]["reconciled"]
+    assert (row["session"], row["verdict"]) == (_S1.isoformat(), "pass")
+    assert event["metrics"]["fallback_ready"] is False
+
+
+def test_collect_dbsec_defers_session_with_unanswered_bar_units(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs",
+        lambda *a, **k: _dbsec_ok_report(("dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar")),
+    )
+    bronze = _reconcile_bronze(tmp_path)
+    entries = _stage_dbsec_session(bronze, _S1, _RECONCILE_TICKERS)
+    del entries[("dbsec_closing_bar", f"{_S1.isoformat()}:{_RECONCILE_TICKERS[0]}")]
+    _stub_reconcile_sources(monkeypatch, entries, {_S1.isoformat(): _reconcile_krx_frame()})
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    root = _reconcile_root(tmp_path)
+    assert not root.exists() or not any(root.glob("*.json"))
+    assert _collect_dbsec_event(tmp_path)["metrics"]["reconciled"] == []
+
+
+def test_collect_dbsec_does_not_rewrite_existing_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.data.dbsec_reconcile import write_reconciliation
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs",
+        lambda *a, **k: _dbsec_ok_report(("dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar")),
+    )
+    bronze = _reconcile_bronze(tmp_path)
+    entries = _stage_dbsec_session(bronze, _S1, _RECONCILE_TICKERS)
+    _stub_reconcile_sources(monkeypatch, entries, {_S1.isoformat(): _reconcile_krx_frame()})
+    root = _reconcile_root(tmp_path)
+    root.mkdir(parents=True, exist_ok=True)
+    sentinel = root / f"{_S1.isoformat()}.json"
+    sentinel.write_text('{"sentinel": true}\n', encoding="utf-8")
+    before = (sentinel.stat().st_mtime_ns, sentinel.read_bytes())
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    assert (sentinel.stat().st_mtime_ns, sentinel.read_bytes()) == before
+    assert write_reconciliation is not None
+
+
+def test_collect_dbsec_reconcile_failure_degrades_without_failing_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.data.dbsec_reconcile as reconcile
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs",
+        lambda *a, **k: _dbsec_ok_report(("dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar")),
+    )
+    bronze = _reconcile_bronze(tmp_path)
+    entries = _stage_dbsec_session(bronze, _S1, _RECONCILE_TICKERS)
+    _stub_reconcile_sources(monkeypatch, entries, {_S1.isoformat(): _reconcile_krx_frame()})
+
+    def _boom(**kwargs: object) -> object:
+        raise RuntimeError("silver unreadable")
+
+    monkeypatch.setattr(reconcile, "reconcile_session", _boom)
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    event = _collect_dbsec_event(tmp_path)
+    assert event["outcome"] == "DEGRADED"
+    assert event["reason"] == "reconcile:RuntimeError"
+    root = _reconcile_root(tmp_path)
+    assert not root.exists() or not any(root.iterdir())
+    assert entries[("dbsec_ticker_master", _S1.isoformat())].payload_path.is_file()
+
+
+def test_morning_build_never_reads_dbsec_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.dbsec_reconcile as reconcile
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    bronze = _reconcile_bronze(tmp_path)
+    _stage_dbsec_session(bronze, date(2026, 10, 7), _RECONCILE_TICKERS)
+    monkeypatch.setattr(jobs, "_previous_session", lambda day: date(2026, 10, 7))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: False)
+    clock = _Clock(datetime(2026, 10, 8, 8, 54, tzinfo=KRX_TZ))
+
+    def _forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("morning must not read DBSEC evidence")
+
+    monkeypatch.setattr(reconcile, "load_dbsec_session_rows", _forbidden)
+
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "NO_DECISION"}
+    target = tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl"
+    morning_event = next(
+        json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["job"] == "morning"
+    )
+    assert morning_event["reason"] == "krx_absent_at_deadline"

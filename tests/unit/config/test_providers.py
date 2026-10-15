@@ -665,3 +665,32 @@ def test_dbsec_policy_rejects_blank_equity_market_names() -> None:
     values["equity_market_names"] = ["거래소", "  "]
     with pytest.raises(pydantic.ValidationError):
         DbsecPolicy.model_validate(values)
+
+
+def test_dbsec_reconcile_policy_loads_from_toml() -> None:
+    policy = _policy().dbsec
+
+    assert (
+        policy.reconcile_min_match_rate,
+        policy.reconcile_min_coverage,
+        policy.reconcile_ready_sessions,
+        policy.reconcile_sample_limit,
+    ) == (0.999, 0.995, 20, 20)
+
+
+def test_dbsec_reconcile_policy_rejects_out_of_range_rates() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy
+
+    for field, bad in (
+        ("reconcile_min_match_rate", 0.0),
+        ("reconcile_min_match_rate", 1.5),
+        ("reconcile_min_coverage", 0.0),
+        ("reconcile_min_coverage", 2.0),
+    ):
+        values = _policy().dbsec.model_dump()
+        values[field] = bad
+        with pytest.raises(pydantic.ValidationError):
+            DbsecPolicy.model_validate(values)
