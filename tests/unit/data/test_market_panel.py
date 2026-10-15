@@ -1457,3 +1457,282 @@ def test_audit_failure_leaves_no_gold_or_staging_behind(tmp_path: Path) -> None:
     if gold_root.exists():
         assert list(gold_root.glob(".market_panel_*.staging")) == []
         assert list(gold_root.glob("market_panel_*")) == []
+
+
+def _spill_inputs(
+    tmp_path: Path, sessions: list[date], tickers: list[str]
+) -> tuple[Path, Path, Path]:
+    daily = {
+        session: [_drow(session, ticker) for ticker in tickers[:2]]
+        for session in sessions
+    }
+    universe = {
+        session: [_urow(f"KRX:{ticker}") for ticker in tickers]
+        for session in sessions
+    }
+    return _inputs(tmp_path, daily, universe)
+
+
+def test_spill_dataset_id_parity_across_buckets(tmp_path: Path) -> None:
+    sessions = list(_sessions(date(2020, 1, 6), 40))
+    tickers = ["005930", "000660", "000020"]
+    narrow_path, narrow_universe, narrow_gold = _spill_inputs(tmp_path / "narrow", sessions, tickers)
+    narrow = materialize_market_panel(
+        daily_market_path=narrow_path, universe_path=narrow_universe,
+        rules=RULES, gold_root=narrow_gold, instrument_buckets=2,
+    )
+    wide_path, wide_universe, wide_gold = _spill_inputs(tmp_path / "wide", sessions, tickers)
+    wide = materialize_market_panel(
+        daily_market_path=wide_path, universe_path=wide_universe,
+        rules=RULES, gold_root=wide_gold, instrument_buckets=16,
+    )
+    assert narrow.dataset_id == wide.dataset_id
+    left = json.loads((narrow.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    right = json.loads((wide.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert left["partitions"] == right["partitions"]
+    assert left["dataset_id"] == right["dataset_id"]
+    assert narrow.dataset_id == "market_panel_58cf93ec3e0bf177"
+    assert [(part["path"], part["rows"], part["sha256"]) for part in left["partitions"]] == [
+        ("instrument_exits.parquet", 0, "01c4079f1ea6003db719bda9eee031294e7a31852af10df34a29d45efceba170"),
+        ("year=2020/part.parquet", 80, "5a35522994f8cd6b19a995fd3bcab85b0b196558989ab44f58a01379d36cce6e"),
+    ]
+
+
+def test_spill_reads_each_universe_file_once(tmp_path: Path, monkeypatch) -> None:
+    import src.data.market_panel as panel_module
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    sessions = list(_sessions(date(2020, 1, 6), 4))
+    daily = {session: [_drow(session, "005930"), _drow(session, "000660")] for session in sessions}
+    silver = tmp_path / "silver"
+    daily_path = _write_dataset(silver, "daily_sessioned", daily)
+    universe_partitions = {
+        f"session={session.isoformat()}/part.parquet": pl.DataFrame(
+            [
+                {"session": session, "instrument_id": "KRX:005930", "eligible": True, "exclusion_reason": "eligible"},
+                {"session": session, "instrument_id": "KRX:000660", "eligible": True, "exclusion_reason": "eligible"},
+            ]
+        )
+        for session in sessions
+    }
+    universe_path = publish_dataset(
+        layer_root=silver,
+        identity=DatasetIdentity("ordinary_universe", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions=universe_partitions,
+    ).path
+    gold_root = tmp_path / "gold"
+    _, _, by_session = panel_module._load_input_manifest(universe_path, expected_kind="ordinary_universe")
+    targets = {Path(str(path)) for path in by_session.values()}
+    counts: dict[str, int] = {}
+    original = pl.read_parquet
+
+    def _counting(source, *args, **kwargs):
+        key = str(source) if isinstance(source, (str, Path)) else None
+        if key is not None and Path(key) in targets:
+            counts[key] = counts.get(key, 0) + 1
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(panel_module.pl, "read_parquet", _counting)
+    materialize_market_panel(
+        daily_market_path=daily_path, universe_path=universe_path,
+        rules=RULES, gold_root=gold_root, instrument_buckets=16,
+    )
+    assert set(counts) == {str(path) for path in targets}
+    assert all(value == 1 for value in counts.values())
+
+
+def test_spill_legacy_file_without_session(tmp_path: Path) -> None:
+    from src.data.market_panel import _bucket_of, _spill_universe_by_bucket
+
+    sessions = [DAY0, DAY1]
+    spill_src = tmp_path / "src"
+    spill_src.mkdir(parents=True)
+    by_session: dict[date, Path] = {}
+    for session in sessions:
+        path = spill_src / f"u-{session.isoformat()}.parquet"
+        pl.DataFrame(
+            [{"instrument_id": "KRX:005930", "eligible": True, "exclusion_reason": "eligible"}]
+        ).write_parquet(path)
+        by_session[session] = path
+    mapping = pl.DataFrame(
+        {"instrument_id": ["KRX:005930"], "bucket": [_bucket_of("KRX:005930", 2)]},
+        schema={"instrument_id": pl.String, "bucket": pl.Int64},
+    )
+    chunks = _spill_universe_by_bucket(
+        by_session, sessions, mapping, instrument_buckets=2, spill_dir=tmp_path / "spill",
+    )
+    frames = [pl.read_parquet(path) for paths in chunks for path in paths]
+    combined = pl.concat(frames, how="vertical_relaxed").sort("session")
+    assert combined["session"].to_list() == sessions
+    assert combined["eligible"].to_list() == [True, True]
+
+
+def test_spill_empty_bucket_matches_single_bucket(tmp_path: Path) -> None:
+    sessions = list(_sessions(date(2020, 1, 6), 3))
+    daily = {session: [_drow(session, "005930")] for session in sessions}
+    universe = _full_universe(daily)
+    one_path, one_universe, one_gold = _inputs(tmp_path / "one", daily, universe)
+    one = materialize_market_panel(
+        daily_market_path=one_path, universe_path=one_universe,
+        rules=RULES, gold_root=one_gold, instrument_buckets=1,
+    )
+    many_path, many_universe, many_gold = _inputs(tmp_path / "many", daily, universe)
+    many = materialize_market_panel(
+        daily_market_path=many_path, universe_path=many_universe,
+        rules=RULES, gold_root=many_gold, instrument_buckets=16,
+    )
+    assert one.dataset_id == many.dataset_id
+    assert many.rows == len(sessions)
+
+
+def test_spill_preserves_session_then_file_order(tmp_path: Path) -> None:
+    from src.data.market_panel import _spill_universe_by_bucket
+
+    sessions = [DAY0, DAY1]
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    order = [["KRX:B", "KRX:A", "KRX:C"], ["KRX:C", "KRX:A", "KRX:B"]]
+    by_session: dict[date, Path] = {}
+    for session, ids in zip(sessions, order, strict=True):
+        rows = [{"instrument_id": iid, "eligible": True, "exclusion_reason": "eligible"} for iid in ids]
+        path = src / f"u-{session.isoformat()}.parquet"
+        pl.DataFrame(rows).write_parquet(path)
+        by_session[session] = path
+    ids_all = ["KRX:A", "KRX:B", "KRX:C"]
+    mapping = pl.DataFrame(
+        {"instrument_id": ids_all, "bucket": [0, 0, 0]},
+        schema={"instrument_id": pl.String, "bucket": pl.Int64},
+    )
+    chunks = _spill_universe_by_bucket(
+        by_session, sessions, mapping, instrument_buckets=1, spill_dir=tmp_path / "spill",
+    )
+    combined = pl.concat([pl.read_parquet(p) for p in chunks[0]], how="vertical_relaxed")
+    assert combined["instrument_id"].to_list() == [iid for ids in order for iid in ids]
+
+
+def test_spill_chunk_boundary_concatenation(tmp_path: Path) -> None:
+    from src.data.market_panel import _spill_universe_by_bucket
+
+    sessions = list(_sessions(date(2020, 1, 6), 5))
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    by_session: dict[date, Path] = {}
+    for session in sessions:
+        path = src / f"u-{session.isoformat()}.parquet"
+        pl.DataFrame(
+            [
+                {"session": session, "instrument_id": "KRX:005930", "eligible": True, "exclusion_reason": "eligible"},
+                {"session": session, "instrument_id": "KRX:000660", "eligible": True, "exclusion_reason": "eligible"},
+            ]
+        ).write_parquet(path)
+        by_session[session] = path
+    mapping = pl.DataFrame(
+        {"instrument_id": ["KRX:005930", "KRX:000660"], "bucket": [0, 1]},
+        schema={"instrument_id": pl.String, "bucket": pl.Int64},
+    )
+    chunked = _spill_universe_by_bucket(
+        by_session, sessions, mapping, instrument_buckets=2,
+        spill_dir=tmp_path / "spill-chunked", sessions_per_chunk=2,
+    )
+    whole = _spill_universe_by_bucket(
+        by_session, sessions, mapping, instrument_buckets=2,
+        spill_dir=tmp_path / "spill-whole", sessions_per_chunk=128,
+    )
+    for bucket in range(2):
+        assert len(chunked[bucket]) == 3
+        left = pl.concat([pl.read_parquet(p) for p in chunked[bucket]], how="vertical_relaxed")
+        right = pl.concat([pl.read_parquet(p) for p in whole[bucket]], how="vertical_relaxed")
+        assert_frame_equal(left, right)
+
+
+def test_probe_fallback_preserves_manifest_and_ordering(tmp_path: Path) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_partition_paths, publish_dataset
+    from src.data.market_panel import _load_input_manifest, _probe_partition_sessions
+
+    good = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={
+            f"session={DAY0.isoformat()}/part.parquet": pl.DataFrame({"session": [DAY0]}),
+            f"session={DAY1.isoformat()}/part.parquet": pl.DataFrame({"value": [1]}),
+        },
+    )
+    mixed_paths = list(dataset_partition_paths(good.path, allow_legacy=False))
+    assert _probe_partition_sessions(mixed_paths) is None
+    name, probe_sessions, by_session = _load_input_manifest(good.path, expected_kind="daily_market")
+    assert probe_sessions == [DAY0, DAY1]
+    assert set(by_session) == {DAY0, DAY1}
+    assert name == good.path.name
+    bad = publish_dataset(
+        layer_root=tmp_path / "silver-bad",
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "fixture-v1", {}, {}),
+        partitions={
+            "session=2020-01-06/part.parquet": pl.DataFrame({"session": [DAY1]}),
+            "session=2020-01-07/part.parquet": pl.DataFrame({"session": [DAY0]}),
+        },
+    )
+    with pytest.raises(PITDataError, match=r"market-panel input sessions are not strictly ordered: .*"):
+        _load_input_manifest(bad.path, expected_kind="daily_market")
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, True, 1.5])
+def test_spill_rejects_invalid_chunk_size(tmp_path: Path, chunk_size) -> None:
+    from src.data.market_panel import _spill_universe_by_bucket
+
+    mapping = pl.DataFrame(schema={"instrument_id": pl.String, "bucket": pl.Int64})
+    with pytest.raises(PITDataError, match="sessions per chunk must be a positive integer"):
+        _spill_universe_by_bucket(
+            {}, [DAY0], mapping, instrument_buckets=2, spill_dir=tmp_path,
+            sessions_per_chunk=chunk_size,
+        )
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt", "malformed"])
+def test_spill_rejects_unreadable_partition(tmp_path: Path, fault: str) -> None:
+    from src.data.market_panel import _spill_universe_by_bucket
+
+    path = tmp_path / "part.parquet"
+    if fault == "corrupt":
+        path.write_bytes(b"not parquet")
+    elif fault == "malformed":
+        pl.DataFrame({"instrument_id": ["KRX:A"]}).write_parquet(path)
+    mapping = pl.DataFrame({"instrument_id": ["KRX:A"], "bucket": [0]})
+    with pytest.raises(PITDataError, match="input partition is unreadable") as caught:
+        _spill_universe_by_bucket(
+            {DAY0: path}, [DAY0], mapping, instrument_buckets=1, spill_dir=tmp_path,
+        )
+    assert isinstance(caught.value.__cause__, (OSError, ValueError, pl.exceptions.PolarsError))
+
+
+def test_probe_requires_physical_session_even_for_empty_hive_partition(tmp_path: Path) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_partition_paths, publish_dataset
+    from src.data.market_panel import _load_input_manifest, _probe_partition_sessions
+
+    dataset = publish_dataset(
+        layer_root=tmp_path,
+        identity=DatasetIdentity("ordinary_universe", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions={
+            f"session={DAY0}/part.parquet": pl.DataFrame(schema={"instrument_id": pl.String}),
+            f"session={DAY1}/part.parquet": pl.DataFrame({"instrument_id": ["KRX:A"]}),
+        },
+    )
+    paths = dataset_partition_paths(dataset.path, allow_legacy=False)
+    assert _probe_partition_sessions(paths) is None
+    assert _load_input_manifest(dataset.path, expected_kind="ordinary_universe") == (
+        dataset.path.name, [DAY0, DAY1], dict(zip([DAY0, DAY1], paths, strict=True)),
+    )
+
+
+def test_probe_preserves_empty_physical_session_validation(tmp_path: Path) -> None:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_partition_paths, publish_dataset
+    from src.data.market_panel import _load_input_manifest, _probe_partition_sessions
+
+    dataset = publish_dataset(
+        layer_root=tmp_path,
+        identity=DatasetIdentity("daily_market", DatasetLayer.SILVER, "test-v1", {}, {}),
+        partitions={f"session={DAY0}/part.parquet": pl.DataFrame(schema={"session": pl.Date})},
+    )
+    paths = dataset_partition_paths(dataset.path, allow_legacy=False)
+    assert _probe_partition_sessions(paths) == {paths[0]: []}
+    with pytest.raises(PITDataError, match="no unique session"):
+        _load_input_manifest(dataset.path, expected_kind="daily_market")
