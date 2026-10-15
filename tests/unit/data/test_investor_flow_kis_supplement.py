@@ -117,6 +117,34 @@ def test_supplement_has_no_gold_input(tmp_path: Path) -> None:
     assert result.filled_cells == 1
 
 
+def test_supplement_identity_matches_previous_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.data import investor_flow_gap
+
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    catalog = ReceiptCatalog(tmp_path / "bronze" / "catalog")
+    _seed_kis(catalog, tmp_path / "bronze", "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    targets = _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001")])
+    projected = _materialize(tmp_path, catalog, targets, ls_path)
+    projected_cells = _cells(projected.dataset_path)
+
+    def previous_coverage(files: list[str]) -> pl.DataFrame:
+        frames = [pl.read_parquet(path) for path in files]
+        return (
+            pl.concat(frames, how="vertical_relaxed")
+            .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String))
+            .unique()
+        )
+
+    monkeypatch.setattr(investor_flow_gap, "_coverage_frame", previous_coverage)
+    previous = _materialize(tmp_path, catalog, targets, ls_path)
+    assert projected.dataset_id == previous.dataset_id
+    assert projected.filled_cells == previous.filled_cells == 1
+    assert projected_cells.equals(_cells(previous.dataset_path))
+
+
 def test_both_kis_layouts_parse_identically(tmp_path: Path) -> None:
     uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000002")])
     ls_path = _write_ls(tmp_path, [(S1, "000001")])
