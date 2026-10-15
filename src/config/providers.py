@@ -334,6 +334,12 @@ class DbsecPolicy(BaseModel):
     token_cache_dir_env: str
     retryable_rsp_codes: tuple[str, ...]
     auth_rsp_codes: tuple[str, ...]
+    session_final_time_kst: str
+    lookback_sessions: PositiveInt
+    closing_bar_count: int
+    chunk_units: PositiveInt
+    equity_market_names: tuple[str, ...]
+    master_valid_until_kst: str
 
     @field_validator("app_key_env", "app_secret_env", "token_cache_dir_env")
     @classmethod
@@ -357,6 +363,28 @@ class DbsecPolicy(BaseModel):
         if float(value) < 60.0:
             raise ValueError(f"invalid token_min_interval_seconds {value!r}: must be >= 60.0")
         return float(value)
+
+    @field_validator("session_final_time_kst", "master_valid_until_kst")
+    @classmethod
+    def _check_hhmm(cls, value: str) -> str:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(value)):
+            raise ValueError(f"invalid KST time {value!r}: expected HH:MM")
+        return str(value)
+
+    @field_validator("closing_bar_count")
+    @classmethod
+    def _check_bar_count(cls, value: int) -> int:
+        if isinstance(value, bool) or not 1 <= int(value) <= 2000:
+            raise ValueError(f"invalid closing_bar_count {value!r}: expected [1, 2000]")
+        return int(value)
+
+    @field_validator("equity_market_names")
+    @classmethod
+    def _check_market_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(item.strip() for item in value if isinstance(item, str) and item.strip())
+        if not cleaned or len(cleaned) != len(tuple(value)):
+            raise ValueError("equity_market_names must be non-empty with no blank entries")
+        return cleaned
 
     @model_validator(mode="after")
     def _check_code_classes(self) -> DbsecPolicy:

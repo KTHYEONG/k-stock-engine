@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE DB Securities fallback collection (Mon-Fri 20:20 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 20:20:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-collect-dbsec.service
+
+[Install]
+WantedBy=timers.target

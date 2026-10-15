@@ -8,6 +8,9 @@ import pytest
 
 from src.core.pit import EvidenceKind, PITDataError
 from src.data.evidence_sources import (
+    DBSEC_CLOSING_BAR_SOURCE,
+    DBSEC_DAILY_CHART_SOURCE,
+    DBSEC_TICKER_MASTER_SOURCE,
     KIS_FLOW_SOURCE,
     KIS_INDUSTRY_SOURCE,
     KRX_HEDGE_SERIES_SOURCE,
@@ -344,3 +347,54 @@ def test_native_payload_always_counts_as_carrying_rows() -> None:
     ) is True
     with pytest.raises(PITDataError, match="not valid JSON"):
         envelope_carries_rows(source_contract(LS_FLOW_SOURCE), b"{oops")
+
+
+def _dbsec_master_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "Iscd": "005930",
+        "StndIscd": "KR7005930003",
+        "KorIsnm": "삼성전자",
+        "MrktClsCode": "STK",
+        "MrktClsName": "거래소",
+    }
+    row.update(overrides)
+    return row
+
+
+def _dbsec_bar_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "Date": "20261002",
+        "Hour": "153000",
+        "Oprc": "90000",
+        "Hprc": "90500",
+        "Lprc": "89800",
+        "Prpr": "90100",
+        "CntgVol": "12345",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_dbsec_sources_are_registered_keyed_raw_rows() -> None:
+    for source in (DBSEC_TICKER_MASTER_SOURCE, DBSEC_DAILY_CHART_SOURCE, DBSEC_CLOSING_BAR_SOURCE):
+        contract = source_contract(source)
+        assert contract.provider == "DBSEC"
+        assert contract.coverage is CoverageShape.KEYED
+        assert contract.envelope is EnvelopeFormat.RAW_ROWS_V1
+    assert source_contract(DBSEC_TICKER_MASTER_SOURCE).endpoints == frozenset({"stock-ticker"})
+    assert source_contract(DBSEC_DAILY_CHART_SOURCE).endpoints == frozenset({"kr-chart/day"})
+    assert source_contract(DBSEC_CLOSING_BAR_SOURCE).endpoints == frozenset({"kr-chart/min"})
+
+
+def test_dbsec_envelope_rejects_missing_row_field() -> None:
+    contract = source_contract(DBSEC_CLOSING_BAR_SOURCE)
+    row = _dbsec_bar_row()
+    del row["Hour"]
+
+    with pytest.raises(PITDataError, match="Hour"):
+        raw_rows_envelope(
+            contract,
+            query={"ticker": "005930", "session": "2026-10-02", "bar_count": "400",
+                   "row_filter": "Date=20261002,Hour=153000"},
+            rows=[row],
+        )

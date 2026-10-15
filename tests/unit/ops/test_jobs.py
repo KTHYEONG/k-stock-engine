@@ -995,3 +995,103 @@ def test_report_without_peaks_records_empty_mapping(tmp_path: Path, monkeypatch:
 def test_node_peak_metrics_ignores_malformed_reports() -> None:
     assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb=["not-a-mapping"])) == {}
     assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb={"x": "bad"})) == {}
+
+
+def _dbsec_ok_report(steps: tuple) -> SimpleNamespace:
+    return SimpleNamespace(
+        steps=tuple(
+            SimpleNamespace(job=name, status="complete", done=1, pending_left=0, requests_used=2) for name in steps
+        ),
+    )
+
+
+def test_collect_dbsec_skips_non_trading_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs", lambda *a, **k: calls.append("run"),
+    )
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    assert calls == []
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "SKIPPED"}
+
+
+def test_collect_dbsec_runs_only_dbsec_steps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.pipeline_graph import _default_collection_steps
+    from src.ops.jobs import DBSEC_COLLECT_STEPS, collect_dbsec
+
+    _trading(monkeypatch, True)
+    seen: list[str] = []
+
+    def _fake(ctx: object, *, dry_run: bool, emit: object, steps: tuple) -> SimpleNamespace:
+        seen.extend(name for name, _ in steps)
+        return _dbsec_ok_report(tuple(name for name, _ in steps))
+
+    monkeypatch.setattr("src.data.pipeline_graph.run_collection_jobs", _fake)
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    expected = [name for name, _ in _default_collection_steps() if name in DBSEC_COLLECT_STEPS]
+    assert seen == expected == ["dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"]
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "OK"}
+
+
+def test_collect_dbsec_degrades_on_failed_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+
+    def _failed(ctx: object, *, dry_run: bool, emit: object, steps: tuple) -> SimpleNamespace:
+        return SimpleNamespace(
+            steps=(
+                SimpleNamespace(job="dbsec_ticker_master", status="complete", done=1, pending_left=0, requests_used=1),
+                SimpleNamespace(job="dbsec_daily_chart", status="complete", done=2, pending_left=0, requests_used=2),
+                SimpleNamespace(job="dbsec_closing_bar", status="failed", done=0, pending_left=3, requests_used=0),
+            ),
+        )
+
+    monkeypatch.setattr("src.data.pipeline_graph.run_collection_jobs", _failed)
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "DEGRADED"}
+    event = _json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert "dbsec_closing_bar" in event["reason"]
+
+
+def test_collect_dbsec_exception_is_degraded_exit_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+
+    def _boom(ctx: object, *, dry_run: bool, emit: object, steps: tuple) -> SimpleNamespace:
+        raise PITDataError("catalog unreadable")
+
+    monkeypatch.setattr("src.data.pipeline_graph.run_collection_jobs", _boom)
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "DEGRADED"}
+
+
+def test_evening_and_krx_step_sets_exclude_dbsec() -> None:
+    assert not (set(EVENING_COLLECT_STEPS) & {"dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"})
+    assert not (set(KRX_COLLECT_STEPS) & {"dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"})
+
+
+def test_collect_dbsec_cli_dispatches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import main
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs",
+        lambda *a, **k: _dbsec_ok_report(("dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar")),
+    )
+
+    assert main(["--data-root", str(tmp_path), "--date", "2026-10-08", "collect-dbsec"]) == 0
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "OK"}
