@@ -287,14 +287,22 @@ def _build_cash_series(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publis
 
 def _build_investor_flow_ls(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver LS investor-flow rows for the resolved universe."""
-    from src.data.investor_flow_silver import materialize_investor_flow_silver
+    from src.data.investor_flow_silver import materialize_investor_flow_silver, parse_fingerprint
+    from src.data.parse_cache import ParseCache
 
-    result = materialize_investor_flow_silver(
-        catalog=ctx.catalog,
-        universe_root=ctx.runtime.workspace.silver_root,
-        silver_root=ctx.runtime.workspace.silver_root,
-        universe_dataset_id=inputs["ordinary_universe"],
-    )
+    with ParseCache(
+        _parse_cache_path(ctx, "ls_investor_flow"),
+        namespace="ls_investor_flow-v1",
+        fingerprint=parse_fingerprint(),
+    ) as cache:
+        result = materialize_investor_flow_silver(
+            catalog=ctx.catalog,
+            universe_root=ctx.runtime.workspace.silver_root,
+            silver_root=ctx.runtime.workspace.silver_root,
+            universe_dataset_id=inputs["ordinary_universe"],
+            parse_cache=cache,
+        )
+        cache.prune({blob.content_hash for blob in ctx.catalog.blobs(source="ls_investor_flow", usable=True)})
     return _published(result.dataset_path)
 
 
@@ -322,6 +330,11 @@ def _build_market_panel(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publi
 def _daily_flag_cache_path(ctx: RefreshContext) -> Path:
     """Single cache location for per-session daily admin flags."""
     return ctx.runtime.workspace.state_root / "cache" / "daily_admin_flags.parquet"
+
+
+def _parse_cache_path(ctx: RefreshContext, namespace: str) -> Path:
+    """Single cache location for content-addressed parse results."""
+    return ctx.runtime.workspace.state_root / "cache" / f"parse_{namespace}.sqlite"
 
 
 def warm_daily_flag_cache(ctx: RefreshContext) -> int:
