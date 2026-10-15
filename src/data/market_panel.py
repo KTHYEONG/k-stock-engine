@@ -8,6 +8,7 @@ import logging
 import re
 import tempfile
 import tomllib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -180,6 +181,31 @@ class MarketPanelResult:
     unexplained_limitless_moves: int = 0
 
 
+def _probe_partition_sessions(paths: Sequence[Path]) -> dict[Path, list[date]] | None:
+    """Unique session values per partition in one scan; None when any partition lacks a session column or is unreadable."""
+    try:
+        ordered = list(paths)
+        str_paths = [str(path) for path in ordered]
+        grouped = (
+            pl.scan_parquet(str_paths, include_file_paths="__file_path__", hive_partitioning=False)
+            .select("__file_path__", "session")
+            .group_by("__file_path__")
+            .agg(pl.col("session").unique())
+            .collect()
+        )
+        index_of: dict[str, Path] = {}
+        for position, raw in enumerate(str_paths):
+            index_of.setdefault(raw, ordered[position])
+        probed: dict[Path, list[date]] = {}
+        for row in grouped.iter_rows(named=True):
+            probed[index_of[str(row["__file_path__"])]] = list(row["session"])
+        for path in ordered:
+            probed.setdefault(path, [])
+        return probed
+    except Exception:
+        return None
+
+
 def _load_input_manifest(
     dataset_dir: Path, *, expected_kind: str
 ) -> tuple[str, list[date], dict[date, Path]]:
@@ -198,12 +224,16 @@ def _load_input_manifest(
         manifest = None
     if manifest is not None and manifest.kind != expected_kind:
         raise PITDataError(f"market-panel input kind mismatch: {directory}")
+    probed = _probe_partition_sessions(paths)
     by_session: dict[date, Path] = {}
     previous_session: date | None = None
     for path in paths:
         try:
-            frame = pl.read_parquet(path, columns=["session"])
-            values = frame.get_column("session").unique().to_list()
+            if probed is None:
+                frame = pl.read_parquet(path, columns=["session"])
+                values = frame.get_column("session").unique().to_list()
+            else:
+                values = probed[path]
         except pl.exceptions.ColumnNotFoundError:
             match = re.search(r"(?:^|/)session=([^/]+)(?:/|$)", path.as_posix())
             if match is None:
@@ -230,6 +260,60 @@ def _load_input_manifest(
 def _bucket_of(instrument_id: str, buckets: int) -> int:
     digest = hashlib.sha256(instrument_id.encode("utf-8")).hexdigest()
     return int(digest, 16) % buckets
+
+
+def _spill_universe_by_bucket(
+    universe_by_session: Mapping[date, Path],
+    calendar: Sequence[date],
+    bucket_of_instrument: pl.DataFrame,
+    *,
+    instrument_buckets: int,
+    spill_dir: Path,
+    sessions_per_chunk: int = 128,
+) -> list[list[Path]]:
+    """Split every session's universe rows into per-bucket parquet chunks; returns chunk paths per bucket in session order."""
+    if isinstance(sessions_per_chunk, bool) or not isinstance(sessions_per_chunk, int) or sessions_per_chunk < 1:
+        raise PITDataError("market panel sessions per chunk must be a positive integer")
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[list[Path]] = [[] for _ in range(instrument_buckets)]
+    ordered = list(calendar)
+    total = len(ordered)
+    index = 0
+    chunk_no = 0
+    while index < total:
+        block = ordered[index : index + sessions_per_chunk]
+        raw: list[pl.DataFrame] = []
+        for session in block:
+            path = universe_by_session[session]
+            try:
+                frame = pl.read_parquet(path)
+                if "session" not in frame.columns:
+                    frame = frame.with_columns(pl.lit(session, dtype=pl.Date).alias("session"))
+                raw.append(frame.select("session", "instrument_id", "eligible", "exclusion_reason"))
+                del frame
+            except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
+                raise PITDataError(f"market-panel input partition is unreadable: {path}") from exc
+        staged = raw[0] if len(raw) == 1 else pl.concat(raw, how="vertical_relaxed")
+        del raw
+        if staged.height:
+            joined = staged.join(
+                bucket_of_instrument, on="instrument_id", how="inner", maintain_order="left"
+            )
+            if joined.height:
+                parts = joined.partition_by(
+                    "bucket", maintain_order=True, include_key=False, as_dict=True
+                )
+                for key, part in parts.items():
+                    bucket = int(key[0])
+                    out = spill_dir / f"universe-b{bucket:02d}-c{chunk_no:05d}.parquet"
+                    part.write_parquet(out)
+                    chunks[bucket].append(out)
+                del parts, part
+            del joined
+        del staged
+        index += sessions_per_chunk
+        chunk_no += 1
+    return chunks
 
 
 def _tick_expr(rules: KrxMarketRules, price_col: str) -> pl.Expr:
@@ -639,12 +723,24 @@ def materialize_market_panel(
         instrument_ids = (
             pl.scan_parquet(daily_files).select("instrument_id").unique().collect()["instrument_id"].to_list()
         )
+        bucket_of_instrument = pl.DataFrame(
+            {
+                "instrument_id": [str(iid) for iid in instrument_ids],
+                "bucket": [_bucket_of(str(iid), instrument_buckets) for iid in instrument_ids],
+            },
+            schema={"instrument_id": pl.String, "bucket": pl.Int64},
+        )
         bucket_members: list[frozenset[str]] = [
-            frozenset(
-                str(iid) for iid in instrument_ids if _bucket_of(str(iid), instrument_buckets) == bucket
-            )
+            frozenset(bucket_of_instrument.filter(pl.col("bucket") == bucket)["instrument_id"].to_list())
             for bucket in range(instrument_buckets)
         ]
+        universe_chunks = _spill_universe_by_bucket(
+            universe_by_session,
+            calendar,
+            bucket_of_instrument,
+            instrument_buckets=instrument_buckets,
+            spill_dir=shard_dir,
+        )
         for bucket in range(instrument_buckets):
             members = bucket_members[bucket]
             if members:
@@ -653,19 +749,21 @@ def materialize_market_panel(
                     .filter(pl.col("instrument_id").is_in(members))
                     .collect()
                 )
-                universe_frames: list[pl.DataFrame] = []
-                for session in calendar:
-                    universe_frame = pl.read_parquet(universe_by_session[session])
-                    if "session" not in universe_frame.columns:
-                        universe_frame = universe_frame.with_columns(
-                            pl.lit(session, dtype=pl.Date).alias("session")
-                        )
-                    universe_frames.append(
-                        universe_frame.select("session", "instrument_id", "eligible", "exclusion_reason")
+                chunk_paths = universe_chunks[bucket]
+                if chunk_paths:
+                    universe_bucket = pl.concat(
+                        [pl.read_parquet(path) for path in chunk_paths], how="vertical_relaxed"
                     )
-                universe_bucket = pl.concat(universe_frames, how="vertical_relaxed").filter(
-                    pl.col("instrument_id").is_in(members)
-                )
+                else:
+                    universe_bucket = pl.DataFrame(
+                        [],
+                        schema={
+                            "session": pl.Date,
+                            "instrument_id": pl.String,
+                            "eligible": pl.Boolean,
+                            "exclusion_reason": pl.String,
+                        },
+                    )
             else:
                 daily_bucket = pl.scan_parquet(daily_files).filter(pl.lit(False)).collect()
                 universe_bucket = pl.DataFrame(
