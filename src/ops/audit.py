@@ -17,7 +17,7 @@ from src.ops.run_outcome import load_run_outcomes
 __all__ = ["AUDIT_HEARTBEAT_RELPATH", "EXPECTED_JOBS", "run_daily_audit"]
 
 AUDIT_HEARTBEAT_RELPATH: Final = "ops/heartbeat/daily_audit.json"
-EXPECTED_JOBS: Final[tuple[str, ...]] = ("collect_eve", "morning", "auction_open", "backup")
+EXPECTED_JOBS: Final[tuple[str, ...]] = ("collect_eve", "collect_dbsec", "morning", "auction_open", "backup")
 
 _BACKUP_MAX_AGE: Final = timedelta(hours=26)
 _LOOSE_BRONZE_MAX_AGE: Final = timedelta(days=14)
