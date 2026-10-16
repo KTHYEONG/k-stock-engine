@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -141,6 +142,22 @@ def test_materialized_financial_quality_preserves_source_dataset_lineage(tmp_pat
     assert load_latest_financial_quality(
         root=tmp_path, decision_time=available - timedelta(days=1)
     ).is_empty()
+
+
+def test_financial_quality_accepts_zoneinfo_decision_time(tmp_path) -> None:
+    available = datetime(2024, 5, 1, tzinfo=UTC)
+    seoul = available.astimezone(ZoneInfo("Asia/Seoul")) + timedelta(hours=1)
+    quality = build_financial_quality_events(
+        pl.DataFrame(_facts(company_id="A", period="2024Q1", available_at=available)),
+        unresolved_events=(),
+        decision_time=seoul,
+    )
+    materialize_financial_quality(
+        quality, root=tmp_path, dataset_id="quality-v1", decision_time=seoul, source_dataset_id="financial-v1",
+    )
+    assert load_latest_financial_quality(root=tmp_path, decision_time=seoul).equals(quality)
+    before = available.astimezone(ZoneInfo("Asia/Seoul")) - timedelta(hours=1)
+    assert load_latest_financial_quality(root=tmp_path, decision_time=before).is_empty()
 
 
 def test_financial_quality_rejects_invalid_contract_inputs(tmp_path) -> None:
