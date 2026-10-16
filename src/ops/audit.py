@@ -21,7 +21,7 @@ EXPECTED_JOBS: Final[tuple[str, ...]] = ("collect_eve", "collect_dbsec", "mornin
 
 _BACKUP_MAX_AGE: Final = timedelta(hours=26)
 _LOOSE_BRONZE_MAX_AGE: Final = timedelta(days=14)
-_MAX_FOOTPRINT_BYTES: Final = 6 * 1024**3
+_MAX_FOOTPRINT_BYTES: Final = 10 * 1024**3
 _PACK_DIRNAME: Final = "_packs"
 _CATALOG_DIRNAME: Final = "catalog"
 _OPEN_HOUR: Final = 9
@@ -167,7 +167,7 @@ def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_
         if stale:
             open_issues.append({"key": "bronze_loose", "text": f"{len(stale)} loose Bronze file(s) older than 14 days"})
         if _measure_data_root_bytes(root) > _MAX_FOOTPRINT_BYTES:
-            open_issues.append({"key": "footprint", "text": "data root is above 6 GiB"})
+            open_issues.append({"key": "footprint", "text": "data root is above 10 GiB"})
         severity = "OK" if not open_issues else "WARNING"
     else:
         day_kind = "closed"
