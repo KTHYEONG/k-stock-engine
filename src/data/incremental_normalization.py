@@ -321,7 +321,7 @@ def _validate_fact_frame(frame: pl.DataFrame, *, decision_time: datetime) -> Non
         raise PITDataError("financial facts contain a null primary key")
     if frame.select(keys).is_duplicated().any():
         raise PITDataError("financial facts contain a duplicate primary key")
-    if frame.filter(pl.col("available_at") > decision_time).height:
+    if frame.filter(pl.col("available_at") > decision_time.astimezone(UTC)).height:
         raise PITDataError("financial facts contain a row after decision_time")
 
 

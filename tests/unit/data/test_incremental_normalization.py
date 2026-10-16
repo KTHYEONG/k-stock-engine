@@ -1193,6 +1193,28 @@ def test_reference_table_loader_skips_invalid_candidates_and_validates_bridge(tm
             _validate_fact_frame(bad_frame, decision_time=decision_time)
 
 
+def test_validate_fact_frame_accepts_zoneinfo_decision_time() -> None:
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    import polars as pl
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.incremental_normalization import _validate_fact_frame
+
+    available = datetime(2024, 1, 1, 1, tzinfo=UTC)
+    frame = pl.DataFrame({
+        "company_id": ["A"], "fiscal_period": ["2024Q1"], "filing_id": ["F1"],
+        "fact": ["sales"], "published_at": [available], "available_at": [available],
+        "value": [1.0], "unit": ["KRW"], "consolidated": [True], "restatement_id": ["r0"],
+    })
+    seoul = ZoneInfo("Asia/Seoul")
+    _validate_fact_frame(frame, decision_time=datetime(2024, 1, 1, 10, tzinfo=seoul))
+    with pytest.raises(PITDataError, match="after decision_time"):
+        _validate_fact_frame(frame, decision_time=datetime(2024, 1, 1, 9, tzinfo=seoul))
+
+
 def test_normalize_dart_facts_entry_uses_provider_trust_flag(tmp_path) -> None:
     from datetime import UTC, datetime
 

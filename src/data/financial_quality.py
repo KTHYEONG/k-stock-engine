@@ -412,7 +412,7 @@ def _materialize_financial_quality_v2(
         raise PITDataError("financial quality materialization requires events")
     if list(events.columns) != _QUALITY_COLUMNS:
         raise PITDataError("financial quality events have an unexpected schema")
-    if events.filter(pl.col("available_at") > decision_time).height:
+    if events.filter(pl.col("available_at") > decision_time.astimezone(UTC)).height:
         raise PITDataError("financial quality events contain a row after decision_time")
     quality_report_hash = canonical_content_hash(events, _QUALITY_COLUMNS)
     identity = DatasetIdentity(
@@ -495,7 +495,7 @@ def load_latest_financial_quality(*, root: Path, decision_time: datetime) -> pl.
     if not candidates:
         raise PITDataError("missing certified financial quality dataset")
     _, dataset_id = max(candidates)
-    return read_dataset(table_root / dataset_id).filter(pl.col("available_at") <= decision_time).collect()
+    return read_dataset(table_root / dataset_id).filter(pl.col("available_at") <= decision_time.astimezone(UTC)).collect()
 
 
 def _parse_quality_decision_time(value: str) -> datetime:
