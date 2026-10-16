@@ -22,6 +22,7 @@ import tomllib
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
@@ -33,6 +34,7 @@ from src.data.lake_backup import (  # noqa: E402
     BackupSource,
     LocalDirStore,
     RcloneStore,
+    RemoteStore,
     push,
     restore,
     verify,
@@ -43,7 +45,7 @@ STATUS_PATH = REPO / "data" / "state" / "lake_backup_status.json"
 LOCK_WAIT_NOTE = "waiting for the shared Drive lock"
 
 
-def _sources(args: argparse.Namespace, config: dict) -> list[BackupSource]:
+def _sources(args: argparse.Namespace, config: dict[str, Any]) -> list[BackupSource]:
     if args.root:
         return [BackupSource(args.name, (REPO / args.root).resolve(), exclude=tuple(args.exclude or ()))]
     wanted = set(args.source or [])
@@ -68,7 +70,7 @@ def _sources(args: argparse.Namespace, config: dict) -> list[BackupSource]:
     return out
 
 
-def _store(args: argparse.Namespace, config: dict, name: str):
+def _store(args: argparse.Namespace, config: dict[str, Any], name: str) -> RemoteStore:
     if args.store_dir:
         return LocalDirStore(Path(args.store_dir) / name)
     rclone = shutil.which("rclone") or str(Path.home() / ".local/bin/rclone")
@@ -170,7 +172,7 @@ def main() -> int:
 
 
 def _run_sources(
-    args: argparse.Namespace, config: dict, sources: list[BackupSource], results: dict[str, object],
+    args: argparse.Namespace, config: dict[str, Any], sources: list[BackupSource], results: dict[str, object],
     log: logging.Logger,
 ) -> int:
     rc = 0
@@ -195,8 +197,8 @@ def _run_sources(
                 results[source.name] = {"problems": problems}
                 rc = rc or (1 if problems else 0)
             else:
-                report = restore(source, store, args.dest, work, patterns=tuple(args.pattern or ()))
-                results[source.name] = asdict(report)
+                restore_report = restore(source, store, args.dest, work, patterns=tuple(args.pattern or ()))
+                results[source.name] = asdict(restore_report)
             log.info("[DATA] lake_backup command=%s source=%s result=%s", args.command, source.name, results[source.name])
         except Exception as exc:
             results[source.name] = {"error": type(exc).__name__}
