@@ -278,6 +278,26 @@ def _sealed_at_for(paths_decisions: Path, execution: date) -> datetime | None:
     return max(stamps) if stamps else None
 
 
+def _prune_unreferenced_datasets(root: Path) -> dict[str, object]:
+    """Delete unreferenced dataset generations; never raises so a prune fault cannot fail collection."""
+    from src.data.dataset_maintenance import prune_datasets
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        runtime = resolve_data_runtime(data_root=root)
+        summary = prune_datasets(
+            runtime, DatasetRegistry(runtime.workspace.state_root), apply=True, emit=lambda payload: None,
+        )
+    except Exception as exc:
+        return {"prune_error": type(exc).__name__}
+    return {
+        "pruned": _as_int(summary.get("deleted")),
+        "prune_failed": _as_int(summary.get("failed")),
+        "prune_unreadable": _as_int(summary.get("unreadable")),
+    }
+
+
 def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     """Evening collection and build of everything except the KRX-derived nodes; returns the process exit code."""
     root = Path(data_root)
@@ -316,25 +336,28 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     except Exception as exc:
         warm_metrics = {"flag_cache_error": type(exc).__name__}
         warm_error = type(exc).__name__
+    prune_metrics = _prune_unreferenced_datasets(root)
     if degraded:
         _record(
             root, "collect_eve", "DEGRADED", today, moment,
             reason=f"optional:{','.join(degraded)}"[:300],
             metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
-                      "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks, **warm_metrics},
+                      "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
+                      **warm_metrics, **prune_metrics},
         )
         return 0
     if warm_error is not None:
         _record(
             root, "collect_eve", "DEGRADED", today, moment, reason="flag_cache_warm_failed",
             metrics={"planned": len(planned), "built": len(built),
-                      "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks, **warm_metrics},
+                      "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
+                      **warm_metrics, **prune_metrics},
         )
         return 0
     _record(
         root, "collect_eve", "OK", today, moment,
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(),
-                 "node_peak_rss_mb": node_peaks, **warm_metrics},
+                 "node_peak_rss_mb": node_peaks, **warm_metrics, **prune_metrics},
     )
     return 0
 

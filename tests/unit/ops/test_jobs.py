@@ -992,6 +992,62 @@ def test_report_without_peaks_records_empty_mapping(tmp_path: Path, monkeypatch:
     assert event["outcome"] == "OK"
 
 
+def _prune_summary(**fields: object) -> dict[str, object]:
+    return {"type": "summary", "candidates": 0, "unreadable": 0, "applied": True, "deleted": 0, "failed": 0, **fields}
+
+
+def test_collect_eve_records_prune_metrics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data import dataset_maintenance
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
+    applied: list[bool] = []
+
+    def prune(runtime: object, registry: object, *, apply: bool, emit: object) -> dict[str, object]:
+        applied.append(apply)
+        return _prune_summary(deleted=4, failed=1, unreadable=2)
+
+    monkeypatch.setattr(dataset_maintenance, "prune_datasets", prune)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert applied == [True]
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["pruned"] == 4
+    assert event["metrics"]["prune_failed"] == 1
+    assert event["metrics"]["prune_unreadable"] == 2
+
+
+def test_collect_eve_survives_prune_fault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data import dataset_maintenance
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
+
+    def prune(*args: object, **kwargs: object) -> dict[str, object]:
+        raise PITDataError("private manifest path")
+
+    monkeypatch.setattr(dataset_maintenance, "prune_datasets", prune)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["prune_error"] == "PITDataError"
+    assert "private manifest path" not in json.dumps(event)
+
+
+def test_collect_eve_prune_runs_only_after_unblocked_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report("dart_facts", ()))
+    monkeypatch.setattr(
+        jobs, "_prune_unreferenced_datasets", lambda root: pytest.fail("prune must not run after a blocked collection"),
+    )
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
+
+
 def test_node_peak_metrics_ignores_malformed_reports() -> None:
     assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb=["not-a-mapping"])) == {}
     assert jobs._node_peak_metrics(SimpleNamespace(node_peak_rss_mb={"x": "bad"})) == {}
