@@ -190,7 +190,10 @@ def test_footprint_breach_is_reported(tmp_path: Path, monkeypatch: pytest.Monkey
         assert _measure_data_root_bytes(tmp_path) >= 0
     finally:
         blocked.chmod(0o755)
-    monkeypatch.setattr(audit_mod, "_measure_data_root_bytes", lambda root: 7 * 1024**3)
+    monkeypatch.setattr(audit_mod, "_measure_data_root_bytes", lambda root: 9 * 1024**3)
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning())
+    assert not any(item["key"] == "footprint" for item in heartbeat["open_issues"])
+    monkeypatch.setattr(audit_mod, "_measure_data_root_bytes", lambda root: 11 * 1024**3)
     heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning())
     assert any(item["key"] == "footprint" for item in heartbeat["open_issues"])
 
