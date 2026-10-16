@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from src.config.providers import load_provider_policy
+from src.config.runtime import load_runtime_config
 from tools.devops import lake_backup as backup_tool
 from tools.devops import provision_env
 
@@ -149,3 +151,74 @@ def test_provision_main_pushes_combined_keys(
     output = capsys.readouterr().out
     assert "private-value" not in output
     assert ",".join(allowed + optional) in output
+
+
+def test_provision_preserves_db_credentials(tmp_path: Path) -> None:
+    allowed = provision_env._allow_list()
+    assert allowed[-3:] == ["ECOS_API", "DB_APP_KEY", "DB_APP_SECRET"]
+    assert "DB_APP_KEY" not in provision_env._optional_keys()
+    assert "DB_APP_SECRET" not in provision_env._optional_keys()
+    source = tmp_path / "secrets.env"
+    source.write_text("\n".join(f"{key}=value-{key}" for key in allowed) + "\nUNRELATED=ignored\n")
+    payload = provision_env._render_env(provision_env._read_secret_file(source), allowed)
+    assert payload.count("DB_APP_KEY=") == 1
+    assert payload.count("DB_APP_SECRET=") == 1
+    assert "DB_APP_KEY=value-DB_APP_KEY\n" in payload
+    assert "DB_APP_SECRET=value-DB_APP_SECRET\n" in payload
+    assert "UNRELATED" not in payload
+    assert payload.index("ECOS_API=") < payload.index("DB_APP_KEY=")
+    assert payload.index("DB_APP_SECRET=") < payload.index("KIS_POOL_SLOT=")
+    assert payload.endswith("KIS_POOL_SLOT=5\nKIS_REQUIRE_SHARED_ADMISSION=true\n")
+
+
+@pytest.mark.parametrize("key", ["DB_APP_KEY", "DB_APP_SECRET"])
+@pytest.mark.parametrize("value", [None, "", " "])
+def test_provision_aborts_without_db_credentials(tmp_path: Path, key: str, value: str | None) -> None:
+    allowed = provision_env._allow_list()
+    values = dict.fromkeys(allowed, "secret")
+    if value is None:
+        del values[key]
+    else:
+        values[key] = value
+    source = tmp_path / "secrets.env"
+    source.write_text("\n".join(f"{name}={secret}" for name, secret in values.items()))
+    with pytest.raises(SystemExit, match=f"^missing keys in secret file: {key}$"):
+        provision_env._render_env(provision_env._read_secret_file(source), allowed)
+
+
+def test_provider_credentials_are_provisioned() -> None:
+    provider = load_provider_policy(load_runtime_config(create_directories=False))
+    assert provider.kis.pool_slot is not None
+    names = [
+        *provider.dart.keys,
+        provider.krx.api_key_env,
+        provider.ls.app_key_env,
+        provider.ls.app_secret_env,
+        provider.dbsec.app_key_env,
+        provider.dbsec.app_secret_env,
+    ]
+    allowed = set(provision_env._allow_list())
+    for name in names:
+        assert name in allowed
+
+
+def test_provision_dry_run_lists_db_keys_without_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    allowed = provision_env._allow_list()
+    values = dict.fromkeys(allowed, "secret")
+    values["DB_APP_KEY"] = "private-db"
+    source = tmp_path / "secrets.env"
+    source.write_text("\n".join(f"{key}={value}" for key, value in values.items()))
+
+    def no_push(**kwargs: object) -> None:
+        raise AssertionError("dry-run must not push")
+
+    monkeypatch.setattr(provision_env, "_push_over_ssh", no_push)
+    monkeypatch.setattr(
+        sys, "argv", ["provision_env", "--secrets-file", str(source), "--host", "fixture", "--dry-run"]
+    )
+    assert provision_env.main() == 0
+    output = capsys.readouterr().out
+    assert "DB_APP_KEY,DB_APP_SECRET" in output
+    assert "private-db" not in output
