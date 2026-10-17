@@ -1125,10 +1125,16 @@ def test_decide_is_idempotent(
         hedge_inputs=hedge,
         trend_inputs=None,
         dataset_ids={"market_panel": "m"},
+        now=lambda: datetime(2021, 1, 6, 9, 0, tzinfo=UTC),
     )
     pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
+    _stub_flow_gate(monkeypatch, [])
     monkeypatch.setattr(
-        cli_module, "_decide_context", lambda args, tail: SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=inputs)
+        cli_module, "_decide_context",
+        lambda args, tail: SimpleNamespace(
+            pipeline=pipeline, context=ctx, cube=cube, inputs=inputs,
+            runtime=SimpleNamespace(marker="tiny-runtime"),
+        ),
     )
     monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorer)
     models = tmp_path / "models"
@@ -1320,12 +1326,29 @@ def _tiny_decide_ctx(sessions: list[Any], *, cash: float = 0.0001, hedge: float 
         ),
         trend_inputs=None,
         dataset_ids={"market_panel": "m"},
+        now=lambda: datetime(2021, 1, 6, 9, 0, tzinfo=UTC),
     )
 
 
 def _tiny_decide_resolved(cube: Any, ctx: Any) -> Any:
     pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
-    return SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=None)
+    return SimpleNamespace(
+        pipeline=pipeline,
+        context=ctx,
+        cube=cube,
+        inputs=SimpleNamespace(investor_flow=Path("investor_flow")),
+        runtime=SimpleNamespace(marker="tiny-runtime"),
+    )
+
+
+def _stub_flow_gate(monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]) -> None:
+    import src.data.investor_flow_freshness as freshness_module
+
+    def _check(**kwargs: Any) -> tuple[()]:
+        calls.append(kwargs)
+        return ()
+
+    monkeypatch.setattr(freshness_module, "check_investor_flow_freshness", _check)
 
 
 def test_decide_rejects_tail_sessions_below_700(tmp_path: Path) -> None:
@@ -1503,11 +1526,54 @@ def test_decide_calendar_failure_fails_closed(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr(panel_module, "build_panel", lambda cube, last_row: panel)
     ctx = _tiny_decide_ctx(sessions)
+    _stub_flow_gate(monkeypatch, [])
     monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
     state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
     code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
                  "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
     assert code == 1
+
+
+def test_decide_flow_gate_blocks_stale(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from datetime import date
+
+    from src.config.live_gate import load_live_gate_policy
+    from src.config.runtime import load_runtime_config
+    from src.data.investor_flow_freshness import FlowFreshness, StaleInvestorFlowError
+    from src.research import cli as cli_module
+    from src.research.cli import main
+    from src.research.pipeline import load_strategy_spec
+    import src.data.investor_flow_freshness as freshness_module
+
+    sessions = [date(2021, 1, 4), date(2021, 1, 5), date(2021, 1, 6)]
+    cube = _tiny_decide_cube(sessions)
+    spec = load_strategy_spec(_write_spec(tmp_path / "spec.toml"))
+    ctx = _tiny_decide_ctx(sessions)
+    calls: list[dict[str, Any]] = []
+
+    def _stale(**kwargs: Any) -> tuple[()]:
+        calls.append(kwargs)
+        raise StaleInvestorFlowError(
+            (FlowFreshness(sessions[0], 100, 90, 10, 10, 0.10),)
+        )
+
+    monkeypatch.setattr(freshness_module, "check_investor_flow_freshness", _stale)
+    monkeypatch.setattr(cli_module, "_decide_context", lambda args, tail: _tiny_decide_resolved(cube, ctx))
+    state_path = _tiny_decide_state(tmp_path, spec, cube, sessions[0])
+    code = main(["decide", "--spec", str(tmp_path / "spec.toml"), "--state", str(state_path),
+                 "--models-dir", str(tmp_path), "--decisions-dir", str(tmp_path / "d")])
+    assert code == 1
+    assert "stale" in json.loads(capsys.readouterr().out.strip().splitlines()[-1])["error"]
+    assert len(calls) == 1
+    assert calls[0]["flow_dataset_dir"] == Path("investor_flow")
+    assert calls[0]["source_sessions"] == [sessions[0], sessions[1]]
+    assert calls[0]["seal_time"] == ctx.now()
+    assert calls[0]["runtime"] is not None
+    expected = load_live_gate_policy(load_runtime_config().live_gate)
+    assert calls[0]["policy"] == expected
 
 
 def test_decide_multi_year_catch_up(
@@ -1710,10 +1776,16 @@ def test_decide_multi_year_catch_up(
         hedge_inputs=hedge,
         trend_inputs=None,
         dataset_ids={"market_panel": "m"},
+        now=lambda: datetime(2021, 1, 6, 9, 0, tzinfo=UTC),
     )
     pipeline = SimpleNamespace(_sim_config=lambda cap: SimpleNamespace(cash_buffer=0.0))
+    _stub_flow_gate(monkeypatch, [])
     monkeypatch.setattr(
-        cli_module, "_decide_context", lambda args, tail: SimpleNamespace(pipeline=pipeline, context=ctx, cube=cube, inputs=inputs)
+        cli_module, "_decide_context",
+        lambda args, tail: SimpleNamespace(
+            pipeline=pipeline, context=ctx, cube=cube, inputs=inputs,
+            runtime=SimpleNamespace(marker="tiny-runtime"),
+        ),
     )
     monkeypatch.setattr(cli_module, "_scorer_for", lambda models_dir, year, expected: scorers[year])
     models = tmp_path / "models"

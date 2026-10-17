@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from src.config.errors import ConfigError
+from src.config.live_gate import LiveGatePolicy, load_live_gate_policy
 from src.config.providers import (
     DartKeyPolicy,
     DartPolicy,
@@ -25,10 +26,12 @@ __all__ = [
     "DividendPlausibilityPolicy",
     "KisPolicy",
     "KrxPolicy",
+    "LiveGatePolicy",
     "LsPolicy",
     "ProviderPolicy",
     "RuntimeConfig",
     "disclosure_filter_for_code",
+    "load_live_gate_policy",
     "load_provider_policy",
     "load_runtime_config",
     "read_secret",

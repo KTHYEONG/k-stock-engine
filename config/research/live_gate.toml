@@ -1,0 +1,3 @@
+# Live fail-closed freshness gate: per-session missing fraction over the last 120 sessions has healthy p99 0.0 (2026-10-17 scratch probe); 0.02 >= 2x p99 and <= 0.05.
+[flow]
+max_missing_flow_fraction = 0.02
