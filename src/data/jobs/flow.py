@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -57,24 +57,51 @@ def _universe_calendar(ctx: JobContext) -> tuple[date, ...]:
     return calendar
 
 
+def _calendar_span_groups(
+    sessions: Sequence[date], *, position: Mapping[date, int], span: int
+) -> tuple[tuple[date, date], ...]:
+    """Greedy cover of sorted sessions by windows whose calendar-position span is below ``span``."""
+    if isinstance(span, bool) or not isinstance(span, int) or span < 1:
+        raise PITDataError("calendar span must be a positive integer")
+    if not sessions:
+        return ()
+    groups: list[tuple[date, date]] = []
+    group_first = sessions[0]
+    try:
+        first_index = position[group_first]
+    except KeyError:
+        raise PITDataError(
+            f"investor-flow target session is outside the universe calendar: {group_first}"
+        ) from None
+    group_last = group_first
+    for session in sessions[1:]:
+        try:
+            index = position[session]
+        except KeyError:
+            raise PITDataError(
+                f"investor-flow target session is outside the universe calendar: {session}"
+            ) from None
+        if index - first_index < span:
+            group_last = session
+        else:
+            groups.append((group_first, group_last))
+            group_first = session
+            group_last = session
+            first_index = index
+    groups.append((group_first, group_last))
+    return tuple(groups)
+
+
 def _ls_units(
     *, pending: pl.DataFrame, calendar: tuple[date, ...], limit: int
 ) -> tuple[JobUnit, ...]:
-    """One unit per ticker per calendar block holding pending cells."""
+    """One unit per ticker per pending-session window spanning at most ``limit`` calendar sessions."""
     position = {session: index for index, session in enumerate(calendar)}
     units: list[JobUnit] = []
     for part in pending.partition_by("ticker", maintain_order=True, as_dict=False):
         ticker = str(part["ticker"][0])
         sessions = sorted(part["session"].to_list())
-        blocks: dict[int, list[date]] = {}
-        for session in sessions:
-            index = position.get(session)
-            if index is None:
-                raise PITDataError(f"investor-flow target session is outside the universe calendar: {session}")
-            blocks.setdefault(index // limit, []).append(session)
-        for block in sorted(blocks):
-            start = calendar[block * limit]
-            end = calendar[min((block + 1) * limit, len(calendar)) - 1]
+        for start, end in _calendar_span_groups(sessions, position=position, span=limit):
             units.append(
                 JobUnit(
                     source=LS_FLOW_SOURCE,
@@ -89,9 +116,9 @@ def _ls_units(
 class LsInvestorFlowJob:
     """Request LS t1702 windows for target cells not yet answered by LS.
 
-    One unit is one (ticker, window): at most ``ls.max_sessions_per_request``
-    consecutive XKRX sessions (by calendar position, not by pending count)
-    containing pending cells. The natural key is ``<ticker>:<start>:<end>``.
+    One unit is one (ticker, window) whose bounds are pending sessions and whose
+    span is at most ``ls.max_sessions_per_request`` calendar sessions.
+    The natural key is ``<ticker>:<start>:<end>``.
     """
 
     name = "ls_investor_flow"
@@ -204,16 +231,7 @@ def _kis_windows(
     for part in pending.partition_by("ticker", maintain_order=True, as_dict=False):
         ticker = str(part["ticker"][0])
         sessions = sorted(part["session"].to_list())
-        groups: list[list[date]] = []
-        for session in sessions:
-            index = position.get(session)
-            if index is None:
-                raise PITDataError(f"investor-flow target session is outside the universe calendar: {session}")
-            if groups and index - position[groups[-1][0]] < rows_per_page:
-                groups[-1].append(session)
-            else:
-                groups.append([session])
-        windows[ticker] = tuple((group[0], group[-1]) for group in groups)
+        windows[ticker] = _calendar_span_groups(sessions, position=position, span=rows_per_page)
     return windows
 
 
