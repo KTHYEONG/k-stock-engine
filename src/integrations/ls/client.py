@@ -24,6 +24,7 @@ from src.integrations.host_broker import (
     open_token_store,
     resolve_broker_dir,
 )
+from src.integrations.oauth import ClientCredentialsGrant, issue_client_credentials_token
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
 from src.integrations.transport import HostSlotGate, HttpTransport, RetryPolicy
 
@@ -41,7 +42,7 @@ _TIMEOUT_SECONDS: Final = 15.0
 _TOKEN_TIMEOUT_SECONDS: Final = 10.0
 _MAX_HTTP_ATTEMPTS: Final = 3
 _SUCCESS_RSP_CD: Final = "00000"
-_DEFAULT_EXPIRY_SECONDS: Final = 86400
+_DEFAULT_EXPIRES_IN_SECONDS: Final = 86400
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,45 +152,20 @@ class LsClient:
         return record.access_token
 
     def _issue_token(self) -> IssuedToken:
-        try:
-            response = self._session.post(
-                f"{self.base_url}/{_TOKEN_ENDPOINT}",
-                data={
-                    "grant_type": "client_credentials",
-                    "appkey": self.credentials.app_key,
-                    "appsecretkey": self.credentials.app_secret,
-                    "scope": "oob",
-                },
-                timeout=_TOKEN_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise ProviderRetryableError(
-                f"LS token issuance failed for {_TOKEN_ENDPOINT}: {exc}",
+        return issue_client_credentials_token(
+            self._session,
+            ClientCredentialsGrant(
                 provider=_PROVIDER,
+                url=f"{self.base_url}/{_TOKEN_ENDPOINT}",
                 endpoint=_TOKEN_ENDPOINT,
-            ) from exc
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ProviderRetryableError(
-                f"LS token issuance returned invalid JSON for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            ) from exc
-        token = str(data.get("access_token", "")) if isinstance(data, Mapping) else ""
-        if not token:
-            raise ProviderTerminalError(
-                f"LS token issuance failed for {_TOKEN_ENDPOINT}", provider=_PROVIDER, endpoint=_TOKEN_ENDPOINT
-            )
-        raw_expires = data.get("expires_in", _DEFAULT_EXPIRY_SECONDS) if isinstance(data, Mapping) else _DEFAULT_EXPIRY_SECONDS
-        try:
-            if isinstance(raw_expires, bool):
-                raise TypeError
-            expires_in = int(raw_expires)
-        except (TypeError, ValueError, OverflowError):
-            expires_in = _DEFAULT_EXPIRY_SECONDS
-        return IssuedToken(token, float(expires_in))
+                timeout_seconds=_TOKEN_TIMEOUT_SECONDS,
+                require_http_ok=True,
+                throttle_rsp_codes=frozenset(),
+                default_expires_in_seconds=_DEFAULT_EXPIRES_IN_SECONDS,
+            ),
+            app_key=self.credentials.app_key,
+            app_secret=self.credentials.app_secret,
+        )
 
     def health_check(self) -> None:
         """Confirm collection credentials are live without touching Bronze."""
