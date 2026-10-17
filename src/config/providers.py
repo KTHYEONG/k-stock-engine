@@ -307,11 +307,13 @@ class LsPolicy(BaseModel):
     app_secret_env: str
     circuit_threshold: PositiveInt
     max_sessions_per_request: PositiveInt
-    min_interval_seconds: PositiveFloat
+    broker_dir_env: str
+    token_lock_timeout_seconds: PositiveFloat
+    token_expiry_margin_seconds: PositiveFloat
     daily_limit: PositiveInt
     retryable_rsp_codes: tuple[str, ...] = ()
 
-    @field_validator("app_key_env", "app_secret_env")
+    @field_validator("app_key_env", "app_secret_env", "broker_dir_env")
     @classmethod
     def _check_env_name(cls, value: str) -> str:
         if not value.strip():
@@ -328,10 +330,10 @@ class DbsecPolicy(BaseModel):
     app_secret_env: str
     circuit_threshold: PositiveInt
     daily_limit: PositiveInt
-    app_min_interval_seconds: PositiveFloat
-    scope_min_interval_seconds: dict[Literal["chart", "quote_master"], PositiveFloat]
-    token_min_interval_seconds: PositiveFloat
-    token_cache_dir_env: str
+    broker_dir_env: str
+    legacy_token_dir_env: str
+    token_lock_timeout_seconds: PositiveFloat
+    token_expiry_margin_seconds: PositiveFloat
     retryable_rsp_codes: tuple[str, ...]
     auth_rsp_codes: tuple[str, ...]
     session_final_time_kst: str
@@ -345,28 +347,12 @@ class DbsecPolicy(BaseModel):
     reconcile_ready_sessions: PositiveInt
     reconcile_sample_limit: PositiveInt
 
-    @field_validator("app_key_env", "app_secret_env", "token_cache_dir_env")
+    @field_validator("app_key_env", "app_secret_env", "broker_dir_env", "legacy_token_dir_env")
     @classmethod
     def _check_env_name(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("DB env names must be non-empty")
         return value
-
-    @field_validator("scope_min_interval_seconds")
-    @classmethod
-    def _check_scopes(
-        cls, value: dict[Literal["chart", "quote_master"], PositiveFloat]
-    ) -> dict[Literal["chart", "quote_master"], PositiveFloat]:
-        if set(value) != {"chart", "quote_master"}:
-            raise ValueError("scope_min_interval_seconds must declare chart and quote_master")
-        return value
-
-    @field_validator("token_min_interval_seconds")
-    @classmethod
-    def _check_token_interval(cls, value: float) -> float:
-        if float(value) < 60.0:
-            raise ValueError(f"invalid token_min_interval_seconds {value!r}: must be >= 60.0")
-        return float(value)
 
     @field_validator("session_final_time_kst", "master_valid_until_kst")
     @classmethod

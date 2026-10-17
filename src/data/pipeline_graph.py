@@ -1537,7 +1537,6 @@ def _run_ls_flow_collection_step(
             client=build_scoped_ls_client(
                 policy=provider.ls,
                 quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
-                token_cache_dir=runtime_config.logs_root,
             ),
         )
     job_ctx = build_ls_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
