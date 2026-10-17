@@ -358,6 +358,12 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
     target_dir.mkdir(parents=True)
     target = target_dir / "kse-run"
     target.write_text("old wrapper", encoding="utf-8")
+    dropins = home / ".config/systemd/user/kse-backup.service.d"
+    dropins.mkdir(parents=True)
+    (dropins / "90-lake-backup-memory.conf").write_text("[Service]\nExecStart=\n", encoding="utf-8")
+    other_dropins = home / ".config/systemd/user/kse-morning.service.d"
+    other_dropins.mkdir(parents=True)
+    (other_dropins / "10-operator.conf").write_text("[Service]\n", encoding="utf-8")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     events = tmp_path / "events.jsonl"
@@ -387,6 +393,8 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
     assert stat.S_IMODE(target_dir.stat().st_mode) == 0o700
     assert (home / ".cache/kis/.host-admission").is_file()
     assert stat.S_IMODE((home / "quant-secrets/kse-alert.env").stat().st_mode) == 0o600
+    assert not dropins.exists()
+    assert (other_dropins / "10-operator.conf").is_file()
     expected_timers = sorted(path.name for path in (source / "systemd").glob("kse-*.timer"))
     assert [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()] == [
         ["systemctl", "--user", "daemon-reload"],
