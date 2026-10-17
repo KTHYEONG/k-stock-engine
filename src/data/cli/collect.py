@@ -185,9 +185,7 @@ def _run_ls_job(args: argparse.Namespace) -> dict[str, object]:
     quota_store = ProviderQuotaStateStore(runtime.workspace.state_root / "quota")
     collector: LsInvestorFlowCollector | None = None
     if not dry_run:
-        client = build_scoped_ls_client(
-            policy=provider.ls, quota_store=quota_store, token_cache_dir=runtime_config.logs_root,
-        )
+        client = build_scoped_ls_client(policy=provider.ls, quota_store=quota_store)
         collector = LsInvestorFlowCollector(client=client)
     ctx = build_ls_job_context(runtime=runtime, provider=provider, collector=collector)
 

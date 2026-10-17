@@ -1,13 +1,17 @@
 """Host broker contract adapter (kse-local)."""
 from __future__ import annotations
 
+import fcntl
 import logging
+import math
+import os
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from src.config.secrets import read_secret
+from src.integrations.errors import ProviderRetryableError
 from src.integrations.host_broker_contract import (
     DEFAULT_RATES,
     MIN_ISSUE_INTERVAL_S,
@@ -15,15 +19,12 @@ from src.integrations.host_broker_contract import (
     HostBrokerDirNotSharedError,
     IssuedToken,
     TokenRecord,
-    TokenStore,
     TokenStoreLockTimeout,
     admission_state_path,
     resolve_host_broker_dir,
     token_record_path,
 )
-from src.integrations.host_broker_contract import (
-    HostPacer as ContractHostPacer,
-)
+from src.integrations.host_broker_contract import TokenStore as ContractTokenStore
 
 __all__ = [
     "AdmissionSlot",
@@ -38,6 +39,14 @@ __all__ = [
 ]
 
 _LOG = logging.getLogger(__name__)
+
+
+class TokenStore(ContractTokenStore):
+    """Contract token store exposing its shared directory to client adapters."""
+
+    @property
+    def broker_dir(self) -> Path:
+        return self._path.parent
 
 
 def resolve_broker_dir(dir_env: str) -> Path:
@@ -68,9 +77,16 @@ class AdmissionSlot:
         *,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        lock_timeout_seconds: float = 30.0,
     ) -> None:
         self._state = admission_state_path(Path(broker_dir), vendor, app_key, scope)
-        self._pacer = ContractHostPacer(self._state, contract_rate(vendor, scope), clock=clock, sleep=sleep)
+        if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds <= 0:
+            raise ValueError("lock_timeout_seconds must be positive")
+        self._interval = 1.0 / contract_rate(vendor, scope)
+        self._vendor = vendor
+        self._clock = clock
+        self._sleep = sleep
+        self._lock_timeout = lock_timeout_seconds
 
     @property
     def state_path(self) -> Path:
@@ -78,7 +94,40 @@ class AdmissionSlot:
 
     def wait_turn(self) -> None:
         """Block until this process owns the next host-wide slot."""
-        self._pacer.acquire()
+        self._state.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._state, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            deadline = time.monotonic() + self._lock_timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ProviderRetryableError(
+                            "Host admission lock timed out",
+                            provider=self._vendor.upper(),
+                            endpoint="host_admission",
+                        ) from None
+                    self._sleep(0.01)
+            raw = os.read(fd, 64).decode("ascii", errors="replace").strip()
+            try:
+                next_free = float(raw)
+                if not math.isfinite(next_free):
+                    raise ValueError("non-finite admission state")
+            except ValueError:
+                next_free = 0.0
+                if raw:
+                    _LOG.warning("[SYS] stage=host_admission status=STATE_RESET path=%s", self._state.name)
+            now = self._clock()
+            slot = max(now, next_free)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, repr(slot + self._interval).encode("ascii"))
+        finally:
+            os.close(fd)
+        if slot > now:
+            self._sleep(slot - now)
 
 
 def open_token_store(

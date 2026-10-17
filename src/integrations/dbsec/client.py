@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
-import os
+import logging
 import re
-import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -18,11 +15,19 @@ from typing import Any, Final, Literal
 import requests
 
 from src.config.providers import DbsecPolicy
-from src.config.runtime import load_runtime_config
 from src.config.secrets import read_secret
 from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
+from src.integrations.host_broker import (
+    AdmissionSlot,
+    IssuedToken,
+    TokenStore,
+    TokenStoreLockTimeout,
+    contract_rate,
+    open_token_store,
+    resolve_broker_dir,
+)
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
-from src.integrations.transport import HostPacer, HttpTransport, RetryPolicy
+from src.integrations.transport import HostSlotGate, HttpTransport, RetryPolicy
 
 __all__ = [
     "DbsecClient",
@@ -31,21 +36,24 @@ __all__ = [
     "build_scoped_dbsec_client",
 ]
 
+_LOG = logging.getLogger(__name__)
+
 _PROVIDER: Final = "DBSEC"
 _BASE_URL: Final = "https://openapi.dbsec.co.kr:8443"
 _TOKEN_ENDPOINT: Final = "oauth2/token"  # noqa: S105 - URL path, not a credential
 _TICKER_ENDPOINT: Final = "api/v1/quote/kr-stock/inquiry/stock-ticker"
 _DAILY_ENDPOINT: Final = "api/v1/quote/kr-chart/day"
 _MINUTE_ENDPOINT: Final = "api/v1/quote/kr-chart/min"
-_TICKER_SCOPE: Final = "quote_master"
+_TICKER_SCOPE: Final = "quote"
 _CHART_SCOPE: Final = "chart"
 _TIMEOUT_SECONDS: Final = 15.0
 _TOKEN_TIMEOUT_SECONDS: Final = 10.0
 _MAX_HTTP_ATTEMPTS: Final = 3
 _SUCCESS_RSP_CD: Final = "00000"
-_TOKEN_LIVE_MARGIN_SECONDS: Final = 600.0
-_TOKEN_EXPIRY_MARGIN_SECONDS: Final = 120
+_LEGACY_FILENAME: Final = "dbsec_token_prod.json"
+_LEGACY_LIVE_MARGIN_SECONDS: Final = 600.0
 _TICKER_PATTERN: Final = re.compile(r"^[0-9A-Z]{6}$")
+_LEGACY_FALLBACK_LOGGED: Final = {"done": False}
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +63,7 @@ class DbsecCredentials:
 
     @classmethod
     def from_env(cls, policy: DbsecPolicy) -> DbsecCredentials:
-        """Read DB credentials from the env names declared in ``policy``; raises ConfigError when unset."""
+        """Read DB credentials from the env names declared in ``policy``."""
         app_key = read_secret(policy.app_key_env).strip()
         app_secret = read_secret(policy.app_secret_env).strip()
         return cls(app_key=app_key, app_secret=app_secret)
@@ -66,54 +74,46 @@ class _DbsecAuthError(ProviderTerminalError):
 
 
 class DbsecTokenStore:
-    """Host-shared DB OAuth token file with single-flight issuance under a file lock."""
+    """Contract v1 dbsec token store with a one-release read-only fallback."""
 
     def __init__(
         self,
-        cache_dir: Path,
+        broker_dir: Path,
+        app_key: str,
         *,
-        min_issue_interval_seconds: float,
-        clock: Callable[[], float] = time.time,
+        legacy_dir: Path | None,
+        lock_timeout_seconds: float,
+        expiry_margin_seconds: float,
+        clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._dir = Path(cache_dir)
-        self._min_interval = float(min_issue_interval_seconds)
-        self._clock = clock
-        self._sleep = sleep
-        self._mutex = threading.Lock()
+        self._broker_dir = Path(broker_dir)
+        self._legacy_dir = Path(legacy_dir) if legacy_dir is not None else None
+        self._expiry_margin = float(expiry_margin_seconds)
+        self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
+        self._store: TokenStore = open_token_store(
+            self._broker_dir,
+            "dbsec",
+            app_key,
+            lock_timeout_seconds=float(lock_timeout_seconds),
+            expiry_margin_seconds=float(expiry_margin_seconds),
+            clock=self._clock,
+            sleep=sleep,
+        )
 
     @property
-    def cache_dir(self) -> Path:
-        return self._dir
+    def broker_dir(self) -> Path:
+        return self._broker_dir
 
-    @property
-    def _path(self) -> Path:
-        return self._dir / "dbsec_token_prod.json"
-
-    @property
-    def _lock_path(self) -> Path:
-        return self._dir / "dbsec_token_prod.json.lock"
-
-    @property
-    def _attempt_path(self) -> Path:
-        return self._dir / "dbsec_token_prod.attempt"
-
-    def _last_attempt(self) -> float | None:
-        try:
-            return float(self._attempt_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    def _read_legacy(self, now: datetime) -> str | None:
+        if self._legacy_dir is None:
             return None
-
-    def _stamp_attempt(self, at: float) -> None:
-        tmp_path = self._dir / f".dbsec_token_prod.attempt.{os.getpid()}.{threading.get_ident()}.tmp"
-        tmp_path.write_text(repr(at), encoding="utf-8")
-        os.replace(tmp_path, self._attempt_path)
-
-    def _read(self) -> tuple[str, float, float] | None:
         try:
-            if self._path.stat().st_mode & 0o077:
+            path = self._legacy_dir / _LEGACY_FILENAME
+            if path.stat().st_mode & 0o077:
                 return None
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
         except (OSError, ValueError):
             return None
         if not isinstance(payload, dict):
@@ -127,58 +127,45 @@ class DbsecTokenStore:
             return None
         if isinstance(issued_at, bool) or not isinstance(issued_at, (int, float)):
             return None
-        return token, float(expire_at), float(issued_at)
+        if not float(expire_at) - now.timestamp() > _LEGACY_LIVE_MARGIN_SECONDS:
+            return None
+        return token
 
-    def _write(self, token: str, expire_at: float, issued_at: float) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._dir / f".dbsec_token_prod.{os.getpid()}.{threading.get_ident()}.tmp"
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps({"access_token": token, "expire_at": expire_at, "issued_at": issued_at}))
-            os.replace(tmp_path, self._path)
-            self._path.chmod(0o600)
-        finally:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
+    def _wrap_issue(self, issue: Callable[[], tuple[str, int]]) -> Callable[[], IssuedToken]:
+        def _issue() -> IssuedToken:
+            token, expires_in = issue()
+            if float(expires_in) <= self._expiry_margin:
+                raise ProviderTerminalError(
+                    f"{_PROVIDER} token expiry too short for {_TOKEN_ENDPOINT}",
+                    provider=_PROVIDER,
+                    endpoint=_TOKEN_ENDPOINT,
+                )
+            return IssuedToken(token, float(expires_in))
+
+        return _issue
 
     def get_or_issue(self, issue: Callable[[], tuple[str, int]], *, reject: str | None = None) -> str:
-        """Return a live token, issuing via ``issue`` (returns token, expires_in seconds) only when none is live; ``reject`` marks a token the server refused."""
-        self._dir.mkdir(parents=True, exist_ok=True)
-        with self._mutex, open(self._lock_path, "w") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                stored = self._read()
-                now = self._clock()
-                if stored is not None:
-                    token, expire_at, _ = stored
-                    if (reject is None or token != reject) and expire_at - now > _TOKEN_LIVE_MARGIN_SECONDS:
-                        return token
-                # Failed issuances (vendor IGW00201) leave no token file, so spacing keys on the last attempt.
-                anchors = [at for at in (stored[2] if stored else None, self._last_attempt()) if at is not None]
-                if anchors:
-                    wait = self._min_interval - (now - max(anchors))
-                    if wait > 0:
-                        self._sleep(wait)
-                        stored = self._read()
-                        now = self._clock()
-                        if stored is not None:
-                            token, expire_at, _ = stored
-                            if (reject is None or token != reject) and expire_at - now > _TOKEN_LIVE_MARGIN_SECONDS:
-                                return token
-                self._stamp_attempt(self._clock())
-                fresh_token, expires_in = issue()
-                if int(expires_in) < _TOKEN_LIVE_MARGIN_SECONDS:
-                    raise ProviderTerminalError(
-                        f"{_PROVIDER} token expiry too short for {_TOKEN_ENDPOINT}",
-                        provider=_PROVIDER,
-                        endpoint=_TOKEN_ENDPOINT,
-                    )
-                issued = self._clock()
-                self._write(fresh_token, issued + int(expires_in) - _TOKEN_EXPIRY_MARGIN_SECONDS, issued)
-                return fresh_token
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        """Return a usable token, issuing through the host-shared store when needed."""
+        try:
+            if reject is None:
+                if self._store.read() is None:
+                    legacy = self._read_legacy(self._clock())
+                    if legacy is not None:
+                        if not _LEGACY_FALLBACK_LOGGED["done"]:
+                            _LEGACY_FALLBACK_LOGGED["done"] = True
+                            _LOG.info(
+                                "[SYS] stage=dbsec_token status=LEGACY_FALLBACK path=%s",
+                                _LEGACY_FILENAME,
+                            )
+                        return legacy
+                return self._store.get_or_issue(self._wrap_issue(issue)).access_token
+            return self._store.replace_rejected(reject, self._wrap_issue(issue)).access_token
+        except TokenStoreLockTimeout as exc:
+            raise ProviderRetryableError(
+                f"{_PROVIDER} token issuance failed for {_TOKEN_ENDPOINT}",
+                provider=_PROVIDER,
+                endpoint=_TOKEN_ENDPOINT,
+            ) from exc
 
 
 class DbsecClient:
@@ -191,7 +178,7 @@ class DbsecClient:
         policy: DbsecPolicy,
         token_store: DbsecTokenStore,
         transport: HttpTransport | None = None,
-        scope_pacers: Mapping[str, HostPacer] | None = None,
+        scope_pacers: Mapping[str, HostSlotGate] | None = None,
         quota_store: ProviderQuotaStateStore | None = None,
         session: requests.Session | None = None,
         now: Callable[[], datetime] | None = None,
@@ -205,19 +192,16 @@ class DbsecClient:
         self._now = now or (lambda: datetime.now(UTC))
         self._retryable_codes = tuple(policy.retryable_rsp_codes)
         self._auth_codes = tuple(policy.auth_rsp_codes)
-        cache_dir = token_store.cache_dir
+        broker_dir = token_store.broker_dir
+        app_key = credentials.app_key
         if scope_pacers is not None:
-            self._scope_pacers: Mapping[str, HostPacer] = scope_pacers
+            if not {_CHART_SCOPE, _TICKER_SCOPE}.issubset(scope_pacers):
+                raise ValueError("scope_pacers must declare chart and quote")
+            self._scope_pacers: Mapping[str, HostSlotGate] = scope_pacers
         else:
             self._scope_pacers = {
-                _TICKER_SCOPE: HostPacer(
-                    cache_dir / "dbsec_quote_master.state",
-                    min_interval_seconds=float(policy.scope_min_interval_seconds["quote_master"]),
-                ),
-                _CHART_SCOPE: HostPacer(
-                    cache_dir / "dbsec_chart.state",
-                    min_interval_seconds=float(policy.scope_min_interval_seconds["chart"]),
-                ),
+                _TICKER_SCOPE: AdmissionSlot(broker_dir, "dbsec", app_key, _TICKER_SCOPE),
+                _CHART_SCOPE: AdmissionSlot(broker_dir, "dbsec", app_key, _CHART_SCOPE),
             }
         if transport is not None:
             self._transport = transport
@@ -229,15 +213,12 @@ class DbsecClient:
         self._transport = HttpTransport(
             provider=_PROVIDER,
             base_url=_BASE_URL,
-            min_interval_seconds=float(policy.app_min_interval_seconds),
+            min_interval_seconds=1.0 / contract_rate("dbsec"),
             retry=RetryPolicy(max_attempts=_MAX_HTTP_ATTEMPTS),
             quota=gate,
             timeout_seconds=_TIMEOUT_SECONDS,
             session=self._session,
-            host_pacer=HostPacer(
-                cache_dir / "dbsec_app.state",
-                min_interval_seconds=float(policy.app_min_interval_seconds),
-            ),
+            host_pacer=AdmissionSlot(broker_dir, "dbsec", app_key),
         )
 
     def _issue_token(self) -> tuple[str, int]:
@@ -305,7 +286,6 @@ class DbsecClient:
                 data = response.json()
             except ValueError as exc:
                 if not is_ok:
-                    # Gateway error pages carry no rsp_cd; the transport status mapping decides retry.
                     return
                 raise ProviderTerminalError(
                     f"{_PROVIDER} {endpoint} returned invalid JSON with rsp_cd unknown",
@@ -426,7 +406,7 @@ class DbsecClient:
         return tuple(dict(row) for row in rows if isinstance(row, dict) and row.get("Date") != "00000000")
 
     def fetch_minute_chart(self, ticker: str, anchor: date, *, bar_count: int) -> tuple[dict[str, Any], ...]:
-        """Return the newest ``bar_count`` 1-minute J bars at or before the end of ``anchor`` (single page)."""
+        """Return the newest ``bar_count`` 1-minute J bars at or before the end of ``anchor``."""
         symbol = self._check_ticker(ticker)
         if isinstance(bar_count, bool) or not 1 <= int(bar_count) <= 2000:
             raise ValueError(f"invalid bar_count {bar_count!r}: expected [1, 2000]")
@@ -458,9 +438,17 @@ def build_scoped_dbsec_client(
     quota_store: ProviderQuotaStateStore | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> DbsecClient:
-    """Build the DB client with host-shared token store and pacers; raises ConfigError when credentials are unset."""
-    raw = read_secret(policy.token_cache_dir_env, default="")
-    cache_dir = Path(raw) if raw.strip() else load_runtime_config().logs_root
+    """Build the DB client on the host broker contract."""
     credentials = DbsecCredentials.from_env(policy)
-    store = DbsecTokenStore(cache_dir, min_issue_interval_seconds=float(policy.token_min_interval_seconds))
+    broker_dir = resolve_broker_dir(policy.broker_dir_env)
+    raw_legacy = read_secret(policy.legacy_token_dir_env, default="")
+    legacy_dir = Path(raw_legacy.strip()) if raw_legacy.strip() else None
+    store = DbsecTokenStore(
+        broker_dir,
+        credentials.app_key,
+        legacy_dir=legacy_dir,
+        lock_timeout_seconds=float(policy.token_lock_timeout_seconds),
+        expiry_margin_seconds=float(policy.token_expiry_margin_seconds),
+        clock=now,
+    )
     return DbsecClient(credentials, policy=policy, token_store=store, quota_store=quota_store, now=now)
