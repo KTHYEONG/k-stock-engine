@@ -8,6 +8,7 @@ DEST_DIR="${HOME}/.config/systemd/user"
 mkdir -p "${DEST_DIR}"
 mkdir -p "${HOME}/.cache/kis"
 chmod 700 "${HOME}/.cache/kis"
+# Legacy dbsec dir backs the read-only mount; remove with the legacy fallback.
 mkdir -p "${HOME}/.cache/dbsec"
 chmod 700 "${HOME}/.cache/dbsec"
 touch "${HOME}/.cache/kis/.host-admission"
