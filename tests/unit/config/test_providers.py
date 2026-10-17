@@ -361,7 +361,9 @@ def test_blank_env_names_are_rejected() -> None:
             app_secret_env="",
             circuit_threshold=3,
             max_sessions_per_request=700,
-            min_interval_seconds=1.05,
+            broker_dir_env="KIS_TOKEN_CACHE_DIR",
+            token_lock_timeout_seconds=30.0,
+            token_expiry_margin_seconds=180.0,
             daily_limit=10000,
         )
 
@@ -571,27 +573,14 @@ def test_dbsec_policy_loads_from_repo_toml() -> None:
     assert provider.runner("dbsec").quota_provider == "DBSEC"
 
 
-def test_dbsec_policy_rejects_token_interval_below_one_minute() -> None:
-    import pydantic
-    import pytest
-
-    from src.config import ConfigError
-    from src.config.providers import DbsecPolicy
-
-    values = _policy().dbsec.model_dump()
-    values["token_min_interval_seconds"] = 30
-    with pytest.raises((pydantic.ValidationError, ValueError, ConfigError)):
-        DbsecPolicy.model_validate(values)
-
-
-def test_dbsec_policy_rejects_missing_scope() -> None:
+def test_dbsec_policy_rejects_removed_rate_keys() -> None:
     import pydantic
     import pytest
 
     from src.config.providers import DbsecPolicy
 
     values = _policy().dbsec.model_dump()
-    values["scope_min_interval_seconds"] = {"quote_master": 0.34}
+    values["app_min_interval_seconds"] = 0.05
     with pytest.raises(pydantic.ValidationError):
         DbsecPolicy.model_validate(values)
 
@@ -676,6 +665,45 @@ def test_dbsec_reconcile_policy_loads_from_toml() -> None:
         policy.reconcile_ready_sessions,
         policy.reconcile_sample_limit,
     ) == (0.999, 0.995, 20, 20)
+
+
+def test_dbsec_policy_contract_fields() -> None:
+    provider = _policy()
+
+    assert provider.dbsec.broker_dir_env == "KIS_TOKEN_CACHE_DIR"
+    assert provider.dbsec.legacy_token_dir_env == "DBSEC_TOKEN_CACHE_DIR"
+    assert provider.dbsec.token_expiry_margin_seconds == 720.0
+    assert provider.ls.broker_dir_env == "KIS_TOKEN_CACHE_DIR"
+    assert provider.ls.token_expiry_margin_seconds == 180.0
+
+
+def test_ls_policy_rejects_local_min_interval() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import LsPolicy
+
+    values = _policy().ls.model_dump()
+    values["min_interval_seconds"] = 1.05
+    with pytest.raises(pydantic.ValidationError):
+        LsPolicy.model_validate(values)
+
+
+def test_broker_env_names_non_blank() -> None:
+    import pydantic
+    import pytest
+
+    from src.config.providers import DbsecPolicy, LsPolicy
+
+    dbsec = _policy().dbsec.model_dump()
+    dbsec["broker_dir_env"] = " "
+    with pytest.raises(pydantic.ValidationError):
+        DbsecPolicy.model_validate(dbsec)
+
+    ls = _policy().ls.model_dump()
+    ls["broker_dir_env"] = " "
+    with pytest.raises(pydantic.ValidationError):
+        LsPolicy.model_validate(ls)
 
 
 def test_dbsec_reconcile_policy_rejects_out_of_range_rates() -> None:

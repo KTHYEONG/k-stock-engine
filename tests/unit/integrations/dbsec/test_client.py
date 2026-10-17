@@ -1,9 +1,11 @@
-"""DB Securities client invariants: token store, rsp-code classes, paced reads."""
+"""DB Securities client invariants: contract token store, legacy fallback, paced reads."""
 
 from __future__ import annotations
 
-import threading
+import hashlib
+import json
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 
 class _FakeResponse:
@@ -81,18 +83,42 @@ class _NoOpPacer:
 
 
 class _RecordingPacer:
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None, name: str = "") -> None:
         self.calls = 0
+        self._order = order
+        self._name = name
 
     def wait_turn(self) -> None:
         self.calls += 1
+        if self._order is not None:
+            self._order.append(self._name)
+
+
+class _OrderTransport:
+    def __init__(self, order: list[str], recording):  # type: ignore[no-untyped-def]
+        self._order = order
+        self._recording = recording
+        self.calls: list[tuple] = []
+
+    def post(self, endpoint, json_body, *, headers=None, classify=None, error_classify=None):  # type: ignore[no-untyped-def]
+        self.calls.append((endpoint, dict(json_body), dict(headers or {})))
+        self._order.append("app")
+        self._recording.calls += 1
+        response = _FakeResponse({"rsp_cd": "00000", "Out": [{"JCODE": "005930"}]})
+        if classify is not None:
+            classify(response)
+        return response
 
 
 class _ScriptedTokenStore:
-    def __init__(self, tokens):  # type: ignore[no-untyped-def]
+    def __init__(self, tokens, broker_dir: Path):  # type: ignore[no-untyped-def]
         self._tokens = list(tokens)
         self.rejects: list = []
-        self.cache_dir = None
+        self._broker_dir = Path(broker_dir)
+
+    @property
+    def broker_dir(self) -> Path:
+        return self._broker_dir
 
     def get_or_issue(self, issue, *, reject=None):  # type: ignore[no-untyped-def]
         self.rejects.append(reject)
@@ -111,28 +137,61 @@ def _credentials(key="key", secret="sec"):  # type: ignore[no-untyped-def]  # no
     return DbsecCredentials(app_key=key, app_secret=secret)
 
 
-def _store(tmp_path, **kwargs):  # type: ignore[no-untyped-def]
+def _sha12(app_key: str) -> str:
+    return hashlib.sha256(app_key.encode()).hexdigest()[:12]
+
+
+def _marked_broker(tmp_path: Path, name: str = "broker") -> Path:
+    broker = tmp_path / name
+    broker.mkdir(parents=True, exist_ok=True)
+    (broker / ".host-admission").write_text("ok", encoding="utf-8")
+    return broker
+
+
+def _contract_store(broker: Path, app_key: str = "contract-key", *, legacy_dir=None, clock=None, sleep=None):  # type: ignore[no-untyped-def]
     from src.integrations.dbsec.client import DbsecTokenStore
 
-    params: dict = {"min_issue_interval_seconds": 61.0}
-    params.update(kwargs)
-    return DbsecTokenStore(tmp_path / "cache", **params)
+    params: dict = {
+        "legacy_dir": Path(legacy_dir) if legacy_dir is not None else None,
+        "lock_timeout_seconds": 240.0,
+        "expiry_margin_seconds": 720.0,
+    }
+    if clock is not None:
+        params["clock"] = clock
+    if sleep is not None:
+        params["sleep"] = sleep
+    return DbsecTokenStore(broker, app_key, **params)
+
+
+def _write_legacy(legacy_dir: Path, *, legacy_token: str = "legacy-live", now: datetime, ttl: float = 3600.0, mode: int = 0o600, expire_raw=None, raw_text: str | None = None) -> Path:  # type: ignore[no-untyped-def]  # noqa: S107 - test fixture token, not a credential
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    path = legacy_dir / "dbsec_token_prod.json"
+    if raw_text is not None:
+        path.write_text(raw_text, encoding="utf-8")
+    else:
+        payload = {
+            "access_token": legacy_token,
+            "expire_at": expire_raw if expire_raw is not None else now.timestamp() + ttl,
+            "issued_at": now.timestamp(),
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(mode)
+    return path
 
 
 def _client(tmp_path, *, script, tokens=("tok",), pacers=None, token_store=None):  # type: ignore[no-untyped-def]
     from src.integrations.dbsec.client import DbsecClient
 
+    broker = _marked_broker(tmp_path, "client-broker")
     store = token_store
     if store is None:
-        store = _store(tmp_path)
-    if getattr(store, "cache_dir", None) is None:
-        store.cache_dir = tmp_path / "cache"
+        store = _ScriptedTokenStore(["tok"], broker)
     return DbsecClient(
         _credentials(),
         policy=_policy(),
         token_store=store,
         transport=_FakeTransport(script),
-        scope_pacers=pacers or {"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers=pacers or {"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(tokens),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -142,74 +201,103 @@ def _ok_script(rows):  # type: ignore[no-untyped-def]
     return [(200, {"rsp_cd": "00000", "Out": rows})]
 
 
-def test_token_store_reuses_live_token_without_issuing(tmp_path) -> None:
-    now = [1_000_000.0]
-    store = _store(tmp_path, clock=lambda: now[0])
+def test_token_store_writes_contract_file_only(tmp_path) -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    before = sorted(p.name for p in legacy_dir.iterdir())
+    store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
 
-    first = store.get_or_issue(lambda: ("t1", 3600))
+    assert store.get_or_issue(lambda: ("fresh", 7200)) == "fresh"
+
+    digest = _sha12("contract-key")
+    names = sorted(p.name for p in broker.iterdir() if p.name != ".host-admission")
+    assert names == [f"token_dbsec_{digest}.json", f"token_dbsec_{digest}.json.lock", f"token_issue_dbsec_{digest}.state"]
+    payload = json.loads((broker / f"token_dbsec_{digest}.json").read_text(encoding="utf-8"))
+    assert set(payload) == {"schema_version", "access_token", "issued_at", "expires_at", "generation"}
+    assert payload["generation"] == 1
+    assert (broker / f"token_dbsec_{digest}.json").stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in legacy_dir.iterdir()) == before
+
+
+def test_token_store_reads_legacy_when_contract_absent(tmp_path) -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    legacy_dir = tmp_path / "legacy"
+    _write_legacy(legacy_dir, legacy_token="legacy-live", now=now)
+    store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
 
     def _boom():  # type: ignore[no-untyped-def]
         raise AssertionError("issue must not be called")
 
-    assert store.get_or_issue(_boom) == first == "t1"
+    assert store.get_or_issue(_boom) == "legacy-live"
+    digest = _sha12("contract-key")
+    assert not (broker / f"token_dbsec_{digest}.json").exists()
 
 
-def test_token_store_issues_once_under_concurrent_callers(tmp_path) -> None:
-    import time
+def test_token_store_ignores_legacy_after_rejection(tmp_path) -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    legacy_dir = tmp_path / "legacy"
+    legacy_path = _write_legacy(legacy_dir, legacy_token="L", now=now)
+    before = legacy_path.read_bytes()
+    store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
 
-    store = _store(tmp_path)
-    calls = {"n": 0}
-    lock = threading.Lock()
+    calls: list[str] = []
 
     def _issue():  # type: ignore[no-untyped-def]
-        with lock:
-            calls["n"] += 1
-        time.sleep(0.2)
-        return "shared", 7200
+        calls.append("issued")
+        return "fresh", 7200
 
-    results: list[str] = []
-
-    def _work() -> None:
-        results.append(store.get_or_issue(_issue))
-
-    threads = [threading.Thread(target=_work) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert results == ["shared", "shared"]
-    assert calls["n"] == 1
+    assert store.get_or_issue(_issue, reject="L") == "fresh"
+    assert calls == ["issued"]
+    assert legacy_path.read_bytes() == before
 
 
-def test_token_store_spaces_issuance_by_min_interval(tmp_path) -> None:
-    now = [1_000_000.0]
-    sleeps: list[float] = []
-    store = _store(tmp_path, clock=lambda: now[0], sleep=sleeps.append)
-
-    old = store.get_or_issue(lambda: ("old", 7200))
-    now[0] += 10.0
-
-    assert store.get_or_issue(lambda: ("new", 7200), reject=old) == "new"
-    assert sleeps
-    assert sleeps[0] >= 51.0 - 1e-9
-
-
-def test_token_store_treats_loose_permissions_as_miss(tmp_path) -> None:
-    sleeps: list[float] = []
-    store = _store(tmp_path, sleep=sleeps.append)
-    assert store.get_or_issue(lambda: ("t1", 7200)) == "t1"
-
-    (tmp_path / "cache" / "dbsec_token_prod.json").chmod(0o644)
+def _run_stale_legacy_case(tmp_path: Path, index: int, *, ttl: float, mode: int, expire_raw: object, now: datetime) -> None:  # type: ignore[no-untyped-def]
+    broker = _marked_broker(tmp_path, f"broker-{index}")
+    legacy_dir = tmp_path / f"legacy-{index}"
+    _write_legacy(
+        legacy_dir,
+        legacy_token="stale",
+        now=now,
+        ttl=ttl,
+        mode=mode,
+        expire_raw=expire_raw,
+    )
+    store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
     seen: list[str] = []
 
-    def _issue():  # type: ignore[no-untyped-def]
+    def _issue() -> tuple[str, int]:
         seen.append("issued")
-        return "t2", 7200
+        return "fresh", 7200
 
-    assert store.get_or_issue(_issue) == "t2"
+    assert store.get_or_issue(_issue) == "fresh"
     assert seen == ["issued"]
-    assert len(sleeps) == 1
+
+
+def test_token_store_ignores_stale_or_loose_legacy(tmp_path) -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    _run_stale_legacy_case(tmp_path, 0, ttl=500.0, mode=0o600, expire_raw=None, now=now)
+    _run_stale_legacy_case(tmp_path, 1, ttl=3600.0, mode=0o644, expire_raw=None, now=now)
+    _run_stale_legacy_case(tmp_path, 2, ttl=3600.0, mode=0o600, expire_raw=True, now=now)
+    _run_stale_legacy_case(tmp_path, 3, ttl=3600.0, mode=0o600, expire_raw=float("nan"), now=now)
+
+
+def test_token_store_prefers_contract_over_legacy(tmp_path) -> None:
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    legacy_dir = tmp_path / "legacy"
+    _write_legacy(legacy_dir, legacy_token="L", now=now)
+    peer = _contract_store(broker, "contract-key", legacy_dir=None, clock=lambda: now)
+    assert peer.get_or_issue(lambda: ("C", 7200)) == "C"
+    store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
+
+    def _boom():  # type: ignore[no-untyped-def]
+        raise AssertionError("issue must not be called")
+
+    assert store.get_or_issue(_boom) == "C"
 
 
 def test_token_store_rejects_short_expiry(tmp_path) -> None:
@@ -217,10 +305,197 @@ def test_token_store_rejects_short_expiry(tmp_path) -> None:
 
     from src.integrations.errors import ProviderTerminalError
 
-    store = _store(tmp_path)
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    store = _contract_store(broker, "contract-key", clock=lambda: now)
 
     with pytest.raises(ProviderTerminalError):
-        store.get_or_issue(lambda: ("t1", 300))
+        store.get_or_issue(lambda: ("t1", 720))
+    digest = _sha12("contract-key")
+    assert not (broker / f"token_dbsec_{digest}.json").exists()
+
+
+def test_token_store_preserves_reuse_window(tmp_path) -> None:
+    from datetime import timedelta
+
+    now = [datetime(2026, 10, 15, tzinfo=UTC)]
+    broker = _marked_broker(tmp_path)
+
+    def _sleep(seconds: float) -> None:
+        now[0] = now[0] + timedelta(seconds=seconds)
+
+    store = _contract_store(broker, "contract-key", clock=lambda: now[0], sleep=_sleep)
+
+    assert store.get_or_issue(lambda: ("t1", 721)) == "t1"
+
+    def _boom():  # type: ignore[no-untyped-def]
+        raise AssertionError("issue must not be called")
+
+    assert store.get_or_issue(_boom) == "t1"
+
+    now[0] = now[0] + timedelta(seconds=2)
+    assert store.get_or_issue(lambda: ("t2", 721)) == "t2"
+
+
+def test_token_store_lock_timeout_is_retryable(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import fcntl
+    import os
+    import time as _time
+
+    import pytest
+
+    from src.integrations.errors import ProviderRetryableError
+
+    now = datetime(2026, 10, 15, tzinfo=UTC)
+    broker = _marked_broker(tmp_path)
+    digest = _sha12("contract-key")
+    lock_path = broker / f"token_dbsec_{digest}.json.lock"
+    lock_path.touch()
+    fd = os.open(str(lock_path), os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        mono = [1000.0]
+        monkeypatch.setattr(_time, "monotonic", lambda: mono[0])
+
+        def _sleep(seconds: float) -> None:
+            mono[0] += 300.0
+
+        store = _contract_store(broker, "contract-key", clock=lambda: now, sleep=_sleep)
+        with pytest.raises(ProviderRetryableError, match="oauth2/token"):
+            store.get_or_issue(lambda: ("t1", 7200))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_client_default_slots_use_contract_files(tmp_path) -> None:
+    from src.integrations.dbsec.client import DbsecClient
+
+    broker = _marked_broker(tmp_path)
+    store = _contract_store(broker, "slot-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC))
+    client = DbsecClient(
+        _credentials(key="slot-key"),
+        policy=_policy(),
+        token_store=store,
+        session=_FakeSession(("tok",)),
+        now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
+    )
+
+    digest = _sha12("slot-key")
+    assert set(client._scope_pacers) == {"chart", "quote"}
+    assert client._scope_pacers["chart"].state_path.name == f"admission_dbsec_{digest}_chart.state"
+    assert client._scope_pacers["quote"].state_path.name == f"admission_dbsec_{digest}_quote.state"
+    assert client._transport._host_pacer.state_path.name == f"admission_dbsec_{digest}.state"
+
+
+def test_client_rejects_incomplete_scope_pacers(tmp_path) -> None:
+    import pytest
+
+    from src.integrations.dbsec.client import DbsecClient
+
+    broker = _marked_broker(tmp_path)
+    store = _contract_store(broker, "slot-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC))
+    with pytest.raises(ValueError, match="scope_pacers"):
+        DbsecClient(
+            _credentials(key="slot-key"),
+            policy=_policy(),
+            token_store=store,
+            transport=_FakeTransport(_ok_script([])),
+            scope_pacers={"chart": _NoOpPacer()},
+            session=_FakeSession(("tok",)),
+            now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
+        )
+
+
+def test_client_waits_scope_then_app_slot(tmp_path) -> None:
+    from src.integrations.dbsec.client import DbsecClient
+
+    broker = _marked_broker(tmp_path)
+    store = _contract_store(broker, "order-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC))
+    order: list[str] = []
+    quote, chart = _RecordingPacer(order, "quote"), _RecordingPacer(order, "chart")
+    app_recording = _RecordingPacer()
+    client = DbsecClient(
+        _credentials(key="order-key"),
+        policy=_policy(),
+        token_store=store,
+        transport=_OrderTransport(order, app_recording),  # type: ignore[arg-type]
+        scope_pacers={"chart": chart, "quote": quote},
+        session=_FakeSession(("tok",)),
+        now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
+    )
+
+    client.fetch_ticker_master("J")
+
+    assert order == ["quote", "app"]
+    assert (quote.calls, chart.calls, app_recording.calls) == (1, 0, 1)
+
+
+def test_builder_resolves_broker_dir_and_legacy_env(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from src.config import load_runtime_config
+    from src.integrations.dbsec.client import build_scoped_dbsec_client
+
+    broker = _marked_broker(tmp_path, "shared")
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    monkeypatch.setenv("DB_APP_KEY", "k")
+    monkeypatch.setenv("DB_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_TOKEN_CACHE_DIR", str(broker))
+    monkeypatch.setenv("DBSEC_TOKEN_CACHE_DIR", str(legacy))
+
+    scoped = build_scoped_dbsec_client(policy=_policy())
+    assert scoped._token_store.broker_dir == broker
+
+    monkeypatch.delenv("DBSEC_TOKEN_CACHE_DIR")
+    without_legacy = build_scoped_dbsec_client(policy=_policy())
+    assert without_legacy._token_store._legacy_dir is None
+    assert without_legacy._token_store.broker_dir == broker
+    assert without_legacy._token_store.broker_dir != load_runtime_config().logs_root
+
+
+def test_builder_fails_closed_without_marker_in_container(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import pathlib
+
+    import pytest
+
+    from src.integrations.host_broker import HostBrokerDirNotSharedError
+    from src.integrations.dbsec.client import build_scoped_dbsec_client
+
+    broker = tmp_path / "unshared"
+    broker.mkdir()
+    monkeypatch.setenv("DB_APP_KEY", "k")
+    monkeypatch.setenv("DB_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_TOKEN_CACHE_DIR", str(broker))
+    monkeypatch.setenv("DBSEC_TOKEN_CACHE_DIR", str(tmp_path / "legacy"))
+
+    orig_exists = pathlib.Path.exists
+
+    def _fake_exists(self: Path) -> bool:
+        if str(self) == "/.dockerenv":
+            return True
+        return orig_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", _fake_exists)
+    with pytest.raises(HostBrokerDirNotSharedError):
+        build_scoped_dbsec_client(policy=_policy())
+    assert list(broker.iterdir()) == []
+
+
+def test_builder_checks_credentials_first(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import pytest
+
+    from src.config import ConfigError
+    from src.integrations.dbsec.client import build_scoped_dbsec_client
+
+    broker = tmp_path / "untouched"
+    monkeypatch.setenv("KIS_TOKEN_CACHE_DIR", str(broker))
+    monkeypatch.setenv("DBSEC_TOKEN_CACHE_DIR", str(tmp_path / "legacy"))
+    monkeypatch.delenv("DB_APP_KEY", raising=False)
+    monkeypatch.setenv("DB_APP_SECRET", "s")
+
+    with pytest.raises(ConfigError):
+        build_scoped_dbsec_client(policy=_policy())
+    assert not broker.exists()
 
 
 def test_client_retries_throttle_code_on_http_403(tmp_path) -> None:
@@ -231,12 +506,13 @@ def test_client_retries_throttle_code_on_http_403(tmp_path) -> None:
 
 
 def test_client_refreshes_token_once_on_auth_code(tmp_path) -> None:
-    store = _ScriptedTokenStore(["tok", "tok2"])
+    broker = _marked_broker(tmp_path, "refresh-broker")
+    store = _ScriptedTokenStore(["tok", "tok2"], broker)
     rows = [{"Date": "20261015"}]
     client = _client(
         tmp_path,
         script=[(200, {"rsp_cd": "IGW00123"}), *_ok_script(rows)],
-        token_store=store,  # type: ignore[arg-type]
+        token_store=store,
     )
 
     assert client.fetch_daily_chart("005930", date(2026, 10, 1), date(2026, 10, 15), adjusted=True) == tuple(rows)
@@ -248,11 +524,12 @@ def test_client_fails_terminal_on_second_auth_failure(tmp_path) -> None:
 
     from src.integrations.errors import ProviderTerminalError
 
-    store = _ScriptedTokenStore(["tok", "tok2"])
+    broker = _marked_broker(tmp_path, "auth-broker")
+    store = _ScriptedTokenStore(["tok", "tok2"], broker)
     client = _client(
         tmp_path,
         script=[(200, {"rsp_cd": "IGW00121"}), (200, {"rsp_cd": "IGW00121"})],
-        token_store=store,  # type: ignore[arg-type]
+        token_store=store,
     )
 
     with pytest.raises(ProviderTerminalError):
@@ -269,6 +546,7 @@ def test_daily_chart_drops_zero_date_padding(tmp_path) -> None:
 
 
 def test_daily_chart_sends_adjustment_flag(tmp_path) -> None:
+    broker = _marked_broker(tmp_path, "flag-broker")
     transport = _FakeTransport(_ok_script([]) + _ok_script([]))
     from src.integrations.dbsec.client import DbsecClient
 
@@ -276,9 +554,9 @@ def test_daily_chart_sends_adjustment_flag(tmp_path) -> None:
         client = DbsecClient(
             _credentials(),
             policy=_policy(),
-            token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+            token_store=_ScriptedTokenStore(["tok"], broker),
             transport=transport,
-            scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+            scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
             session=_FakeSession(("tok",)),
             now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
         )
@@ -291,15 +569,16 @@ def test_daily_chart_sends_adjustment_flag(tmp_path) -> None:
 def test_minute_chart_rejects_out_of_range_count(tmp_path) -> None:
     import pytest
 
+    broker = _marked_broker(tmp_path, "bar-broker")
     transport = _FakeTransport(_ok_script([]))
     from src.integrations.dbsec.client import DbsecClient
 
     client = DbsecClient(
         _credentials(),
         policy=_policy(),
-        token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+        token_store=_ScriptedTokenStore(["tok"], broker),
         transport=transport,
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -314,15 +593,16 @@ def test_minute_chart_rejects_out_of_range_count(tmp_path) -> None:
 def test_client_rejects_malformed_ticker(tmp_path) -> None:
     import pytest
 
+    broker = _marked_broker(tmp_path, "ticker-broker")
     transport = _FakeTransport(_ok_script([]))
     from src.integrations.dbsec.client import DbsecClient
 
     client = DbsecClient(
         _credentials(),
         policy=_policy(),
-        token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+        token_store=_ScriptedTokenStore(["tok"], broker),
         transport=transport,
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -335,17 +615,17 @@ def test_client_rejects_malformed_ticker(tmp_path) -> None:
 
 
 def test_client_waits_scope_pacer_before_send(tmp_path) -> None:
-    chart, quote_master = _RecordingPacer(), _RecordingPacer()
+    chart, quote = _RecordingPacer(), _RecordingPacer()
     client = _client(
         tmp_path,
         script=_ok_script([{"Date": "20261015"}]),
-        pacers={"chart": chart, "quote_master": quote_master},  # type: ignore[dict-item]
+        pacers={"chart": chart, "quote": quote},  # type: ignore[dict-item]
     )
 
     client.fetch_daily_chart("005930", date(2026, 10, 1), date(2026, 10, 15), adjusted=False)
 
     assert chart.calls == 1
-    assert quote_master.calls == 0
+    assert quote.calls == 0
 
 
 def test_client_never_logs_credentials(tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
@@ -356,14 +636,15 @@ def test_client_never_logs_credentials(tmp_path, caplog) -> None:  # type: ignor
     from src.integrations.dbsec.client import DbsecClient, DbsecCredentials
     from src.integrations.errors import ProviderTerminalError
 
+    broker = _marked_broker(tmp_path, "nolog-broker")
     key, secret, token = "DBKEY-UNIQUE-1", "DBSECRET-UNIQUE-2", "DBTOKEN-UNIQUE-3"
-    store = _ScriptedTokenStore([token, token])
+    store = _ScriptedTokenStore([token, token], broker)
     client = DbsecClient(
         DbsecCredentials(app_key=key, app_secret=secret),
         policy=_policy(),
-        token_store=store,  # type: ignore[arg-type]
+        token_store=store,
         transport=_FakeTransport([(200, {"rsp_cd": "IGW00121"}), (200, {"rsp_cd": "IGW00121"})]),
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession((token,)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -398,54 +679,6 @@ def test_credentials_from_env_round_trip(monkeypatch) -> None:  # type: ignore[n
         DbsecCredentials.from_env(_policy())
 
 
-def test_token_store_treats_corrupt_payloads_as_miss(tmp_path) -> None:
-    import json
-
-    from src.integrations.dbsec.client import DbsecTokenStore
-
-    cases = [
-        "not json{{{",
-        json.dumps(["tok"]),
-        json.dumps({}),
-        json.dumps({"access_token": "", "expire_at": 9999999999, "issued_at": 1000}),
-        json.dumps({"access_token": "t", "expire_at": True, "issued_at": 1000}),
-        json.dumps({"access_token": "t", "expire_at": 9999999999, "issued_at": False}),
-        json.dumps({"access_token": "t"}),
-    ]
-    for index, raw in enumerate(cases):
-        cache = tmp_path / f"case-{index}"
-        cache.mkdir(parents=True)
-        (cache / "dbsec_token_prod.json").write_text(raw, encoding="utf-8")
-        (cache / "dbsec_token_prod.json").chmod(0o600)
-        store = DbsecTokenStore(cache, min_issue_interval_seconds=61.0)
-        assert store.get_or_issue(lambda: ("fresh", 7200)) == "fresh"
-        assert store.cache_dir == cache
-
-
-def test_token_store_returns_peer_token_issued_during_spacing(tmp_path) -> None:
-    import json
-
-    now = [1_000_000.0]
-    sleeps: list[float] = []
-
-    def _sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        payload = {"access_token": "peer", "expire_at": now[0] + 7000.0, "issued_at": now[0]}
-        path = tmp_path / "cache" / "dbsec_token_prod.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        path.chmod(0o600)
-
-    store = _store(tmp_path, clock=lambda: now[0], sleep=_sleep)
-    old = store.get_or_issue(lambda: ("old", 7200))
-    now[0] += 10.0
-
-    def _boom():  # type: ignore[no-untyped-def]
-        raise AssertionError("issue must not be called")
-
-    assert store.get_or_issue(_boom, reject=old) == "peer"
-    assert sleeps == [51.0]
-
-
 def test_issue_token_branches(tmp_path) -> None:
     import pytest
     import requests
@@ -453,13 +686,15 @@ def test_issue_token_branches(tmp_path) -> None:
     from src.integrations.dbsec.client import DbsecClient
     from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
 
+    broker = _marked_broker(tmp_path, "issue-broker")
+
     def _issued(session, expected_posts=1):  # type: ignore[no-untyped-def]
         client = DbsecClient(
             _credentials(),
             policy=_policy(),
-            token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+            token_store=_ScriptedTokenStore(["tok"], broker),
             transport=_FakeTransport(_ok_script([])),
-            scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+            scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
             session=session,
             now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
         )
@@ -490,13 +725,14 @@ def test_issue_token_branches(tmp_path) -> None:
 def test_health_check_reuses_live_token(tmp_path) -> None:
     from src.integrations.dbsec.client import DbsecClient
 
+    broker = _marked_broker(tmp_path, "health-broker")
     session = _FakeSession(("tok",))
     client = DbsecClient(
         _credentials(),
         policy=_policy(),
-        token_store=_store(tmp_path),
+        token_store=_contract_store(broker, "health-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC)),
         transport=_FakeTransport(_ok_script([])),
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=session,
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -509,14 +745,15 @@ def test_health_check_reuses_live_token(tmp_path) -> None:
 def test_minute_chart_success_sends_single_page_body(tmp_path) -> None:
     from src.integrations.dbsec.client import DbsecClient
 
+    broker = _marked_broker(tmp_path, "minute-broker")
     rows = [{"Time": "150000"}]
     transport = _FakeTransport(_ok_script(rows))
     client = DbsecClient(
         _credentials(),
         policy=_policy(),
-        token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+        token_store=_ScriptedTokenStore(["tok"], broker),
         transport=transport,
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -583,14 +820,15 @@ def test_quote_unknown_and_malformed_bodies_are_terminal(tmp_path) -> None:
             "005930", date(2026, 10, 1), date(2026, 10, 15), adjusted=False
         )
     transport = _FakeTransport([(500, {"rsp_cd": "IGW99999"})])
+    broker = _marked_broker(tmp_path, "terminal-broker")
     from src.integrations.dbsec.client import DbsecClient as _DbsecClient2
 
     client = _DbsecClient2(
         _credentials(),
         policy=_policy(),
-        token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+        token_store=_ScriptedTokenStore(["tok"], broker),
         transport=transport,
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
@@ -599,67 +837,37 @@ def test_quote_unknown_and_malformed_bodies_are_terminal(tmp_path) -> None:
     assert len(transport.calls) == 1
 
 
-def test_build_scoped_client_uses_env_cache_dir(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    from src.config import load_runtime_config
-    from src.integrations.dbsec.client import DbsecClient, build_scoped_dbsec_client
-
-    monkeypatch.setenv("DB_APP_KEY", "k")
-    monkeypatch.setenv("DB_APP_SECRET", "s")
-    monkeypatch.setenv("DBSEC_TOKEN_CACHE_DIR", str(tmp_path / "shared"))
-
-    scoped = build_scoped_dbsec_client(policy=_policy())
-    assert isinstance(scoped, DbsecClient)
-    assert scoped._token_store.cache_dir == tmp_path / "shared"
-
-    monkeypatch.delenv("DBSEC_TOKEN_CACHE_DIR")
-    fallback = build_scoped_dbsec_client(policy=_policy())
-    assert fallback._token_store.cache_dir == load_runtime_config().logs_root
-
-
 def test_client_builds_default_transport_and_pacers(tmp_path) -> None:
     import pytest
 
     from src.integrations.dbsec.client import DbsecClient
     from src.integrations.quota import ProviderQuotaStateStore
 
+    broker = _marked_broker(tmp_path, "default-broker")
     client = DbsecClient(
-        _credentials(),
+        _credentials(key="default-key"),
         policy=_policy(),
-        token_store=_store(tmp_path),
+        token_store=_contract_store(broker, "default-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC)),
         quota_store=ProviderQuotaStateStore(tmp_path / "quota"),
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )
 
     assert client._transport.provider == "DBSEC"
-    assert set(client._scope_pacers) == {"chart", "quote_master"}
+    assert set(client._scope_pacers) == {"chart", "quote"}
     with pytest.raises(ValueError, match="credentials"):
-        DbsecClient(_credentials(key=" ", secret="s"), policy=_policy(), token_store=_store(tmp_path))
-
-
-def test_token_store_spaces_issuance_after_failed_attempt(tmp_path) -> None:
-    import pytest
-
-    from src.integrations.errors import ProviderRetryableError
-
-    now = [1_000_000.0]
-    sleeps: list[float] = []
-    store = _store(tmp_path, clock=lambda: now[0], sleep=sleeps.append)
-
-    def _throttled():  # type: ignore[no-untyped-def]
-        raise ProviderRetryableError("throttled", provider="DBSEC", endpoint="oauth2/token")
-
-    with pytest.raises(ProviderRetryableError):
-        store.get_or_issue(_throttled)
-    now[0] += 5.0
-
-    assert store.get_or_issue(lambda: ("t1", 7200)) == "t1"
-    assert sleeps == [56.0]
+        DbsecClient(
+            _credentials(key=" ", secret="s"),
+            policy=_policy(),
+            token_store=_contract_store(broker, "default-key", clock=lambda: datetime(2026, 10, 15, tzinfo=UTC)),
+        )
 
 
 def _real_transport_client(tmp_path, responses):  # type: ignore[no-untyped-def]
     from src.integrations.dbsec.client import DbsecClient
     from src.integrations.transport import HttpTransport, RetryPolicy
+
+    broker = _marked_broker(tmp_path, "real-broker")
 
     class _QuoteSession:
         def __init__(self) -> None:
@@ -683,9 +891,9 @@ def _real_transport_client(tmp_path, responses):  # type: ignore[no-untyped-def]
     client = DbsecClient(
         _credentials(),
         policy=_policy(),
-        token_store=_ScriptedTokenStore(["tok"]),  # type: ignore[arg-type]
+        token_store=_ScriptedTokenStore(["tok"], broker),
         transport=transport,
-        scope_pacers={"chart": _NoOpPacer(), "quote_master": _NoOpPacer()},
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
         session=_FakeSession(("tok",)),
         now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
     )

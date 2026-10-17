@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
 from typing import Any, Final
 
 import requests
@@ -15,8 +14,18 @@ from src.config.providers import LsPolicy
 from src.config.runtime import load_runtime_config
 from src.config.secrets import read_secret
 from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
+from src.integrations.host_broker import (
+    AdmissionSlot,
+    IssuedToken,
+    TokenRecord,
+    TokenStore,
+    TokenStoreLockTimeout,
+    contract_rate,
+    open_token_store,
+    resolve_broker_dir,
+)
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
-from src.integrations.transport import HttpTransport, RetryPolicy, TokenCache
+from src.integrations.transport import HostSlotGate, HttpTransport, RetryPolicy
 
 __all__ = [
     "LsClient",
@@ -32,6 +41,7 @@ _TIMEOUT_SECONDS: Final = 15.0
 _TOKEN_TIMEOUT_SECONDS: Final = 10.0
 _MAX_HTTP_ATTEMPTS: Final = 3
 _SUCCESS_RSP_CD: Final = "00000"
+_DEFAULT_EXPIRY_SECONDS: Final = 86400
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +65,7 @@ def _default_ls_policy() -> LsPolicy:
 
 
 class LsClient:
-    """LS Securities OpenAPI client for investor flow (t1702).
-
-    Transport-only: pacing, retries, and quotas belong to ``HttpTransport``
-    and the quota ledger. Bronze writes belong to the data layer.
-    """
+    """LS Securities OpenAPI client for investor flow (t1702)."""
 
     def __init__(
         self,
@@ -68,7 +74,8 @@ class LsClient:
         base_url: str = _BASE_URL,
         policy: LsPolicy | None = None,
         transport: HttpTransport | None = None,
-        token_cache: TokenCache | None = None,
+        token_store: TokenStore | None = None,
+        host_pacer: HostSlotGate | None = None,
         session: requests.Session | None = None,
         quota_store: ProviderQuotaStateStore | None = None,
         now: Callable[[], datetime] | None = None,
@@ -80,14 +87,21 @@ class LsClient:
         self._session = session if session is not None else requests.Session()
         self._now = now or (lambda: datetime.now(UTC))
         resolved = policy if policy is not None else _default_ls_policy()
-        pace = float(resolved.min_interval_seconds)
+        self._policy = resolved
         self._retryable_codes = tuple(resolved.retryable_rsp_codes)
-        self._token: str | None = None
-        self._token_expire_at: datetime | None = None
-        if token_cache is not None:
-            self.token_cache = token_cache
+        self._margin = float(resolved.token_expiry_margin_seconds)
+        self._memory: TokenRecord | None = None
+        if token_store is not None:
+            self._token_store = token_store
         else:
-            self.token_cache = TokenCache(load_runtime_config().logs_root, provider="ls", env="prod")
+            self._token_store = open_token_store(
+                resolve_broker_dir(resolved.broker_dir_env),
+                "ls",
+                credentials.app_key,
+                lock_timeout_seconds=float(resolved.token_lock_timeout_seconds),
+                expiry_margin_seconds=float(resolved.token_expiry_margin_seconds),
+                clock=self._now,
+            )
         if transport is not None:
             self._transport = transport
             return
@@ -95,37 +109,48 @@ class LsClient:
         if quota_store is not None:
             gate = LedgerQuotaGate(quota_store, provider=_PROVIDER, daily_limit=resolved.daily_limit)
             gate.bind_now(self._now)
+        pacer = host_pacer if host_pacer is not None else AdmissionSlot(
+            self._token_store.broker_dir, "ls", credentials.app_key
+        )
         self._transport = HttpTransport(
             provider=_PROVIDER,
             base_url=self.base_url,
-            min_interval_seconds=pace,
+            min_interval_seconds=1.0 / contract_rate("ls"),
             retry=RetryPolicy(max_attempts=_MAX_HTTP_ATTEMPTS),
             quota=gate,
             timeout_seconds=_TIMEOUT_SECONDS,
             session=self._session,
             sleep=lambda seconds: time.sleep(seconds),
             monotonic=lambda: time.monotonic(),
+            host_pacer=pacer,
         )
 
-    def ensure_token(self) -> str:
-        """Return a live OAuth token, reusing the file cache across runs."""
-        now = self._now()
-        if self._token and self._token_expire_at and self._token_expire_at > now + timedelta(minutes=1):
-            return self._token
-        cached = self.token_cache.load()
-        if cached is not None:
-            token, expire_at_iso = cached
-            try:
-                expire_at = datetime.fromisoformat(expire_at_iso)
-            except ValueError:
-                expire_at = now
-            if token and expire_at > now + timedelta(minutes=1):
-                self._token = token
-                self._token_expire_at = expire_at
-                return token
-        return self._request_new_token()
+    @property
+    def token_store(self) -> TokenStore:
+        return self._token_store
 
-    def _request_new_token(self) -> str:
+    def ensure_token(self) -> str:
+        """Return a usable OAuth token from memory or the host-shared store."""
+        now = self._now()
+        memory = self._memory
+        if (
+            memory is not None
+            and memory.expires_at is not None
+            and now < memory.expires_at - timedelta(seconds=self._margin)
+        ):
+            return memory.access_token
+        try:
+            record = self._token_store.get_or_issue(self._issue_token)
+        except TokenStoreLockTimeout as exc:
+            raise ProviderRetryableError(
+                f"LS token issuance failed for {_TOKEN_ENDPOINT}",
+                provider=_PROVIDER,
+                endpoint=_TOKEN_ENDPOINT,
+            ) from exc
+        self._memory = record
+        return record.access_token
+
+    def _issue_token(self) -> IssuedToken:
         try:
             response = self._session.post(
                 f"{self.base_url}/{_TOKEN_ENDPOINT}",
@@ -157,15 +182,14 @@ class LsClient:
             raise ProviderTerminalError(
                 f"LS token issuance failed for {_TOKEN_ENDPOINT}", provider=_PROVIDER, endpoint=_TOKEN_ENDPOINT
             )
+        raw_expires = data.get("expires_in", _DEFAULT_EXPIRY_SECONDS) if isinstance(data, Mapping) else _DEFAULT_EXPIRY_SECONDS
         try:
-            expires_in = int(data.get("expires_in", 86400))
-        except (TypeError, ValueError):
-            expires_in = 86400
-        expire_at = self._now() + timedelta(seconds=max(expires_in - 120, 60))
-        self._token = token
-        self._token_expire_at = expire_at
-        self.token_cache.save(token, expire_at.isoformat())
-        return token
+            if isinstance(raw_expires, bool):
+                raise TypeError
+            expires_in = int(raw_expires)
+        except (TypeError, ValueError, OverflowError):
+            expires_in = _DEFAULT_EXPIRY_SECONDS
+        return IssuedToken(token, float(expires_in))
 
     def health_check(self) -> None:
         """Confirm collection credentials are live without touching Bronze."""
@@ -178,12 +202,7 @@ class LsClient:
         end_date: date,
         unit: str = "shares",
     ) -> tuple[dict[str, Any], ...]:
-        """Request daily per-investor net trading for one symbol over a date range.
-
-        Only the share-quantity mode is supported: it is the only mode whose unit
-        has been verified against exchange volume. Amount mode is rejected rather
-        than guessed.
-        """
+        """Request daily per-investor net trading for one symbol over a date range."""
         if unit != "shares":
             raise ValueError(f"LS t1702 supports only unit='shares', got {unit!r}")
         if not isinstance(start_date, date) or not isinstance(end_date, date):
@@ -241,7 +260,14 @@ class LsClient:
                 endpoint=_TREND_ENDPOINT,
             )
 
-        self._transport.post(_TREND_ENDPOINT, body, headers=headers, classify=_classify)
+        try:
+            self._transport.post(_TREND_ENDPOINT, body, headers=headers, classify=_classify)
+        except OSError as exc:
+            raise ProviderRetryableError(
+                f"LS t1702 pacing failed for {_TREND_ENDPOINT}",
+                provider=_PROVIDER,
+                endpoint=_TREND_ENDPOINT,
+            ) from exc
         rows = parsed[0].get("t1702OutBlock1")
         if not isinstance(rows, list):
             raise ProviderTerminalError(
@@ -256,19 +282,12 @@ def build_scoped_ls_client(
     *,
     policy: LsPolicy,
     quota_store: ProviderQuotaStateStore | None = None,
-    token_cache_dir: Path | str | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> LsClient:
-    """Build the LS collector for one declared key from its provider policy.
-
-    Raises:
-        ValueError: the key's environment variables are unset.
-    """
-    cache_dir = Path(token_cache_dir) if token_cache_dir is not None else load_runtime_config().logs_root
+    """Build the LS collector for one declared key."""
     return LsClient(
         LsCredentials.from_env(policy),
         policy=policy,
-        token_cache=TokenCache(cache_dir, provider="ls", env="prod"),
         quota_store=quota_store,
         now=now,
     )
