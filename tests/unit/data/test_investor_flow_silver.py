@@ -854,3 +854,37 @@ def test_page_batch_bounds_parse_read_ahead() -> None:
     from src.data import investor_flow_silver
 
     assert investor_flow_silver._PAGE_BATCH <= 100
+
+
+def test_availability_frame_tail_nulls() -> None:
+    from src.data.investor_flow_silver import flow_availability_frame
+
+    assert flow_availability_frame([], lag=1).height == 0
+    single = flow_availability_frame([date(2026, 3, 4)], lag=1)
+    assert single["available_session"].to_list() == [None]
+    frame = flow_availability_frame(list(SESSIONS), lag=1)
+    assert frame["available_session"].to_list() == [SESSIONS[1], SESSIONS[2], None]
+    frame2 = flow_availability_frame(list(SESSIONS), lag=2)
+    assert frame2["available_session"].to_list() == [SESSIONS[2], None, None]
+
+
+def test_availability_rejects_bad_lag() -> None:
+    from src.data.investor_flow_silver import flow_availability_frame, flow_tail_sessions
+
+    for bad in (0, -1, True):
+        with pytest.raises(PITDataError, match="availability lag"):
+            flow_availability_frame(list(SESSIONS), lag=bad)
+        with pytest.raises(PITDataError, match="availability lag"):
+            flow_tail_sessions(list(SESSIONS), lag=bad)
+
+
+def test_tail_sessions_match_frame() -> None:
+    from src.data.investor_flow_silver import flow_availability_frame, flow_tail_sessions
+
+    for lag in (1, 2):
+        frame = flow_availability_frame(list(SESSIONS), lag=lag)
+        expected = frozenset(
+            frame.filter(pl.col("available_session").is_null())["session"].to_list()
+        )
+        assert flow_tail_sessions(list(SESSIONS), lag=lag) == expected
+    assert flow_tail_sessions([], lag=1) == frozenset()

@@ -523,3 +523,37 @@ def test_calendar_growth_reparses_cached_page(tmp_path: Path, monkeypatch) -> No
         assert grown_manifest.dataset_id == cold_manifest.dataset_id
         assert grown_manifest.details == cold_manifest.details
         assert grown_manifest.partitions == cold_manifest.partitions
+
+
+def test_supplement_reports_deferred_tail_cells(tmp_path: Path) -> None:
+    import json as _json
+
+    uni_id, daily_id = _write_universe_daily(
+        tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000001")]
+    )
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    _seed_kis(catalog, bronze, "000001", S3, [_kis_row(S3, "100", "-60", "-30", "-10")])
+    result = _materialize(
+        tmp_path, catalog,
+        _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001"), (S3, "000001")]), ls_path,
+    )
+    assert result.filled_cells == 1
+    assert result.still_missing_cells == 1
+    assert result.deferred_tail_cells == 1
+    manifest = _json.loads((result.dataset_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["details"]["deferred_tail_cells"] == 1
+    assert _cells(result.dataset_path)["session"].to_list() == [S2]
+
+
+def test_supplement_rows_unchanged(tmp_path: Path) -> None:
+    uni_id, daily_id = _write_universe_daily(tmp_path, [(S1, "000001"), (S2, "000001"), (S3, "000002")])
+    ls_path = _write_ls(tmp_path, [(S1, "000001")])
+    bronze = tmp_path / "bronze"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed_kis(catalog, bronze, "000001", S2, [_kis_row(S2, "100", "-60", "-30", "-10")])
+    result = _materialize(tmp_path, catalog, _targets(uni_id, daily_id, [(S1, "000001"), (S2, "000001")]), ls_path)
+    assert result.filled_cells == 1
+    assert _cells(result.dataset_path)["session"].to_list() == [S2]

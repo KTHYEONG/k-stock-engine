@@ -404,21 +404,24 @@ def test_collect_krx_security_master_executes_one_chunk(tmp_path, capsys, monkey
     assert summary["done"] == 5
 
 
-def _write_flow_requirement_sets(runtime, sessions, tickers):  # type: ignore[no-untyped-def]
+def _write_flow_requirement_sets(runtime, sessions, tickers, *, tail: int = 0):  # type: ignore[no-untyped-def]
     """Register ordinary-universe and daily-market Silver covering every cell."""
     import polars as pl
+    from datetime import timedelta as _timedelta
 
     from src.data.dataset_registry import DatasetRegistry
     from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
 
     rows = [(day, ticker) for day in sessions for ticker in tickers]
+    tail_days = [sessions[-1] + _timedelta(days=index + 1) for index in range(tail)] if tail else []
+    universe_rows = rows + [(day, ticker) for day in tail_days for ticker in tickers]
     universe = publish_dataset(
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(kind="ordinary_universe", layer=DatasetLayer.SILVER,
                                  policy_version="flow-fixture-v1", inputs={}, params={}),
         partitions={"part.parquet": pl.DataFrame(
-            {"session": [day for day, _ in rows], "ticker": [ticker for _, ticker in rows],
-             "eligible": [True] * len(rows)},
+            {"session": [day for day, _ in universe_rows], "ticker": [ticker for _, ticker in universe_rows],
+             "eligible": [True] * len(rows) + [False] * (len(universe_rows) - len(rows))},
             schema={"session": pl.Date, "ticker": pl.String, "eligible": pl.Boolean},
         )},
     )
@@ -450,8 +453,8 @@ def _write_fresh_ls_silver(runtime, rows):  # type: ignore[no-untyped-def]
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(kind="investor_flow_ls", layer=DatasetLayer.SILVER,
                                  policy_version="flow-fixture-v1",
-                                 inputs={"bronze_flow": catalog.blob_digest(source="ls_investor_flow")},
-                                 params={}),
+                                  inputs={"bronze_flow": catalog.blob_digest(source="ls_investor_flow")},
+                                  params={"available_session_lag": 1, "available_time": "08:00:00"}),
         partitions={"part.parquet": pl.DataFrame(
             {"session": [day for day, _ in rows], "ticker": [ticker for _, ticker in rows]},
             schema={"session": pl.Date, "ticker": pl.String},
@@ -563,7 +566,7 @@ def test_collect_kis_investor_flow_dry_run(tmp_path, capsys) -> None:
 
     scope_config = Path("config/research/kr_swing_2019_v1.toml")
     runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
-    _write_flow_requirement_sets(runtime, [date(2026, 1, 5)], ["005930"])
+    _write_flow_requirement_sets(runtime, [date(2026, 1, 5)], ["005930"], tail=1)
     _write_fresh_ls_silver(runtime, [])
     assert main([
         "collect-kis-investor-flow",
@@ -590,7 +593,7 @@ def test_collect_kis_investor_flow_executes(tmp_path, capsys, monkeypatch) -> No
     monkeypatch.setattr("src.integrations.kis.client.KisCredentials", stub_creds)
     scope_config = Path("config/research/kr_swing_2019_v1.toml")
     runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
-    _write_flow_requirement_sets(runtime, [date(2026, 1, 5)], ["005930"])
+    _write_flow_requirement_sets(runtime, [date(2026, 1, 5)], ["005930"], tail=1)
     _write_fresh_ls_silver(runtime, [])
     assert main([
         "collect-kis-investor-flow",

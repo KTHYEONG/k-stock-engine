@@ -69,6 +69,7 @@ class InvestorFlowKisSupplementResult:
     still_missing_cells: int
     identity_violation_cells: int
     rows: int
+    deferred_tail_cells: int
 
 
 def _parse_qty(row: dict[str, Any], field: str) -> int:
@@ -325,7 +326,10 @@ def materialize_investor_flow_kis_supplement(
             out_of_calendar_rows,
         )
 
-    lag = policy.available_session_lag
+    from src.data.investor_flow_silver import flow_availability_frame, flow_tail_sessions
+
+    tail = flow_tail_sessions(calendar, lag=policy.available_session_lag)
+    deferred_tail_cells = sum(1 for session, _ in target if session in tail)
     agreed: dict[tuple[date, str], tuple[tuple[int, int, int, int], str]] = {}
     for key, hashes in options.items():
         if len(hashes) == 1:
@@ -361,16 +365,7 @@ def materialize_investor_flow_kis_supplement(
             pl.lit("KIS").alias("provider"),
         )
         .join(
-            pl.DataFrame(
-                {
-                    "session": list(calendar),
-                    "available_session": [
-                        calendar[index + lag] if index + lag < len(calendar) else None
-                        for index in range(len(calendar))
-                    ],
-                },
-                schema={"session": pl.Date, "available_session": pl.Date},
-            ),
+            flow_availability_frame(calendar, lag=policy.available_session_lag),
             on="session",
             how="left",
         )
@@ -434,6 +429,7 @@ def materialize_investor_flow_kis_supplement(
             "target_cells": len(target),
             "filled_cells": frame.height,
             "still_missing_cells": len(target) - frame.height,
+            "deferred_tail_cells": deferred_tail_cells,
             "identity_violation_cells": len(violation_keys),
             "out_of_calendar_rows": out_of_calendar_rows,
             "parsed_pages": parsed_pages,
@@ -448,4 +444,5 @@ def materialize_investor_flow_kis_supplement(
         still_missing_cells=len(target) - frame.height,
         identity_violation_cells=len(violation_keys),
         rows=frame.height,
+        deferred_tail_cells=deferred_tail_cells,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
@@ -14,9 +15,10 @@ import polars as pl
 from src.config.providers import ProviderPolicy
 from src.core.pit import PITDataError
 from src.data.dataset_registry import DatasetRegistry
-from src.data.datasets import dataset_partition_paths, load_manifest
+from src.data.datasets import DatasetManifest, dataset_partition_paths, load_manifest
 from src.data.evidence_sources import KIS_FLOW_SOURCE, LS_FLOW_SOURCE, raw_rows_envelope, source_contract
 from src.data.flow_targets import investor_flow_targets, pending_flow_cells
+from src.data.investor_flow_silver import flow_tail_sessions
 from src.data.jobs.runner import JobContext, JobUnit
 from src.data.receipt_catalog import CoverageRange, EvidenceStatus, ReceiptCatalog
 from src.data.runtime import DataRuntime
@@ -24,6 +26,8 @@ from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRangePayload
 from src.integrations.kis.investor_flow import KisInvestorFlowCollector
 from src.integrations.ls.investor_flow import LsInvestorFlowCollector
 from src.integrations.quota import ProviderQuotaStateStore
+
+_LOG = logging.getLogger(__name__)
 
 __all__ = [
     "KIS_CHUNK_SIZE",
@@ -213,22 +217,23 @@ def _kis_windows(
     return windows
 
 
-class KisInvestorFlowJob:
-    """Request KIS pages for target cells LS left without a value.
+def _ls_availability_lag(manifest: DatasetManifest) -> int:
+    """The ``available_session_lag`` the LS Silver dataset was built with."""
+    lag = manifest.params.get("available_session_lag")
+    if isinstance(lag, bool) or not isinstance(lag, int) or lag < 1:
+        raise PITDataError("investor_flow_ls manifest lacks a valid available_session_lag")
+    return lag
 
-    Pending cells are the targets minus the rows of the registry's current
-    ``investor_flow_ls`` dataset, minus cells inside an answered KIS range. One
-    unit is one ticker. Its ``max_requests`` is the number of windows of at most
-    ``kis.investor_flow_rows_per_page`` consecutive sessions that its pending
-    cells fall into. Each request is anchored at its window's last pending
-    session.
-    """
+
+class KisInvestorFlowJob:
+    """Request KIS pages for target cells LS left without a value, deferring cells not yet available."""
 
     name = "kis_investor_flow"
     fail_fast = True
 
     def __init__(self, *, since: date | None = None) -> None:
         self.since = since
+        self.deferred_tail_cells: int = 0
 
     def _pending_windows(self, ctx: JobContext) -> dict[str, tuple[tuple[date, date], ...]]:
         targets = investor_flow_targets(ctx.runtime, since=self.since)
@@ -242,12 +247,23 @@ class KisInvestorFlowJob:
             raise PITDataError("investor_flow_ls is stale")
         valued = _read_ls_valued_cells(silver_root=ctx.runtime.workspace.silver_root, dataset_id=ls_id)
         missing = targets.cells.join(valued, on=["session", "ticker"], how="anti").sort(["ticker", "session"])
+        lag = _ls_availability_lag(manifest)
+        calendar = _universe_calendar(ctx)
+        tail = flow_tail_sessions(calendar, lag=lag)
+        deferred = missing.filter(pl.col("session").is_in(sorted(tail)))
+        missing = missing.filter(~pl.col("session").is_in(sorted(tail)))
+        self.deferred_tail_cells = deferred.height
+        _LOG.info(
+            "[DATA] job=kis_investor_flow phase=defer deferred_tail_cells=%d tail_sessions=%s",
+            self.deferred_tail_cells,
+            sorted(day.isoformat() for day in tail),
+        )
         pending = pending_flow_cells(missing, ctx.catalog.ranges(source=KIS_FLOW_SOURCE))
         if pending.height == 0:
             return {}
         return _kis_windows(
             pending=pending,
-            calendar=_universe_calendar(ctx),
+            calendar=calendar,
             rows_per_page=ctx.provider.kis.investor_flow_rows_per_page,
         )
 
