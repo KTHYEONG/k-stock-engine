@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="ghcr.io/kthyeong/k-stock-engine:latest"
+BASE_ENV="${HOME}/quant-secrets/k-stock-engine.env"
+
+PRINT=0
+if [[ "${1-}" == "--print" ]]; then
+  PRINT=1
+  shift
+fi
+
+JOB="${1-}"
+usage() {
+  printf '[SYS] kse-run status=USAGE job=%s\n' "${JOB//$'\n'/ }" >&2
+  exit 64
+}
+
+[[ -n "$JOB" ]] || usage
+shift
+
+NAME=""
+MEM=""
+CPUS=""
+EXTRA_ENVS=()
+WANT_KIS=0
+WANT_MALLOC=0
+EXTRA_E=()
+EXTRA_V=()
+WANT_LOG=0
+WANT_STDIN=0
+MODULE_ARGV=()
+
+case "$JOB" in
+  auction-open)
+    NAME="kse-auction-open"; MEM="512m"; CPUS="0.5"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=0
+    EXTRA_E=("BROKER_ADMISSION_CLASS=standard")
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.execution auction-open --decisions-dir /app/data/state/kr_swing_2019_v1/decisions --shadow-dir /app/data/state/kr_swing_2019_v1/shadow --out /app/data/ops/auction/open.json --events-root /app/data/ops/events --limit 80)
+    ;;
+  backup)
+    NAME="kse-backup"; MEM="1g"; CPUS="1.0"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=("${HOME}/.config/rclone:/tmp/.config/rclone:ro")
+    WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs backup --no-lock)
+    ;;
+  collect-dbsec)
+    NAME="kse-collect-dbsec"; MEM="1g"; CPUS="0.5"
+    EXTRA_ENVS=()
+    WANT_KIS=1; WANT_MALLOC=1
+    EXTRA_E=("DBSEC_TOKEN_CACHE_DIR=/app/.cache/dbsec")
+    EXTRA_V=("${HOME}/.cache/dbsec:/app/.cache/dbsec:ro")
+    WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs collect-dbsec)
+    ;;
+  collect-eve)
+    NAME="kse-collect-eve"; MEM="3g"; CPUS="1.5"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=1
+    EXTRA_E=("BROKER_ADMISSION_CLASS=bulk" "KSE_KIND_TRANSPORT=relay")
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs collect-eve)
+    ;;
+  daily-audit)
+    NAME="kse-daily-audit"; MEM="512m"; CPUS="0.5"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env" "${HOME}/quant-secrets/kse-alert.env")
+    WANT_KIS=1; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs audit)
+    ;;
+  morning)
+    NAME="kse-morning"; MEM="4g"; CPUS="1.8"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=1
+    EXTRA_E=("BROKER_ADMISSION_CLASS=bulk")
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs morning)
+    ;;
+  weekly-report)
+    NAME="kse-weekly-report"; MEM="2g"; CPUS="1.0"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs weekly-report)
+    ;;
+  alert)
+    NAME="kse-alert-notify"; MEM="256m"; CPUS="0.5"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kse-alert.env")
+    WANT_KIS=0; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=(); WANT_LOG=0; WANT_STDIN=1
+    MODULE_ARGV=(src.ops.jobs alert)
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+if [[ "$JOB" != "alert" && "$#" -gt 0 ]]; then
+  usage
+fi
+
+ARGS=(run --rm)
+if [[ "$WANT_STDIN" -eq 1 ]]; then
+  ARGS+=(-i)
+fi
+if [[ "$WANT_LOG" -eq 1 ]]; then
+  ARGS+=(--log-opt max-size=10m --log-opt max-file=3)
+fi
+ARGS+=(--name "$NAME" --user "$(id -u):$(id -g)")
+ARGS+=(-e HOME=/tmp)
+if [[ "$WANT_MALLOC" -eq 1 ]]; then
+  ARGS+=(-e _RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0)
+fi
+ARGS+=(-e UV_CACHE_DIR=/tmp/uv-cache)
+ARGS+=(--memory="$MEM" --memory-swap="$MEM" --cpus="$CPUS")
+ARGS+=(--env-file "$BASE_ENV")
+for f in "${EXTRA_ENVS[@]}"; do
+  ARGS+=(--env-file "$f")
+done
+if [[ "$WANT_KIS" -eq 1 ]]; then
+  ARGS+=(-v "${HOME}/.cache/kis:/app/.cache/kis" -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis)
+fi
+for e in "${EXTRA_E[@]}"; do
+  ARGS+=(-e "$e")
+done
+ARGS+=(-v "${HOME}/k-stock-engine/data:/app/data" -v "${HOME}/k-stock-engine/logs:/app/logs")
+for v in "${EXTRA_V[@]}"; do
+  ARGS+=(-v "$v")
+done
+ARGS+=("$IMAGE")
+ARGS+=(uv run python -m "${MODULE_ARGV[@]}")
+if [[ "$JOB" == "alert" && "$#" -gt 0 ]]; then
+  ARGS+=("$@")
+fi
+
+if [[ "$PRINT" -eq 1 ]]; then
+  printf '%s\0' docker
+  for t in "${ARGS[@]}"; do
+    printf '%s\0' "$t"
+  done
+  exit 0
+fi
+
+exec docker "${ARGS[@]}"
