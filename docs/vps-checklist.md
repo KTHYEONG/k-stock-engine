@@ -1,115 +1,229 @@
-# VPS Daily Automation Audit Runbook (K-Stock Engine)
+# kse VPS Automation Audit Checklist
 
-> **Agent-Executable Operational Runbook:**  
-> An AI auditor or site reliability engineer runs this runbook to verify that every automated routine of K-Stock Engine ran on schedule, **and that the data produced adheres strictly to financial invariants and Point-in-Time contracts**.
+> Runbook for an AI auditor verifying that every k-stock-engine (kse) automation on `or-vps` ran on schedule, used the
+> current deploy (wrapper + image + host broker contract v1), and left the expected artefacts. Every probe below was
+> run read-only against production on 2026-10-17 (HEAD `94d99a7`).
 
-- **Target Host:** `or-vps` (SSH alias, tailnet) / local workstation
-- **Systemd Units:** `kse-morning.service`, `kse-auction-open.service`, `kse-collect-eve.service`, `kse-daily-audit.service`, `kse-backup.service`, `kse-weekly-report.service`, `kse-alert@.service`
-- **Output Language:** Report findings in Korean (한국어); keys, IDs, badges stay English.
-
----
-
-## 1. Operating Rules (Non-Negotiable)
-
-1. **Read-Only Inspection**: VPS 상에서 파일 수정, 임의 프로세스 재시작, `git pull`, `rclone` 쓰기를 절대 수행하지 않음. 진단 결과는 로컬 터미널 및 `scratch/`에만 기록.
-2. **No Secrets Leakage**: `.env`, `.quant.env`, API 키, KIS 토큰, 계좌번호 등 민감 정보를 출력에 절대 표시하지 않음.
-3. **UNKNOWN is Not PASS**: 로그 누락, 파일 미발견, 호스트 접속 불가 상태는 PASS가 아니며 반드시 원인과 함께 `UNKNOWN`으로 판정.
-4. **Day-Kind Determination First**: 검사 전 당일이 `BUSINESS`(영업일), `WEEKEND`(주말), `HOLIDAY`(공휴일)인지 캘린더 캐시(`data/state/calendar/`)로 선제 확정.
-5. **Fail-Closed Verification**: 시스템 상태 불일치, 쿼터 고갈, 원장 불일치가 감지되면 즉시 SEV1로 보고하고 다음 파이프라인 진행을 차단.
+- **Host:** `or-vps` (SSH alias). Host clock is **UTC**; all schedules below are **KST (UTC+9)**. `list-timers` prints UTC.
+- **Deploy shape:** no git checkout on the host. `~/k-stock-engine/` holds only `data/`, `logs/`, `scratch/`. Units call
+  the installed wrapper `~/.local/lib/kse/kse-run <job>`, which `docker run`s `ghcr.io/kthyeong/k-stock-engine:latest`.
+  `kse-run --print <job>` prints the argv (NUL-separated) without running anything.
+- **Data root:** `~/k-stock-engine/data` (scope `kr_swing_2019_v1`). **Shared broker dir:** `~/.cache/kis` (mounted at
+  `/app/.cache/kis`, injected as `KIS_TOKEN_CACHE_DIR`), shared with krx-alpha (`krx-collector`) and k-closing-alpha
+  (`kca-*`). Same single LS app key and same DB금융투자 app key across all three projects; kse uses KIS data pool slot 5.
+- **Report:** reply in chat only, in Korean (keys/IDs/badges in English). Do not write report files.
 
 ---
 
-## 2. Severity Classification & Escalation Matrix
+## 1. Rules (non-negotiable)
 
-| Severity | 정의 및 기준 | 대표 발생 사례 | 대응 프로토콜 |
-| :---: | :--- | :--- | :--- |
-| **SEV1** | 데이터 영구 유실, 인과성 파괴, 원장 불일치 | 영업일 08:32 결정 봉인 실패, 장전 호가 누락, 디스크 잔여 < 5GB, NTP Drift > 2.0s | 사용자 즉시 경보(텔레그램), 신규 주문 즉시 동결 |
-| **SEV2** | 보조 데이터 결측, 쿼터 한도 임박 | LS 수급 결측(KIS 백업 투입됨), DART 16,000건 쿼터 소진, 일일 감사 WARN 발생 | 당일 리포트 헤드라인 기재 및 야간 점검 조치 |
-| **SEV3** | 경미한 일시적 지연 | 1회 재시도로 복구된 네트워크 일시 오류, 백업 대기 지연 | 리포트 본문 기록 |
-| **INFO** | 정상 완료 지표 | 타이머 정시 실행, 레코드 건수, 피크 RSS 메모리 | 본문 상태 테이블 표시 |
+| Rule | Detail |
+| :--- | :--- |
+| Read-only | No `systemctl start/stop/restart/enable`, no `daemon-reload`, no file writes/deletes, no `docker run` (only `kse-run --print`), no `rclone` writes, no `git pull`. |
+| Leave nothing behind | Do not create report, evidence or script files on the host or locally (no scratch/scratchpad). Run probes by piping a heredoc over SSH stdin: `ssh or-vps 'bash -s' <<'EOF' ... EOF`. |
+| Secrets | Never print env-file values, tokens, app keys, or contents of `~/.cache/kis` / `~/.cache/dbsec` files. Names, mtimes, sizes and digests already embedded in filenames are fine. Redact `*KEY*|*SECRET*|*TOKEN*` in printed argv. |
+| No broker traffic | Never send a request to KIS / LS / DB / KRX / DART. |
+| UNKNOWN is not PASS | Unreachable host, missing log or missing artefact = `UNKNOWN` with the reason. |
+| Day kind first | Jobs self-skip on non-trading days (`SKIPPED non_trading_day`; audit heartbeat `HOLIDAY_SKIP`). Judge weekday jobs only on XKRX sessions. |
 
----
+## 2. Severity
 
-## 3. Automation Cadence & Daily Audit Windows
+| Severity | Criteria (kse is research + shadow only; it sends no orders) |
+| :---: | :--- |
+| **SEV1** | Trading day without a sealed decision (`morning` `NO_DECISION`/`DEGRADED`, incl. `late_seal`); `.host-admission` marker missing; `HostBrokerDirNotSharedError` or `ConfigError` (broker dir unset) in any job; token-issue storm on the shared LS/DB key (`IGW00201`/`EGW00201`/`TokenIssueThrottled` repeating) since it also hurts kca/krx-alpha; `NTPSynchronized=no`; free disk < 25 GB or available RAM < 3500 MB (job guards refuse); backup `rc != 0` or older than 26 h. |
+| **SEV2** | `collect_eve` / `collect_dbsec` / `auction_open` not `OK` or missing on a trading day; daily audit `WARNING`; deploy drift (installed unit/wrapper hash differs from repo, any `kse-*.service.d` drop-in, image revision != deployed HEAD); data root > 10 GiB; `SCHEMA_INVALID`, `TokenStoreLockTimeout`; kernel `oom-kill` in a kse container. |
+| **SEV3** | Hygiene: non-contract files in `~/.cache/kis`, stale token files outside the shared dir, leftovers in `~/k-stock-engine/scratch`, loose Bronze older than 14 days, accumulating image tags, a single retried transient error. |
+| **INFO** | On-time runs, durations, row/request counts, peak RSS. |
 
-| Audit Mode | 실행 시각 (KST) | 검사 목적 및 주안점 | 점검 대상 서비스 / 산출물 |
-| :---: | :--- | :--- | :--- |
-| **M0 (아침 봉인)** | **평일 08:33 ~ 08:38** | 당일 영업일 판별 및 결정 체인 봉인 확인 | `kse-morning.service`<br/>`data/state/decisions/YYYY-MM-DD.json` |
-| **M1 (장전 경매)** | **평일 08:42 ~ 08:50** | 시초가 10호가/예상체결가 수집 확인 | `kse-auction-open.service`<br/>`data/bronze/kis/auction_open/dt=YYYY-MM-DD/` |
-| **M2 (장개시 집행)** | **평일 09:05 ~ 09:30** | 시가 단일가 체결 및 정수 원장 기록 확인 | `data/state/shadow/official/fills.parquet`<br/>`data/state/shadow/official/ledger.parquet` |
-| **M3 (저녁 수집)** | **평일 19:30 ~ 20:30** | 시세, 수급, DART, KIND 수집 및 Silver 빌드 | `kse-collect-eve.service`<br/>`ReceiptCatalog` SQLite3 WAL 동기화 |
-| **M4 (야간 감사)** | **매일 21:45 ~ 22:30** | 12대 금융 무결성 및 시계열 연속성 전수 감사 | `kse-daily-audit.service`<br/>`data/ops/events/daily_audit_YYYY-MM-DD.json` |
-| **M5 (원격 백업)** | **매일 02:40 ~ 03:30** | Google Drive 원격 대사 백업 완료 검증 | `kse-backup.service`<br/>`rclone` 원격 파일 크기 일치 확인 |
+## 3. Schedule and expected outcomes
 
----
+Events: `data/ops/events/YYYY-MM/YYYY-MM-DD.jsonl`, one JSON line per run with `job`, `outcome`
+(`OK|DEGRADED|NO_DECISION|SKIPPED`), `reason`, `metrics`, `ts`. `ts` is the job's start moment for `collect_*`/`backup`
+and the record time for `morning`/`auction_open`.
 
-## 4. Phase-by-Phase Verification Procedures
+| Unit (timer) | KST | `kse-run` job / limits | Expected result | Normal duration |
+| :--- | :--- | :--- | :--- | :--- |
+| `kse-morning` | Mon–Fri 08:32 | `morning`, 4g / 1.8 CPU | event `morning OK`, `metrics.sealed_at` < 09:00; new line in `state/kr_swing_2019_v1/decisions/chain.jsonl` with `execution_session` = today; `<data_session>.json` in `decisions/`; `shadow/official/*.parquet` mtime today | ~20–22 min (seal 08:51–08:54) |
+| `kse-auction-open` | Mon–Fri 08:39:30 | `auction-open`, 512m, admission `standard` | event `auction_open OK`, `unresolved: []`; `data/ops/auction/open.json/YYYY-MM/<date>.parquet` (`open.json` is a directory) | until ~09:01; polls for the seal first |
+| `kse-collect-eve` | Mon–Fri 18:30 | `collect-eve`, 3g / 1.5 CPU, admission `bulk`, `KSE_KIND_TRANSPORT=relay` | event `collect_eve OK` with `built == planned`, `prune_failed 0` | ~2 h (LS flow ~65 min, KIS flow ~55 min) |
+| `kse-collect-dbsec` | Mon–Fri 20:40 | `collect-dbsec`, 1g; `ExecStartPre` = marker test + wait up to 60 min for `collect-eve` | event `collect_dbsec OK`, each step `pending_left 0`; `fallback_ready` false until 20 reconciled sessions | ~25 min |
+| `kse-daily-audit` | Mon–Fri 21:40, Sat–Sun 12:00 | `daily-audit` (`audit`) | `data/ops/heartbeat/daily_audit.json` with `severity` `OK` (weekday) / `HOLIDAY_SKIP` (weekend), `open_issues: []` | < 2 min |
+| `kse-backup` | daily 02:30, `Persistent=true` | `backup --no-lock` under `flock -w 7200 %t/quant-gdrive.lock` | event `backup OK`; `data/state/lake_backup_status.json` `rc 0`, `last_ok_at` < 26 h; sources `bronze, bronze_catalog, state, ops` → `gdrive:quant-lake/live/k-stock-engine/lake` | ~10–13 min |
+| `kse-weekly-report` | Sat 10:30 | `weekly-report` | `data/ops/reports/weekly-<date>.json` | seconds |
+| `kse-alert@<unit>` | on failure | `alert` (stdin = journal tail) | `[SYS] alert outcome=SENT`; line in `data/ops/alerts/sent.jsonl`. Its own `OnFailure` is `kca-alert@`. | seconds |
 
-### 4.1 M0: 아침 결정 봉인 검증 (`kse-morning`)
+Daily-audit open-issue keys: `collect_eve`, `collect_dbsec`, `morning`, `auction_open`, `backup` (missing or non-OK),
+`divergence`, `bronze_loose` (> 14 days), `footprint` (> 10 GiB), `events`.
+
+## 4. Probes
+
+Run each block as `ssh or-vps 'bash -s' <<'EOF'` … `EOF`. Set `D=YYYY-MM-DD` (KST) where used.
+
+### P1. Host, clock, resources
 ```bash
-# 1. systemd 서비스 실행 성공 여부 확인
-systemctl status kse-morning.service --no-pager
-
-# 2. 당일 결정 파일 존재 및 무결성 확인
-ls -la data/state/decisions/$(date +%Y-%m-%d).json
-cat data/state/decisions/$(date +%Y-%m-%d).json | jq '{session: .session, candidate_count: (.targets | length)}'
+TZ=Asia/Seoul date; uptime; df -h / | tail -1; free -h | head -2
+timedatectl show -p NTPSynchronized -p Timezone; chronyc tracking 2>/dev/null | grep -E 'System time|Leap'
 ```
-* **PASS 조건**: `exit_code == 0`, 당일 결정 파일 존재, 종목 수가 설정된 상한(`n=20`)과 일치.
+PASS: `NTPSynchronized=yes`, offset ≪ 2 s, free disk ≥ 25 GB, available RAM ≥ 3.5 GiB.
 
-### 4.2 M1: 장전 시초가 경매 수집 검증 (`kse-auction-open`)
+### P2. Timers and last results
 ```bash
-# 1. 경매 수집 서비스 상태 확인
-systemctl status kse-auction-open.service --no-pager
-
-# 2. 당일 수집된 10호가/예상체결 JSONL 확인
-ls -la data/bronze/kis/auction_open/dt=$(date +%Y-%m-%d)/
-wc -l data/bronze/kis/auction_open/dt=$(date +%Y-%m-%d)/*.jsonl
+systemctl --user list-timers --all --no-pager 'kse-*'
+systemctl --user --failed --no-pager
+for u in morning auction-open collect-eve collect-dbsec daily-audit backup weekly-report; do printf '%-18s ' $u; systemctl --user show -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p DropInPaths --value kse-$u.service | tr '\n' '|'; echo; done
+journalctl --user -u 'kse-*' --since "$D" --no-pager -o short-iso | grep -E "Failed with result" | cut -c1-140
 ```
-* **PASS 조건**: 예상 종목 수(기본 80종목)의 95% 이상에서 `antc_cnpr > 0` 확인.
+PASS: 7 timers listed, none failed, `Result=success`, `DropInPaths` empty for every unit.
+A unit failure can be followed by a manual `systemctl --user start` re-run; the last run then shows `success` — use the
+events file (P4) for the full day history.
 
-### 4.3 M3: 저녁 수집 및 정규화 검증 (`kse-collect-eve`)
+### P3. Deploy drift (installed vs repo, image, wrapper argv)
+On the host:
 ```bash
-# 1. 저녁 수집 서비스 로그 확인
-journalctl -u kse-collect-eve.service -n 50 --no-pager
-
-# 2. SQLite 영수증 카탈로그 무결성 검사
-sqlite3 data/state/receipts.db "PRAGMA integrity_check;"
-sqlite3 data/state/receipts.db "SELECT count(*) FROM receipts WHERE collected_at >= datetime('now', '-1 day');"
+cd ~/.config/systemd/user && for f in kse-*; do printf '%s %s\n' "$(sha256sum < $f | cut -c1-16)" "$f"; done
+printf '%s %s\n' "$(sha256sum < ~/.local/lib/kse/kse-run | cut -c1-16)" kse-run
+systemctl --user cat kse-backup.service | head -40
+docker image inspect -f '{{.Id}} {{.Created}} {{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/kthyeong/k-stock-engine:latest
+docker ps -a --filter name=kse- --format '{{.Names}} {{.Status}}'
+docker system df
+for j in morning auction-open collect-eve collect-dbsec daily-audit backup weekly-report alert; do
+  printf '== %s: ' "$j"; ~/.local/lib/kse/kse-run --print "$j" | tr '\0' ' ' | sed -E 's/([A-Z_]*(KEY|SECRET|TOKEN)[A-Z_]*)=[^ ]*/\1=<redacted>/g'; echo
+done
 ```
-* **PASS 조건**: SQLite `integrity_check` 결과 `ok`, 당일 영수증 신규 등록 건수 정상 증가.
+Locally, compare against `for f in deploy/systemd/* deploy/kse-run; do printf '%s %s\n' "$(sha256sum < $f | cut -c1-16)" "$(basename $f)"; done`.
+PASS: all hashes equal; no `kse-*.service.d` entry (it prints `sha256sum: -: Is a directory`); image revision = deployed
+commit; no lingering `kse-*` containers; every argv except `alert` has `-v /home/ubuntu/.cache/kis:/app/.cache/kis` and
+`KIS_TOKEN_CACHE_DIR`, `collect-dbsec` additionally mounts `~/.cache/dbsec:/app/.cache/dbsec:ro` (legacy, see §5).
 
-### 4.4 M4: 일일 감사 결과 검증 (`kse-daily-audit`)
+### P4. Outcomes, heartbeat, alerts
 ```bash
-# 1. 감사 이벤트 결과 JSON 확인
-cat data/ops/events/daily_audit_$(date +%Y-%m-%d).json | jq '.'
+python3 - "$D" <<'PY'
+import json,sys,pathlib
+d=sys.argv[1]; p=pathlib.Path.home()/f"k-stock-engine/data/ops/events/{d[:7]}/{d}.jsonl"
+for l in p.read_text().splitlines():
+    e=json.loads(l); m=e.get("metrics",{})
+    print(e["ts"][11:19], e["job"], e["outcome"], e["reason"] or "-", {k:m[k] for k in ("data_session","sealed_at","symbols","expected_rows","built","planned","removed","fallback_ready","pruned") if k in m})
+PY
+python3 - 7 <<'PY'
+import json,sys,pathlib,datetime as dt
+root=pathlib.Path.home()/"k-stock-engine/data/ops/events"; days=int(sys.argv[1])
+today=dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+for i in range(days,-1,-1):
+    d=today-dt.timedelta(days=i); p=root/f"{d:%Y-%m}"/f"{d}.jsonl"
+    if not p.exists(): continue
+    for l in p.read_text().splitlines():
+        e=json.loads(l)
+        if e["outcome"] not in ("OK","SKIPPED"): print(d, e["ts"][11:19], e["job"], e["outcome"], e["reason"])
+PY
+cd ~/k-stock-engine/data/ops
+python3 -c "import json;d=json.load(open('heartbeat/daily_audit.json'));print(json.dumps(d)[:1500])"
+tail -5 alerts/sent.jsonl | cut -c1-400
 ```
-* **PASS 조건**: `outcome == "PASS"`, 결측치 0건, 인과성 역전 0건.
+Job exceptions are recorded as `reason=<ExceptionClass>` in the event, **without a traceback in the journal**
+(e.g. 2026-10-16 `collect_eve DEGRADED SchemaError`). Locate the cause from the event reason, the last journal lines
+before the exit (P6), and the fix history in the repo.
 
-### 4.5 M5: 오프사이트 백업 검증 (`kse-backup`)
+### P5. Artefacts
 ```bash
-# 1. 백업 서비스 종료 상태 확인
-systemctl status kse-backup.service --no-pager
-
-# 2. 백업 로그에서 rclone 대사 결과 확인
-journalctl -u kse-backup.service -n 30 | grep -E "Transferred|Checks|Elapsed"
+cd ~/k-stock-engine/data
+python3 -c "
+import json
+for l in open('state/kr_swing_2019_v1/decisions/chain.jsonl').read().splitlines()[-3:]:
+    e=json.loads(l); print(e['data_session'],'->',e['execution_session'],e.get('sealed_at'))"
+ls -la --time-style=+%m-%dT%H:%M ops/auction/open.json/2026-10/ state/kr_swing_2019_v1/shadow/official/ | awk 'NF>5{print $5,$6,$7}'
+python3 -c "import json;d=json.load(open('state/lake_backup_status.json'));print(d['rc'],d['finished_at'],d['last_ok_at'],sorted(d['sources']))"
+ls ops/reports
 ```
-* **PASS 조건**: 에러 0건, 로컬 아카이브와 원격 드라이브 간 해시/바이트 일치.
+`auction_open.metrics.expected_rows = symbols × snapshots`; snapshots are at 08:40/08:50/08:55/08:58/08:59. Only those
+after the seal are captured, so a ~08:52 seal yields 3 per symbol (see §5).
 
----
-
-## 5. Structured Audit Output Template
-
-감사 완료 후 아래 템플릿에 따라 한국어로 보고서를 작성합니다:
-
-```markdown
-### 🛡️ K-Stock Engine 일일 무인 운영 감사 보고서 (YYYY-MM-DD)
-
-| Audit Phase | 상태 | 주요 지표 및 세부 내용 | 판정 사유 |
-| :--- | :---: | :--- | :--- |
-| **M0 Morning Seal** | `PASS` | 08:32:04 완료, 20종목 목표 봉인 (`decisions/YYYY-MM-DD.json`) | 정상 봉인 완료 |
-| **M1 Auction Capture** | `PASS` | 08:39:31 완료, 80개 종목 10호가 수집 (`antc_cnpr` 100%) | 결측치 없음 |
-| **M2 Intraday Fills** | `PASS` | 09:00:15 체결, 정수 원장 잔고 오차 0원, 미수금 0건 | 정수 원장 무결 |
-| **M3 Evening Collect** | `PASS` | 18:30:12 기동, DART 1,240건 / KRX 2,750건 / LS 수급 적재 | SQLite WAL 정상 |
-| **M4 Daily Audit** | `PASS` | 21:40:02 실행, 12개 Invariant Rule 전수 Green | 불변식 위반 0건 |
-| **M5 Offsite Backup** | `PASS` | 02:30:15 백업 완료, Google Drive 원격 크기 100% 대사 | 백업 완료 |
+### P6. Shared broker dir and contract errors
+```bash
+ls -la --time-style=+%m-%dT%H:%M ~/.cache/kis/ | awk '{print $1,$3,$4,$5,$6,$7}'
+test -f ~/.cache/kis/.host-admission && echo marker=present
+stat -c '%a %U %n' ~/.cache/kis
+cd ~/.cache/kis && ls -A | python3 -c "
+import re,sys
+ok=re.compile(r'^(\.host-admission|token_(ls|toss|dbsec|kiwoom)_[0-9a-f]{12}\.json(\.lock)?|token_issue_(ls|toss|dbsec|kiwoom)_[0-9a-f]{12}\.state|admission_(ls|toss|dbsec|kiwoom)_[0-9a-f]{12}(_[A-Za-z0-9_-]+)?\.state|token_[0-9a-f]{12}\.json(\.lock)?|tps_[0-9a-f]{12}\.state)$')
+bad=[n for n in sys.stdin.read().split() if not ok.match(n)]
+print('non_contract:',bad or 'none')"
+ls -la --time-style=+%m-%dT%H:%M ~/.cache/dbsec/ | awk '{print $1,$5,$6,$7}'
+P='IGW00201|EGW00201|TokenIssueThrottled|TokenStoreLockTimeout|HostBrokerDirNotSharedError|SCHEMA_INVALID|LEGACY_FALLBACK|ConfigError|SchemaError|Traceback'
+printf 'journal_matches=%s\n' "$(journalctl --user -u 'kse-*' --since "$D" --no-pager -o cat | grep -cE "$P")"
+journalctl --user -u 'kse-*' --since "$D" --no-pager -o short-iso | grep -E "$P" | cut -c1-240
 ```
+Expected kse files (`<sha12>` = sha256(app key)[:12]): `token_ls_<sha12>.json`, `admission_ls_<sha12>.state`,
+`token_dbsec_<sha12>.json`, `token_issue_dbsec_<sha12>.state`, `admission_dbsec_<sha12>[_chart|_quote].state`, and the
+KIS slot-5 `token_<sha12>.json` / `tps_<sha12>.state`. `toss`/`kiwoom` files belong to sibling projects.
+PASS: marker present, dir `700 ubuntu`, `non_contract: none`, `journal_matches=0`, and the same pattern absent from event
+`reason` fields (P4). `LEGACY_FALLBACK` means a DB run read `~/.cache/dbsec/dbsec_token_prod.json` because the shared
+token was unusable — acceptable this release only (SEV3, SEV2 after the fallback is removed).
+To map a digest to a key name, hash the key inside a python heredoc and print only the 12-hex digest.
+
+### P7. Failure window and memory
+```bash
+journalctl --user -u kse-collect-eve.service --since "$D 09:00 UTC" --until "$D 11:30 UTC" --no-pager -o short-iso | tail -40
+journalctl -k --since "$D" --no-pager -o short-iso | grep -i 'oom-kill' | cut -c1-250
+```
+Grep `oom-kill`, not `oom`: kse logs contain `headroom=`. Compare `metrics.node_peak_rss_mb` against the container
+limit (morning 4g, collect-eve 3g): > 90 % of the limit is SEV3.
+
+### P8. Footprint, retention, log growth
+```bash
+cd ~/k-stock-engine/data && du -sb . | awk '{printf "total_GiB=%.2f\n",$1/2^30}'
+du -sh bronze/*/ silver/*/ gold/*/ state/*/ 2>/dev/null
+du -sh bronze/kr_swing_2019_v1/* 2>/dev/null | sort -h | tail -15
+cd bronze/kr_swing_2019_v1 && find investor_flow daily_market -type f -printf '%TY-%Tm-%Td %P %s\n' | awk '{s[$1]+=$3; n[$1]++} END{for(x in s) printf "%s files=%d MiB=%.1f\n",x,n[x],s[x]/2^20}' | sort
+du -sh ~/k-stock-engine/scratch ~/k-stock-engine/logs; ls -la ~/k-stock-engine/logs
+journalctl --user --disk-usage
+for d in 2026-10-14 2026-10-15 2026-10-16; do printf '%s kse journal lines: ' $d; journalctl --user --since "$d 00:00" --until "$d 23:59:59" -u 'kse-*' --no-pager -o cat | wc -l; done
+```
+Loose Bronze is packed and pruned by `kse-backup` only when older than 14 days **and** confirmed offsite; growth
+before that is expected. Project the date the data root crosses 10 GiB from the per-day MiB.
+
+### P9. Catalog coverage (read-only SQLite)
+```bash
+python3 - <<'PY'
+import sqlite3,os
+c=sqlite3.connect('file:'+os.path.expanduser('~/k-stock-engine/data/bronze/kr_swing_2019_v1/catalog/catalog.sqlite3')+'?mode=ro',uri=True)
+q="""select source, substr(retrieved_at,1,10) d, status, min(start), max(start), min(end), max(end), count(*) from ranges where retrieved_at>='2026-10-14' group by 1,2,3 order by 2,1"""
+for r in c.execute(q): print(r)
+PY
+```
+Always open with `?mode=ro`. Never run `sqlite3` CLI writes or `PRAGMA` that checkpoints.
+
+### P10. Cross-project schedule and Drive lock
+```bash
+systemctl --user list-timers --all --no-pager | grep -E 'kse|kca|krx|NEXT'
+for u in kca-backup kca-backup-prune krx-host-backup crypto-pilot-backup kca-offsite-verify kca-core-snapshot; do printf '%s: ' $u; systemctl --user cat $u.service 2>/dev/null | grep -E '^ExecStart' | grep -oE 'flock[^%]*%t/[a-z-]+\.lock|quant-gdrive|rclone' | sort -u | tr '\n' ' '; systemctl --user cat $u.timer 2>/dev/null | grep OnCalendar | tr '\n' ' '; echo; done
+```
+Known neighbours (KST): kca-price-ingest 08:30, kca-auction-open 08:39:55 (KIS `critical`), kca-order-exit 08:40:10,
+kca-archive-intraday 20:05, kca-tape-sweep 20:35, kca-backup-prune 21:00, kca-backup 22:15, krx-host-backup 23:30;
+Drive writers kca/krx-alpha/crypto-pilot all serialize on `%t/quant-gdrive.lock`. Shared LS/DB/KIS pacing is enforced
+through the `admission_*`/`tps_*` state files, so overlap slows jobs rather than failing them; contention shows up as
+the P6 error codes.
+
+## 5. Transitional and known items (as of 2026-10-17)
+
+| Item | Status / what to check |
+| :--- | :--- |
+| Legacy DB token dir `~/.cache/dbsec` | Read-only fallback (`DBSEC_TOKEN_CACHE_DIR`, mounted `:ro`) for **one release**; the next release removes the mount, the env and the fallback. After that, any `~/.cache/dbsec` reference in `kse-run --print collect-dbsec` is drift (SEV2). |
+| `logs/ls_token_prod.json` | Written by the pre-contract LS client (last 2026-10-16). Current code never reads it; LS tokens live in `~/.cache/kis`. Report as SEV3 hygiene until the user removes it. |
+| `kse-backup.service.d/90-lake-backup-memory.conf` | 2026-10-13 hotfix drop-in that bypasses `kse-run` and pins image `kse-backup-memory:20261013`. Report as SEV2 drift while present. |
+| Auction snapshots | Seal at ~08:51–08:54 means the 08:40 and 08:50 snapshots are never captured (`expected_rows = 3 × symbols`). |
+| First runs on the new contract | Morning 2026-10-19 is the first trading-day run of `94d99a7`; LS/DB tokens then come from `~/.cache/kis` (check `admission_ls_*`/`admission_dbsec_*` mtimes move to kse run times). |
+
+## 6. Chat report template
+
+| Check | Status | Evidence (time KST, value) | Severity |
+| :--- | :---: | :--- | :---: |
+| Morning seal | `PASS` | `sealed_at` 08:51, chain `2026-10-15 -> 2026-10-16` | INFO |
+| Auction open | … | … | … |
+| Evening collect | … | … | … |
+| DB fallback collect | … | … | … |
+| Daily audit | … | … | … |
+| Backup | … | … | … |
+| Weekly report | … | … | … |
+| Shared broker dir / contract | … | … | … |
+| Deploy drift | … | … | … |
+| Footprint / growth | … | … | … |
