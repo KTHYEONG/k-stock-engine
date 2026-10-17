@@ -7,5 +7,5 @@ Type=oneshot
 WorkingDirectory=%h/k-stock-engine
 Environment=TZ=Asia/Seoul
 TimeoutStartSec=5min
-ExecStart=/bin/sh -c 'journalctl --user -u "$$0" -n 40 -o cat --no-pager | /usr/bin/docker run --rm -i --name kse-alert-notify --user %U:%G -e HOME=/tmp -e UV_CACHE_DIR=/tmp/uv-cache --memory=256m --memory-swap=256m --cpus=0.5 --env-file %h/quant-secrets/k-stock-engine.env --env-file %h/quant-secrets/kse-alert.env -v %h/k-stock-engine/data:/app/data -v %h/k-stock-engine/logs:/app/logs ghcr.io/kthyeong/k-stock-engine:latest uv run python -m src.ops.jobs alert --unit "$$0" --result "$$(systemctl --user show -p Result --value "$$0")" --exit-status "$$(systemctl --user show -p ExecMainStatus --value "$$0")"' %i
+ExecStart=/bin/sh -c 'journalctl --user -u "$$0" -n 40 -o cat --no-pager | %h/.local/lib/kse/kse-run alert --unit "$$0" --result "$$(systemctl --user show -p Result --value "$$0")" --exit-status "$$(systemctl --user show -p ExecMainStatus --value "$$0")"' %i
 ExecStopPost=-/usr/bin/docker rm -f kse-alert-notify
