@@ -1400,3 +1400,41 @@ def test_morning_build_never_reads_dbsec_sources(tmp_path: Path, monkeypatch: py
         if json.loads(line)["job"] == "morning"
     )
     assert morning_event["reason"] == "krx_absent_at_deadline"
+
+
+def test_morning_records_stale_investor_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.investor_flow_freshness import FlowFreshness, StaleInvestorFlowError
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(jobs, "_previous_session", lambda day: date(2026, 10, 7))
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **kwargs: calls.append("build"))
+    freshness = (FlowFreshness(date(2026, 10, 7), 100, 90, 10, 10, 0.10),)
+
+    def _stale(root: Path) -> list[str]:
+        raise StaleInvestorFlowError(freshness)
+
+    monkeypatch.setattr(jobs, "_decide_phase", _stale)
+    monkeypatch.setattr(jobs, "_shadow_phase", lambda root: calls.append("shadow"))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert "shadow" not in calls
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "NO_DECISION"}
+    target = tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl"
+    morning_event = next(
+        json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["job"] == "morning"
+    )
+    assert morning_event["reason"] == "stale_investor_flow"
+    assert morning_event["metrics"]["flow_freshness"] == [
+        {
+            "source_session": "2026-10-07",
+            "required_cells": 100,
+            "present_cells": 90,
+            "late_cells": 10,
+            "missing_cells": 10,
+            "missing_fraction": 0.10,
+        }
+    ]

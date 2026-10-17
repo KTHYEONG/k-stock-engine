@@ -31,6 +31,7 @@ class RuntimeConfig(BaseModel):
     research_protocol: Path
     futures_constants: Path
     champion_file: Path
+    live_gate: Path
 
 
 def _repo_root_for(config_path: Path) -> Path:

@@ -551,6 +551,8 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
         return 1
     phase = "build"
     build_report: object = None
+    from src.data.investor_flow_freshness import StaleInvestorFlowError
+
     try:
         mark = time.monotonic()
         build_report = _build_all(root, decision_time=_aware(now()))
@@ -565,6 +567,17 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
         mark = time.monotonic()
         _shadow_phase(root)
         shadow_s = time.monotonic() - mark
+    except StaleInvestorFlowError as exc:
+        from dataclasses import asdict
+
+        _record(root, "morning", "NO_DECISION", today, _aware(now()), reason=exc.reason,
+                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
+                         "node_peak_rss_mb": _node_peak_metrics(build_report),
+                         "flow_freshness": [
+                             {**asdict(item), "source_session": item.source_session.isoformat()}
+                             for item in exc.freshness
+                         ]})
+        return 1
     except PITDataError as exc:
         outcome = "DEGRADED" if phase == "shadow" else "NO_DECISION"
         _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__,
