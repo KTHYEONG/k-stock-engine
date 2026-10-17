@@ -165,40 +165,11 @@ def test_pacing_across_threads() -> None:
         assert second - first >= 0.2 - 1e-9
 
 
-def test_token_cache_is_private_and_atomic(tmp_path) -> None:
-    import threading
+def test_token_cache_removed() -> None:
+    import pytest
 
-    from src.integrations.transport import TokenCache
-
-    cache = TokenCache(tmp_path, provider="kis", env="demo")
-    cache.save("token-1", "2030-01-01T00:00:00")
-    assert (cache.path.stat().st_mode & 0o777) == 0o600
-
-    errors: list[BaseException] = []
-    stop = threading.Event()
-
-    def _reader() -> None:
-        while not stop.is_set():
-            try:
-                loaded = cache.load()
-                if loaded is not None:
-                    token, _ = loaded
-                    assert token in {"token-1", "token-2"}
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-                stop.set()
-
-    readers = [threading.Thread(target=_reader) for _ in range(4)]
-    for thread in readers:
-        thread.start()
-    for _ in range(50):
-        cache.save("token-2", "2030-01-01T00:00:00")
-        cache.save("token-1", "2030-01-01T00:00:00")
-    stop.set()
-    for thread in readers:
-        thread.join()
-
-    assert errors == []
+    with pytest.raises(ImportError):
+        from src.integrations.transport import TokenCache  # noqa: F401
 
 
 def test_retry_policy_rejects_non_positive_attempts() -> None:
@@ -392,35 +363,6 @@ def test_quota_error_from_classify_is_recorded() -> None:
     with pytest.raises(ProviderQuotaExhaustedError):
         transport.get("ep", {}, classify=_classify)
     assert recorded == ["ep"]
-
-
-def test_token_cache_load_branches(tmp_path) -> None:
-    import json
-
-    from src.integrations.transport import TokenCache
-
-    cache = TokenCache(tmp_path, provider="kis", env="demo")
-    assert cache.path.name == "kis_token_demo.json"
-    assert cache.load() is None
-
-    cache.path.write_text("not json", encoding="utf-8")
-    cache.path.chmod(0o600)
-    assert cache.load() is None
-
-    cache.path.write_text("[1, 2]", encoding="utf-8")
-    cache.path.chmod(0o600)
-    assert cache.load() is None
-
-    cache.path.write_text(json.dumps({"access_token": "", "expire_at": ""}), encoding="utf-8")
-    cache.path.chmod(0o600)
-    assert cache.load() is None
-
-    cache.save("tok", "2030-01-01T00:00:00")
-    assert cache.load() == ("tok", "2030-01-01T00:00:00")
-
-    cache.path.write_text("{}", encoding="utf-8")
-    cache.path.chmod(0o644)
-    assert cache.load() is None
 
 
 def _host_pacer(state_path, *, interval=0.1, clock=None, sleeps=None):  # type: ignore[no-untyped-def]
