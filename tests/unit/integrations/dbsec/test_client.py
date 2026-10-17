@@ -202,6 +202,8 @@ def _ok_script(rows):  # type: ignore[no-untyped-def]
 
 
 def test_token_store_writes_contract_file_only(tmp_path) -> None:
+    from src.integrations.host_broker import IssuedToken
+
     now = datetime(2026, 10, 15, tzinfo=UTC)
     broker = _marked_broker(tmp_path)
     legacy_dir = tmp_path / "legacy"
@@ -209,7 +211,7 @@ def test_token_store_writes_contract_file_only(tmp_path) -> None:
     before = sorted(p.name for p in legacy_dir.iterdir())
     store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
 
-    assert store.get_or_issue(lambda: ("fresh", 7200)) == "fresh"
+    assert store.get_or_issue(lambda: IssuedToken("fresh", 7200)) == "fresh"
 
     digest = _sha12("contract-key")
     names = sorted(p.name for p in broker.iterdir() if p.name != ".host-admission")
@@ -237,6 +239,8 @@ def test_token_store_reads_legacy_when_contract_absent(tmp_path) -> None:
 
 
 def test_token_store_ignores_legacy_after_rejection(tmp_path) -> None:
+    from src.integrations.host_broker import IssuedToken
+
     now = datetime(2026, 10, 15, tzinfo=UTC)
     broker = _marked_broker(tmp_path)
     legacy_dir = tmp_path / "legacy"
@@ -248,7 +252,7 @@ def test_token_store_ignores_legacy_after_rejection(tmp_path) -> None:
 
     def _issue():  # type: ignore[no-untyped-def]
         calls.append("issued")
-        return "fresh", 7200
+        return IssuedToken("fresh", 7200)
 
     assert store.get_or_issue(_issue, reject="L") == "fresh"
     assert calls == ["issued"]
@@ -256,6 +260,8 @@ def test_token_store_ignores_legacy_after_rejection(tmp_path) -> None:
 
 
 def _run_stale_legacy_case(tmp_path: Path, index: int, *, ttl: float, mode: int, expire_raw: object, now: datetime) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.host_broker import IssuedToken
+
     broker = _marked_broker(tmp_path, f"broker-{index}")
     legacy_dir = tmp_path / f"legacy-{index}"
     _write_legacy(
@@ -269,9 +275,9 @@ def _run_stale_legacy_case(tmp_path: Path, index: int, *, ttl: float, mode: int,
     store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
     seen: list[str] = []
 
-    def _issue() -> tuple[str, int]:
+    def _issue() -> IssuedToken:
         seen.append("issued")
-        return "fresh", 7200
+        return IssuedToken("fresh", 7200)
 
     assert store.get_or_issue(_issue) == "fresh"
     assert seen == ["issued"]
@@ -286,12 +292,14 @@ def test_token_store_ignores_stale_or_loose_legacy(tmp_path) -> None:
 
 
 def test_token_store_prefers_contract_over_legacy(tmp_path) -> None:
+    from src.integrations.host_broker import IssuedToken
+
     now = datetime(2026, 10, 15, tzinfo=UTC)
     broker = _marked_broker(tmp_path)
     legacy_dir = tmp_path / "legacy"
     _write_legacy(legacy_dir, legacy_token="L", now=now)
     peer = _contract_store(broker, "contract-key", legacy_dir=None, clock=lambda: now)
-    assert peer.get_or_issue(lambda: ("C", 7200)) == "C"
+    assert peer.get_or_issue(lambda: IssuedToken("C", 7200)) == "C"
     store = _contract_store(broker, "contract-key", legacy_dir=legacy_dir, clock=lambda: now)
 
     def _boom():  # type: ignore[no-untyped-def]
@@ -304,19 +312,22 @@ def test_token_store_rejects_short_expiry(tmp_path) -> None:
     import pytest
 
     from src.integrations.errors import ProviderTerminalError
+    from src.integrations.host_broker import IssuedToken
 
     now = datetime(2026, 10, 15, tzinfo=UTC)
     broker = _marked_broker(tmp_path)
-    store = _contract_store(broker, "contract-key", clock=lambda: now)
-
-    with pytest.raises(ProviderTerminalError):
-        store.get_or_issue(lambda: ("t1", 720))
-    digest = _sha12("contract-key")
-    assert not (broker / f"token_dbsec_{digest}.json").exists()
+    for index, expiry in enumerate([720.0, 0.0, None, float("nan"), float("inf"), float("-inf")]):
+        key = f"short-expiry-{index}"
+        store = _contract_store(broker, key, clock=lambda: now)
+        with pytest.raises(ProviderTerminalError):
+            store.get_or_issue(lambda expiry=expiry: IssuedToken("t1", expiry))
+        assert not (broker / f"token_dbsec_{_sha12(key)}.json").exists()
 
 
 def test_token_store_preserves_reuse_window(tmp_path) -> None:
     from datetime import timedelta
+
+    from src.integrations.host_broker import IssuedToken
 
     now = [datetime(2026, 10, 15, tzinfo=UTC)]
     broker = _marked_broker(tmp_path)
@@ -326,7 +337,7 @@ def test_token_store_preserves_reuse_window(tmp_path) -> None:
 
     store = _contract_store(broker, "contract-key", clock=lambda: now[0], sleep=_sleep)
 
-    assert store.get_or_issue(lambda: ("t1", 721)) == "t1"
+    assert store.get_or_issue(lambda: IssuedToken("t1", 721)) == "t1"
 
     def _boom():  # type: ignore[no-untyped-def]
         raise AssertionError("issue must not be called")
@@ -334,7 +345,7 @@ def test_token_store_preserves_reuse_window(tmp_path) -> None:
     assert store.get_or_issue(_boom) == "t1"
 
     now[0] = now[0] + timedelta(seconds=2)
-    assert store.get_or_issue(lambda: ("t2", 721)) == "t2"
+    assert store.get_or_issue(lambda: IssuedToken("t2", 721)) == "t2"
 
 
 def test_token_store_lock_timeout_is_retryable(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -345,6 +356,7 @@ def test_token_store_lock_timeout_is_retryable(tmp_path, monkeypatch) -> None:  
     import pytest
 
     from src.integrations.errors import ProviderRetryableError
+    from src.integrations.host_broker import IssuedToken
 
     now = datetime(2026, 10, 15, tzinfo=UTC)
     broker = _marked_broker(tmp_path)
@@ -362,7 +374,7 @@ def test_token_store_lock_timeout_is_retryable(tmp_path, monkeypatch) -> None:  
 
         store = _contract_store(broker, "contract-key", clock=lambda: now, sleep=_sleep)
         with pytest.raises(ProviderRetryableError, match="oauth2/token"):
-            store.get_or_issue(lambda: ("t1", 7200))
+            store.get_or_issue(lambda: IssuedToken("t1", 7200))
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -679,12 +691,31 @@ def test_credentials_from_env_round_trip(monkeypatch) -> None:  # type: ignore[n
         DbsecCredentials.from_env(_policy())
 
 
+def test_issue_token_delegates_with_dbsec_hooks(tmp_path) -> None:
+    from src.integrations.dbsec.client import DbsecClient
+    from src.integrations.host_broker import IssuedToken
+
+    broker = _marked_broker(tmp_path, "delegate-broker")
+    client = DbsecClient(
+        _credentials(),
+        policy=_policy(),
+        token_store=_ScriptedTokenStore(["tok"], broker),
+        transport=_FakeTransport(_ok_script([])),
+        scope_pacers={"chart": _NoOpPacer(), "quote": _NoOpPacer()},
+        session=_ScriptedSession([_FakeResponse({"access_token": "t", "expires_in": 3600}, status_code=403)]),
+        now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
+    )
+
+    assert client._issue_token() == IssuedToken("t", 3600.0)
+
+
 def test_issue_token_branches(tmp_path) -> None:
     import pytest
     import requests
 
     from src.integrations.dbsec.client import DbsecClient
     from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
+    from src.integrations.host_broker import IssuedToken
 
     broker = _marked_broker(tmp_path, "issue-broker")
 
@@ -698,11 +729,13 @@ def test_issue_token_branches(tmp_path) -> None:
             session=session,
             now=lambda: datetime(2026, 10, 15, tzinfo=UTC),
         )
-        token, expires_in = client._issue_token()
+        issued = client._issue_token()
         assert session.posts == expected_posts
-        return token, expires_in
+        return issued
 
-    assert _issued(_ScriptedSession([_FakeResponse({"access_token": "t", "expires_in": 3600})])) == ("t", 3600)
+    assert _issued(_ScriptedSession([_FakeResponse({"access_token": "t", "expires_in": 3600})])) == IssuedToken(
+        "t", 3600.0
+    )
     with pytest.raises(ProviderTerminalError):
         _issued(_ScriptedSession([_FakeResponse({"access_token": "t", "expires_in": "soon"})]))
     with pytest.raises(ProviderTerminalError):
