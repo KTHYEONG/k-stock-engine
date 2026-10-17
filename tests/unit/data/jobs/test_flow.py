@@ -28,19 +28,21 @@ def _sessions(count: int, *, start: date = date(2020, 1, 1)) -> list[date]:
     return [start + timedelta(days=index) for index in range(count)]
 
 
-def _publish_requirement_sets(runtime, sessions, tickers):  # type: ignore[no-untyped-def]
+def _publish_requirement_sets(runtime, sessions, tickers, *, tail: int = 0):  # type: ignore[no-untyped-def]
     """Register ordinary-universe and daily-market Silver covering every cell."""
     from src.data.dataset_registry import DatasetRegistry
     from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
 
     rows = [(day, ticker) for day in sessions for ticker in tickers]
+    tail_days = [sessions[-1] + timedelta(days=index + 1) for index in range(tail)] if tail else []
+    universe_rows = rows + [(day, ticker) for day in tail_days for ticker in tickers]
     universe = publish_dataset(
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(kind="ordinary_universe", layer=DatasetLayer.SILVER,
                                  policy_version="flow-fixture-v1", inputs={}, params={}),
         partitions={"part.parquet": pl.DataFrame(
-            {"session": [day for day, _ in rows], "ticker": [ticker for _, ticker in rows],
-             "eligible": [True] * len(rows)},
+            {"session": [day for day, _ in universe_rows], "ticker": [ticker for _, ticker in universe_rows],
+             "eligible": [True] * len(rows) + [False] * (len(universe_rows) - len(rows))},
             schema={"session": pl.Date, "ticker": pl.String, "eligible": pl.Boolean},
         )},
     )
@@ -60,7 +62,7 @@ def _publish_requirement_sets(runtime, sessions, tickers):  # type: ignore[no-un
     return universe, daily
 
 
-def _publish_ls_silver(runtime, rows, *, bronze_flow):  # type: ignore[no-untyped-def]
+def _publish_ls_silver(runtime, rows, *, bronze_flow, lag: int = 1):  # type: ignore[no-untyped-def]
     from src.data.dataset_registry import DatasetRegistry
     from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
 
@@ -68,7 +70,8 @@ def _publish_ls_silver(runtime, rows, *, bronze_flow):  # type: ignore[no-untype
         layer_root=runtime.workspace.silver_root,
         identity=DatasetIdentity(kind="investor_flow_ls", layer=DatasetLayer.SILVER,
                                  policy_version="flow-fixture-v1",
-                                 inputs={"bronze_flow": bronze_flow}, params={}),
+                                 inputs={"bronze_flow": bronze_flow},
+                                 params={"available_session_lag": lag, "available_time": "08:00:00"}),
         partitions={"part.parquet": pl.DataFrame(
             {"session": [day for day, _ in rows], "ticker": [ticker for _, ticker in rows]},
             schema={"session": pl.Date, "ticker": pl.String},
@@ -220,7 +223,7 @@ def test_kis_skips_ls_valued_cells(tmp_path: Path) -> None:
     sessions = _sessions(3)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
     _publish_ls_silver(
         runtime, [(sessions[0], TICKER), (sessions[1], TICKER)],
@@ -240,7 +243,7 @@ def test_kis_short_page_converges(tmp_path: Path) -> None:
     sessions = _sessions(30)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     collector = _KisStub(sessions, kept=10)
     ctx = _kis_ctx(runtime, provider, collector=collector)
     _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
@@ -285,7 +288,7 @@ def test_stored_payload_is_a_valid_envelope_without_records(tmp_path: Path) -> N
     sessions = _sessions(3)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ls_ctx = _ls_ctx(runtime, provider, collector=_LsStub(sessions))
     report, _ = _run(LsInvestorFlowJob(), ls_ctx)
     assert report.status == "complete"
@@ -383,7 +386,7 @@ def test_kis_empty_answer_records_empty_range(tmp_path: Path) -> None:
     sessions = _sessions(2)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ctx = _kis_ctx(runtime, provider, collector=_KisStub(()))
     _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
 
@@ -405,7 +408,7 @@ def test_kis_undecipherable_row_dates_answer_the_anchor(tmp_path: Path) -> None:
     sessions = _sessions(2)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
 
     class _GarbledKis(_KisStub):
         def fetch(self, symbol, anchor):  # type: ignore[no-untyped-def]
@@ -439,7 +442,7 @@ def test_kis_pending_is_empty_after_completion(tmp_path: Path) -> None:
     sessions = _sessions(1)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
     _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
 
@@ -457,7 +460,7 @@ def test_kis_invalid_unit_windows_fail_closed(tmp_path: Path) -> None:
     sessions = _sessions(1)
     runtime = _runtime(tmp_path)
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
     _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
 
@@ -628,7 +631,7 @@ def test_kis_page_reaching_before_scope_start_claims_only_in_scope_range(tmp_pat
     sessions = _sessions(3, start=start)
     pre_scope = _sessions(3, start=start - timedelta(days=3))[:3]
     provider = _provider()
-    _publish_requirement_sets(runtime, sessions, [TICKER])
+    _publish_requirement_sets(runtime, sessions, [TICKER], tail=1)
     ctx = _kis_ctx(runtime, provider, collector=_KisStub([*pre_scope, *sessions]))
     _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
 
@@ -639,3 +642,211 @@ def test_kis_page_reaching_before_scope_start_claims_only_in_scope_range(tmp_pat
     assert [(item.start, item.end, item.status) for item in ranges] == [
         (start, sessions[-1], EvidenceStatus.SUCCESS)
     ]
+
+
+def test_kis_defers_tail_cells(tmp_path: Path) -> None:
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(3)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
+    _publish_ls_silver(
+        runtime, [(sessions[0], TICKER)],
+        bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"),
+    )
+
+    job = KisInvestorFlowJob()
+    units = job.pending(ctx)
+
+    assert len(units) == 1
+    assert job.deferred_tail_cells == 1
+    import json as _json
+
+    windows = _json.loads(units[0].payload["windows"])
+    assert windows[-1][1] == sessions[1].isoformat()
+    assert all(end != sessions[2].isoformat() for _, end in windows)
+
+
+def test_kis_tail_only_ticker_yields_no_unit(tmp_path: Path) -> None:
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    tickers = [TICKER, "000001"]
+    sessions = _sessions(2)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, tickers)
+    collector = _KisStub(sessions)
+    ctx = _kis_ctx(runtime, provider, collector=collector)
+    _publish_ls_silver(
+        runtime, [(sessions[0], ticker) for ticker in tickers],
+        bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"),
+    )
+
+    job = KisInvestorFlowJob()
+    assert job.pending(ctx) == ()
+    assert job.deferred_tail_cells == len(tickers)
+
+    report, _ = _run(KisInvestorFlowJob(), ctx)
+    assert report.status == "complete"
+    assert collector.calls == []
+
+
+def test_kis_deferred_cell_not_answered(tmp_path: Path) -> None:
+    from src.data.evidence_sources import KIS_FLOW_SOURCE
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(3)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
+    _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
+
+    report, _ = _run(KisInvestorFlowJob(), ctx)
+    assert report.status == "complete"
+    tail = sessions[-1]
+    for item in ctx.catalog.ranges(source=KIS_FLOW_SOURCE):
+        assert not (item.start <= tail <= item.end)
+
+
+def test_kis_deferred_cell_reenters_when_calendar_grows(tmp_path: Path) -> None:
+    import json as _json
+
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(3)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
+    _publish_ls_silver(
+        runtime, [(sessions[0], TICKER)],
+        bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"),
+    )
+
+    first = KisInvestorFlowJob()
+    first.pending(ctx)
+    assert first.deferred_tail_cells == 1
+
+    grown = _sessions(4)
+    from src.data.dataset_registry import DatasetRegistry as _Registry
+    from src.data.datasets import DatasetIdentity as _Identity
+    from src.data.datasets import DatasetLayer as _Layer
+    from src.data.datasets import publish_dataset as _publish
+
+    grown_rows = [(day, TICKER) for day in grown]
+    _universe = _publish(
+        layer_root=runtime.workspace.silver_root,
+        identity=_Identity(kind="ordinary_universe", layer=_Layer.SILVER,
+                           policy_version="flow-fixture-v2", inputs={}, params={}),
+        partitions={"part.parquet": pl.DataFrame(
+            {"session": [day for day, _ in grown_rows], "ticker": [t for _, t in grown_rows],
+             "eligible": [True] * len(grown_rows)},
+            schema={"session": pl.Date, "ticker": pl.String, "eligible": pl.Boolean},
+        )},
+    )
+    _daily = _publish(
+        layer_root=runtime.workspace.silver_root,
+        identity=_Identity(kind="daily_market", layer=_Layer.SILVER,
+                           policy_version="flow-fixture-v2", inputs={}, params={}),
+        partitions={"part.parquet": pl.DataFrame(
+            {"session": [day for day, _ in grown_rows], "ticker": [t for _, t in grown_rows],
+             "price_state": ["tradable"] * len(grown_rows)},
+            schema={"session": pl.Date, "ticker": pl.String, "price_state": pl.String},
+        )},
+    )
+    _Registry(runtime.workspace.state_root).register("ordinary_universe", _universe.dataset_id)
+    _Registry(runtime.workspace.state_root).register("daily_market", _daily.dataset_id)
+    second = KisInvestorFlowJob()
+    units = second.pending(ctx)
+    assert second.deferred_tail_cells == 1
+    assert len(units) == 1
+    windows = _json.loads(units[0].payload["windows"])
+    anchors = [end for _, end in windows]
+    assert sessions[2].isoformat() in anchors
+    assert grown[-1].isoformat() not in anchors
+
+
+def test_kis_lag_follows_ls_manifest(tmp_path: Path) -> None:
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(4)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
+    _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"), lag=2)
+
+    job = KisInvestorFlowJob()
+    units = job.pending(ctx)
+    assert job.deferred_tail_cells == 2
+    import json as _json
+
+    anchors = [end for unit in units for _, end in _json.loads(unit.payload["windows"])]
+    assert sessions[-2].isoformat() not in anchors
+    assert sessions[-1].isoformat() not in anchors
+
+
+def test_kis_missing_lag_fails_closed(tmp_path: Path) -> None:
+    import polars as pl
+
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(2)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    collector = _KisStub(sessions)
+    ctx = _kis_ctx(runtime, provider, collector=collector)
+    published = publish_dataset(
+        layer_root=runtime.workspace.silver_root,
+        identity=DatasetIdentity(kind="investor_flow_ls", layer=DatasetLayer.SILVER,
+                                 policy_version="flow-fixture-v1",
+                                 inputs={"bronze_flow": ctx.catalog.blob_digest(source="ls_investor_flow")},
+                                 params={}),
+        partitions={"part.parquet": pl.DataFrame(
+            {"session": [], "ticker": []},
+            schema={"session": pl.Date, "ticker": pl.String},
+        )},
+    )
+    DatasetRegistry(runtime.workspace.state_root).register("investor_flow_ls", published.dataset_id)
+
+    with pytest.raises(PITDataError, match="available_session_lag"):
+        KisInvestorFlowJob().pending(ctx)
+    assert collector.calls == []
+
+
+def test_kis_calendar_not_longer_than_lag(tmp_path: Path) -> None:
+    from src.data.jobs.flow import KisInvestorFlowJob
+
+    sessions = _sessions(1)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    ctx = _kis_ctx(runtime, provider, collector=_KisStub(sessions))
+    _publish_ls_silver(runtime, [], bronze_flow=ctx.catalog.blob_digest(source="ls_investor_flow"))
+
+    job = KisInvestorFlowJob()
+    assert job._pending_windows(ctx) == {}
+    assert job.pending(ctx) == ()
+    assert job.deferred_tail_cells == 1
+
+
+def test_ls_still_fetches_tail(tmp_path: Path) -> None:
+    from src.data.jobs.flow import LsInvestorFlowJob
+
+    sessions = _sessions(3)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+
+    units = LsInvestorFlowJob().pending(_ls_ctx(runtime, provider))
+
+    assert any(unit.payload["start"] <= sessions[-1].isoformat() <= unit.payload["end"] for unit in units)
