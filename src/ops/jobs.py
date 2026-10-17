@@ -51,6 +51,11 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
+
+def _log_job_failure(job: str, exc: BaseException) -> None:
+    """Log the swallowed job exception with its traceback; the job record keeps only the class name."""
+    _LOG.error("[OPS] command=%s status=DEGRADED reason=%s", job, type(exc).__name__, exc_info=exc)
+
 EVENING_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
     {
         "dart_corp_codes",
@@ -313,6 +318,7 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     try:
         report = _run_refresh(root, decision_time=moment, collect=True, collect_steps=EVENING_COLLECT_STEPS)
     except Exception as exc:
+        _log_job_failure("collect_eve", exc)
         _record(root, "collect_eve", "DEGRADED", today, moment, reason=type(exc).__name__)
         return 1
     blocking = getattr(report, "blocking_job", None)
@@ -480,6 +486,7 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
             ctx, dry_run=False, emit=lambda payload: _LOG.debug("refresh %s", dict(payload)), steps=steps,
         )
     except Exception as exc:
+        _log_job_failure("collect_dbsec", exc)
         _record(root, "collect_dbsec", "DEGRADED", today, moment, reason=type(exc).__name__)
         return 1
     metrics = {
@@ -490,6 +497,7 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
     try:
         reconciled, fallback_ready = _reconcile_dbsec_sessions(runtime, now=moment)
     except Exception as exc:
+        _log_job_failure("collect_dbsec", exc)
         _record(
             root, "collect_dbsec", "DEGRADED", today, moment,
             reason=f"reconcile:{type(exc).__name__}"[:300],
@@ -529,6 +537,7 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     try:
         waited = _wait_for_krx(root, data_session, now=now, sleep=sleep, deadline=deadline)
     except Exception as exc:
+        _log_job_failure("morning", exc)
         outcome = "NO_DECISION" if isinstance(exc, PITDataError) else "DEGRADED"
         _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__)
         return 1
@@ -563,6 +572,7 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
                          "node_peak_rss_mb": _node_peak_metrics(build_report)})
         return 1
     except Exception as exc:
+        _log_job_failure("morning", exc)
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
                 metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
                          "node_peak_rss_mb": _node_peak_metrics(build_report)})
@@ -720,6 +730,7 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     try:
         sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
     except Exception as exc:
+        _log_job_failure("backup", exc)
         _ensure_backup_failure_status(status_path, moment)
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
                 metrics={"detail": _failure_detail(exc)})
@@ -727,6 +738,7 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     try:
         pruned = _prune_bronze(root, now=moment)
     except Exception as exc:
+        _log_job_failure("backup", exc)
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
                 metrics={"sources": sorted(sources), "detail": _failure_detail(exc)})
         return 1
