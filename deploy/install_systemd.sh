@@ -21,6 +21,9 @@ _TMP_RUN="$(mktemp "${HOME}/.local/lib/kse/.kse-run.XXXXXX")"
 install -m 0755 "${SRC_DIR}/../kse-run" "${_TMP_RUN}"
 mv -f "${_TMP_RUN}" "${HOME}/.local/lib/kse/kse-run"
 cp "${SRC_DIR}"/kse-*.timer "${SRC_DIR}"/kse-*.service "${DEST_DIR}/"
+# The 2026-10-13 OOM hotfix drop-in pinned a local image and bypassed kse-run; its memory fix (7549e46) ships in :latest.
+rm -f "${DEST_DIR}/kse-backup.service.d/90-lake-backup-memory.conf"
+rmdir "${DEST_DIR}/kse-backup.service.d" 2>/dev/null || true
 
 systemctl --user daemon-reload
 
