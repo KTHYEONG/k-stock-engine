@@ -257,8 +257,57 @@ def test_kind_relay_delivery_path_matches_importer_inbox() -> None:
 
 def test_dbsec_collection_waits_for_collect_eve_and_is_enabled() -> None:
     service = (SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8")
-    assert "ExecStartPre=" in service
-    assert "kse-collect-eve.service" in service.split("ExecStartPre=", 1)[1].splitlines()[0]
+    pres = [line.strip() for line in service.splitlines() if line.strip().startswith("ExecStartPre=")]
+    assert len(pres) == 2
+    assert "kse-collect-eve.service" in pres[1]
     installer = (REPO / "deploy" / "install_systemd.sh").read_text(encoding="utf-8")
     assert "kse-collect-dbsec.timer" in installer
     assert '.cache/dbsec"' in installer
+
+
+def test_dbsec_unit_mounts_host_broker_dir() -> None:
+    start = _exec_start((SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8"))
+    assert "%h/.cache/kis:/app/.cache/kis" in _mounts(start)
+    assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in start
+
+
+def test_dbsec_legacy_mount_is_read_only() -> None:
+    holders: dict[str, list[str]] = {}
+    for path in _services():
+        start = _exec_start(path.read_text(encoding="utf-8"))
+        legacy = [mount for mount in _mounts(start) if mount.startswith("%h/.cache/dbsec:")]
+        if legacy:
+            holders[path.name] = legacy
+    assert holders == {"kse-collect-dbsec.service": ["%h/.cache/dbsec:/app/.cache/dbsec:ro"]}
+    start = _exec_start((SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8"))
+    assert "-e DBSEC_TOKEN_CACHE_DIR=/app/.cache/dbsec" in start
+
+
+def test_dbsec_unit_checks_marker_first() -> None:
+    text = (SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8")
+    pres = [line.strip() for line in text.splitlines() if line.strip().startswith("ExecStartPre=")]
+    assert pres[0] == "ExecStartPre=/usr/bin/test -f %h/.cache/kis/.host-admission"
+    assert "kse-collect-eve.service" in pres[1]
+
+
+def test_dbsec_unit_resources_unchanged() -> None:
+    start = _exec_start((SYSTEMD / "kse-collect-dbsec.service").read_text(encoding="utf-8"))
+    assert _flag(start, "--memory=") == "1g"
+    assert _flag(start, "--memory-swap=") == "1g"
+    assert _flag(start, "--cpus=") == "0.5"
+    assert re.findall(r"--env-file (\S+)", start) == ["%h/quant-secrets/k-stock-engine.env"]
+    assert "kis-data.env" not in start
+    assert "BROKER_ADMISSION_CLASS" not in start
+
+
+def test_broker_dir_units_share_one_container_path() -> None:
+    found = False
+    for path in _services():
+        start = _exec_start(path.read_text(encoding="utf-8"))
+        kis_mounts = [mount for mount in _mounts(start) if mount.startswith("%h/.cache/kis:")]
+        if not kis_mounts:
+            continue
+        found = True
+        assert kis_mounts == ["%h/.cache/kis:/app/.cache/kis"]
+        assert "-e KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in start
+    assert found
