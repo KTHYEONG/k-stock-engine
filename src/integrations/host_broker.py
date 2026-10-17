@@ -10,6 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.config.errors import ConfigError
 from src.config.secrets import read_secret
 from src.integrations.errors import ProviderRetryableError
 from src.integrations.host_broker_contract import (
@@ -50,10 +51,10 @@ class TokenStore(ContractTokenStore):
 
 
 def resolve_broker_dir(dir_env: str) -> Path:
-    """Return the host-shared broker dir for env ``dir_env``."""
+    """Return the host-shared broker dir named by env ``dir_env``; raise ConfigError when it is unset or blank."""
     raw = read_secret(dir_env, default="")
     if not raw.strip():
-        return resolve_host_broker_dir(None)
+        raise ConfigError(f"{dir_env} is unset; the host broker dir must be injected")
     return resolve_host_broker_dir(Path(raw.strip()))
 
 

@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 CONTRACT_VERSION: Final[int] = 1
 VENDOR_IDS: Final[frozenset[str]] = frozenset({"ls", "toss", "dbsec", "kiwoom"})
 HOST_ADMISSION_MARKER: Final[str] = ".host-admission"
-DEFAULT_HOST_BROKER_DIR: Final[Path] = Path("/home/ubuntu/.cache/kis")
 DEFAULT_UNKNOWN_EXPIRY_MAX_AGE_S: Final[float] = 43200.0
 MIN_ISSUE_INTERVAL_S: Final[Mapping[str, float]] = MappingProxyType({"dbsec": 61.0})
 WILDCARD_SCOPE: Final[str] = "*"
@@ -120,13 +119,13 @@ def _validate_scope(scope: str) -> str:
 
 
 def resolve_host_broker_dir(
-    configured: Path | None,
+    configured: Path,
     *,
     require_shared: Literal["auto", "always", "never"] = "auto",
     in_container: bool | None = None,
 ) -> Path:
-    """Return configured (or DEFAULT_HOST_BROKER_DIR); raise HostBrokerDirNotSharedError when enforced and the marker is absent."""
-    directory = Path(configured) if configured is not None else DEFAULT_HOST_BROKER_DIR
+    """Return the caller-injected broker dir; raise HostBrokerDirNotSharedError when enforced and the marker is absent."""
+    directory = Path(configured)
     container = Path("/.dockerenv").exists() if in_container is None else bool(in_container)
     enforced = require_shared == "always" or (require_shared == "auto" and container)
     if enforced and not (directory / HOST_ADMISSION_MARKER).is_file():
@@ -748,7 +747,6 @@ class HostPacer:
 
 __all__ = [
     "CONTRACT_VERSION",
-    "DEFAULT_HOST_BROKER_DIR",
     "DEFAULT_RATES",
     "DEFAULT_UNKNOWN_EXPIRY_MAX_AGE_S",
     "HOST_ADMISSION_MARKER",
