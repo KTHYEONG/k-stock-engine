@@ -191,8 +191,8 @@ def test_ls_window_spans_calendar_sessions(tmp_path: Path) -> None:
     units = LsInvestorFlowJob().pending(_ls_ctx(runtime, provider))
 
     assert [(unit.payload["symbol"], unit.payload["start"], unit.payload["end"]) for unit in units] == [
-        (TICKER, sessions[0].isoformat(), sessions[699].isoformat()),
-        (TICKER, sessions[700].isoformat(), sessions[799].isoformat()),
+        (TICKER, sessions[0].isoformat(), sessions[0].isoformat()),
+        (TICKER, sessions[799].isoformat(), sessions[799].isoformat()),
     ]
     assert all(unit.max_requests == 1 for unit in units)
 
@@ -574,6 +574,15 @@ def test_off_calendar_sessions_fail_closed() -> None:
     with pytest.raises(PITDataError, match="outside the universe calendar"):
         _kis_windows(pending=pending, calendar=(date(2024, 1, 2),), rows_per_page=30)
 
+    trailing = pl.DataFrame(
+        {"session": [date(2024, 1, 2), date(2024, 1, 3)], "ticker": [TICKER, TICKER]},
+        schema={"session": pl.Date, "ticker": pl.String},
+    )
+    with pytest.raises(PITDataError, match="outside the universe calendar"):
+        _ls_units(pending=trailing, calendar=(date(2024, 1, 2),), limit=700)
+    with pytest.raises(PITDataError, match="outside the universe calendar"):
+        _kis_windows(pending=trailing, calendar=(date(2024, 1, 2),), rows_per_page=30)
+
 
 def test_empty_calendar_fails_closed(tmp_path: Path) -> None:
     from src.core.pit import PITDataError
@@ -850,3 +859,147 @@ def test_ls_still_fetches_tail(tmp_path: Path) -> None:
     units = LsInvestorFlowJob().pending(_ls_ctx(runtime, provider))
 
     assert any(unit.payload["start"] <= sessions[-1].isoformat() <= unit.payload["end"] for unit in units)
+
+
+def test_ls_tail_cell_requests_only_the_tail(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from src.data.evidence_sources import LS_FLOW_SOURCE
+    from src.data.jobs.flow import LsInvestorFlowJob
+    from src.data.receipt_catalog import CoverageRange, EvidenceStatus, ReceiptCatalog
+
+    sessions = _sessions(800)
+    runtime = _runtime(tmp_path)
+    provider = _provider()
+    _publish_requirement_sets(runtime, sessions, [TICKER])
+    catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+    catalog.publish(
+        (),
+        ranges=[CoverageRange(
+            source=LS_FLOW_SOURCE, subject=TICKER, start=sessions[0], end=sessions[798],
+            status=EvidenceStatus.EMPTY, content_hash=None,
+            retrieved_at=datetime(2026, 1, 10, tzinfo=UTC),
+        )],
+    )
+
+    units = LsInvestorFlowJob().pending(_ls_ctx(runtime, provider))
+
+    assert [(unit.payload["symbol"], unit.payload["start"], unit.payload["end"]) for unit in units] == [
+        (TICKER, sessions[799].isoformat(), sessions[799].isoformat()),
+    ]
+    assert units[0].max_requests == 1
+
+
+def _ls_pending_frame(days: list[date], ticker: str = TICKER) -> pl.DataFrame:
+    return pl.DataFrame(
+        {"session": days, "ticker": [ticker] * len(days)},
+        schema={"session": pl.Date, "ticker": pl.String},
+    )
+
+
+def test_ls_full_backfill_chunks_at_limit() -> None:
+    from src.data.jobs.flow import _ls_units
+
+    sessions = _sessions(800)
+    units = _ls_units(
+        pending=_ls_pending_frame(sessions), calendar=tuple(sessions), limit=700,
+    )
+
+    assert [(unit.payload["start"], unit.payload["end"]) for unit in units] == [
+        (sessions[0].isoformat(), sessions[699].isoformat()),
+        (sessions[700].isoformat(), sessions[799].isoformat()),
+    ]
+
+
+def test_ls_window_bounds_are_pending_sessions() -> None:
+    from src.data.jobs.flow import _ls_units
+
+    sessions = _sessions(50)
+    pending_days = [sessions[10], sessions[40], sessions[45]]
+    units = _ls_units(
+        pending=_ls_pending_frame(pending_days), calendar=tuple(sessions), limit=700,
+    )
+
+    assert len(units) == 1
+    assert (units[0].payload["start"], units[0].payload["end"]) == (
+        sessions[10].isoformat(), sessions[45].isoformat(),
+    )
+
+
+def test_ls_span_boundary() -> None:
+    from src.data.jobs.flow import _ls_units
+
+    limit = 700
+    sessions = _sessions(limit + 1)
+    close = _ls_units(
+        pending=_ls_pending_frame([sessions[0], sessions[limit - 1]]),
+        calendar=tuple(sessions), limit=limit,
+    )
+    assert len(close) == 1
+    assert (close[0].payload["start"], close[0].payload["end"]) == (
+        sessions[0].isoformat(), sessions[limit - 1].isoformat(),
+    )
+
+    split = _ls_units(
+        pending=_ls_pending_frame([sessions[0], sessions[limit]]),
+        calendar=tuple(sessions), limit=limit,
+    )
+    assert [(unit.payload["start"], unit.payload["end"]) for unit in split] == [
+        (sessions[0].isoformat(), sessions[0].isoformat()),
+        (sessions[limit].isoformat(), sessions[limit].isoformat()),
+    ]
+
+
+def test_ls_natural_key_format_unchanged() -> None:
+    from src.data.jobs.flow import _ls_units
+
+    sessions = _sessions(10)
+    units = _ls_units(
+        pending=_ls_pending_frame([sessions[2], sessions[5]]),
+        calendar=tuple(sessions), limit=700,
+    )
+
+    assert len(units) == 1
+    assert units[0].natural_key == (
+        f"{TICKER}:{sessions[2].isoformat()}:{sessions[5].isoformat()}"
+    )
+    assert units[0].payload == {
+        "symbol": TICKER,
+        "start": sessions[2].isoformat(),
+        "end": sessions[5].isoformat(),
+    }
+
+
+def test_ls_request_count_never_exceeds_block_count() -> None:
+    from src.data.jobs.flow import _ls_units
+
+    calendar = tuple(_sessions(2000))
+    position = {session: index for index, session in enumerate(calendar)}
+    for limit in (1, 7, 700):
+        picked = sorted({(k * 37 + limit * 13) % len(calendar) for k in range(400)})
+        pending_days = [calendar[index] for index in picked]
+        units = _ls_units(
+            pending=_ls_pending_frame(pending_days), calendar=calendar, limit=limit,
+        )
+        blocks = {position[day] // limit for day in pending_days}
+        assert len(units) <= len(blocks)
+        covered = set()
+        for unit in units:
+            start = position[date.fromisoformat(unit.payload["start"])]
+            end = position[date.fromisoformat(unit.payload["end"])]
+            assert end - start <= limit - 1
+            covered.update(
+                day.isoformat() for day in pending_days
+                if start <= position[day] <= end
+            )
+        assert covered == {day.isoformat() for day in pending_days}
+
+
+def test_calendar_span_groups_empty_and_span_validation() -> None:
+    from src.core.pit import PITDataError
+    from src.data.jobs.flow import _calendar_span_groups
+
+    assert _calendar_span_groups([], position={}, span=700) == ()
+    for bad in (0, -1, True, "700", 7.0):
+        with pytest.raises(PITDataError):
+            _calendar_span_groups([date(2020, 1, 1)], position={date(2020, 1, 1): 0}, span=bad)
