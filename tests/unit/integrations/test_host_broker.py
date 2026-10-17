@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from src.config.errors import ConfigError
+
 from src.integrations import host_broker as hb
 
 
@@ -55,12 +57,11 @@ def test_broker_dir_from_env(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("X_DIR", str(marked))
     assert hb.resolve_broker_dir("X_DIR") == marked
     monkeypatch.delenv("X_DIR")
-    default = tmp_path / "default"
-    monkeypatch.setattr(hb.resolve_host_broker_dir.__globals__["Path"], "exists", lambda _p: False)
-    monkeypatch.setitem(hb.resolve_host_broker_dir.__globals__, "DEFAULT_HOST_BROKER_DIR", default)
-    assert hb.resolve_broker_dir("X_DIR") == default
+    with pytest.raises(ConfigError, match="X_DIR"):
+        hb.resolve_broker_dir("X_DIR")
     monkeypatch.setenv("X_DIR", "   ")
-    assert hb.resolve_broker_dir("X_DIR") == default
+    with pytest.raises(ConfigError, match="X_DIR"):
+        hb.resolve_broker_dir("X_DIR")
 
 
 def test_undeclared_rate_fails_closed() -> None:
