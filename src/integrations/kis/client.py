@@ -150,7 +150,7 @@ class KisClient:
             session=self.session,
             sleep=lambda seconds: time.sleep(seconds),
             monotonic=lambda: time.monotonic(),
-            host_pacer=_LimiterPacer(limiter) if limiter is not None else None,  # type: ignore[arg-type]
+            host_pacer=_LimiterPacer(limiter) if limiter is not None else None,
         )
 
     def _sync_session(self) -> None:
