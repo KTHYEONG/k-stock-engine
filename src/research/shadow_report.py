@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import polars as pl
@@ -29,6 +30,28 @@ def _price_of(payload: Any, keys: tuple[str, ...]) -> int | None:
         if parsed > 0:
             return parsed
     return None
+
+
+def _expected_block(raw: Any) -> dict[str, Any] | None:
+    """The expected-auction mapping from a stored ``output2`` JSON string."""
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        return parsed[0]
+    return None
+
+
+def _expected_price(block: Mapping[str, Any]) -> int | None:
+    """Positive integer ``antc_cnpr`` or None."""
+    try:
+        parsed = int(str(block.get("antc_cnpr", "")).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def slippage_table(
@@ -68,17 +91,20 @@ def slippage_table(
     expected: dict[tuple[Any, str, int], int] = {}
     if auction.height and {"session", "symbol", "kind", "scheduled_at", "output1"} <= set(auction.columns):
         for row in auction.to_dicts():
-            try:
-                payload = json.loads(row["output1"])
-            except (TypeError, ValueError):
-                continue
             key = (row["session"], str(row["symbol"]))
             if row["kind"] == "open":
+                try:
+                    payload = json.loads(row["output1"])
+                except (TypeError, ValueError):
+                    continue
                 printed = _price_of(payload, ("stck_oprc",))
                 if printed is not None:
                     captured[key] = printed
             elif row["kind"] == "expected":
-                exp_price = _price_of(payload, ("antc_cnpr", "stck_oprc"))
+                block = _expected_block(row.get("output2"))
+                if block is None:
+                    continue
+                exp_price = _expected_price(block)
                 if exp_price is None:
                     continue
                 try:

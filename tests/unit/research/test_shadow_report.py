@@ -51,12 +51,14 @@ def _auction(*, captured: int = 10000, expected: int | None = 9950) -> pl.DataFr
         {
             "session": DAY, "symbol": "005930", "kind": "expected",
             "scheduled_at": OPEN - timedelta(minutes=1), "received_at": OPEN - timedelta(minutes=1),
-            "output1": json.dumps({"antc_cnpr": str(expected)}), "output2": "[]",
+            "output1": json.dumps({"askp1": "9940", "bidp1": "9950"}),
+            "output2": json.dumps({"antc_cnpr": str(expected), "stck_oprc": "0"}),
         },
         {
             "session": DAY, "symbol": "000660", "kind": "expected",
             "scheduled_at": OPEN - timedelta(minutes=1), "received_at": OPEN - timedelta(minutes=1),
-            "output1": json.dumps({"antc_cnpr": str(expected)}), "output2": "[]",
+            "output1": json.dumps({"askp1": "9940", "bidp1": "9950"}),
+            "output2": json.dumps({"antc_cnpr": str(expected), "stck_oprc": "0"}),
         },
         {
             "session": DAY, "symbol": "005930", "kind": "open",
@@ -165,3 +167,153 @@ def test_unparseable_cells_skipped() -> None:
     assert by_inst["KRX:005930"]["official_open"] == 10000
     assert by_inst["KRX:005930"]["notional_over_adtv20"] is None
     assert by_inst["KRX:000660"]["official_open"] is None
+
+
+def _expected_auction(*, output1: str, output2: str | None, offset_min: int = 1) -> pl.DataFrame:
+    rows = [
+        {
+            "session": DAY, "symbol": "005930", "kind": "expected",
+            "scheduled_at": OPEN - timedelta(minutes=offset_min), "received_at": OPEN - timedelta(minutes=offset_min),
+            "output1": output1, "output2": output2,
+        },
+        {
+            "session": DAY, "symbol": "000660", "kind": "expected",
+            "scheduled_at": OPEN - timedelta(minutes=offset_min), "received_at": OPEN - timedelta(minutes=offset_min),
+            "output1": output1, "output2": output2,
+        },
+        {
+            "session": DAY, "symbol": "005930", "kind": "open",
+            "scheduled_at": OPEN, "received_at": OPEN,
+            "output1": json.dumps({"stck_oprc": "10000"}), "output2": "{}",
+        },
+        {
+            "session": DAY, "symbol": "000660", "kind": "open",
+            "scheduled_at": OPEN, "received_at": OPEN,
+            "output1": json.dumps({"stck_oprc": "10000"}), "output2": "{}",
+        },
+    ]
+    return pl.DataFrame(
+        rows,
+        schema={"session": pl.Date, "symbol": pl.String, "kind": pl.String,
+                "scheduled_at": pl.Datetime("us", "Asia/Seoul"), "received_at": pl.Datetime("us", "Asia/Seoul"),
+                "output1": pl.String, "output2": pl.String},
+    )
+
+
+def test_expected_price_read_from_output2_object() -> None:
+    from src.research.shadow_report import slippage_table
+
+    table = slippage_table(_fills(), _auction(), _market(), _rules())
+    by_inst = {row["instrument_id"]: row for row in table.to_dicts()}
+    assert by_inst["KRX:005930"]["expected_minus_open_ticks_m1"] == -5.0
+    assert by_inst["KRX:000660"]["expected_minus_open_ticks_m1"] == 5.0
+
+
+def test_expected_price_from_list_shaped_output2() -> None:
+    from src.research.shadow_report import slippage_table
+
+    output2 = json.dumps([{"antc_cnpr": "9950"}])
+    table = slippage_table(_fills(), _expected_auction(output1=json.dumps({"askp1": "1"}), output2=output2), _market(), _rules())
+    by_inst = {row["instrument_id"]: row for row in table.to_dicts()}
+    assert by_inst["KRX:005930"]["expected_minus_open_ticks_m1"] == -5.0
+    assert by_inst["KRX:000660"]["expected_minus_open_ticks_m1"] == 5.0
+
+
+def test_zero_antc_cnpr_is_missing() -> None:
+    from src.research.shadow_report import slippage_table
+
+    output2 = json.dumps({"antc_cnpr": "0", "stck_oprc": "10000"})
+    table = slippage_table(_fills(), _expected_auction(output1=json.dumps({"askp1": "1"}), output2=output2), _market(), _rules())
+    assert table["expected_minus_open_ticks_m1"].to_list() == [None, None]
+    for bad_value in ("abc", "", "  ", None):
+        bad_block = json.dumps({"antc_cnpr": bad_value, "stck_oprc": "10000"})
+        bad_table = slippage_table(
+            _fills(), _expected_auction(output1=json.dumps({"askp1": "1"}), output2=bad_block), _market(), _rules()
+        )
+        assert bad_table["expected_minus_open_ticks_m1"].to_list() == [None, None]
+    missing = json.dumps({"stck_oprc": "10000"})
+    missing_table = slippage_table(
+        _fills(), _expected_auction(output1=json.dumps({"askp1": "1"}), output2=missing), _market(), _rules()
+    )
+    assert missing_table["expected_minus_open_ticks_m1"].to_list() == [None, None]
+
+
+def test_output1_antc_cnpr_ignored() -> None:
+    from src.research.shadow_report import slippage_table
+
+    table = slippage_table(
+        _fills(),
+        _expected_auction(output1=json.dumps({"antc_cnpr": "9950"}), output2="[]"),
+        _market(), _rules(),
+    )
+    assert table["expected_minus_open_ticks_m1"].to_list() == [None, None]
+
+
+def test_malformed_output2_skipped() -> None:
+    from src.research.shadow_report import slippage_table
+
+    for bad in ("not json", "[]", "[1]", "5", None):
+        table = slippage_table(_fills(), _expected_auction(output1=json.dumps({"askp1": "1"}), output2=bad), _market(), _rules())
+        assert table["expected_minus_open_ticks_m1"].to_list() == [None, None]
+        assert table["captured_open"].to_list() == [10000, 10000]
+
+
+def test_invalid_output1_does_not_drop_expected() -> None:
+    from src.research.shadow_report import slippage_table
+
+    output2 = json.dumps({"antc_cnpr": "9950", "stck_oprc": "0"})
+    table = slippage_table(_fills(), _expected_auction(output1="not json", output2=output2), _market(), _rules())
+    by_inst = {row["instrument_id"]: row for row in table.to_dicts()}
+    assert by_inst["KRX:005930"]["expected_minus_open_ticks_m1"] == -5.0
+    assert by_inst["KRX:000660"]["expected_minus_open_ticks_m1"] == 5.0
+
+
+def test_frame_without_output2_column() -> None:
+    from src.research.shadow_report import slippage_table
+
+    auction = _auction().drop("output2")
+    assert "output2" not in auction.columns
+    table = slippage_table(_fills(), auction, _market(), _rules())
+    assert table["captured_open"].to_list() == [10000, 10000]
+    for offset in (-20, -10, -5, -2, -1):
+        assert table[f"expected_minus_open_ticks_m{abs(offset)}"].to_list() == [None, None]
+
+
+def test_all_offsets_populated() -> None:
+    from src.core.time import OPEN_SNAPSHOT_OFFSETS_MIN
+
+    from src.research.shadow_report import slippage_table
+
+    rows: list[dict[str, object]] = []
+    for symbol in ("005930", "000660"):
+        for offset in OPEN_SNAPSHOT_OFFSETS_MIN:
+            antc = 10000 + int(offset) * 10
+            rows.append(
+                {
+                    "session": DAY, "symbol": symbol, "kind": "expected",
+                    "scheduled_at": OPEN + timedelta(minutes=int(offset)),
+                    "received_at": OPEN + timedelta(minutes=int(offset)),
+                    "output1": json.dumps({"askp1": "1"}),
+                    "output2": json.dumps({"antc_cnpr": str(antc), "stck_oprc": "0"}),
+                }
+            )
+    rows.extend(
+        {
+            "session": DAY, "symbol": symbol, "kind": "open",
+            "scheduled_at": OPEN, "received_at": OPEN,
+            "output1": json.dumps({"stck_oprc": "10000"}), "output2": "{}",
+        }
+        for symbol in ("005930", "000660")
+    )
+    auction = pl.DataFrame(
+        rows,
+        schema={"session": pl.Date, "symbol": pl.String, "kind": pl.String,
+                "scheduled_at": pl.Datetime("us", "Asia/Seoul"), "received_at": pl.Datetime("us", "Asia/Seoul"),
+                "output1": pl.String, "output2": pl.String},
+    )
+    table = slippage_table(_fills(), auction, _market(), _rules())
+    by_inst = {row["instrument_id"]: row for row in table.to_dicts()}
+    for offset in OPEN_SNAPSHOT_OFFSETS_MIN:
+        col = f"expected_minus_open_ticks_m{abs(int(offset))}"
+        assert by_inst["KRX:005930"][col] == float(int(offset))
+        assert by_inst["KRX:000660"][col] == float(-int(offset))
