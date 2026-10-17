@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -26,6 +27,7 @@ from src.integrations.host_broker import (
     open_token_store,
     resolve_broker_dir,
 )
+from src.integrations.oauth import ClientCredentialsGrant, issue_client_credentials_token
 from src.integrations.quota import LedgerQuotaGate, ProviderQuotaStateStore
 from src.integrations.transport import HostSlotGate, HttpTransport, RetryPolicy
 
@@ -48,6 +50,7 @@ _TICKER_SCOPE: Final = "quote"
 _CHART_SCOPE: Final = "chart"
 _TIMEOUT_SECONDS: Final = 15.0
 _TOKEN_TIMEOUT_SECONDS: Final = 10.0
+_TOKEN_THROTTLE_RSP_CODES: Final = frozenset({"IGW00201"})
 _MAX_HTTP_ATTEMPTS: Final = 3
 _SUCCESS_RSP_CD: Final = "00000"
 _LEGACY_FILENAME: Final = "dbsec_token_prod.json"
@@ -131,20 +134,21 @@ class DbsecTokenStore:
             return None
         return token
 
-    def _wrap_issue(self, issue: Callable[[], tuple[str, int]]) -> Callable[[], IssuedToken]:
+    def _wrap_issue(self, issue: Callable[[], IssuedToken]) -> Callable[[], IssuedToken]:
         def _issue() -> IssuedToken:
-            token, expires_in = issue()
-            if float(expires_in) <= self._expiry_margin:
+            issued = issue()
+            expires = issued.expires_in_seconds
+            if expires is None or not math.isfinite(expires) or expires <= self._expiry_margin:
                 raise ProviderTerminalError(
                     f"{_PROVIDER} token expiry too short for {_TOKEN_ENDPOINT}",
                     provider=_PROVIDER,
                     endpoint=_TOKEN_ENDPOINT,
                 )
-            return IssuedToken(token, float(expires_in))
+            return issued
 
         return _issue
 
-    def get_or_issue(self, issue: Callable[[], tuple[str, int]], *, reject: str | None = None) -> str:
+    def get_or_issue(self, issue: Callable[[], IssuedToken], *, reject: str | None = None) -> str:
         """Return a usable token, issuing through the host-shared store when needed."""
         try:
             if reject is None:
@@ -221,63 +225,21 @@ class DbsecClient:
             host_pacer=AdmissionSlot(broker_dir, "dbsec", app_key),
         )
 
-    def _issue_token(self) -> tuple[str, int]:
-        try:
-            response = self._session.post(
-                f"{_BASE_URL}/{_TOKEN_ENDPOINT}",
-                data={
-                    "grant_type": "client_credentials",
-                    "appkey": self._credentials.app_key,
-                    "appsecretkey": self._credentials.app_secret,
-                    "scope": "oob",
-                },
-                timeout=_TOKEN_TIMEOUT_SECONDS,
-            )
-        except requests.RequestException as exc:
-            raise ProviderRetryableError(
-                f"{_PROVIDER} token issuance failed for {_TOKEN_ENDPOINT}",
+    def _issue_token(self) -> IssuedToken:
+        return issue_client_credentials_token(
+            self._session,
+            ClientCredentialsGrant(
                 provider=_PROVIDER,
+                url=f"{_BASE_URL}/{_TOKEN_ENDPOINT}",
                 endpoint=_TOKEN_ENDPOINT,
-            ) from exc
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ProviderRetryableError(
-                f"{_PROVIDER} token issuance returned invalid JSON for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            ) from exc
-        if not isinstance(data, Mapping):
-            raise ProviderTerminalError(
-                f"{_PROVIDER} token issuance returned non-object for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            )
-        rsp_cd = str(data.get("rsp_cd", "") or "").strip()
-        if rsp_cd == "IGW00201":
-            raise ProviderRetryableError(
-                f"{_PROVIDER} token issuance throttled for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            )
-        token = data.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise ProviderTerminalError(
-                f"{_PROVIDER} token issuance failed for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            )
-        expires_in = data.get("expires_in")
-        try:
-            if isinstance(expires_in, bool):
-                raise TypeError
-            return token, int(expires_in)  # type: ignore[arg-type]
-        except (TypeError, ValueError) as exc:
-            raise ProviderTerminalError(
-                f"{_PROVIDER} token issuance returned no valid expires_in for {_TOKEN_ENDPOINT}",
-                provider=_PROVIDER,
-                endpoint=_TOKEN_ENDPOINT,
-            ) from exc
+                timeout_seconds=_TOKEN_TIMEOUT_SECONDS,
+                require_http_ok=False,
+                throttle_rsp_codes=_TOKEN_THROTTLE_RSP_CODES,
+                default_expires_in_seconds=None,
+            ),
+            app_key=self._credentials.app_key,
+            app_secret=self._credentials.app_secret,
+        )
 
     def _hooks(self, endpoint: str, parsed: list[dict[str, Any]]) -> Callable[[requests.Response], None]:
         def _hook(response: requests.Response) -> None:

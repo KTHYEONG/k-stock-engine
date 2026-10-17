@@ -15,7 +15,7 @@ from src.config.secrets import read_secret
 from src.core.market_rules import KrxMarket, KrxMarketRules
 from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
 from src.integrations.kis.admission import HostPacedLimiter, SharedTokenStore
-from src.integrations.transport import HttpTransport, RetryPolicy, TokenCache
+from src.integrations.transport import HttpTransport, RetryPolicy
 
 
 @dataclass
@@ -139,7 +139,6 @@ class KisClient:
         )
         cache_dir = token_cache_dir if token_cache_dir is not None else load_runtime_config().logs_root
         self._token_cache_path = Path(cache_dir) / f"kis_token_{self.creds.env}.json"
-        self.token_cache = TokenCache(cache_dir, provider="kis", env=self.creds.env)
         self._transport = HttpTransport(
             provider="KIS",
             base_url=self.base_url,
