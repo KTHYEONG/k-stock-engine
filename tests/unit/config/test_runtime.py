@@ -47,6 +47,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
     assert config.engine == repo / "config" / "backtest" / "default_engine.toml"
     assert config.futures_constants == repo / "config" / "market" / "futures.toml"
     assert config.champion_file == repo / "config" / "research" / "champion.toml"
+    assert config.live_gate == repo / "config" / "research" / "live_gate.toml"
     for path in (
         config.data_root,
         config.default_scope,
@@ -59,6 +60,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
         config.engine,
         config.research_protocol,
         config.futures_constants,
+        config.live_gate,
     ):
         assert path.is_absolute()
 
@@ -123,6 +125,7 @@ def test_missing_referenced_file_fails_closed_with_key_name(tmp_path: Path) -> N
         ("research_protocol", "config/research/protocol.toml"),
         ("futures_constants", "config/market/futures.toml"),
         ("champion_file", "config/research/champion.toml"),
+        ("live_gate", "config/research/live_gate.toml"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
     document = document.replace(
@@ -167,6 +170,7 @@ def test_missing_champion_file_loads_but_missing_futures_fails(tmp_path: Path) -
         ("research_protocol", "config/research/protocol.toml"),
         ("futures_constants", "config/market/futures.toml"),
         ("champion_file", "config/research/champion.toml"),
+        ("live_gate", "config/research/live_gate.toml"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
     (tmp_path / "config" / "market").mkdir(parents=True)
