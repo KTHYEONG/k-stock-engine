@@ -53,6 +53,12 @@ class QuotaGate(Protocol):
         ...
 
 
+class HostSlotGate(Protocol):
+    """Cross-process admission hook awaited before every HTTP attempt."""
+
+    def wait_turn(self) -> None: ...
+
+
 class HostPacer:
     """Cross-process minimum spacing between attempts that share one host-level rate limit.
 
@@ -177,7 +183,7 @@ class HttpTransport:
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
-        host_pacer: HostPacer | None = None,
+        host_pacer: HostSlotGate | None = None,
     ) -> None:
         self._provider = provider
         self._base_url = base_url.rstrip("/")
