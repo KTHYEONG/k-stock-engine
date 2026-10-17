@@ -7,12 +7,22 @@ import json
 import logging
 import sys
 import tempfile
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
+
+__all__ = [
+    "InvestorFlowSilverPolicy",
+    "InvestorFlowSilverResult",
+    "flow_availability_frame",
+    "flow_tail_sessions",
+    "materialize_investor_flow_silver",
+    "parse_fingerprint",
+]
 
 import polars as pl
 
@@ -243,6 +253,36 @@ def _encode_page(symbol: str, content: _PageContent) -> dict[str, Any]:
     }
 
 
+def _check_availability_lag(lag: Any) -> int:
+    if isinstance(lag, bool) or not isinstance(lag, int) or lag < 1:
+        raise PITDataError("investor-flow availability lag must be a positive integer")
+    return lag
+
+
+def flow_availability_frame(calendar: Sequence[date], *, lag: int) -> pl.DataFrame:
+    """Map each calendar session to the session ``lag`` positions later."""
+    checked = _check_availability_lag(lag)
+    ordered = list(calendar)
+    return pl.DataFrame(
+        {
+            "session": ordered,
+            "available_session": [
+                ordered[index + checked] if index + checked < len(ordered) else None
+                for index in range(len(ordered))
+            ],
+        },
+        schema={"session": pl.Date, "available_session": pl.Date},
+    )
+
+
+def flow_tail_sessions(calendar: Sequence[date], *, lag: int) -> frozenset[date]:
+    """Sessions whose flow has no availability session yet under ``lag``."""
+    frame = flow_availability_frame(calendar, lag=lag)
+    if frame.height == 0:
+        return frozenset()
+    return frozenset(frame.filter(pl.col("available_session").is_null())["session"].to_list())
+
+
 def _is_plain_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -451,17 +491,7 @@ def materialize_investor_flow_silver(
             },
             schema={"session": pl.Date, "ticker": pl.String},
         )
-        lag = policy.available_session_lag
-        availability = pl.DataFrame(
-            {
-                "session": list(calendar),
-                "available_session": [
-                    calendar[index + lag] if index + lag < len(calendar) else None
-                    for index in range(len(calendar))
-                ],
-            },
-            schema={"session": pl.Date, "available_session": pl.Date},
-        )
+        availability = flow_availability_frame(calendar, lag=policy.available_session_lag)
         shards = sorted(shard_dir.glob("shard-*.parquet"))
         with PartitionSpool() as spool:
             for year in sorted({session.year for session in calendar}):

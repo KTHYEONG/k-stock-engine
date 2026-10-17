@@ -230,16 +230,18 @@ def _run_kis_flow_job(args: argparse.Namespace) -> dict[str, object]:
     def _emit(payload: Mapping[str, object]) -> None:
         sys.stdout.write(json.dumps(dict(payload), sort_keys=True, default=str) + "\n")
 
+    job = KisInvestorFlowJob(since=getattr(args, "since", None))
     report = run_job(
-        KisInvestorFlowJob(since=getattr(args, "since", None)), ctx, chunk_size=KIS_CHUNK_SIZE,
+        job, ctx, chunk_size=KIS_CHUNK_SIZE,
         max_chunks=getattr(args, "max_chunks", None), dry_run=dry_run, emit=_emit,
     )
     _LOG.info(
-        "[DATA] command=kis_investor_flow status=%s done=%d pending_left=%d requests_used=%d",
-        report.status, report.done, report.pending_left, report.requests_used,
+        "[DATA] command=kis_investor_flow status=%s done=%d pending_left=%d requests_used=%d deferred_tail_cells=%d",
+        report.status, report.done, report.pending_left, report.requests_used, job.deferred_tail_cells,
     )
     return {"job": "kis_investor_flow", "status": report.status,
-            "done": report.done, "pending_left": report.pending_left, "requests_used": report.requests_used}
+            "done": report.done, "pending_left": report.pending_left, "requests_used": report.requests_used,
+            "deferred_tail_cells": job.deferred_tail_cells}
 
 
 def _add_dry_run_max_chunks(parser: argparse.ArgumentParser) -> None:
