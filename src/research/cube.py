@@ -182,6 +182,7 @@ def research_cube_id(inputs: CubeInputs, *, first_session: date | None = None) -
 
 
 def _decision_at(session_day: date) -> datetime:
+    # Session-grid decision clock (18:00 KST), not the real seal time; paired with Silver available_at stamps.
     return datetime(session_day.year, session_day.month, session_day.day, 18, 0, tzinfo=KRX_TZ)
 
 
@@ -701,6 +702,9 @@ def assemble_flows(
     flows: pl.DataFrame, close: NDArray[np.float64], *, sessions: Sequence[date], instrument_ids: Sequence[str]
 ) -> dict[str, NDArray[np.float64]]:
     """Accumulate investor net-share flows into KRW at their availability session.
+
+    Row ``s`` receives flow whose ``available_at`` falls in ``(decision(s-1), decision(s)]``; with Silver's
+    next-session 08:00 stamp that is exactly flow of the previous session.
 
     Vectorized over the full flow history (millions of rows): building per-row Python objects
     would exceed the cube's memory budget.

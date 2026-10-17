@@ -364,7 +364,7 @@ def _decide_context(args: argparse.Namespace, tail_sessions: int) -> Any:  # pra
         cash_returns=cash_returns,
         trend_inputs=trend_inputs,
     )
-    return SimpleNamespace(pipeline=Pipeline(context), context=context, cube=cube, inputs=inputs)
+    return SimpleNamespace(pipeline=Pipeline(context), context=context, cube=cube, inputs=inputs, runtime=runtime)
 
 
 def _scorer_for(models_dir: Path, year: int, expected_hash: str) -> Any:
@@ -467,6 +467,20 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
             from src.core.pit import PITDataError
 
             raise PITDataError(f"trend series is missing at {sessions[pos].isoformat()}")
+    from src.research.panel import feature_names_for
+
+    if any(name.startswith("fl_") for name in feature_names_for(spec.scorer.feature_set)):
+        from src.config.live_gate import load_live_gate_policy
+        from src.config.runtime import load_runtime_config
+        from src.data.investor_flow_freshness import check_investor_flow_freshness
+
+        check_investor_flow_freshness(
+            runtime=resolved.runtime,
+            flow_dataset_dir=resolved.inputs.investor_flow,
+            source_sessions=[sessions[pos - 1] for pos in new_positions],
+            seal_time=ctx.now(),
+            policy=load_live_gate_policy(load_runtime_config().live_gate),
+        )
     by_year: dict[int, list[int]] = {}
     for pos in new_positions:
         by_year.setdefault(sessions[pos].year, []).append(pos)

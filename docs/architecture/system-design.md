@@ -139,6 +139,7 @@ flowchart LR
 * **시점 일치 뷰어 (`PITView`)**:
   - 의사결정 시점(18:00 KST) 이전에 가용한 데이터만을 `bisect_right` 이진 탐색으로 분할 제공.
   - 마켓 시세 배열은 `writeable = False` 속성을 강제하여 전략 계층에서의 임의 수정을 구조적으로 방지.
+  - Session-grid clock pair: Silver flow `available_at = next session 08:00` meets the cube decision clock `18:00`, while the real provider landing (`~18:31 LS` / `~19:46 KIS` next day) and the real seal (`~08:54`) both sit later; change both conventions or neither, or causality (lookahead) and freshness (extra lag) break.
 
 ---
 

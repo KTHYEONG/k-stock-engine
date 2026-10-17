@@ -1,4 +1,10 @@
-"""Silver investor-flow dataset built from catalog-selected LS t1702 rows."""
+"""Silver investor-flow dataset built from catalog-selected LS t1702 rows.
+
+Availability contract: ``available_at`` is the session-grid stamp ``next_session(s) + available_time``
+(default lag 1, 08:00 KST), paired with the cube decision clock (session 18:00 KST) so flow of ``s`` is
+first usable on row ``next(s)``. It is not the provider landing time; moving either convention alone
+creates lookahead or adds a session of staleness.
+"""
 
 from __future__ import annotations
 
@@ -91,6 +97,9 @@ _SCHEMA: dict[str, Any] = {
 @dataclass(frozen=True, slots=True)
 class InvestorFlowSilverPolicy:
     """Availability contract for per-investor daily flows.
+
+    ``available_time`` must stay at or before the cube decision clock time (18:00 KST);
+    documented here, not enforced.
 
     Attributes:
         available_session_lag: Sessions after the flow session before the row
