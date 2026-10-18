@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from src.core.pit import EvidenceKind, PITDataError
 from src.data.investor_flow_silver import REVISION as INVESTOR_FLOW_SILVER_REVISION
 from src.data.investor_flow_silver import (
     InvestorFlowSilverPolicy,
+    InvestorFlowSilverResult,
     materialize_investor_flow_silver,
 )
 from src.data.receipt_catalog import BlobEntry, ReceiptCatalog
@@ -888,3 +890,502 @@ def test_tail_sessions_match_frame() -> None:
         )
         assert flow_tail_sessions(list(SESSIONS), lag=lag) == expected
     assert flow_tail_sessions([], lag=1) == frozenset()
+
+
+BUCKET_SESSIONS = (date(2025, 12, 29), date(2025, 12, 30), date(2026, 1, 2), date(2026, 1, 5))
+BUCKET_TICKERS = ("005930", "000660", "035420", "005380", "051910", "068270")
+
+
+def _write_universe_sessions(universe_root: Path, sessions: tuple[date, ...]) -> Path:
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    return publish_dataset(
+        layer_root=Path(universe_root),
+        identity=DatasetIdentity(
+            kind="ordinary_universe",
+            layer=DatasetLayer.SILVER,
+            policy_version="krx-ordinary-equity-v1",
+            inputs={},
+            params={"calendar": ",".join(day.isoformat() for day in sessions)},
+        ),
+        partitions={
+            f"session={day.isoformat()}/part.parquet": pl.DataFrame(
+                {"session": [day], "instrument_id": ["KRX:005930"], "ticker": ["005930"], "eligible": [True]}
+            )
+            for day in sessions
+        },
+    ).path
+
+
+def _bucket_roots(tmp_path: Path) -> tuple[Path, Path, Path, ReceiptCatalog]:
+    bronze_root = tmp_path / "bronze"
+    universe_root = tmp_path / "silver"
+    silver_root = tmp_path / "silver"
+    _write_universe_sessions(universe_root, BUCKET_SESSIONS)
+    return bronze_root, universe_root, silver_root, ReceiptCatalog(bronze_root / "catalog")
+
+
+def _conflict_variant(base: dict[str, object]) -> dict[str, object]:
+    variant = dict(base)
+    variant["tjj0000"] = "-99"
+    variant["tjj0001"] = "-51"
+    return variant
+
+
+def _seed_shared_fixture(catalog: ReceiptCatalog, bronze_root: Path) -> None:
+    days = [day.strftime("%Y%m%d") for day in BUCKET_SESSIONS]
+    start, end = BUCKET_SESSIONS[0].isoformat(), BUCKET_SESSIONS[-1].isoformat()
+    for ticker in BUCKET_TICKERS:
+        _seed_blob(
+            catalog, bronze_root,
+            _ls_payload(ticker, [_row(days[0]), _row(days[1])], start=start, end=end),
+        )
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_envelope("005930", [_row(days[0]), _row(days[1])], start=start, end=end),
+    )
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload(
+            "000660",
+            [_row(days[0]), _conflict_variant(_row(days[1])), _row(days[2], volume="100")],
+            start=start, end=end,
+        ),
+    )
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("000660", [_row(days[0]), _row(days[1]), _row(days[2], volume="100")], start=start, end=end),
+    )
+    bad = _row(days[2], tjj0000="-99")
+    _seed_blob(catalog, bronze_root, _ls_payload("035420", [bad, _row(days[3])], start=start, end=end))
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005380", [_row(days[3])], start=start, end=end),
+    )
+
+
+def _snapshot(dataset_path: Path) -> tuple[str, list[tuple[str, int, str]], dict[str, object]]:
+    from src.data.datasets import load_manifest
+
+    manifest = load_manifest(dataset_path)
+    return (
+        manifest.dataset_id,
+        [(part.path, part.rows, part.sha256) for part in manifest.partitions],
+        dict(manifest.details),
+    )
+
+
+def _result_key(result: InvestorFlowSilverResult) -> dict[str, object]:
+    return {key: value for key, value in asdict(result).items() if key != "dataset_path"}
+
+
+def test_bucket_count_one_equals_legacy_default(tmp_path: Path) -> None:
+    bronze_root, universe_root, _, catalog = _bucket_roots(tmp_path)
+    _seed_shared_fixture(catalog, bronze_root)
+    silver_default = tmp_path / "silver-default"
+    silver_one = tmp_path / "silver-one"
+    for path in (silver_default, silver_one):
+        _write_universe_sessions(path, BUCKET_SESSIONS)
+    default = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_default, workers=1
+    )
+    explicit = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_one, workers=1, ticker_buckets=1
+    )
+    assert _snapshot(default.dataset_path)[0] == _snapshot(explicit.dataset_path)[0]
+    assert _snapshot(default.dataset_path)[1] == _snapshot(explicit.dataset_path)[1]
+    assert _snapshot(default.dataset_path)[2] == _snapshot(explicit.dataset_path)[2]
+    assert _result_key(default) == _result_key(explicit)
+
+
+def test_bucketed_output_is_byte_identical(tmp_path: Path) -> None:
+    bronze_root, universe_root, _, catalog = _bucket_roots(tmp_path)
+    _seed_shared_fixture(catalog, bronze_root)
+    snapshots: list[tuple[str, list[tuple[str, int, str]], dict[str, object]]] = []
+    keys = []
+    for buckets in (1, 2, 3, 7, 64):
+        silver = tmp_path / f"silver-{buckets}"
+        _write_universe_sessions(silver, BUCKET_SESSIONS)
+        result = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver, workers=1, ticker_buckets=buckets
+        )
+        snapshots.append(_snapshot(result.dataset_path))
+        keys.append(_result_key(result))
+    for snapshot in snapshots[1:]:
+        assert snapshot == snapshots[0]
+    for key in keys[1:]:
+        assert key == keys[0]
+
+
+def test_rebuild_with_different_bucket_count_is_noop(tmp_path: Path) -> None:
+    bronze_root, universe_root, silver_root, catalog = _bucket_roots(tmp_path)
+    _seed_shared_fixture(catalog, bronze_root)
+    first = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1, ticker_buckets=1
+    )
+    before = {
+        path.relative_to(first.dataset_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in first.dataset_path.rglob("*") if path.is_file()
+    }
+    second = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1, ticker_buckets=8
+    )
+    assert second.dataset_id == first.dataset_id
+    assert second.dataset_path == first.dataset_path
+    assert {
+        path.relative_to(second.dataset_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in second.dataset_path.rglob("*") if path.is_file()
+    } == before
+
+
+def test_single_ticker_single_year_many_buckets(tmp_path: Path) -> None:
+    bronze_root, universe_root, _, catalog = _bucket_roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20251229"), _row("20251230")], start="2025-12-29", end="2026-01-05"),
+    )
+    expected_roots = []
+    for buckets in (1, 8):
+        silver = tmp_path / f"silver-{buckets}"
+        _write_universe_sessions(silver, BUCKET_SESSIONS)
+        expected_roots.append(
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver, workers=1,
+                ticker_buckets=buckets,
+            )
+        )
+    assert _snapshot(expected_roots[0].dataset_path) == _snapshot(expected_roots[1].dataset_path)
+    assert [part[0] for part in _snapshot(expected_roots[1].dataset_path)[1]] == ["year=2025/part.parquet"]
+
+
+def test_empty_year_publishes_no_partition(tmp_path: Path) -> None:
+    sessions = BUCKET_SESSIONS
+    bronze_root = tmp_path / "bronze"
+    universe_root = tmp_path / "silver"
+    silver_one = tmp_path / "silver-one"
+    silver_four = tmp_path / "silver-four"
+    _write_universe_sessions(universe_root, sessions)
+    for path in (silver_one, silver_four):
+        _write_universe_sessions(path, sessions)
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    bad = _row("20251229", tjj0000="-99")
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", [bad], start="2025-12-29", end="2026-01-05"))
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20251229"), _row("20251230"), _row("20260102")],
+                    start="2025-12-29", end="2026-01-05"),
+    )
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_conflict_variant(_row("20251230"))], start="2025-12-29", end="2026-01-05"),
+    )
+    one = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_one, workers=1, ticker_buckets=1
+    )
+    four = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_four, workers=1, ticker_buckets=4
+    )
+    assert _snapshot(one.dataset_path) == _snapshot(four.dataset_path)
+    assert _result_key(one) == _result_key(four)
+    assert _snapshot(four.dataset_path)[1][0][:2] == ("year=2026/part.parquet", 1)
+    assert len(_snapshot(four.dataset_path)[1]) == 1
+    assert _manifest_details(four.dataset_path)["partitions"] == [{"year": 2026, "rows": 1}]
+    assert four.conflict_cells == four.identity_violation_cells == 1
+
+
+def test_bucket_with_zero_rows_for_a_year_is_skipped(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import _ticker_bucket
+
+    sessions = (date(2025, 12, 29), date(2026, 1, 2), date(2026, 1, 5))
+    bronze_root = tmp_path / "bronze"
+    universe_root = tmp_path / "silver"
+    _write_universe_sessions(universe_root, sessions)
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    ticker_a, ticker_b = "005930", "000660"
+    buckets = 2
+    if _ticker_bucket(ticker_a, buckets=buckets) == _ticker_bucket(ticker_b, buckets=buckets):
+        for candidate in ("035420", "005380", "051910", "068270", "000001", "000002", "000003"):
+            if _ticker_bucket(candidate, buckets=buckets) != _ticker_bucket(ticker_a, buckets=buckets):
+                ticker_b = candidate
+                break
+    assert _ticker_bucket(ticker_a, buckets=buckets) != _ticker_bucket(ticker_b, buckets=buckets)
+    _seed_blob(catalog, bronze_root, _ls_payload(ticker_a, [_row("20251229")], start="2025-12-29", end="2026-01-05"))
+    _seed_blob(catalog, bronze_root, _ls_payload(ticker_b, [_row("20260102")], start="2025-12-29", end="2026-01-05"))
+    silver_n = tmp_path / "silver-n"
+    silver_one = tmp_path / "silver-one"
+    for path in (silver_n, silver_one):
+        _write_universe_sessions(path, sessions)
+    bucketed = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_n, workers=1, ticker_buckets=buckets
+    )
+    single = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_one, workers=1, ticker_buckets=1
+    )
+    assert _snapshot(bucketed.dataset_path) == _snapshot(single.dataset_path)
+    assert sorted(part[0] for part in _snapshot(bucketed.dataset_path)[1]) == [
+        "year=2025/part.parquet", "year=2026/part.parquet",
+    ]
+
+
+def test_conflict_cell_dropped_in_every_bucketing(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import _ticker_bucket
+
+    ticker_x, ticker_y = "005930", "000660"
+    probe_buckets = 3
+    if _ticker_bucket(ticker_x, buckets=probe_buckets) == _ticker_bucket(ticker_y, buckets=probe_buckets):
+        for candidate in ("035420", "005380", "051910", "068270"):
+            if _ticker_bucket(candidate, buckets=probe_buckets) != _ticker_bucket(
+                ticker_x, buckets=probe_buckets
+            ):
+                ticker_y = candidate
+                break
+    bronze_root = tmp_path / "bronze"
+    universe_root = tmp_path / "silver"
+    _write_universe_sessions(universe_root, BUCKET_SESSIONS)
+    catalog = ReceiptCatalog(bronze_root / "catalog")
+    start, end = BUCKET_SESSIONS[0].isoformat(), BUCKET_SESSIONS[-1].isoformat()
+    day = BUCKET_SESSIONS[0].strftime("%Y%m%d")
+    _seed_blob(catalog, bronze_root, _ls_payload(ticker_x, [_row(day)], start=start, end=end))
+    _seed_blob(catalog, bronze_root, _ls_envelope(ticker_x, [_row(day)], start=start, end=end))
+    _seed_blob(catalog, bronze_root, _ls_payload(ticker_x, [_conflict_variant(_row(day))], start=start, end=end))
+    y_hashes = [
+        _seed_blob(catalog, bronze_root, payload)
+        for payload in (
+            _ls_payload(ticker_y, [_row(day)], start=start, end=end),
+            _ls_envelope(ticker_y, [_row(day)], start=start, end=end),
+        )
+    ]
+    results = []
+    for buckets in (1, 3):
+        silver = tmp_path / f"silver-{buckets}"
+        _write_universe_sessions(silver, BUCKET_SESSIONS)
+        results.append(
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver, workers=1,
+                ticker_buckets=buckets,
+            )
+        )
+    assert results[0].conflict_cells == 1 == results[1].conflict_cells
+    for result in results:
+        frame = pl.read_parquet(result.dataset_path / "year=2025" / "part.parquet")
+        assert ticker_x not in frame.filter(pl.col("session") == BUCKET_SESSIONS[0])["ticker"].to_list()
+        y_rows = frame.filter(
+            (pl.col("session") == BUCKET_SESSIONS[0]) & (pl.col("ticker") == ticker_y)
+        )
+        assert y_rows.height == 1
+        assert y_rows["source_hash"].item() == min(y_hashes)
+
+
+def test_source_hash_tie_break_picks_smallest_content_hash(tmp_path: Path) -> None:
+    bronze_root, universe_root, _, catalog = _bucket_roots(tmp_path)
+    day = BUCKET_SESSIONS[0].strftime("%Y%m%d")
+    start, end = BUCKET_SESSIONS[0].isoformat(), BUCKET_SESSIONS[-1].isoformat()
+    digest_a = _seed_blob(
+        catalog, bronze_root, _ls_payload("005930", [_row(day, close="50000")], start=start, end=end)
+    )
+    digest_b = _seed_blob(
+        catalog, bronze_root, _ls_payload("005930", [_row(day, close="50001")], start=start, end=end)
+    )
+    expected_close = "50000" if min(digest_a, digest_b) == digest_a else "50001"
+    expected_hash = min(digest_a, digest_b)
+    for buckets in (1, 5):
+        silver = tmp_path / f"silver-{buckets}"
+        _write_universe_sessions(silver, BUCKET_SESSIONS)
+        result = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver, workers=1, ticker_buckets=buckets
+        )
+        frame = pl.read_parquet(result.dataset_path / "year=2025" / "part.parquet")
+        cell = frame.filter(
+            (pl.col("session") == BUCKET_SESSIONS[0]) & (pl.col("ticker") == "005930")
+        )
+        assert cell.height == 1
+        assert str(cell["ls_close"].to_list()[0]) == expected_close
+        assert cell["source_hash"].to_list()[0] == expected_hash
+
+
+def test_availability_lag_preserved_under_buckets(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    from src.core.time import KRX_TZ as _TZ
+
+    bronze_root, universe_root, silver_root, catalog = _bucket_roots(tmp_path)
+    start, end = BUCKET_SESSIONS[0].isoformat(), BUCKET_SESSIONS[-1].isoformat()
+    rows = [_row(day.strftime("%Y%m%d")) for day in BUCKET_SESSIONS]
+    _seed_blob(catalog, bronze_root, _ls_payload("005930", rows, start=start, end=end))
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, workers=1, ticker_buckets=3
+    )
+    frames = []
+    for year in (2025, 2026):
+        part = result.dataset_path / f"year={year}" / "part.parquet"
+        if part.exists():
+            frames.append(pl.read_parquet(part))
+    frame = pl.concat(frames).sort(["session", "ticker"])
+    assert frame["session"].to_list() == list(BUCKET_SESSIONS[:3])
+    assert frame["available_at"].to_list() == [
+        _dt(2025, 12, 30, 8, 0, tzinfo=_TZ),
+        _dt(2026, 1, 2, 8, 0, tzinfo=_TZ),
+        _dt(2026, 1, 5, 8, 0, tzinfo=_TZ),
+    ]
+    assert result.unavailable_tail_cells == 1
+
+
+def test_cold_warm_parity_under_buckets(tmp_path: Path) -> None:
+    from src.data.investor_flow_silver import parse_fingerprint
+    from src.data.parse_cache import ParseCache
+
+    bronze_root, universe_root, _, catalog = _bucket_roots(tmp_path)
+    _seed_shared_fixture(catalog, bronze_root)
+    silver_cold = tmp_path / "silver-cold"
+    silver_warm = tmp_path / "silver-warm"
+    for path in (silver_cold, silver_warm):
+        _write_universe_sessions(path, BUCKET_SESSIONS)
+    cold = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_cold, workers=1, ticker_buckets=3
+    )
+    cache_path = tmp_path / "parse.sqlite"
+    with ParseCache(cache_path, namespace="ls_investor_flow-v1", fingerprint=parse_fingerprint()) as cache:
+        materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1,
+            ticker_buckets=3, parse_cache=cache,
+        )
+        warm = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_warm, workers=1,
+            ticker_buckets=3, parse_cache=cache,
+        )
+    assert _snapshot(cold.dataset_path) == _snapshot(warm.dataset_path)
+    assert _result_key(cold) == _result_key(warm)
+
+
+def test_ticker_bucket_is_process_stable(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    from src.data.investor_flow_silver import _ticker_bucket
+
+    tickers = list(BUCKET_TICKERS)
+    expected = [_ticker_bucket(ticker, buckets=7) for ticker in tickers]
+    assert all(0 <= index < 7 for index in expected)
+    import zlib
+
+    assert expected == [zlib.crc32(ticker.encode("utf-8")) % 7 for ticker in tickers]
+    code = (
+        "import json; from src.data.investor_flow_silver import _ticker_bucket; "
+        f"tickers={tickers!r}; "
+        "print(json.dumps([_ticker_bucket(t, buckets=7) for t in tickers]))"
+    )
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter and inline script in tests
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True,
+        env={"PYTHONHASHSEED": "1", "PATH": "/usr/bin:/bin"},
+    )
+    assert json.loads(proc.stdout) == expected
+    proc2 = subprocess.run(  # noqa: S603 - fixed interpreter and inline script in tests
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True,
+        env={"PYTHONHASHSEED": "99", "PATH": "/usr/bin:/bin"},
+    )
+    assert json.loads(proc2.stdout) == expected
+
+
+def test_invalid_ticker_buckets_fail_before_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.investor_flow_silver as flow
+
+    universe_root, silver_root = tmp_path / "universe", tmp_path / "silver"
+    catalog = ReceiptCatalog(tmp_path / "catalog")
+
+    def fail_read(*args, **kwargs):
+        raise AssertionError("invalid buckets must fail before reading inputs")
+
+    monkeypatch.setattr(flow, "universe_sessions", fail_read)
+    monkeypatch.setattr(ReceiptCatalog, "blobs", fail_read)
+    for bad in (0, -1, True, 1.5, "3", None):
+        with pytest.raises(PITDataError, match="ticker_buckets"):
+            materialize_investor_flow_silver(
+                catalog=catalog, universe_root=universe_root, silver_root=silver_root,
+                workers=1, ticker_buckets=bad,
+            )
+        assert not silver_root.exists()
+
+
+def test_build_config_loader_contract(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    from src.data.investor_flow_silver import InvestorFlowBuildConfig, load_investor_flow_build_config
+
+    valid = tmp_path / "valid.toml"
+    valid.write_text("ticker_buckets = 4\n", encoding="utf-8")
+    config = load_investor_flow_build_config(valid)
+    assert config.ticker_buckets == 4
+    with pytest.raises(ValidationError):
+        config.ticker_buckets = 9  # type: ignore[misc]
+    assert InvestorFlowBuildConfig.model_validate({"ticker_buckets": 4}).ticker_buckets == 4
+    missing = tmp_path / "missing.toml"
+    with pytest.raises(PITDataError, match=str(missing)):
+        load_investor_flow_build_config(missing)
+    invalid_toml = tmp_path / "invalid.toml"
+    invalid_toml.write_text("ticker_buckets = [\n", encoding="utf-8")
+    with pytest.raises(PITDataError, match=str(invalid_toml)):
+        load_investor_flow_build_config(invalid_toml)
+    for name, body in (
+        ("unknown", "ticker_buckets = 4\nextra = 1\n"),
+        ("missing-key", "other = 1\n"),
+        ("zero", "ticker_buckets = 0\n"),
+        ("bool", "ticker_buckets = true\n"),
+        ("float", "ticker_buckets = 2.0\n"),
+        ("str", 'ticker_buckets = "2"\n'),
+        ("negative", "ticker_buckets = -1\n"),
+        ("empty", ""),
+    ):
+        candidate = tmp_path / f"{name}.toml"
+        candidate.write_text(body, encoding="utf-8")
+        with pytest.raises(PITDataError, match=str(candidate)):
+            load_investor_flow_build_config(candidate)
+    assert load_investor_flow_build_config().ticker_buckets >= 1
+
+
+def test_empty_shards_emit_yearly_resolve_heartbeat(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    bronze_root, universe_root, silver_root, catalog = _bucket_roots(tmp_path)
+    _seed_blob(
+        catalog, bronze_root,
+        _ls_payload("005930", [_row("20251229", tjj0000="-99")], start="2025-12-29", end="2026-01-05"),
+    )
+    with caplog.at_level(logging.INFO, logger="src.data.investor_flow_silver"):
+        result = materialize_investor_flow_silver(
+            catalog=catalog, universe_root=universe_root, silver_root=silver_root, ticker_buckets=8,
+        )
+    assert result.rows == 0
+    assert result.identity_violation_cells == 1
+    assert _snapshot(result.dataset_path)[1] == []
+    assert [record.getMessage() for record in caplog.records if "stage=investor_flow_ls_resolve" in record.message] == [
+        f"[DATA] stage=investor_flow_ls_resolve year={year} buckets=8 rows=0 conflict_cells=0"
+        for year in (2025, 2026)
+    ]
+
+
+def test_bucket_parts_are_released_before_spooling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import weakref
+
+    from src.data.datasets import PartitionSpool
+
+    bronze_root, universe_root, silver_root, catalog = _bucket_roots(tmp_path)
+    _seed_shared_fixture(catalog, bronze_root)
+    references = []
+    concat = pl.concat
+    add = PartitionSpool.add
+
+    def track_parts(parts, **kwargs):
+        references.extend(weakref.ref(part) for part in parts)
+        return concat(parts, **kwargs)
+
+    def spool_part(self, relative_path, part):
+        assert references
+        assert all(reference() is None for reference in references)
+        return add(self, relative_path, part)
+
+    monkeypatch.setattr(pl, "concat", track_parts)
+    monkeypatch.setattr(PartitionSpool, "add", spool_part)
+    result = materialize_investor_flow_silver(
+        catalog=catalog, universe_root=universe_root, silver_root=silver_root, ticker_buckets=3,
+    )
+    assert result.rows > 0

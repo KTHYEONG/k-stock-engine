@@ -13,6 +13,8 @@ import json
 import logging
 import sys
 import tempfile
+import tomllib
+import zlib
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -22,15 +24,18 @@ from pathlib import Path
 from typing import Any, cast
 
 __all__ = [
+    "InvestorFlowBuildConfig",
     "InvestorFlowSilverPolicy",
     "InvestorFlowSilverResult",
     "flow_availability_frame",
     "flow_tail_sessions",
+    "load_investor_flow_build_config",
     "materialize_investor_flow_silver",
     "parse_fingerprint",
 ]
 
 import polars as pl
+from pydantic import BaseModel, ConfigDict, StrictInt, field_validator
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
@@ -123,6 +128,45 @@ class InvestorFlowSilverResult:
     unavailable_tail_cells: int
     retail_exceeds_volume_rows: int
     dateless_rows: int
+
+
+class InvestorFlowBuildConfig(BaseModel):
+    """Execution knobs of the LS investor-flow Silver build; never part of dataset identity."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    ticker_buckets: StrictInt
+
+    @field_validator("ticker_buckets")
+    @classmethod
+    def _positive_buckets(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("ticker_buckets must be a positive integer")
+        return value
+
+
+def load_investor_flow_build_config(path: Path | None = None) -> InvestorFlowBuildConfig:
+    """Parse the build config (default ``config/data/investor_flow_silver.toml``); raises PITDataError."""
+    resolved = (
+        path
+        if path is not None
+        else Path(__file__).resolve().parents[2] / "config" / "data" / "investor_flow_silver.toml"
+    )
+    try:
+        with open(resolved, "rb") as handle:
+            raw = tomllib.load(handle)
+    except OSError as exc:
+        raise PITDataError(f"investor-flow build config is missing: {resolved}") from exc
+    except ValueError as exc:
+        raise PITDataError(f"investor-flow build config is invalid TOML: {resolved}") from exc
+    try:
+        return InvestorFlowBuildConfig.model_validate(raw)
+    except ValueError as exc:
+        raise PITDataError(f"investor-flow build config is invalid: {resolved}: {exc}") from exc
+
+
+def _ticker_bucket(ticker: str, *, buckets: int) -> int:
+    """Stable bucket index in ``[0, buckets)`` for one ticker, identical across processes and versions."""
+    return zlib.crc32(ticker.encode("utf-8")) % buckets
 
 
 def _parse_share_int(row: dict[str, Any], field: str) -> int:
@@ -363,11 +407,14 @@ def materialize_investor_flow_silver(
     universe_dataset_id: str | None = None,
     bronze_flow_digest: str | None = None,
     parse_cache: ParseCache | None = None,
+    ticker_buckets: int = 1,
 ) -> InvestorFlowSilverResult:
     """Build an immutable Silver investor-flow dataset from catalog LS blobs."""
 
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise PITDataError("workers must be a positive integer")
+    if isinstance(ticker_buckets, bool) or not isinstance(ticker_buckets, int) or ticker_buckets < 1:
+        raise PITDataError("ticker_buckets must be a positive integer")
     if (
         isinstance(policy.available_session_lag, bool)
         or not isinstance(policy.available_session_lag, int)
@@ -407,7 +454,7 @@ def materialize_investor_flow_silver(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for offset in range(0, len(blobs), _PAGE_BATCH):
                 batch = blobs[offset : offset + _PAGE_BATCH]
-                columns: dict[str, list[Any]] = {name: [] for name in _SHARD_SCHEMA}
+                buckets_columns: dict[int, dict[str, list[Any]]] = {}
                 ordered: list[tuple[str, str, _PageContent]] = []
                 cache_hits = 0
                 if parse_cache is None:
@@ -463,20 +510,26 @@ def materialize_investor_flow_silver(
                     page_cells, page_dateless, page_violations = content
                     dateless_rows += page_dateless
                     violation_keys.update((day.isoformat(), symbol) for day in page_violations)
+                    bucket = _ticker_bucket(symbol, buckets=ticker_buckets)
+                    bucket_columns = buckets_columns.get(bucket)
+                    if bucket_columns is None:
+                        bucket_columns = {name: [] for name in _SHARD_SCHEMA}
+                        buckets_columns[bucket] = bucket_columns
                     for session, groups, close, volume, value in page_cells:
-                        columns["session"].append(session)
-                        columns["ticker"].append(symbol)
+                        bucket_columns["session"].append(session)
+                        bucket_columns["ticker"].append(symbol)
                         for code, amount in zip(_GROUP_CODES, groups, strict=True):
-                            columns[code].append(amount)
-                        columns["ls_close"].append(close)
-                        columns["ls_volume"].append(volume)
-                        columns["ls_value_mkrw"].append(value)
-                        columns["source_hash"].append(page_hash)
+                            bucket_columns[code].append(amount)
+                        bucket_columns["ls_close"].append(close)
+                        bucket_columns["ls_volume"].append(volume)
+                        bucket_columns["ls_value_mkrw"].append(value)
+                        bucket_columns["source_hash"].append(page_hash)
                     parsed_rows += len(page_cells)
-                if columns["session"]:
-                    pl.DataFrame(columns, schema=_SHARD_SCHEMA).write_parquet(
-                        shard_dir / f"shard-{offset:07d}.parquet"
-                    )
+                for bucket, bucket_columns in sorted(buckets_columns.items()):
+                    if bucket_columns["session"]:
+                        pl.DataFrame(bucket_columns, schema=_SHARD_SCHEMA).write_parquet(
+                            shard_dir / f"shard-b{bucket:04d}-{offset:07d}.parquet"
+                        )
                 if parse_cache is None:
                     _LOG.info(
                         "[DATA] stage=investor_flow_ls pages=%d/%d rows=%d",
@@ -501,61 +554,93 @@ def materialize_investor_flow_silver(
             schema={"session": pl.Date, "ticker": pl.String},
         )
         availability = flow_availability_frame(calendar, lag=policy.available_session_lag)
-        shards = sorted(shard_dir.glob("shard-*.parquet"))
         with PartitionSpool() as spool:
             for year in sorted({session.year for session in calendar}):
-                if not shards:
+                parts: list[pl.DataFrame] = []
+                for bucket in range(ticker_buckets):
+                    bucket_shards = sorted(shard_dir.glob(f"shard-b{bucket:04d}-*.parquet"))
+                    if not bucket_shards:
+                        continue
+                    cells = (
+                        pl.scan_parquet(bucket_shards)
+                        .filter(pl.col("session").dt.year() == year)
+                        .collect()
+                        .join(violations, on=["session", "ticker"], how="anti")
+                    )
+                    _LOG.debug(
+                        "[DATA] stage=investor_flow_ls_bucket year=%d bucket=%d/%d cells=%d",
+                        year,
+                        bucket,
+                        ticker_buckets,
+                        cells.height,
+                    )
+                    if cells.height == 0:
+                        del cells
+                        continue
+                    grouped = (
+                        cells.sort("source_hash")
+                        .group_by(["session", "ticker"], maintain_order=True)
+                        .agg(pl.struct(list(_GROUP_CODES)).n_unique().alias("_distinct"), pl.all().first())
+                    )
+                    conflict_cells += grouped.filter(pl.col("_distinct") > 1).height
+                    resolved = grouped.filter(pl.col("_distinct") == 1).join(
+                        availability, on="session", how="left"
+                    )
+                    unavailable_tail_cells += resolved.filter(pl.col("available_session").is_null()).height
+                    resolved = resolved.filter(pl.col("available_session").is_not_null())
+                    retail_exceeds_volume_rows += resolved.filter(
+                        pl.col("tjj0008").abs() > pl.col("ls_volume")
+                    ).height
+                    part_bucket = resolved.select(
+                        "session",
+                        pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
+                        "ticker",
+                        pl.lit("LS").alias("provider"),
+                        pl.col("tjj0008").alias("individual_net_shares"),
+                        pl.col("tjj0016").alias("foreign_net_shares"),
+                        pl.col("tjj0018").alias("institution_net_shares"),
+                        pl.col("tjj0017").alias("other_net_shares"),
+                        *(pl.col(column.removesuffix("_net_shares")).alias(column) for column in _SUBGROUP_COLUMNS),
+                        "ls_close",
+                        "ls_volume",
+                        "ls_value_mkrw",
+                        pl.col("available_session")
+                        .dt.combine(policy.available_time)
+                        .dt.replace_time_zone(str(KRX_TZ))
+                        .alias("available_at"),
+                        "source_hash",
+                        pl.lit(REVISION).alias("policy_version"),
+                    ).cast(pl.Schema(_SCHEMA))
+                    del cells, grouped, resolved
+                    if part_bucket.height == 0:
+                        del part_bucket
+                        continue
+                    parts.append(part_bucket)
+                    del part_bucket
+                if not parts:
+                    _LOG.info(
+                        "[DATA] stage=investor_flow_ls_resolve year=%d buckets=%d rows=%d conflict_cells=%d",
+                        year,
+                        ticker_buckets,
+                        0,
+                        conflict_cells,
+                    )
                     continue
-                cells = (
-                    pl.scan_parquet(shards)
-                    .filter(pl.col("session").dt.year() == year)
-                    .collect()
-                    .join(violations, on=["session", "ticker"], how="anti")
-                )
-                grouped = (
-                    cells.sort("source_hash")
-                    .group_by(["session", "ticker"], maintain_order=True)
-                    .agg(pl.struct(list(_GROUP_CODES)).n_unique().alias("_distinct"), pl.all().first())
-                )
-                conflict_cells += grouped.filter(pl.col("_distinct") > 1).height
-                resolved = grouped.filter(pl.col("_distinct") == 1).join(
-                    availability, on="session", how="left"
-                )
-                unavailable_tail_cells += resolved.filter(pl.col("available_session").is_null()).height
-                resolved = resolved.filter(pl.col("available_session").is_not_null())
-                retail_exceeds_volume_rows += resolved.filter(
-                    pl.col("tjj0008").abs() > pl.col("ls_volume")
-                ).height
-                part = resolved.select(
-                    "session",
-                    pl.concat_str(pl.lit("KRX:"), pl.col("ticker")).alias("instrument_id"),
-                    "ticker",
-                    pl.lit("LS").alias("provider"),
-                    pl.col("tjj0008").alias("individual_net_shares"),
-                    pl.col("tjj0016").alias("foreign_net_shares"),
-                    pl.col("tjj0018").alias("institution_net_shares"),
-                    pl.col("tjj0017").alias("other_net_shares"),
-                    *(pl.col(column.removesuffix("_net_shares")).alias(column) for column in _SUBGROUP_COLUMNS),
-                    "ls_close",
-                    "ls_volume",
-                    "ls_value_mkrw",
-                    pl.col("available_session")
-                    .dt.combine(policy.available_time)
-                    .dt.replace_time_zone(str(KRX_TZ))
-                    .alias("available_at"),
-                    "source_hash",
-                    pl.lit(REVISION).alias("policy_version"),
-                ).cast(pl.Schema(_SCHEMA)).sort(["session", "ticker"])
-                if part.height == 0:
-                    del cells, grouped, resolved, part
-                    continue
+                part = pl.concat(parts, how="vertical").sort(["session", "ticker"])
+                del parts
                 relative_path = f"year={year}/part.parquet"
-                del cells, grouped, resolved
                 rows = spool.add(relative_path, part)
                 partition_details.append({"year": year, "rows": rows})
                 total_rows += rows
                 tickers.update(part["ticker"].unique().to_list())
                 del part
+                _LOG.info(
+                    "[DATA] stage=investor_flow_ls_resolve year=%d buckets=%d rows=%d conflict_cells=%d",
+                    year,
+                    ticker_buckets,
+                    rows,
+                    conflict_cells,
+                )
 
             flow_digest = resolve_bronze_digest(
                 bronze_flow_digest,
