@@ -21,7 +21,9 @@ OpenDART(`I003` 채널)는 KOSDAQ 시장조치는 높은 정확도로 전달하�
 
 ## 2. Relay Pipeline & Importer Inbox Topology
 
-KIND 웹 엔드포인트는 비공식 스크래핑 인터페이스이므로 변경 위험이 있습니다. K-Stock Engine은 메인 엔진의 런타임 안정성을 위해 **릴레이 번들 수집기(`kind_relay_producer`)**를 통해 격리 수집하고, 검증된 아카이브 번들만을 **임포터 인박스(`inbox/kind_relay`)**로 전달합니다.
+KIND 웹 엔드포인트는 비공식 스크래핑 인터페이스이므로 변경 위험이 있습니다. K-Stock Engine은 메인 엔진의 런타임 안정성을 위해 **릴레이 번들 수집기(`kind_relay_producer`)**를 통해 격리 수집하고, 검증된 canonical JSON 번들(`schema=kind-relay-v1`)만을 **임포터 인박스(`<state_root>/kind_relay/inbox/bundle.json`, `relay_inbox_path`)**로 전달합니다.
+
+**Import cadence**: `kse-morning`(08:32 KST)이 `market_actions` 빌드 직전에 인박스 번들을 파일 전용으로 import하고, `kse-collect-eve`(18:30 KST)가 동일 스텝을 다시 수행합니다. 저녁 재-import는 같은 번들이면 멱등(변경 페이로드 0건, Bronze 쓰기·watermark 무변)이고, 아침 실행 이후 도착한 더 새로운 번들은 같은 저녁에 반영됩니다.
 
 ```mermaid
 flowchart LR
@@ -31,8 +33,8 @@ flowchart LR
 
     KIND_WEB["🌐 KRX KIND Web<br/>(kind.krx.co.kr)"]:::kind
     PRODUCER["🤖 KIND Relay Producer<br/>(1.0 req/s Paced Scraper)"]:::relay
-    BUNDLE["📦 Tar/Zst Bundle<br/>(SHA256 Manifest + Sealed)"]:::relay
-    INBOX["📥 Importer Inbox<br/>(data/inbox/kind_relay)"]:::engine
+    BUNDLE["📦 Canonical JSON Bundle<br/>(kind-relay-v1 + items_sha256)"]:::relay
+    INBOX["📥 Importer Inbox<br/>(&lt;state_root&gt;/kind_relay/inbox/bundle.json)"]:::engine
     SILVER["⚙️ Silver Normalizer<br/>(build-market-actions)"]:::engine
 
     KIND_WEB -->|HTML Scrape @ 1 req/s| PRODUCER
