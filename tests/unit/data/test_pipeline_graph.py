@@ -2014,3 +2014,31 @@ def test_default_collection_steps_end_with_dbsec_in_registry_order(tmp_path: Pat
 
     assert names[-3:] == ["dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"]
     assert "dbsec_ticker_master" in graph.OPTIONAL_COLLECTION_JOBS
+
+
+def test_ls_build_passes_configured_bucket_count_and_keeps_preview_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.data.investor_flow_silver as flow
+    import src.data.pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    universe = graph._build_ordinary_universe(ctx, {})
+    inputs = {"ordinary_universe": universe.dataset_id}
+    ctx.registry.register("ordinary_universe", universe.dataset_id)
+    monkeypatch.setattr(
+        flow, "load_investor_flow_build_config", lambda path=None: flow.InvestorFlowBuildConfig(ticker_buckets=3)
+    )
+    seen: dict[str, object] = {}
+    original = flow.materialize_investor_flow_silver
+
+    def _spy(**kwargs: object):  # type: ignore[no-untyped-def]
+        seen.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(flow, "materialize_investor_flow_silver", _spy)
+    result = graph._build_investor_flow_ls(ctx, inputs)
+    assert seen.get("ticker_buckets") == 3
+    from src.data.datasets import dataset_id_for
+
+    assert result.dataset_id == dataset_id_for(graph._preview_investor_flow_ls(ctx))

@@ -168,7 +168,7 @@ def _run_flow_silver(args: argparse.Namespace) -> Mapping[str, object]:
 
     from src.data.cli.common import scoped_catalog
     from src.data.dataset_registry import DatasetRegistry
-    from src.data.investor_flow_silver import materialize_investor_flow_silver
+    from src.data.investor_flow_silver import load_investor_flow_build_config, materialize_investor_flow_silver
 
     runtime = scoped_runtime(args)
     registry = DatasetRegistry(runtime.workspace.state_root)
@@ -176,6 +176,7 @@ def _run_flow_silver(args: argparse.Namespace) -> Mapping[str, object]:
     result = materialize_investor_flow_silver(
         catalog=scoped_catalog(runtime), universe_root=runtime.workspace.silver_root,
         silver_root=runtime.workspace.silver_root, workers=args.workers, universe_dataset_id=universe_id,
+        ticker_buckets=load_investor_flow_build_config().ticker_buckets,
     )
     register_dataset(runtime, "investor_flow_ls", result.dataset_id)
     return asdict(result) | {"dataset_path": str(result.dataset_path)}

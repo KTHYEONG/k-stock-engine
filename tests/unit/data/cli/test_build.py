@@ -117,14 +117,26 @@ def test_normalize_dart_facts_dispatch_reports_failure(tmp_path, monkeypatch, ca
 
 
 
-def test_build_investor_flow_silver_command_emits_dataset_counts(tmp_path, capsys) -> None:
+def test_build_investor_flow_silver_command_emits_dataset_counts(tmp_path, capsys, monkeypatch) -> None:
     import hashlib
     import json
     from datetime import date
 
     from src.data.cli import main
+    from src.data import investor_flow_silver as flow
     from src.data.runtime import load_data_runtime
 
+    monkeypatch.setattr(
+        flow, "load_investor_flow_build_config", lambda: flow.InvestorFlowBuildConfig(ticker_buckets=3)
+    )
+    original = flow.materialize_investor_flow_silver
+    received_buckets = []
+
+    def build(**kwargs):
+        received_buckets.append(kwargs["ticker_buckets"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(flow, "materialize_investor_flow_silver", build)
     scope_config = Path("config/research/kr_swing_2019_v1.toml")
     runtime = load_data_runtime(scope_config=scope_config, data_root=tmp_path / "data")
     import polars as pl
@@ -185,6 +197,7 @@ def test_build_investor_flow_silver_command_emits_dataset_counts(tmp_path, capsy
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["dataset_id"].startswith("investor_flow_")
     assert emitted["rows"] == 1
+    assert received_buckets == [3]
 
 
 

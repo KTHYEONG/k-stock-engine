@@ -293,7 +293,11 @@ def _build_cash_series(ctx: RefreshContext, inputs: Mapping[str, str]) -> Publis
 
 def _build_investor_flow_ls(ctx: RefreshContext, inputs: Mapping[str, str]) -> PublishedDataset:
     """Build Silver LS investor-flow rows for the resolved universe."""
-    from src.data.investor_flow_silver import materialize_investor_flow_silver, parse_fingerprint
+    from src.data.investor_flow_silver import (
+        load_investor_flow_build_config,
+        materialize_investor_flow_silver,
+        parse_fingerprint,
+    )
     from src.data.parse_cache import ParseCache
 
     with ParseCache(
@@ -307,6 +311,7 @@ def _build_investor_flow_ls(ctx: RefreshContext, inputs: Mapping[str, str]) -> P
             silver_root=ctx.runtime.workspace.silver_root,
             universe_dataset_id=inputs["ordinary_universe"],
             parse_cache=cache,
+            ticker_buckets=load_investor_flow_build_config().ticker_buckets,
         )
         cache.prune({blob.content_hash for blob in ctx.catalog.blobs(source="ls_investor_flow", usable=True)})
     return _published(result.dataset_path)
