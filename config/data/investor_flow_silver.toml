@@ -1,0 +1,3 @@
+# Execution knob for the LS investor-flow Silver build; peak resolve memory
+# scales ~1/ticker_buckets. Never part of dataset identity; output is identical for every value.
+ticker_buckets = 8
