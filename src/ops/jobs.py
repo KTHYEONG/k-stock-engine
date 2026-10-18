@@ -38,6 +38,7 @@ __all__ = [
     "DBSEC_COLLECT_STEPS",
     "EVENING_COLLECT_STEPS",
     "KRX_COLLECT_STEPS",
+    "MORNING_RELAY_JOBS",
     "POLL_INTERVAL_S",
     "alert",
     "audit",
@@ -81,6 +82,7 @@ KRX_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
 DBSEC_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
     {"dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"}
 )
+MORNING_RELAY_JOBS: Final[tuple[str, ...]] = ("kind_notice_search", "kind_notice_documents")
 POLL_INTERVAL_S: Final = 60.0
 
 _DEADLINE_HOUR: Final = 8
@@ -220,6 +222,55 @@ def _wait_for_krx(
 
 def _build_all(data_root: Path, *, decision_time: datetime) -> object:
     return _run_refresh(data_root, decision_time=decision_time, collect=False, collect_steps=None)
+
+
+def _relay_failure_summary(job: str, exc: BaseException) -> dict[str, object]:
+    _LOG.warning("[DATA] stage=relay_import job=%s status=failed error=%s", job, type(exc).__name__, exc_info=exc)
+    return {
+        "job": job,
+        "status": "failed",
+        "imported": 0,
+        "unchanged": 0,
+        "rejected": 0,
+        "pending_left": 0,
+        "fetched_at": None,
+    }
+
+
+def _import_kind_relay(data_root: Path, *, now: datetime) -> list[dict[str, object]]:
+    """Import the inbox KIND relay bundle file-only for each relay job; never raises, returns per-job summaries."""
+    from datetime import UTC
+
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.kind_relay_import import import_relay_bundle
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        runtime = resolve_data_runtime(data_root=Path(data_root))
+        provider = load_provider_policy(load_runtime_config())
+    except Exception as exc:
+        return [_relay_failure_summary(job, exc) for job in MORNING_RELAY_JOBS]
+    summaries: list[dict[str, object]] = []
+    for job in MORNING_RELAY_JOBS:
+        try:
+            report = import_relay_bundle(runtime=runtime, provider=provider, job=job, now=now, dry_run=False)
+        except Exception as exc:
+            summaries.append(_relay_failure_summary(job, exc))
+            continue
+        summaries.append(
+            {
+                "job": report.job,
+                "status": report.status,
+                "imported": report.imported,
+                "unchanged": report.unchanged,
+                "rejected": report.rejected,
+                "pending_left": report.pending_left,
+                "fetched_at": (
+                    report.fetched_at.astimezone(UTC).isoformat() if report.fetched_at is not None else None
+                ),
+            }
+        )
+    return summaries
 
 
 def _research_paths(data_root: Path) -> SimpleNamespace:
@@ -549,6 +600,9 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
                      "node_peak_rss_mb": {}},
         )
         return 1
+    mark = time.monotonic()
+    relay = _import_kind_relay(root, now=_aware(now()))
+    relay_s = time.monotonic() - mark
     phase = "build"
     build_report: object = None
     from src.data.investor_flow_freshness import StaleInvestorFlowError
@@ -572,7 +626,7 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
 
         _record(root, "morning", "NO_DECISION", today, _aware(now()), reason=exc.reason,
                 metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report),
+                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay,
                          "flow_freshness": [
                              {**asdict(item), "source_session": item.source_session.isoformat()}
                              for item in exc.freshness
@@ -582,13 +636,13 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
         outcome = "DEGRADED" if phase == "shadow" else "NO_DECISION"
         _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__,
                 metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report)})
+                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay})
         return 1
     except Exception as exc:
         _log_job_failure("morning", exc)
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
                 metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report)})
+                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay})
         return 1
     elapsed_s = time.monotonic() - started
     metrics: dict[str, object] = {
@@ -602,6 +656,8 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
         "build_s": build_s,
         "decide_s": decide_s,
         "shadow_s": shadow_s,
+        "relay_s": relay_s,
+        "kind_relay": relay,
     }
     opened = datetime(today.year, today.month, today.day, _LATE_SEAL_HOUR, tzinfo=KRX_TZ)
     if _aware(sealed_at).astimezone(KRX_TZ) >= opened:

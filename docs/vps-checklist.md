@@ -54,7 +54,7 @@ Events: `data/ops/events/YYYY-MM/YYYY-MM-DD.jsonl`, one JSON line per run: `job`
 | `kse-backup` daily 02:30, `Persistent=true` | `backup --no-lock` under `flock -w 7200 %t/quant-gdrive.lock`, 1g | `data/state/lake_backup_status.json` (`rc`, `finished_at`, `last_ok_at`, `sources.<name>.{scanned,stored,archives}`); Drive `gdrive:quant-lake/live/k-stock-engine/lake`; packs loose Bronze older than 14 d **and** offsite into `$B/_packs` | event `OK`, `rc 0`, sources `bronze, bronze_catalog, ops, state`; `bronze.scanned` ≥ previous run; ~5–13 min | P5 |
 | `kse-weekly-report` Sat 10:30 | `weekly-report` 2g | `data/ops/reports/weekly-<D>.json` (`days` = 7 keys → job→outcome) | file exists; `days` outcomes equal the last event line per job/day | P5 |
 | `kse-alert@<unit>` on failure | `alert` 256m, stdin = journal tail | `data/ops/alerts/sent.jsonl` (`ts,key,subject`), `ops/alerts/outbox/` when undeliverable; 24 h dedup per key; its own `OnFailure` is `kca-alert@` | one line per failure key; outbox empty | P4 |
-| GitHub `kind-relay.yml` cron 08:10 + 09:05 UTC (actual start 21:07–23:28 KST, GitHub delay) | runner fetches KIND, scp to host | `$T/kind_relay/inbox/bundle.json` (`schema kind-relay-v1`, `fetch_date_kst`, `fetched_at`, `items`); consumer writes `$T/kind_relay/last_accepted.json` (`fetched_at`, `items_sha256`) | 2 successful runs per day; `collect_eve D` consumes the bundle fetched the night of `D-1` (≈ 20 h old; refused > 36 h) | P10, K1g |
+| GitHub `kind-relay.yml` cron 08:10 + 09:05 UTC (actual start 21:07–23:28 KST, GitHub delay) | runner fetches KIND, scp to host | `$T/kind_relay/inbox/bundle.json` (`schema kind-relay-v1`, `fetch_date_kst`, `fetched_at`, `items`); consumer writes `$T/kind_relay/last_accepted.json` (`fetched_at`, `items_sha256`) | 2 successful runs per day; `morning D` imports the bundle fetched the night of `D-1` (≈ 10 h old) before `market_actions`, and `collect_eve D` re-imports it idempotently (refused > 36 h) | P10, K1g |
 | GitHub `deploy.yml` on push to `main` | test → build `sha-<commit>` → blackout wait → promote `:latest` → `install_systemd.sh` | `~/.config/systemd/user/kse-*`, `~/.local/lib/kse/kse-run`, `~/.cache/kis/.host-admission` (touched), `~/k-stock-engine/.deploy/staging-<sha>/` (never cleaned) | latest run `success`, image revision = `origin/main` | P3 |
 | Manual `python -m tools.vps_dart.sync push` (not scheduled) | installs `kse-dart-worker.{service,timer}` (every 15 min) + `~/kse-collect/` | `~/kse-collect/out` | **absent** unless a DART backfill is in progress; `sync finish` removes both | P2 |
 
@@ -202,9 +202,9 @@ python3 -c "import json;b=json.load(open('inbox/bundle.json'));print(b['schema']
 systemctl --user list-timers --all --no-pager | grep -E 'kca|krx|crypto' | awk '{print $3,$(NF-1)}' | sort   # NEXT time, UTC
 ```
 Locally: `gh run list -R kthyeong/k-stock-engine --workflow kind-relay.yml --limit 6`.
-PASS: 2 `success` runs per day; `last_accepted.fetched_at` advances on each business day's `collect_eve` and is ≤ 36 h older
-than that run's start (2026-10-16 22:17 run accepted the 2026-10-16 13:12 UTC bundle); K1g `kind_stale_sessions` ≤ 2
-(observed 1; `market_actions` refuses > 5). Neighbours (KST): kca-price-ingest 08:30, kca-auction-open 08:39:55,
+PASS: 2 `success` runs per day; `last_accepted.fetched_at` advances on each business day's `morning` import (and again on `collect_eve` when a newer bundle arrived) and is ≤ 36 h older
+than that run's start (2026-10-16 22:17 run accepted the 2026-10-16 13:12 UTC bundle); K1g `kind_stale_sessions` is expected to be 0 after morning import when the previous night's bundle arrived
+(observed 1 before morning import was introduced; `market_actions` refuses > 5). Neighbours (KST): kca-price-ingest 08:30, kca-auction-open 08:39:55,
 kca-order-exit 08:40:10, kca-archive-intraday 20:05, kca-tape-sweep 20:35, kca-backup-prune 21:00, kca-daily-audit 21:20,
 crypto-pilot-backup 21:30, kca-altdata-capture 21:35, krx-deferred-recreate 22:00, kca-backup 22:15, kca-extended-backfill
 23:05, krx-host-backup 23:30. Drive writers serialize on `%t/quant-gdrive.lock`; shared LS/DB/KIS pacing goes through
@@ -359,7 +359,7 @@ PY
 | `~/k-stock-engine/scratch/lake_backup_check` (133 MB, 2026-10-13) | SEV3 leftover; user deletes. |
 | `.deploy/staging-<sha>`, `sha-*` image tags | `deploy.yml` never removes them (22 dirs / 1.8 MB, 23 tags on 2026-10-18). SEV3. |
 | First trading day on `c65833b` = 2026-10-19 | Expect `gate=investor_flow` lines (P5), `collect_dbsec` on the shared DB token (P6), first `dbsec_reconcile/2026-10-16.json` after the 20:40 run (K7). |
-| KIND relay lands after `collect_eve` | GitHub cron starts 4–5 h late (21:07–23:28 KST), so `collect_eve D` uses the `D-1` night bundle and `kind_stale_sessions` 1 is normal; one missed relay night makes the next bundle > 36 h old → refused. |
+| KIND relay lands after `collect_eve` | GitHub cron starts 4–5 h late (21:07–23:28 KST), so the next `morning D` imports the `D-1` night bundle before `market_actions` (expected `kind_stale_sessions` 0 when it arrived). After one missed night, the remaining bundle can still be within 36 h at morning (about 33–35 h old), with a one-session lag; import refuses bundles older than 36 h, and `market_actions` still refuses lag > 5 observed sessions. |
 | Footprint growth | ~0.54 GiB per business day of loose flow Bronze until the first 14-day prune (2026-10-27 backup); P8 projection. |
 | Auction snapshots | Seal 08:51–08:54 ⇒ 08:40/08:50 snapshots never captured (`expected_rows = 3 × symbols`). |
 | `kse-backup.service.d` drop-in | Removed by `install_systemd.sh` (`2884942`); absent 2026-10-18. Reappearance = SEV2. |
