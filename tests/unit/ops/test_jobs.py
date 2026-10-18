@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -19,6 +19,7 @@ from src.ops.guards import GuardRefused
 from src.ops.jobs import (
     EVENING_COLLECT_STEPS,
     KRX_COLLECT_STEPS,
+    MORNING_RELAY_JOBS,
     audit,
     backup,
     collect_eve,
@@ -1438,3 +1439,175 @@ def test_morning_records_stale_investor_flow(tmp_path: Path, monkeypatch: pytest
             "missing_fraction": 0.10,
         }
     ]
+
+
+def _raiser(error: BaseException):  # type: ignore[no-untyped-def]
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise error
+
+    return _raise
+
+
+_RELAY_SUMMARIES: list[dict[str, object]] = [
+    {"job": "kind_notice_search", "status": "complete", "imported": 3, "unchanged": 0, "rejected": 0,
+     "pending_left": 0, "fetched_at": "2026-10-07T12:00:00+00:00"},
+    {"job": "kind_notice_documents", "status": "complete", "imported": 1, "unchanged": 0, "rejected": 0,
+     "pending_left": 0, "fetched_at": "2026-10-07T12:00:00+00:00"},
+]
+
+
+def test_morning_imports_relay_after_wait_before_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert MORNING_RELAY_JOBS == ("kind_notice_search", "kind_notice_documents")
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: calls.append("wait") or True)
+    seen: dict[str, datetime] = {}
+    clock = _Clock(_morning_now())
+
+    def relay(root: Path, *, now: datetime) -> list[dict[str, object]]:
+        calls.append("relay")
+        seen["now"] = now
+        clock.sleep(1)
+        return []
+
+    def build(root: Path, *, decision_time: datetime) -> None:
+        calls.append("build")
+        seen["decision_time"] = decision_time
+
+    monkeypatch.setattr(jobs, "_import_kind_relay", relay)
+    monkeypatch.setattr(jobs, "_build_all", build)
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert calls == ["wait", "relay", "build", "decide", "shadow"]
+    assert seen["now"] < seen["decision_time"]
+    assert seen["decision_time"] < datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)
+
+
+def test_morning_absent_krx_skips_relay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, _morning_now())
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: False)
+    monkeypatch.setattr(jobs, "_import_kind_relay", _raiser(AssertionError("relay must not run without KRX bars")))
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "NO_DECISION"
+    assert event["reason"] == "krx_absent_at_deadline"
+    assert "kind_relay" not in event["metrics"]
+
+
+@pytest.mark.parametrize("status", ["relay_absent", "relay_rejected", "relay_partial", "failed"])
+def test_relay_status_never_changes_morning_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    summaries = [{**_RELAY_SUMMARIES[0], "status": status}]
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_import_kind_relay", lambda root, *, now: [dict(item) for item in summaries])
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["kind_relay"] == summaries
+    assert isinstance(event["metrics"]["relay_s"], float)
+
+
+@pytest.mark.parametrize("mode", ["ok", "late", "pit", "error", "shadow", "stale"])
+def test_relay_metrics_ride_every_post_import_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from src.data.investor_flow_freshness import FlowFreshness, StaleInvestorFlowError
+
+    seal = datetime(2026, 10, 8, 9 if mode == "late" else 8, 31, tzinfo=KRX_TZ)
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, seal)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_import_kind_relay", lambda root, *, now: [dict(item) for item in _RELAY_SUMMARIES])
+    if mode == "pit":
+        monkeypatch.setattr(jobs, "_build_all", _raiser(PITDataError("cash return is missing")))
+    elif mode == "error":
+        monkeypatch.setattr(jobs, "_build_all", _raiser(RuntimeError("scorer missing")))
+    elif mode == "shadow":
+        monkeypatch.setattr(jobs, "_shadow_phase", _raiser(PITDataError("shadow changed")))
+    elif mode == "stale":
+        freshness = (FlowFreshness(date(2026, 10, 7), 10, 9, 1, 1, 0.1),)
+        monkeypatch.setattr(jobs, "_decide_phase", _raiser(StaleInvestorFlowError(freshness)))
+    clock = _Clock(_morning_now())
+    exit_code = morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep)
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["kind_relay"] == _RELAY_SUMMARIES
+    if mode == "ok":
+        assert (exit_code, event["outcome"]) == (0, "OK")
+    else:
+        assert exit_code == 1
+    if mode == "late":
+        assert event["outcome"] == "DEGRADED"
+        assert event["reason"] == "late_seal"
+        assert isinstance(event["metrics"]["relay_s"], float)
+
+
+@pytest.mark.parametrize("transport", [None, "direct"])
+def test_relay_helper_is_file_only_under_direct_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport: str | None,
+) -> None:
+    import src.data.kind_relay_import as importer
+    import src.data.pipeline_graph as graph
+
+    if transport is None:
+        monkeypatch.delenv("KSE_KIND_TRANSPORT", raising=False)
+    else:
+        monkeypatch.setenv("KSE_KIND_TRANSPORT", transport)
+    calls: list[dict[str, object]] = []
+    fetched = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+
+    def spy(**kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(job=kwargs["job"], status="complete", imported=1, unchanged=0,
+                               rejected=0, pending_left=0, fetched_at=fetched)
+
+    monkeypatch.setattr(importer, "import_relay_bundle", spy)
+    monkeypatch.setattr(
+        "src.integrations.krx.kind.build_scoped_kind_client", _raiser(AssertionError("no KIND client"))
+    )
+    monkeypatch.setattr(graph, "_run_kind_collection_step", _raiser(AssertionError("no collection step")))
+
+    now = datetime(2026, 10, 8, 0, 30, tzinfo=KRX_TZ)
+    summaries = jobs._import_kind_relay(tmp_path, now=now)
+
+    assert [call["job"] for call in calls] == ["kind_notice_search", "kind_notice_documents"]
+    assert all(call["dry_run"] is False and call["now"] == now for call in calls)
+    assert [item["job"] for item in summaries] == ["kind_notice_search", "kind_notice_documents"]
+    assert all(item["fetched_at"] == "2026-10-07T12:00:00+00:00" for item in summaries)
+
+
+def test_relay_helper_isolates_job_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.kind_relay_import as importer
+
+    invoked: list[str] = []
+
+    def spy(**kwargs: object) -> SimpleNamespace:
+        invoked.append(str(kwargs["job"]))
+        if kwargs["job"] == "kind_notice_search":
+            raise OSError("inbox unreadable")
+        return SimpleNamespace(job=kwargs["job"], status="complete", imported=0, unchanged=0,
+                               rejected=0, pending_left=0, fetched_at=None)
+
+    monkeypatch.setattr(importer, "import_relay_bundle", spy)
+    summaries = jobs._import_kind_relay(tmp_path, now=_morning_now())
+    assert invoked == ["kind_notice_search", "kind_notice_documents"]
+    assert [item["status"] for item in summaries] == ["failed", "complete"]
+    assert (summaries[0]["imported"], summaries[0]["rejected"], summaries[0]["fetched_at"]) == (0, 0, None)
+
+
+@pytest.mark.parametrize("target", ["src.data.runtime.resolve_data_runtime", "src.config.load_provider_policy"])
+def test_relay_helper_resolution_failure_yields_two_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, target: str,
+) -> None:
+    monkeypatch.setattr(target, _raiser(PITDataError("configuration unavailable")))
+    summaries = jobs._import_kind_relay(tmp_path, now=_morning_now())
+    assert [item["job"] for item in summaries] == ["kind_notice_search", "kind_notice_documents"]
+    assert [item["status"] for item in summaries] == ["failed", "failed"]
+    assert all(item["imported"] == 0 and item["fetched_at"] is None for item in summaries)
+    assert all(item[key] == 0 for item in summaries for key in ("unchanged", "rejected", "pending_left"))
+    for job in MORNING_RELAY_JOBS:
+        assert f"[DATA] stage=relay_import job={job} status=failed error=PITDataError" in caplog.text

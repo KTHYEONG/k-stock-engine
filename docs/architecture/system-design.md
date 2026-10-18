@@ -104,10 +104,10 @@ stateDiagram-v2
 ```
 
 ### 3.1 6단계 라이프사이클 상세 규약
-1. **08:32 KST [kse-morning.service]**: KRX 영업일 판별, 우선주/관리종목/환기종목 배제 유니버스 확정, 전일 확정 팩터 기반 목표 포트폴리오 산출 및 당일 결정 체인 봉인 (`decisions/YYYY-MM-DD.json`).
+1. **08:32 KST [kse-morning.service]**: KRX 영업일 판별, 전일 야간 수신한 인박스 KIND 릴레이 번들 import(파일 전용) 후 빌드. import 상태는 기록만 하고, KIND 신선도 한도 초과 시 `market_actions` 빌드가 결정을 차단합니다. 우선주/관리종목/환기종목 배제 유니버스 확정, 전일 확정 팩터 기반 목표 포트폴리오 산출 및 당일 결정 체인 봉인 (`decisions/YYYY-MM-DD.json`).
 2. **08:39:30 KST [kse-auction-open.service]**: 당일 결정 체인 봉인 확인 후 상위 후보군의 10단계 호가 및 시초가 단일가 예상 체결가/체결량 스냅샷 수집. (ADR-014 순차 의존성 보장).
 3. **09:00 ~ 09:30 KST [OPEN_EXECUTION]**: 전일 목표 포트폴리오를 T+1 시가 단일가(Open-Auction)로 집행. 매도 주문을 매수 주문보다 항상 먼저 체결(`_submission_order`)하여 T+2 예수금 초과 및 미수금을 원천 차단.
-4. **18:30 KST [kse-collect-eve.service]**: KRX 일봉, LS/KIS 투자자 수급, DART 공시/재무제표, KIND 릴레이 번들 수신. Bronze 불변 저널 적재 후 Silver Point-in-Time Parquet 데이터셋으로 정규화.
+4. **18:30 KST [kse-collect-eve.service]**: KRX 일봉, LS/KIS 투자자 수급, DART 공시/재무제표, KIND 릴레이 번들 수신(아침 import와 동일 번들이면 멱등 재-import). Bronze 불변 저널 적재 후 Silver Point-in-Time Parquet 데이터셋으로 정규화.
 5. **21:40 KST [kse-daily-audit.service]**: 12개 무결성 검증 규칙(결측치 0, 단조 증가, 시계열 연속성, 카탈로그 동기화) 전수 실행. 위반 시 즉시 장애 보고서 생성 및 알림 발송.
 6. **02:30 KST [kse-backup.service]**: 호스트 전역 공유 락 획득 후 변경된 세그먼트만을 Google Drive 원격 저장소로 $O(1)$ 대사 백업. (주간 토요일 10:30 KST에는 주간 운영 리포트 `kse-weekly-report.service` 가동).
 
@@ -239,4 +239,3 @@ uv run python -m src.research champion --sync-file  # 저장된 spec_json을 con
 * **OpenDART Spec**: [provider_dart.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/provider_dart.md) — 16,000 req/day 쿼터 원장 및 Point-in-Time 재무 데이터.
 * **KRX KIND Relay Spec**: [provider_kind.md](file:///home/kth/k-stock-engine/docs/architecture/brokers/provider_kind.md) — KOSPI 시장조치 공시 릴레이 번들 수집 및 인박스 파이프라인.
 * **VPS Daily Automation Audit Runbook**: [vps-checklist.md](file:///home/kth/k-stock-engine/docs/vps-checklist.md) — 24/7 무인 자동화 운영 및 일일 감사 런북.
-

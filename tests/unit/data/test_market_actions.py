@@ -1210,9 +1210,12 @@ def _publish_stale_setup(runtime, *, sessions: list) -> None:  # type: ignore[no
         _publish_daily(runtime, session=session, records=[{"ISU_SRT_CD": "005930"}])
 
 
-def test_within_budget_builds_and_records_provenance(tmp_path: Path) -> None:
+@pytest.mark.parametrize("lag", [3, 5])
+def test_within_budget_builds_and_records_provenance(tmp_path: Path, lag: int) -> None:
     runtime = _runtime(tmp_path)
     sessions = [date(2024, 4, 1), date(2024, 4, 2), date(2024, 4, 3), date(2024, 4, 4), date(2024, 4, 5)]
+    if lag == 5:
+        sessions.extend([date(2024, 4, 8), date(2024, 4, 9)])
     _publish_stale_setup(runtime, sessions=sessions)
     path = materialize_market_actions(
         catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
@@ -1220,7 +1223,7 @@ def test_within_budget_builds_and_records_provenance(tmp_path: Path) -> None:
         kind_max_stale_sessions=5, kind_coverage_start=date(2024, 1, 1),
     )
     manifest = load_manifest(path)
-    assert manifest.details["kind_stale_sessions"] == 3
+    assert manifest.details["kind_stale_sessions"] == lag
     assert manifest.details["kind_covered_through"] == "2024-04-02"
 
 
@@ -1599,3 +1602,131 @@ def test_materialised_dataset_id_unchanged(tmp_path: Path) -> None:
         kind_keywords=(), kind_max_stale_sessions=5, kind_coverage_start=date(2024, 1, 2),
     )
     assert load_manifest(path).dataset_id == "market_actions_9dc417301c11e282"
+
+
+def _relay_search_item(keyword: str, start: str, end: str, rows: list):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.evidence_sources import KIND_NOTICE_SEARCH_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.data.scoped_ingestion import ScopedRawPayload
+
+    reported = len(rows)
+    body = json.dumps(
+        {"keyword": keyword, "start": start, "end": end,
+         "reported_total": reported, "pages": [kind_search_html(rows, reported)]},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    return ScopedRawPayload(
+        kind=EvidenceKind.DISCLOSURES, source=KIND_NOTICE_SEARCH_SOURCE,
+        natural_key=f"{keyword}:{start}..{end}", as_of=date.fromisoformat(end), fiscal_period=None,
+        status=EvidenceStatus.EMPTY if reported == 0 else EvidenceStatus.SUCCESS,
+        payload=body, retrieved_at=RETRIEVED_AT, source_label="test",
+    )
+
+
+def _relay_document_item(acptno: str, html: str, disclosed_at: str):  # type: ignore[no-untyped-def]
+    from src.core.pit import EvidenceKind
+    from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE
+    from src.data.receipt_catalog import EvidenceStatus
+    from src.data.scoped_ingestion import ScopedRawPayload
+
+    body = json.dumps(
+        {"acptno": acptno, "doc_no": "1234567", "template": "68051.htm",
+         "html": html, "disclosed_at": disclosed_at},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    return ScopedRawPayload(
+        kind=EvidenceKind.DISCLOSURES, source=KIND_NOTICE_DOCUMENT_SOURCE,
+        natural_key=acptno, as_of=datetime.fromisoformat(disclosed_at).date(), fiscal_period=None,
+        status=EvidenceStatus.SUCCESS, payload=body, retrieved_at=RETRIEVED_AT, source_label="test",
+    )
+
+
+def _write_relay_bundle(runtime, *, items: list, fetched_at: datetime, fetch_date: date) -> None:  # type: ignore[no-untyped-def]
+    from src.data.kind_relay import RelayBundle, encode_relay_bundle
+    from src.data.kind_relay_import import relay_inbox_path
+
+    bundle = RelayBundle(
+        fetched_at=fetched_at, fetch_date_kst=fetch_date, producer={"run_id": "test"}, items=tuple(items),
+    )
+    path = relay_inbox_path(runtime.workspace.state_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encode_relay_bundle(bundle))
+
+
+def _import_relay(runtime, job: str, *, now: datetime):  # type: ignore[no-untyped-def]
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.kind_relay_import import import_relay_bundle
+
+    provider = load_provider_policy(load_runtime_config())
+    return import_relay_bundle(runtime=runtime, provider=provider, job=job, now=now, dry_run=False)
+
+
+def test_morning_import_removes_one_session_kind_lag(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.workspace.initialize()
+    sessions = [date(2024, 4, 1), date(2024, 4, 2), date(2024, 4, 3)]
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-01-01", end="2024-03-31", rows=[])
+    _publish_kind_search(runtime, keyword="상장폐지", start="2024-04-01", end="2024-04-02", rows=[])
+    for session in sessions:
+        _publish_daily(runtime, session=session, records=[{"ISU_SRT_CD": "005930"}])
+
+    def _stale() -> int:
+        path = materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(*sessions), bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_max_stale_sessions=5, kind_coverage_start=date(2024, 1, 1),
+        )
+        return int(load_manifest(path).details["kind_stale_sessions"])
+
+    assert _stale() == 1
+
+    _write_relay_bundle(
+        runtime,
+        items=[_relay_search_item("상장폐지", "2024-04-01", "2024-04-03", [])],
+        fetched_at=datetime(2024, 4, 3, 22, 0, tzinfo=KRX_TZ), fetch_date=date(2024, 4, 3),
+    )
+    now = datetime(2024, 4, 4, 8, 0, tzinfo=KRX_TZ)
+    assert _import_relay(runtime, "kind_notice_search", now=now).imported == 1
+    _import_relay(runtime, "kind_notice_documents", now=now)
+
+    assert _stale() == 0
+
+
+def test_kind_availability_is_independent_of_import_time(tmp_path: Path) -> None:
+    acptno = "20180913000001"
+    row = kind_row_html(acptno, "2018-09-13 18:59", "상장폐지", "00598", "유가증권시장본부")
+    sessions = [date(2018, 9, 13), date(2018, 9, 14), date(2018, 9, 17), date(2018, 9, 18)]
+    items = [
+        _relay_search_item("상장폐지", "2018-09-13", "2018-09-18", [row]),
+        _relay_document_item(acptno, KIND_DELISTING_HTML, "2018-09-13T18:59:00+09:00"),
+    ]
+    fetched_at = datetime(2018, 9, 18, 22, 0, tzinfo=KRX_TZ)
+    instants = [
+        ("morning", datetime(2018, 9, 19, 8, 0, tzinfo=KRX_TZ)),
+        ("evening", datetime(2018, 9, 19, 20, 0, tzinfo=KRX_TZ)),
+    ]
+
+    ids: list[str] = []
+    frames: list[pl.DataFrame] = []
+    for name, now in instants:
+        runtime = _runtime(tmp_path / name)
+        runtime.workspace.initialize()
+        for session in sessions:
+            _publish_daily(runtime, session=session, records=[{"ISU_SRT_CD": "005980"}])
+        _write_relay_bundle(runtime, items=items, fetched_at=fetched_at, fetch_date=date(2018, 9, 18))
+        assert _import_relay(runtime, "kind_notice_search", now=now).imported == 1
+        assert _import_relay(runtime, "kind_notice_documents", now=now).imported == 1
+        path = materialize_market_actions(
+            catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+            calendar=_calendar(*sessions), bridge=_bridge(), kind_keywords=("상장폐지",),
+            kind_max_stale_sessions=5, kind_coverage_start=date(2018, 9, 13),
+        )
+        ids.append(load_manifest(path).dataset_id)
+        frames.append(read_dataset(path).collect().select(["rcept_no", "available_at"]).sort("rcept_no"))
+
+    assert ids[0] == ids[1]
+    assert frames[0].equals(frames[1])
+    kind_rows = frames[0].filter(pl.col("rcept_no") == f"KIND-{acptno}")
+    assert kind_rows.height == 1
+    assert kind_rows["available_at"][0] == datetime(2018, 9, 14, 9, 0, tzinfo=KRX_TZ)

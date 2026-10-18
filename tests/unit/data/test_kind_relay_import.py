@@ -586,3 +586,107 @@ def test_malformed_document_is_isolated_before_storage(tmp_path: Path) -> None:
         _import(runtime, _provider(), "kind_notice_search")
         report = _import(runtime, _provider(), "kind_notice_documents")
         assert (report.status, report.rejected, report.pending_left) == ("relay_partial", 1, 1)
+
+
+def _catalog_absent(runtime) -> bool:  # type: ignore[no-untyped-def]
+    return not (runtime.workspace.bronze_root / "catalog" / "catalog.sqlite3").exists()
+
+
+def test_over_age_boundary_is_exclusive_at_max_age(tmp_path: Path) -> None:
+    runtime = _scope_runtime(tmp_path)
+    provider = _provider()
+    max_age = timedelta(hours=int(provider.kind.relay_max_age_hours))
+    assert max_age == timedelta(hours=36)
+
+    _write_bundle(runtime, _search_bundle())
+    accepted = _import(runtime, provider, "kind_notice_search", now=FETCHED_AT + max_age)
+    assert (accepted.status, accepted.imported) == ("complete", 3)
+
+    past = _scope_runtime(tmp_path / "past")
+    _write_bundle(past, _search_bundle())
+    rejected = _import(past, provider, "kind_notice_search", now=FETCHED_AT + max_age + timedelta(microseconds=1))
+    assert rejected.status == "relay_rejected"
+    assert rejected.imported == 0
+    assert _catalog_absent(past)
+    assert not _state_file(past).exists()
+
+
+def test_future_dated_bundle_beyond_skew_is_rejected(tmp_path: Path) -> None:
+    runtime = _scope_runtime(tmp_path)
+    provider = _provider()
+    skew = timedelta(seconds=int(provider.kind.relay_clock_skew_seconds))
+    assert skew == timedelta(seconds=300)
+
+    _write_bundle(
+        runtime, _bundle(_search_bundle().items, fetched_at=FETCHED_AT + skew + timedelta(microseconds=1))
+    )
+    report = _import(runtime, provider, "kind_notice_search", now=FETCHED_AT)
+    assert report.status == "relay_rejected"
+    assert report.fetched_at is None
+    assert _catalog_absent(runtime)
+    assert not _state_file(runtime).exists()
+
+    boundary = _scope_runtime(tmp_path / "boundary")
+    _write_bundle(boundary, _bundle(_search_bundle().items, fetched_at=FETCHED_AT + skew))
+    assert _import(boundary, provider, "kind_notice_search", now=FETCHED_AT).status == "complete"
+
+
+def test_morning_then_evening_reimport_is_a_noop(tmp_path: Path) -> None:
+    from src.data.evidence_sources import KIND_NOTICE_DOCUMENT_SOURCE, KIND_NOTICE_SEARCH_SOURCE
+    from src.data.kind_notices import kind_source_digest
+
+    runtime = _scope_runtime(tmp_path)
+    provider = _provider()
+    _write_bundle(runtime, _target_bundle())
+    morning = FETCHED_AT + timedelta(hours=1)
+    evening = FETCHED_AT + timedelta(hours=12)
+    search_keys = {f"{keyword}:{OPEN_START.isoformat()}..{FETCH_DATE.isoformat()}" for keyword in _keywords()}
+    document_keys = {"20240101000001"}
+
+    first_search = _import(runtime, provider, "kind_notice_search", now=morning)
+    first_docs = _import(runtime, provider, "kind_notice_documents", now=morning)
+    sequence = _sequence(runtime.workspace.bronze_root)
+    digest = kind_source_digest(_catalog(runtime))
+    search_before = _catalog(runtime).latest(source=KIND_NOTICE_SEARCH_SOURCE, natural_keys=search_keys)
+    docs_before = _catalog(runtime).latest(source=KIND_NOTICE_DOCUMENT_SOURCE, natural_keys=document_keys)
+    state_before = _state_file(runtime).read_bytes()
+
+    second_search = _import(runtime, provider, "kind_notice_search", now=evening)
+    second_docs = _import(runtime, provider, "kind_notice_documents", now=evening)
+
+    assert (second_search.imported, second_search.rejected) == (0, 0)
+    assert second_search.unchanged == first_search.imported
+    assert (second_docs.imported, second_docs.rejected) == (0, 0)
+    assert second_docs.unchanged == first_docs.imported
+    assert _sequence(runtime.workspace.bronze_root) == sequence
+    assert kind_source_digest(_catalog(runtime)) == digest
+    assert _catalog(runtime).latest(source=KIND_NOTICE_SEARCH_SOURCE, natural_keys=search_keys) == search_before
+    assert _catalog(runtime).latest(source=KIND_NOTICE_DOCUMENT_SOURCE, natural_keys=document_keys) == docs_before
+    assert _state_file(runtime).read_bytes() == state_before
+
+
+def test_newer_bundle_after_morning_import_wins_and_b0_is_refused(tmp_path: Path) -> None:
+    runtime = _scope_runtime(tmp_path)
+    provider = _provider()
+    b0 = _search_bundle()
+    _write_bundle(runtime, b0)
+    assert _import(runtime, provider, "kind_notice_search", now=FETCHED_AT + timedelta(hours=1)).imported == 3
+
+    b1_fetched = FETCHED_AT + timedelta(hours=8)
+    b1_items = [
+        _search_item(keyword, [_row(f"20260925{position:06d}")])
+        for position, keyword in enumerate(_keywords())
+    ]
+    _write_bundle(runtime, _bundle(b1_items, fetched_at=b1_fetched))
+    second = _import(runtime, provider, "kind_notice_search", now=b1_fetched + timedelta(hours=1))
+    assert second.imported > 0
+    accepted = json.loads(_state_file(runtime).read_text(encoding="utf-8"))
+    assert accepted["fetched_at"] == b1_fetched.isoformat()
+
+    sequence = _sequence(runtime.workspace.bronze_root)
+    _write_bundle(runtime, b0)
+    third = _import(runtime, provider, "kind_notice_search", now=b1_fetched + timedelta(hours=2))
+    assert third.status == "relay_rejected"
+    assert (third.imported, third.rejected) == (0, 0)
+    assert _sequence(runtime.workspace.bronze_root) == sequence
+    assert json.loads(_state_file(runtime).read_text(encoding="utf-8")) == accepted
