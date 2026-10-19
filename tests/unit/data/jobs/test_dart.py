@@ -1211,9 +1211,7 @@ def test_refresh_reports_coverage_gap(tmp_path: Path) -> None:
     assert not report.complete
 
 
-def test_refresh_reraises_unexpected_step_error(tmp_path: Path) -> None:
-    import pytest
-
+def test_refresh_reports_unexpected_step_error(tmp_path: Path) -> None:
     from src.data.pipeline_graph import build_refresh_context, run_collection_jobs
 
     runtime = _runtime(tmp_path)
@@ -1222,8 +1220,10 @@ def test_refresh_reraises_unexpected_step_error(tmp_path: Path) -> None:
     def _boom(_ctx, *, dry_run, emit):  # type: ignore[no-untyped-def]
         raise RuntimeError("boom")
 
-    with pytest.raises(RuntimeError, match="boom"):
-        run_collection_jobs(ctx, dry_run=False, emit=lambda _p: None, steps=(("dart_facts", _boom),))
+    report = run_collection_jobs(ctx, dry_run=False, emit=lambda _p: None, steps=(("dart_facts", _boom),))
+    assert report.steps[0].status == "failed"
+    assert report.blocking_job == "dart_facts"
+    assert not report.complete
 
 
 def _listing_collector(*, broken_index: int | None = None):  # type: ignore[no-untyped-def]

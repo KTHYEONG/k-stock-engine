@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -12,8 +13,10 @@ from src.data.dataset_registry import DatasetRegistry
 from src.data.pipeline_graph import (
     SCOPE_GRAPH,
     BuildNode,
+    CollectionStep,
     CollectionStepReport,
     RefreshContext,
+    RefreshReport,
     build_refresh_context,
     plan_refresh,
     refresh_scope,
@@ -1099,7 +1102,7 @@ def test_build_nodes_and_phase_helpers_fail_closed(tmp_path: Path, monkeypatch: 
             (pipeline_graph.BuildNode(kind="phantom", inputs=(), bronze_sources=(), build=_bad_build),),  # type: ignore[arg-type]
             {}, {}, set(), lambda _p: None,
         )
-    assert pipeline_graph._phase_split((),) == ((), ())
+    assert pipeline_graph._phase_split((),) == ((), (), ())
     with pytest.raises(PITDataError, match="no certified"):
         pipeline_graph._preview_industry(build_refresh_context(_scope_runtime(tmp_path / "empty-scope")))
 
@@ -1129,10 +1132,12 @@ def test_refresh_dry_run_reports_phased_order(tmp_path: Path) -> None:
     )
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append, steps=steps)
     assert report.status == "dry_run"
-    kinds = [str(item.get("kind")) for item in events if isinstance(item, dict) and item.get("type") == "plan"]
-    assert "investor_flow_ls" in kinds
-    jobs = [str(item.get("job")) for item in events if isinstance(item, dict) and item.get("type") == "collection"]
-    assert jobs.index("ls_investor_flow") < jobs.index("kis_investor_flow")
+    assert report.blocking_job is None
+    progress = [item.get("job", item.get("kind")) for item in events if isinstance(item, dict)]
+    phase_a = ["ordinary_universe", "daily_market", "investor_flow_ls"]
+    phase_b = ["investor_flow_kis_supplement", "investor_flow"]
+    phase_c = [kind for kind in EXPECTED_KINDS if kind not in phase_a + phase_b]
+    assert progress == [name for name, _ in steps[:-1]] + phase_a + ["kis_investor_flow"] + phase_b + phase_c
 
 
 def test_facts_preview_plans_without_hashing_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1507,17 +1512,25 @@ def test_optional_exception_is_contained(
     assert report.degraded_jobs == (job,)
 
 
-def test_required_exception_still_raises(tmp_path: Path) -> None:
+def test_required_exception_becomes_failed_and_continues(tmp_path: Path) -> None:
     ctx = _fixture_context(tmp_path)
+    ran: list[str] = []
 
     def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
         raise PITDataError("ls down")
 
-    with pytest.raises(PITDataError, match="ls down"):
-        run_collection_jobs(
-            ctx, dry_run=False, emit=lambda payload: None,
-            steps=(_ok_step("dart_disclosures"), ("ls_investor_flow", _boom)),
-        )
+    def _after(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        ran.append("ls_investor_flow")
+        return CollectionStepReport(job="ls_investor_flow", status="complete", done=1, pending_left=0, requests_used=0)
+
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None,
+        steps=(("dart_disclosures", _boom), ("ls_investor_flow", _after)),
+    )
+    assert ran == ["ls_investor_flow"]
+    assert [step.status for step in report.steps] == ["failed", "complete"]
+    assert report.blocking_job == "dart_disclosures"
+    assert report.complete is False
 
 
 def test_required_block_still_blocks(tmp_path: Path) -> None:
@@ -2042,3 +2055,428 @@ def test_ls_build_passes_configured_bucket_count_and_keeps_preview_identity(
     from src.data.datasets import dataset_id_for
 
     assert result.dataset_id == dataset_id_for(graph._preview_investor_flow_ls(ctx))
+
+
+def test_required_exception_emits_optional_shaped_event_and_traceback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    ctx = _fixture_context(tmp_path)
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise RuntimeError("dart down")
+
+    events: list[object] = []
+    with caplog.at_level(logging.ERROR, logger="src.data.pipeline_graph"):
+        report = run_collection_jobs(
+            ctx, dry_run=False, emit=events.append,
+            steps=(("dart_disclosures", _boom), _ok_step("ls_investor_flow")),
+        )
+    assert events[0] == {
+        "type": "collection", "job": "dart_disclosures", "status": "failed",
+        "done": 0, "pending_left": 0, "requests_used": 0,
+    }
+    assert report.blocking_job == "dart_disclosures"
+    record = next(record for record in caplog.records if record.levelno >= logging.ERROR)
+    assert "job=dart_disclosures status=failed error=RuntimeError" in record.getMessage()
+    assert record.exc_info is not None
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_required_keyboard_interrupt_propagates(tmp_path: Path, error_type: type[BaseException]) -> None:
+    ctx = _fixture_context(tmp_path)
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise error_type("stop")
+
+    with pytest.raises(error_type):
+        run_collection_jobs(
+            ctx, dry_run=False, emit=lambda payload: None,
+            steps=(("dart_disclosures", _boom),),
+        )
+
+
+def test_required_coverage_gap_continues(tmp_path: Path) -> None:
+    from src.data.jobs.dart import DisclosureCoverageError
+
+    ctx = _fixture_context(tmp_path)
+    ran: list[str] = []
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise DisclosureCoverageError("gap", periods=("2025Q4",))
+
+    def _after(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        ran.append("ls_investor_flow")
+        return CollectionStepReport(job="ls_investor_flow", status="complete", done=1, pending_left=0, requests_used=0)
+
+    events: list[object] = []
+    report = run_collection_jobs(
+        ctx, dry_run=False, emit=events.append,
+        steps=(("dart_disclosures", _boom), ("ls_investor_flow", _after)),
+    )
+    assert ran == ["ls_investor_flow"]
+    assert report.steps[0].status == "coverage_gap"
+    assert report.blocking_job == "dart_disclosures"
+    assert events[0]["periods"] == ["2025Q4"]  # type: ignore[index]
+
+
+def test_gate_table_covers_every_node_and_only_real_steps() -> None:
+    from src.data import pipeline_graph as graph
+
+    kinds = {node.kind for node in graph.SCOPE_GRAPH}
+    assert set(graph.NODE_COLLECTION_GATES) == kinds
+    real_steps = {name for name, _ in graph._default_collection_steps()}
+    for kind, gate in graph.NODE_COLLECTION_GATES.items():
+        assert gate <= real_steps, kind
+        assert not (gate & graph.OPTIONAL_COLLECTION_JOBS), kind
+    assert {
+        "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions", "earnings_releases",
+    } == graph.DART_COLLECTION_STEPS
+
+
+def test_phase_split_on_real_graph() -> None:
+    from src.data import pipeline_graph as graph
+
+    plan = tuple(graph.SCOPE_GRAPH)
+    first, flow_done, rest = graph._phase_split(plan)
+    assert {node.kind for node in first} == {"ordinary_universe", "daily_market", "investor_flow_ls"}
+    assert {node.kind for node in flow_done} == {"investor_flow_kis_supplement", "investor_flow"}
+    assert {node.kind for node in first} | {node.kind for node in flow_done} | {node.kind for node in rest} == {
+        node.kind for node in plan
+    }
+    order = [node.kind for node in graph.SCOPE_GRAPH]
+    for group in (first, flow_done, rest):
+        assert [node.kind for node in group] == sorted([node.kind for node in group], key=order.index)
+    dart_kinds = {
+        "financial_facts", "financial_quality", "dividend_events", "earnings_releases",
+        "market_actions", "market_panel", "reference_benchmarks",
+    }
+    assert not (dart_kinds & ({node.kind for node in first} | {node.kind for node in flow_done}))
+
+
+def test_blocked_kinds_transitive_and_local() -> None:
+    from src.data import pipeline_graph as graph
+
+    plan = tuple(graph.SCOPE_GRAPH)
+    assert graph._blocked_kinds(plan, frozenset({"dart_disclosures"})) == frozenset({
+        "financial_facts", "financial_quality", "dividend_events", "earnings_releases",
+        "market_actions", "market_panel", "reference_benchmarks",
+    })
+    assert graph._blocked_kinds(plan, frozenset({"krx_hedge_series"})) == frozenset({"hedge_series"})
+    assert graph._blocked_kinds(plan, frozenset()) == frozenset()
+    assert graph._blocked_kinds(plan, frozenset({"kind_notice_search"})) == frozenset()
+
+
+def _refresh_steps(names: list[str], statuses: dict[str, str] | None = None) -> tuple[CollectionStep, ...]:
+    statuses = statuses or {}
+    return tuple(_ok_step(name, statuses.get(name, "complete")) for name in names)
+
+
+def _dart_blocked_invariants(report: RefreshReport, *, blocking: str) -> None:
+    assert report.status == "blocked"
+    assert report.blocking_job == blocking
+    assert "investor_flow" in report.built
+    assert "financial_facts" not in report.built
+
+
+def test_dart_exception_still_collects_kis(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+    real_builders = {node.kind: node.build for node in graph.SCOPE_GRAPH}
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise PITDataError("dart down")
+
+    def _collect(name: str):
+        def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+            calls.append(f"collect:{name}")
+            return CollectionStepReport(job=name, status="complete", done=1, pending_left=0, requests_used=0)
+
+        return (name, _step)
+
+    def _wrap(kind: str):
+        def _build(inner_ctx: RefreshContext, inputs: object) -> object:
+            calls.append(f"build:{kind}")
+            return real_builders[kind](inner_ctx, inputs)
+
+        return _build
+
+    patched = tuple(
+        graph.BuildNode(kind=node.kind, inputs=node.inputs, bronze_sources=node.bronze_sources, build=_wrap(node.kind))
+        for node in graph.SCOPE_GRAPH
+    )
+    original_graph, original_validated = graph.SCOPE_GRAPH, graph._VALIDATED_GRAPH
+    try:
+        graph.SCOPE_GRAPH = patched  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = patched  # type: ignore[assignment]
+        steps = (
+            ("dart_disclosures", _boom),
+            _collect("krx_daily_market"), _collect("krx_security_master"),
+            _collect("ls_investor_flow"), _collect("kis_investor_flow"),
+        )
+        report = graph.refresh_scope(ctx, collect=True, dry_run=False, emit=lambda payload: None, steps=steps)
+    finally:
+        graph.SCOPE_GRAPH = original_graph  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = original_validated  # type: ignore[assignment]
+    _dart_blocked_invariants(report, blocking="dart_disclosures")
+    assert calls.index("collect:kis_investor_flow") > calls.index("build:investor_flow_ls")
+    assert "build:financial_facts" not in calls
+
+
+def test_dart_pending_still_collects_kis_and_skips_dart_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.data.pipeline_graph as graph
+
+    ctx = _built_fixture(tmp_path)
+    before = dict(ctx.registry.snapshot())
+    monkeypatch.setattr(graph, "_expected_matches_registered", lambda expected, path: False)
+    built_spy: list[str] = []
+    real_builders = {node.kind: node.build for node in graph.SCOPE_GRAPH}
+
+    def _spy(kind: str):
+        def _build(inner_ctx: RefreshContext, inputs: object) -> object:
+            built_spy.append(kind)
+            return real_builders[kind](inner_ctx, inputs)
+
+        return _build
+
+    patched = tuple(
+        graph.BuildNode(kind=node.kind, inputs=node.inputs, bronze_sources=node.bronze_sources, build=_spy(node.kind))
+        for node in graph.SCOPE_GRAPH
+    )
+    original_graph, original_validated = graph.SCOPE_GRAPH, graph._VALIDATED_GRAPH
+    try:
+        graph.SCOPE_GRAPH = patched  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = patched  # type: ignore[assignment]
+        steps = _refresh_steps(
+            ["dart_disclosures", "dart_facts", "krx_daily_market", "krx_security_master",
+             "ls_investor_flow", "kis_investor_flow"],
+            {"dart_facts": "pending"},
+        )
+        events: list[object] = []
+        report = graph.refresh_scope(ctx, collect=True, dry_run=False, emit=events.append, steps=steps)
+    finally:
+        graph.SCOPE_GRAPH = original_graph  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = original_validated  # type: ignore[assignment]
+    _dart_blocked_invariants(report, blocking="dart_facts")
+    assert ctx.registry.snapshot()["investor_flow"] == report.datasets["investor_flow"]
+    for kind in (
+        "financial_facts", "financial_quality", "dividend_events", "earnings_releases",
+        "market_actions", "market_panel", "reference_benchmarks",
+    ):
+        assert kind not in built_spy
+        assert ctx.registry.snapshot()[kind] == before[kind]
+    assert "hedge_series" in built_spy
+    assert "industry" in built_spy
+    skipped = {str(item.get("kind")) for item in events if isinstance(item, dict) and item.get("status") == "skipped_blocked"}
+    assert skipped == {
+        "financial_facts", "financial_quality", "dividend_events", "earnings_releases",
+        "market_actions", "market_panel", "reference_benchmarks",
+    }
+    for item in events:
+        if isinstance(item, dict) and item.get("status") == "skipped_blocked":
+            assert item["blocking_job"] == "dart_facts"
+
+
+def test_flow_chain_failure_keeps_blocked_before_build(tmp_path: Path) -> None:
+    ctx = _built_fixture(tmp_path)
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise PITDataError("ls down")
+
+    events: list[object] = []
+    report = refresh_scope(
+        ctx, collect=True, dry_run=False, emit=events.append,
+        steps=(("ls_investor_flow", _boom), _ok_step("kis_investor_flow")),
+    )
+    assert report.status == "blocked"
+    assert report.planned == ()
+    assert report.built == ()
+    assert report.blocking_job == "ls_investor_flow"
+    assert not any(
+        isinstance(event, dict) and event.get("job") == "kis_investor_flow" for event in events
+    )
+
+
+def test_kis_and_dart_blocking_precedence(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+    steps = _refresh_steps(
+        ["dart_facts", "krx_daily_market", "krx_security_master", "ls_investor_flow", "kis_investor_flow"],
+        {"dart_facts": "pending", "kis_investor_flow": "budget_exhausted"},
+    )
+    report = refresh_scope(ctx, collect=True, dry_run=False, emit=lambda payload: None, steps=steps)
+    assert report.status == "blocked"
+    assert report.blocking_job == "dart_facts"
+    assert report.built == ("ordinary_universe", "daily_market", "investor_flow_ls")
+    assert set(ctx.registry.snapshot()) == set(report.built)
+
+
+def test_complete_run_keeps_graph_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+    import src.data.pipeline_graph as graph
+
+    registrations: list[tuple[str, ...]] = []
+    original_register = DatasetRegistry.register_many
+
+    def register(registry: DatasetRegistry, kinds: Mapping[str, str]) -> None:
+        registrations.append(tuple(kinds))
+        original_register(registry, kinds)
+
+    monkeypatch.setattr(DatasetRegistry, "register_many", register)
+
+    def emit(payload: Mapping[str, object]) -> None:
+        if payload["type"] == "dataset":
+            calls.append(f"build:{payload['kind']}")
+
+    def _collect(name: str):
+        def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+            calls.append(f"collect:{name}")
+            return CollectionStepReport(job=name, status="complete", done=1, pending_left=0, requests_used=0)
+
+        return (name, _step)
+
+    steps = (
+        _collect("dart_disclosures"), _collect("dart_facts"), _collect("dividend_decisions"),
+        _collect("krx_daily_market"), _collect("krx_security_master"),
+        _collect("ls_investor_flow"), _collect("kis_investor_flow"),
+    )
+    report = graph.refresh_scope(ctx, collect=True, dry_run=False, emit=emit, steps=steps)
+    assert report.status == "complete"
+    assert report.built == EXPECTED_KINDS
+    assert tuple(report.datasets) == EXPECTED_KINDS
+    assert calls.index("collect:ls_investor_flow") < calls.index("collect:kis_investor_flow")
+    phases = graph._phase_split(graph.SCOPE_GRAPH)
+    assert registrations == [tuple(node.kind for node in phase) for phase in phases]
+    assert calls.index("build:investor_flow_ls") < calls.index("collect:kis_investor_flow")
+    for node in phases[2]:
+        assert calls.index("build:investor_flow") < calls.index(f"build:{node.kind}")
+
+
+def test_phase_c_raise_keeps_flow_registered(tmp_path: Path) -> None:
+    import src.data.pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+    real_builders = {node.kind: node.build for node in graph.SCOPE_GRAPH}
+
+    def _wrap(kind: str):
+        def _build(inner_ctx: RefreshContext, inputs: object) -> object:
+            calls.append(f"build:{kind}")
+            if kind == "financial_facts":
+                raise PITDataError("facts schema")
+            return real_builders[kind](inner_ctx, inputs)
+
+        return _build
+
+    def _collect(name: str):
+        def _step(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+            calls.append(f"collect:{name}")
+            return CollectionStepReport(job=name, status="complete", done=1, pending_left=0, requests_used=0)
+
+        return (name, _step)
+
+    patched = tuple(
+        graph.BuildNode(kind=node.kind, inputs=node.inputs, bronze_sources=node.bronze_sources, build=_wrap(node.kind))
+        for node in graph.SCOPE_GRAPH
+    )
+    original_graph, original_validated = graph.SCOPE_GRAPH, graph._VALIDATED_GRAPH
+    try:
+        graph.SCOPE_GRAPH = patched  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = patched  # type: ignore[assignment]
+        steps = (
+            _collect("dart_disclosures"), _collect("dart_facts"), _collect("dividend_decisions"),
+            _collect("krx_daily_market"), _collect("krx_security_master"),
+            _collect("ls_investor_flow"), _collect("kis_investor_flow"),
+        )
+        with pytest.raises(PITDataError, match="facts schema"):
+            graph.refresh_scope(ctx, collect=True, dry_run=False, emit=lambda payload: None, steps=steps)
+    finally:
+        graph.SCOPE_GRAPH = original_graph  # type: ignore[assignment]
+        graph._VALIDATED_GRAPH = original_validated  # type: ignore[assignment]
+    assert calls.index("collect:kis_investor_flow") < calls.index("build:financial_facts")
+    assert calls.index("build:investor_flow") < calls.index("build:financial_facts")
+    snapshot = ctx.registry.snapshot()
+    assert set(snapshot) == {
+        "ordinary_universe", "daily_market", "investor_flow_ls", "investor_flow_kis_supplement", "investor_flow",
+    }
+    assert plan_refresh(ctx)
+    assert "investor_flow" not in {node.kind for node in plan_refresh(ctx)}
+
+
+def test_dry_run_ignores_failing_dart_gate(tmp_path: Path) -> None:
+    ctx = _fixture_context(tmp_path)
+    silver_before = sorted(ctx.runtime.workspace.silver_root.rglob("*"))
+
+    def _boom(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        raise PITDataError("dart down")
+
+    events: list[object] = []
+    report = refresh_scope(
+        ctx, collect=True, dry_run=True, emit=events.append,
+        steps=(("dart_disclosures", _boom), _ok_step("ls_investor_flow"), _ok_step("kis_investor_flow")),
+    )
+    assert report.status == "dry_run"
+    assert report.blocking_job is None
+    assert not ctx.registry.snapshot()
+    assert sorted(ctx.runtime.workspace.silver_root.rglob("*")) == silver_before
+    assert not list(ctx.runtime.workspace.gold_root.iterdir())
+    progress = [event.get("job", event.get("kind")) for event in events if isinstance(event, dict)]
+    assert progress.index("investor_flow_ls") < progress.index("kis_investor_flow")
+    assert progress.index("kis_investor_flow") < progress.index("investor_flow_kis_supplement")
+    assert progress.index("investor_flow") < progress.index("financial_facts")
+
+
+@pytest.mark.parametrize("job", ["dart_disclosures", "kind_notice_search"])
+@pytest.mark.parametrize("from_step", [True, False])
+def test_collection_emit_failure_propagates(
+    tmp_path: Path, job: str, from_step: bool,
+) -> None:
+    ctx = build_refresh_context(_scope_runtime(tmp_path))
+    failure = RuntimeError("progress sink unavailable")
+    emissions: list[Mapping[str, object]] = []
+
+    def emit(payload: Mapping[str, object]) -> None:
+        emissions.append(payload)
+        if len(emissions) == 1:
+            raise failure
+
+    def step(
+        inner_ctx: RefreshContext, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None],
+    ) -> CollectionStepReport:
+        if from_step:
+            emit({"type": "progress", "job": job})
+        return CollectionStepReport(job, "complete", 1, 0, 0)
+
+    with pytest.raises(RuntimeError) as caught:
+        run_collection_jobs(
+            ctx, dry_run=False, emit=emit,
+            steps=((job, step), ("ls_investor_flow", lambda *a, **k: pytest.fail("must stop"))),
+        )
+    assert caught.value is failure
+    assert len(emissions) == 1
+
+
+def test_phase_split_closes_inputs_and_tolerates_unknown_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+
+    def unused(ctx: RefreshContext, inputs: Mapping[str, str]):
+        pytest.fail("phase planning must not build")
+
+    nodes = (
+        BuildNode("custom_input", (), (), unused),
+        BuildNode("ordinary_universe", ("custom_input",), (), unused),
+        BuildNode("investor_flow_ls", ("ordinary_universe",), (), unused),
+        BuildNode("investor_flow", ("investor_flow_ls",), (), unused),
+        BuildNode("custom_rest", (), (), unused),
+    )
+    monkeypatch.setattr(graph, "_VALIDATED_GRAPH", nodes)
+    assert graph._phase_split(nodes) == (nodes[:3], nodes[3:4], nodes[4:])
+    assert graph._phase_split(nodes[2:4]) == (nodes[2:3], nodes[3:4], ())
+    assert graph._blocked_kinds(nodes, frozenset({"krx_security_master"})) == {
+        "ordinary_universe", "investor_flow_ls", "investor_flow",
+    }
