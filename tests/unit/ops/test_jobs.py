@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -14,7 +15,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import src.ops.jobs as jobs
+from src.config.errors import ConfigError
 from src.core.pit import PITDataError
+from src.integrations.host_broker_contract import HostBrokerDirNotSharedError
 from src.ops.guards import GuardRefused
 from src.ops.jobs import (
     EVENING_COLLECT_STEPS,
@@ -1120,6 +1123,77 @@ def test_collect_dbsec_degrades_on_failed_step(tmp_path: Path, monkeypatch: pyte
     assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "DEGRADED"}
     event = _json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
     assert "dbsec_closing_bar" in event["reason"]
+
+
+def _dbsec_status_report(status: str, pending_left: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        steps=(
+            SimpleNamespace(job="dbsec_ticker_master", status="complete", done=1, pending_left=0, requests_used=1),
+            SimpleNamespace(job="dbsec_daily_chart", status=status, done=1, pending_left=pending_left, requests_used=1),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "pending_left", "expected"),
+    [
+        ("complete", 0, "OK"),
+        ("provider_unreachable", 3, "DEGRADED"),
+        ("quota_blocked", 3, "DEGRADED"),
+        ("provider_unstable", 3, "DEGRADED"),
+        ("budget_exhausted", 3, "DEGRADED"),
+        ("chunk_limit", 3, "DEGRADED"),
+        ("failed", 0, "DEGRADED"),
+        ("complete", 2, "DEGRADED"),
+    ],
+)
+def test_collect_dbsec_outcome_status_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, pending_left: int, expected: str,
+) -> None:
+    import json as _json
+
+    from src.ops.audit import run_daily_audit
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+    monkeypatch.setattr(
+        "src.data.pipeline_graph.run_collection_jobs", lambda *a, **k: _dbsec_status_report(status, pending_left),
+    )
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 0
+
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": expected}
+    event = _json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    chart = event["metrics"]["dbsec_daily_chart"]
+    assert chart["status"] == status
+    assert chart["pending_left"] == pending_left
+    issues = run_daily_audit(tmp_path, today=DAY, now=_morning_now())["open_issues"]
+    flagged = any(item["key"] == "collect_dbsec" and "ended" in item["text"] for item in issues)  # type: ignore[attr-defined,union-attr]
+    assert flagged is (expected == "DEGRADED")
+
+
+@pytest.mark.parametrize("error", [ConfigError("bad broker cfg"), HostBrokerDirNotSharedError("not shared")])
+def test_collect_dbsec_config_error_is_hard_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    from src.ops.jobs import collect_dbsec
+
+    _trading(monkeypatch, True)
+
+    def _raise(*a: object, **k: object) -> object:
+        raise error
+
+    def _swallowing_runner(ctx: object, *, dry_run: bool, emit: object, steps: tuple) -> SimpleNamespace:
+        for _, step in steps:
+            with contextlib.suppress(Exception):
+                step(ctx, dry_run=dry_run, emit=emit)
+        return _dbsec_status_report("failed", 0)
+
+    monkeypatch.setattr("src.data.pipeline_graph.run_collection_jobs", _swallowing_runner)
+    monkeypatch.setattr("src.data.pipeline_graph._default_collection_steps", lambda: (("dbsec_daily_chart", _raise),))
+
+    assert collect_dbsec(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"collect_dbsec": "DEGRADED"}
 
 
 def test_collect_dbsec_exception_is_degraded_exit_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
