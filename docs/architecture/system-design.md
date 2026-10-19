@@ -105,7 +105,7 @@ stateDiagram-v2
 
 ### 3.1 6단계 라이프사이클 상세 규약
 1. **08:32 KST [kse-morning.service]**: KRX 영업일 판별, 전일 야간 수신한 인박스 KIND 릴레이 번들 import(파일 전용) 후 빌드. import 상태는 기록만 하고, KIND 신선도 한도 초과 시 `market_actions` 빌드가 결정을 차단합니다. 우선주/관리종목/환기종목 배제 유니버스 확정, 전일 확정 팩터 기반 목표 포트폴리오 산출 및 당일 결정 체인 봉인 (`decisions/YYYY-MM-DD.json`).
-2. **08:39:30 KST [kse-auction-open.service]**: 당일 결정 체인 봉인 확인 후 상위 후보군의 10단계 호가 및 시초가 단일가 예상 체결가/체결량 스냅샷 수집. (ADR-014 순차 의존성 보장).
+2. **08:39:30 KST [kse-auction-open.service]**: 당일 결정 체인 봉인 확인 후 상위 후보군의 10단계 호가 및 시초가 단일가 예상 체결가/체결량 스냅샷 수집. (ADR-014 순차 의존성 보장). 슬롯이 끝날 때마다 `open.json/<YYYY-MM>/<D>.parquet`에 증분 영속하며 `(symbol, kind, scheduled_at)` 키로 선착 우선 중복 제거한다. 슬롯 마감에 못 맞추면 최저 우선순위 꼬리를 `SlotDeadline`으로 잘라 다음 슬롯을 정시에 시작하고, 파일 존재가 완성도를 의미하지 않으므로 이벤트의 `slots_captured/slots_expected/failed`가 완성 기록이다.
 3. **09:00 ~ 09:30 KST [OPEN_EXECUTION]**: 전일 목표 포트폴리오를 T+1 시가 단일가(Open-Auction)로 집행. 매도 주문을 매수 주문보다 항상 먼저 체결(`_submission_order`)하여 T+2 예수금 초과 및 미수금을 원천 차단.
 4. **18:30 KST [kse-collect-eve.service]**: KRX 일봉, LS/KIS 투자자 수급, DART 공시/재무제표, KIND 릴레이 번들 수신(아침 import와 동일 번들이면 멱등 재-import). Bronze 불변 저널 적재 후 Silver Point-in-Time Parquet 데이터셋으로 정규화. 수집-빌드 순서는 A(유니버스·일봉·LS 플로우 선행 노드) → KIS 수집 → B(플로우 보완·통합) → C(나머지)이며, DART 단계 미완료는 C의 DART 파생 빌드만 게이팅하고 플로우 수집·빌드는 차단하지 않는다.
 5. **21:40 KST [kse-daily-audit.service]**: 12개 무결성 검증 규칙(결측치 0, 단조 증가, 시계열 연속성, 카탈로그 동기화) 전수 실행. 위반 시 즉시 장애 보고서 생성 및 알림 발송.

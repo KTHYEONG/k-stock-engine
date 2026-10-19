@@ -5,19 +5,23 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Protocol, TypedDict
 
 if TYPE_CHECKING:
+    from src.execution.auction_capture import AuctionRow, CaptureBatch
     from src.integrations.kis.client import KisCredentials
 
 __all__ = ["main"]
 
 _LOG = logging.getLogger(__name__)
+
+_DEFAULT_SLOT_MARGIN_S: Final = 0.0
 
 
 def _today() -> date:
@@ -34,6 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--shadow-dir", type=Path, required=True)
     capture.add_argument("--out", type=Path, required=True)
     capture.add_argument("--limit", type=int, required=False, default=80)
+    capture.add_argument("--slot-margin-s", type=float, required=False, default=_DEFAULT_SLOT_MARGIN_S)
     capture.add_argument("--events-root", type=Path, default=None)
     rehearse = sub.add_parser("rehearse")
     rehearse.add_argument("--decisions-dir", type=Path, required=True)
@@ -83,50 +88,122 @@ def _net_holdings(shadow_dir: Path) -> tuple[str, ...]:
     return tuple(sorted(row for row in net.filter(pl.col("net") != 0)["instrument_id"].to_list()))
 
 
-def _run_auction_open(args: argparse.Namespace) -> Mapping[str, object]:
+class _AuctionMetrics(TypedDict):
+    symbols: int
+    expected_rows: int
+    open_resolved: int
+    unresolved: list[str]
+    failed: dict[str, str]
+    slots_expected: int
+    slots_captured: int
+    persist_error: str | None
+
+
+class _AuctionPersister(Protocol):
+    persist_error: str | None
+
+    def on_batch(self, batch: CaptureBatch) -> None: ...
+
+    def finalize(self, rows: Sequence[AuctionRow]) -> None: ...
+
+
+def _make_persister(out: Path) -> _AuctionPersister:
+    from src.execution.auction_capture import write_auction_rows
+
+    class _Persister:
+        def __init__(self) -> None:
+            self.persist_error: str | None = None
+
+        def on_batch(self, batch: CaptureBatch) -> None:
+            self.finalize(batch.rows)
+
+        def finalize(self, rows: Sequence[AuctionRow]) -> None:
+            if not rows:
+                return
+            try:
+                write_auction_rows(out, rows)
+            except Exception as exc:
+                if self.persist_error is None:
+                    self.persist_error = type(exc).__name__
+                _LOG.error("[EXEC] stage=auction_persist status=failed error=%s", type(exc).__name__, exc_info=True)
+
+    return _Persister()
+
+
+def _empty_auction_result() -> _AuctionMetrics:
+    return {
+        "symbols": 0,
+        "expected_rows": 0,
+        "open_resolved": 0,
+        "unresolved": [],
+        "failed": {},
+        "slots_expected": 0,
+        "slots_captured": 0,
+        "persist_error": None,
+    }
+
+
+def _run_auction_open(args: argparse.Namespace) -> _AuctionMetrics:
     from datetime import datetime as _datetime
 
     from src.core.time import KRX_TZ
-    from src.execution.auction_capture import capture_open_auction, capture_symbols, write_auction_rows
+    from src.execution.auction_capture import (
+        AuctionCapturePolicy,
+        capture_open_auction,
+        capture_symbols,
+    )
     from src.research.operate import read_chain
 
     limit = int(getattr(args, "limit", 80))
+    margin = float(getattr(args, "slot_margin_s", _DEFAULT_SLOT_MARGIN_S))
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError("slot_margin_s must be finite and >= 0")
     chain = read_chain(Path(args.decisions_dir))
     if not chain:
-        return {"symbols": 0, "expected_rows": 0, "open_resolved": 0, "unresolved": []}
+        return _empty_auction_result()
     session = _today()
     open_at = _session_open(session)
     if open_at is None:
         _LOG.info("[EXEC] auction capture skipped: %s is not a regular 09:00 session", session.isoformat())
-        return {"symbols": 0, "expected_rows": 0, "open_resolved": 0, "unresolved": []}
+        return _empty_auction_result()
     holdings = _net_holdings(Path(args.shadow_dir))
     symbols = capture_symbols(chain, holdings, session=session, limit=limit)
     if not symbols:
-        return {"symbols": 0, "expected_rows": 0, "open_resolved": 0, "unresolved": []}
+        return _empty_auction_result()
     from src.config.providers import load_provider_policy
     from src.config.runtime import load_runtime_config
     from src.integrations.kis import build_pool_client
     from src.integrations.kis.admission import AdmissionClass
 
     policy = load_provider_policy(load_runtime_config()).kis
+    capture_policy = AuctionCapturePolicy(
+        call_estimate_s=float(policy.min_interval_seconds),
+        slot_margin_s=margin,
+    )
     client = build_pool_client(policy, admission_class=AdmissionClass.STANDARD)
-    rows = capture_open_auction(
+    persist = _make_persister(Path(args.out))
+    result = capture_open_auction(
         client,
         symbols,
         session=session,
         open_at=open_at,
         now=lambda: _datetime.now(KRX_TZ),
         sleep=time.sleep,
+        policy=capture_policy,
+        on_batch=persist.on_batch,
     )
-    if rows:
-        write_auction_rows(Path(args.out), rows)
-    opened = {row.symbol for row in rows if row.kind == "open"}
-    expected = sum(1 for row in rows if row.kind == "expected")
+    persist.finalize(result.rows)
+    opened = {row.symbol for row in result.rows if row.kind == "open"}
+    expected = sum(1 for row in result.rows if row.kind == "expected")
     return {
         "symbols": len(symbols),
         "expected_rows": expected,
         "open_resolved": len(opened),
         "unresolved": sorted(set(symbols) - opened),
+        "failed": dict(sorted(result.failed.items())),
+        "slots_expected": result.slots_expected,
+        "slots_captured": result.slots_captured,
+        "persist_error": persist.persist_error,
     }
 
 
@@ -317,8 +394,17 @@ def _scheduled_capture(args: argparse.Namespace) -> int:
             record("NO_DECISION", "missing_execution_decision")
             return 1
         result = _run_auction_open(args)
+        reasons: list[str] = []
+        if result["slots_captured"] < result["slots_expected"]:
+            reasons.append("slots_incomplete")
+        if result.get("failed"):
+            reasons.append("symbol_failed")
+        if result.get("persist_error") is not None:
+            reasons.append("persist_failed")
         if result.get("unresolved"):
-            record("DEGRADED", "unresolved_auction", result)
+            reasons.append("unresolved_auction")
+        if reasons:
+            record("DEGRADED", ",".join(reasons), result)
             return 1
         record("OK", metrics=result)
         _emit(result)
