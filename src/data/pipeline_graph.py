@@ -1720,12 +1720,25 @@ def run_collection_jobs(
     emit: Callable[[Mapping[str, object]], None],
     steps: tuple[CollectionStep, ...] | None = None,
 ) -> CollectionReport:
-    """Run collection steps in order, reporting every step without building."""
+    """Run collection steps in order and report each; a step ``Exception`` becomes a ``failed`` report."""
     reports: list[CollectionStepReport] = []
-    for name, step in steps if steps is not None else _default_collection_steps():
+    emit_failure: Exception | None = None
+
+    def step_emit(payload: Mapping[str, object]) -> None:
+        nonlocal emit_failure
         try:
-            report = step(ctx, dry_run=dry_run, emit=emit)
+            emit(payload)
         except Exception as exc:
+            emit_failure = exc
+            raise
+
+    for name, step in steps if steps is not None else _default_collection_steps():
+        emit_failure = None
+        try:
+            report = step(ctx, dry_run=dry_run, emit=step_emit)
+        except Exception as exc:
+            if exc is emit_failure:
+                raise
             from src.data.jobs.dart import DisclosureCoverageError
 
             if isinstance(exc, DisclosureCoverageError) and name not in OPTIONAL_COLLECTION_JOBS:
@@ -1773,7 +1786,27 @@ def run_collection_jobs(
                 )
                 reports.append(report)
                 continue
-            raise
+            report = CollectionStepReport(
+                job=name, status="failed", done=0, pending_left=0, requests_used=0,
+            )
+            emit(
+                {
+                    "type": "collection",
+                    "job": report.job,
+                    "status": report.status,
+                    "done": report.done,
+                    "pending_left": report.pending_left,
+                    "requests_used": report.requests_used,
+                }
+            )
+            _LOG.error(
+                "[DATA] stage=refresh_collect job=%s status=failed error=%s",
+                report.job,
+                type(exc).__name__,
+                exc_info=exc,
+            )
+            reports.append(report)
+            continue
         if report.job != name:
             raise PITDataError(f"collection step name mismatch: expected={name!r} actual={report.job!r}")
         emit(
@@ -1797,17 +1830,104 @@ def run_collection_jobs(
     return CollectionReport(steps=tuple(reports), optional=OPTIONAL_COLLECTION_JOBS)
 
 
-def _phase_split(plan: tuple[BuildNode, ...]) -> tuple[tuple[BuildNode, ...], tuple[BuildNode, ...]]:
-    """Split a build plan at ``investor_flow_ls`` in graph order."""
-    order = [node.kind for node in _VALIDATED_GRAPH]
-    try:
-        cutoff = order.index("investor_flow_ls")
-    except ValueError:  # pragma: no cover - the scope graph always contains the LS node
-        return (plan, ())
-    first_kinds = set(order[: cutoff + 1])
-    first = tuple(node for node in plan if node.kind in first_kinds)
-    second = tuple(node for node in plan if node.kind not in first_kinds)
-    return (first, second)
+DART_COLLECTION_STEPS: Final[frozenset[str]] = frozenset({
+    "dart_corp_codes",
+    "dart_disclosures",
+    "dart_facts",
+    "dividend_decisions",
+    "earnings_releases",
+})
+
+NODE_COLLECTION_GATES: Final[Mapping[str, frozenset[str]]] = MappingProxyType({
+    "ordinary_universe": frozenset({"krx_security_master"}),
+    "daily_market": frozenset({"krx_daily_market"}),
+    "hedge_series": frozenset({"krx_hedge_series"}),
+    "trend_series": frozenset({"krx_trend_series"}),
+    "cash_series": frozenset({"krx_cash_series"}),
+    "investor_flow_ls": frozenset({"ls_investor_flow"}),
+    "investor_flow_kis_supplement": frozenset({"kis_investor_flow"}),
+    "financial_facts": frozenset(DART_COLLECTION_STEPS),
+    "dividend_events": frozenset(DART_COLLECTION_STEPS),
+    "earnings_releases": frozenset(DART_COLLECTION_STEPS),
+    "market_actions": frozenset(DART_COLLECTION_STEPS | {"krx_daily_market"}),
+    "industry": frozenset(),
+    "financial_quality": frozenset(),
+    "market_panel": frozenset(),
+    "investor_flow": frozenset(),
+    "reference_benchmarks": frozenset(),
+})
+
+KIS_PREREQUISITE_KINDS: Final[tuple[str, ...]] = (
+    "ordinary_universe",
+    "daily_market",
+    "investor_flow_ls",
+)
+
+FLOW_COMPLETION_KINDS: Final[tuple[str, ...]] = (
+    "investor_flow_kis_supplement",
+    "investor_flow",
+)
+
+
+def _effective_gate(
+    kind: str,
+    inputs_by_kind: Mapping[str, tuple[str, ...]],
+    memo: dict[str, frozenset[str]],
+) -> frozenset[str]:
+    """Own gate plus transitive input gates for one kind."""
+    cached = memo.get(kind)
+    if cached is not None:
+        return cached
+    own = NODE_COLLECTION_GATES.get(kind, frozenset())
+    union: set[str] = set(own)
+    for dependency in inputs_by_kind.get(kind, ()):
+        union |= set(_effective_gate(dependency, inputs_by_kind, memo))
+    result = frozenset(union)
+    memo[kind] = result
+    return result
+
+
+def _closure(seeds: tuple[str, ...], inputs_by_kind: Mapping[str, tuple[str, ...]]) -> set[str]:
+    """Seed kinds plus their transitive inputs."""
+    closed: set[str] = set()
+    stack = list(seeds)
+    while stack:
+        kind = stack.pop()
+        if kind in closed:
+            continue
+        if kind not in inputs_by_kind:
+            continue
+        closed.add(kind)
+        stack.extend(inputs_by_kind[kind])
+    return closed
+
+
+def _phase_split(plan: tuple[BuildNode, ...]) -> tuple[tuple[BuildNode, ...], tuple[BuildNode, ...], tuple[BuildNode, ...]]:
+    """Split a plan into (KIS prerequisites, flow completion, remainder), each in graph order."""
+    inputs_by_kind = {node.kind: node.inputs for node in _VALIDATED_GRAPH}
+    present = set(inputs_by_kind)
+    phase_a = _closure(KIS_PREREQUISITE_KINDS, inputs_by_kind) & present
+    phase_b = (_closure(FLOW_COMPLETION_KINDS, inputs_by_kind) & present) - phase_a
+    wanted = {node.kind for node in plan}
+    first = tuple(node for node in _VALIDATED_GRAPH if node.kind in phase_a and node.kind in wanted)
+    flow_done = tuple(node for node in _VALIDATED_GRAPH if node.kind in phase_b and node.kind in wanted)
+    rest = tuple(node for node in _VALIDATED_GRAPH if node.kind not in phase_a and node.kind not in phase_b and node.kind in wanted)
+    return (first, flow_done, rest)
+
+
+def _blocked_kinds(
+    plan: tuple[BuildNode, ...], incomplete_steps: frozenset[str]
+) -> frozenset[str]:
+    """Kinds in ``plan`` whose effective gate intersects ``incomplete_steps``."""
+    if not incomplete_steps:
+        return frozenset()
+    inputs_by_kind = {node.kind: node.inputs for node in _VALIDATED_GRAPH}
+    memo: dict[str, frozenset[str]] = {}
+    return frozenset(
+        node.kind
+        for node in plan
+        if _effective_gate(node.kind, inputs_by_kind, memo) & incomplete_steps
+    )
 
 
 def _build_nodes(
@@ -1851,16 +1971,7 @@ def refresh_scope(
     steps: tuple[CollectionStep, ...] | None = None,
     collect_steps: frozenset[str] | None = None,
 ) -> RefreshReport:
-    """Run one scope refresh with KIS collection after the LS build.
-
-    With ``collect``, the order is: DART/KRX/LS collection, build and register
-    the graph up to ``investor_flow_ls``, the ``kis_investor_flow`` collection
-    step, then the remaining builds. KIS collection needs a current LS Silver
-    dataset, so it cannot run before the LS build. ``dry_run`` reports all
-    steps in the same order without requests or writes. ``collect_steps`` runs
-    only the named collection steps, in the default order; an unknown name
-    fails before any collection, and the build phase is unchanged.
-    """
+    """Collect, then build flow prerequisites, collect KIS, build flow completion, then the remainder."""
     resolved_steps = steps if steps is not None else _default_collection_steps()
     if collect_steps is not None:
         known_steps = {name for name, _ in resolved_steps}
@@ -1905,12 +2016,12 @@ def refresh_scope(
     if dry_run and collect:
         pre_collection = run_collection_jobs(ctx, dry_run=True, emit=emit, steps=pre_steps)
         plan = plan_refresh(ctx)
-        first, second = _phase_split(plan)
+        first, flow_done, rest = _phase_split(plan)
         for kind in tuple(node.kind for node in first):
             emit({"type": "plan", "kind": kind, "status": "stale"})
             _LOG.info("[DATA] stage=refresh_plan kind=%s status=stale", kind)
         kis_collection = run_collection_jobs(ctx, dry_run=True, emit=emit, steps=kis_steps)
-        for kind in tuple(node.kind for node in second):
+        for kind in tuple(node.kind for node in (*flow_done, *rest)):
             emit({"type": "plan", "kind": kind, "status": "stale"})
             _LOG.info("[DATA] stage=refresh_plan kind=%s status=stale", kind)
         summaries = tuple(
@@ -1947,7 +2058,15 @@ def refresh_scope(
         )
         for step in pre_collection.steps
     ]
-    if pre_collection.blocking_job is not None:
+    inputs_by_kind = {node.kind: node.inputs for node in _VALIDATED_GRAPH}
+    memo: dict[str, frozenset[str]] = {}
+    full_phase_a, _, _ = _phase_split(tuple(_VALIDATED_GRAPH))
+    flow_gate: set[str] = set()
+    for node in full_phase_a:
+        flow_gate |= set(_effective_gate(node.kind, inputs_by_kind, memo))
+    if any(
+        step.job in flow_gate and step.status != "complete" for step in pre_collection.steps
+    ):
         return RefreshReport(
             decision_time=ctx.decision_time,
             status="blocked",
@@ -1963,14 +2082,17 @@ def refresh_scope(
     for kind in planned_kinds:
         emit({"type": "plan", "kind": kind, "status": "stale"})
         _LOG.info("[DATA] stage=refresh_plan kind=%s status=stale", kind)
-    first, _ = _phase_split(plan)
+    order_index = {node.kind: position for position, node in enumerate(_VALIDATED_GRAPH)}
+    first, _, _ = _phase_split(plan)
     snapshot = dict(ctx.registry.snapshot())
     built: dict[str, PublishedDataset] = {}
     peaks: dict[str, float] = {}
     known = _disk_dataset_ids(ctx, set(snapshot.values()))
     _build_nodes(ctx, first, snapshot, built, known, emit, peaks)
-    if built:
-        ctx.registry.register_many({kind: outcome.dataset_id for kind, outcome in built.items()})
+    if any(node.kind in built for node in first):
+        ctx.registry.register_many(
+            {node.kind: built[node.kind].dataset_id for node in first if node.kind in built}
+        )
         snapshot = dict(ctx.registry.snapshot())
     kis_collection = run_collection_jobs(ctx, dry_run=False, emit=emit, steps=kis_steps)
     summaries = tuple(pre_summaries) + tuple(
@@ -1985,41 +2107,89 @@ def refresh_scope(
         )
         for step in kis_collection.steps
     )
+    degraded = tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs)
     if not kis_collection.complete:
+        blocking = pre_collection.blocking_job or kis_collection.blocking_job
+        ordered_built = tuple(sorted(built, key=lambda kind: order_index.get(kind, 0)))
         return RefreshReport(
             decision_time=ctx.decision_time,
             status="blocked",
             planned=planned_kinds,
-            built=tuple(built),
-            datasets=MappingProxyType({kind: outcome.dataset_id for kind, outcome in built.items()}),
-            blocking_job=kis_collection.blocking_job,
+            built=ordered_built,
+            datasets=MappingProxyType({kind: built[kind].dataset_id for kind in ordered_built}),
+            blocking_job=blocking,
             collection=summaries,
-            degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
-            node_peak_rss_mb=MappingProxyType(dict(peaks)),
+            degraded_jobs=degraded,
+            node_peak_rss_mb=MappingProxyType({kind: peaks[kind] for kind in ordered_built if kind in peaks}),
         )
     remaining = plan_refresh(ctx)
-    _, second = _phase_split(remaining)
-    # Nodes already built in the first phase are registered, so the fresh plan
-    # only contains what is still stale; build exactly that remainder.
-    _build_nodes(ctx, second, snapshot, built, known, emit, peaks)
-    if second:
+    _, flow_done, rest = _phase_split(remaining)
+    _build_nodes(ctx, flow_done, snapshot, built, known, emit, peaks)
+    if any(node.kind in built for node in flow_done):
         ctx.registry.register_many(
-            {node.kind: built[node.kind].dataset_id for node in second if node.kind in built}
+            {node.kind: built[node.kind].dataset_id for node in flow_done if node.kind in built}
+        )
+        snapshot = dict(ctx.registry.snapshot())
+    incomplete_required = frozenset(
+        step.job
+        for step in (*pre_collection.steps, *kis_collection.steps)
+        if step.status != "complete" and step.job not in OPTIONAL_COLLECTION_JOBS
+    )
+    step_order = [step.job for step in (*pre_collection.steps, *kis_collection.steps)]
+    blocked = _blocked_kinds(rest, incomplete_required)
+    blocked_memo: dict[str, frozenset[str]] = {}
+    buildable = []
+    for node in rest:
+        if node.kind not in blocked:
+            buildable.append(node)
+            continue
+        gate = _effective_gate(node.kind, inputs_by_kind, blocked_memo)
+        blocker = next((job for job in step_order if job in gate and job in incomplete_required), None)
+        emit({"type": "plan", "kind": node.kind, "status": "skipped_blocked", "blocking_job": blocker})
+        _LOG.warning(
+            "[DATA] stage=refresh_build kind=%s status=skipped_blocked gate=%s",
+            node.kind,
+            blocker,
+        )
+    _build_nodes(ctx, tuple(buildable), snapshot, built, known, emit, peaks)
+    if any(node.kind in built for node in buildable):
+        ctx.registry.register_many(
+            {node.kind: built[node.kind].dataset_id for node in buildable if node.kind in built}
+        )
+    ordered_built = tuple(sorted(built, key=lambda kind: order_index.get(kind, 0)))
+    ordered_datasets = MappingProxyType({kind: built[kind].dataset_id for kind in ordered_built})
+    ordered_peaks = MappingProxyType({kind: peaks[kind] for kind in ordered_built if kind in peaks})
+    if pre_collection.blocking_job is not None:
+        blocking = pre_collection.blocking_job
+        return RefreshReport(
+            decision_time=ctx.decision_time,
+            status="blocked",
+            planned=planned_kinds,
+            built=ordered_built,
+            datasets=ordered_datasets,
+            blocking_job=blocking,
+            collection=summaries,
+            degraded_jobs=degraded,
+            node_peak_rss_mb=ordered_peaks,
         )
     return RefreshReport(
         decision_time=ctx.decision_time,
         status="complete",
         planned=planned_kinds,
-        built=tuple(built),
-        datasets=MappingProxyType({kind: outcome.dataset_id for kind, outcome in built.items()}),
+        built=ordered_built,
+        datasets=ordered_datasets,
         blocking_job=None,
         collection=summaries,
-        degraded_jobs=tuple(pre_collection.degraded_jobs) + tuple(kis_collection.degraded_jobs),
-        node_peak_rss_mb=MappingProxyType(dict(peaks)),
+        degraded_jobs=degraded,
+        node_peak_rss_mb=ordered_peaks,
     )
 
 
 __all__ = [
+    "DART_COLLECTION_STEPS",
+    "FLOW_COMPLETION_KINDS",
+    "KIS_PREREQUISITE_KINDS",
+    "NODE_COLLECTION_GATES",
     "OPTIONAL_COLLECTION_JOBS",
     "SCOPE_GRAPH",
     "BuildNode",
