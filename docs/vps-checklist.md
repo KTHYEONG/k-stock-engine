@@ -47,6 +47,7 @@ Events: `data/ops/events/YYYY-MM/YYYY-MM-DD.jsonl`, one JSON line per run: `job`
 | Routine (trigger, KST) | Job / limits | Writes (path, format) | Outcome expected | Content check |
 | :--- | :--- | :--- | :--- | :--- |
 | `kse-morning` Mon–Fri 08:32 | `morning` 4g/1.8 CPU, `bulk` | KRX Bronze (catalog `krx_daily_market`, `krx_security_master`, `krx_{hedge,trend,cash}_series`, 1 receipt each for `P`); Silver `daily_market`, `ordinary_universe`, `{hedge,trend,cash}_series` (`$S/<id>/session=P/part.parquet`), `market_actions`; Gold `market_panel` (`year=YYYY/part.parquet` + `manifest.json`); `$T/decisions/chain.jsonl` + `$T/decisions/P.json`; `$T/operate/state.json`; `$T/shadow/{official,ideal}/{fills,nav,rejects}.parquet` + `runs.jsonl` | event `OK`, `metrics.sealed` = `[P]`, `sealed_at` < 09:00 (2026-10-14..16: 08:51–08:54); ~20 min | K1, K2, K3, P5 feature coverage |
+| `kse-morning-late` operator-triggered, no timer | `morning_late` 4g/1.8 CPU, `bulk` | same writes as `morning` for a missed seal | event `DEGRADED late_seal`, never `OK`; `auction_open` captures nothing after 08:59 | P4 |
 | `kse-auction-open` Mon–Fri 08:39:30 | `auction-open` 512m, `standard`, `--limit 80` | `data/ops/auction/open.json/YYYY-MM/D.parquet` (`open.json` is a dir): `session,symbol,kind(expected|open),scheduled_at,received_at,output1,output2` — incremental per-slot persist, dedup on `(symbol,kind,scheduled_at)` first-wins | event `OK`, `unresolved: []`, `slots_captured == slots_expected`, `failed == {}`, `persist_error None`; `expected_rows = 3 × symbols` when sealed 08:51–08:54; ends ~09:01. File presence ≠ completeness: partial file possible when the event is missing or `DEGRADED`. `--limit` above ~58 truncates the lowest-priority tail of the 08:58/08:59 slots (`failed` `SlotDeadline`) | K4 |
 | `kse-collect-eve` Mon–Fri 18:30 | `collect-eve` 3g/1.5 CPU, `bulk`, `KSE_KIND_TRANSPORT=relay` | Bronze `investor_flow` (LS t1702 + KIS, ~9 680 files ≈ 536 MiB/day), `disclosures`, `dart_documents`, `financial_facts`, `corporate_actions`; catalog `ranges` (`ls_investor_flow`, `kis_investor_flow`, end = `D-1`); Silver `investor_flow{,_ls,_kis_supplement}` (`year=YYYY`), `financial_facts`, `financial_quality`, `dividend_events`, `earnings_releases`; `$T/quota/quota_state.json`; `$T/cache/*.sqlite`, `daily_admin_flags.parquet`; prunes unreferenced dataset generations | event `OK`, `built == planned` (7/7 on 10-16), `prune_failed 0`, `prune_unreadable 0`, `flag_cache_sessions` +1 per business day (2644→2645); ~1–2 h | K5, K6, K7 |
 | `kse-collect-dbsec` Mon–Fri 20:40 | `collect-dbsec` 1g; `ExecStartPre` marker test + wait ≤ 60 min for `collect-eve` | catalog `dbsec_ticker_master` (1), `dbsec_daily_chart`, `dbsec_closing_bar` (keys `D:<ticker>`); Bronze `daily_market`/`security_master` (~11 k files); `$T/dbsec_reconcile/<session>.json` once KRX Silver for that session exists (i.e. session `D-1` on run `D`) | event `OK`, every step `pending_left 0`, `fallback_ready` false until 20 `pass` reports; ~25 min | K7 |
@@ -73,12 +74,13 @@ PASS: `NTPSynchronized=yes`, offset < 0.1 s (2026-10-18: 7 µs), free disk ≥ 2
 ```bash
 systemctl --user list-timers --all --no-pager 'kse-*'
 systemctl --user --failed --no-pager
-for u in morning auction-open collect-eve collect-dbsec daily-audit backup weekly-report; do printf '%-14s ' $u; systemctl --user show -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p DropInPaths --value kse-$u.service | tr '\n' '|'; echo; done
-ls ~/.config/systemd/user | grep -E '^kse-' | grep -vE '^kse-(alert@|morning|auction-open|collect-eve|collect-dbsec|daily-audit|backup|weekly-report)\.'; ls -d ~/kse-collect 2>/dev/null
+for u in morning morning-late auction-open collect-eve collect-dbsec daily-audit backup weekly-report; do printf '%-14s ' $u; systemctl --user show -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p DropInPaths --value kse-$u.service | tr '\n' '|'; echo; done
+ls ~/.config/systemd/user | grep -E '^kse-' | grep -vE '^kse-(alert@|morning|morning-late|auction-open|collect-eve|collect-dbsec|daily-audit|backup|weekly-report)\.'; ls -d ~/kse-collect 2>/dev/null
 TZ=Asia/Seoul journalctl --user -u 'kse-*' --since "$D 00:00" --until "$D 23:59:59" --no-pager -o short-iso | grep -E 'Failed with result|Finished' | cut -c1-110
 ```
 PASS: 7 timers, none failed, `Result=success`, `DropInPaths` empty, no stray `kse-*` file (e.g. `kse-dart-worker.*`) and no
-`~/kse-collect` unless a DART backfill was announced. `list-timers` prints UTC. A failure followed by a manual
+`~/kse-collect` unless a DART backfill was announced. 7 timers stay 7 while 8 service files exist
+(`kse-morning-late.service` has no timer). `list-timers` prints UTC. A failure followed by a manual
 `systemctl --user start` shows `success` as the last result; the events file (P4) holds the full day (2026-10-16:
 `collect-eve` failed 19:41, re-run finished 23:17).
 
@@ -89,15 +91,15 @@ printf '%s %s\n' "$(sha256sum < ~/.local/lib/kse/kse-run | cut -c1-16)" kse-run
 docker image inspect -f '{{.Id}} {{.Created}} {{index .Config.Labels "org.opencontainers.image.revision"}}' ghcr.io/kthyeong/k-stock-engine:latest
 docker images ghcr.io/kthyeong/k-stock-engine --format '{{.Tag}}' | wc -l; ls -d ~/k-stock-engine/.deploy/staging-* | wc -l
 docker ps -a --filter name=kse- --format '{{.Names}} {{.Status}}'
-for j in morning auction-open collect-eve collect-dbsec daily-audit backup weekly-report alert; do
+for j in morning morning-late auction-open collect-eve collect-dbsec daily-audit backup weekly-report alert; do
   printf '== %s: ' "$j"; ~/.local/lib/kse/kse-run --print "$j" | tr '\0' ' ' | sed -E 's/([A-Z_]*(KEY|SECRET|TOKEN)[A-Z_]*)=[^ ]*/\1=<redacted>/g'; echo
 done
 ```
 Locally: `cd /home/kth/k-stock-engine && for f in deploy/systemd/* deploy/kse-run; do printf '%s %s\n' "$(sha256sum < $f | cut -c1-16)" "$(basename $f)"; done; git ls-remote origin refs/heads/main; gh run list --workflow deploy.yml --limit 3`.
-PASS: all 16 hashes equal; image revision = `origin/main` (2026-10-18: `c65833b`, created 2026-10-17 08:50 UTC); deploy
+PASS: all 17 hashes equal; image revision = `origin/main` (2026-10-18: `c65833b`, created 2026-10-17 08:50 UTC); deploy
 run `success`; no `kse-*` container; every argv except `alert` mounts `/home/ubuntu/.cache/kis:/app/.cache/kis` with
 `KIS_TOKEN_CACHE_DIR`; `collect-dbsec` additionally `~/.cache/dbsec:/app/.cache/dbsec:ro` (legacy, §5); `backup` mounts
-rclone config `:ro`; `--memory` equals `--memory-swap` per job (4g/512m/3g/1g/512m/1g/2g/256m). Tag/staging counts are
+rclone config `:ro`; `--memory` equals `--memory-swap` per job (4g/4g/512m/3g/1g/512m/1g/2g/256m). Tag/staging counts are
 SEV3 above 5 (2026-10-18: 23 tags, 22 staging dirs).
 
 ### P4. Outcomes, heartbeat, alerts
@@ -118,7 +120,8 @@ cd ~/k-stock-engine/data/ops && cat heartbeat/daily_audit.json; echo; tail -5 al
 PASS: last line per job on `D`: `morning OK` (`sealed == [P]`), `auction_open OK`, `collect_eve OK` (`built == planned`,
 `prune_failed 0`, `flag_cache_sessions` = previous + 1), `collect_dbsec OK` (each step `pending_left 0`), `backup OK`; `blocked on dart_*`인 `collect_eve`는 `investor_flow` 최신·KIS ranges와 공존할 수 있으므로 K5·ranges는 outcome과 무관하게 독립 확인; node
 peak RSS ≤ 90 % of the container limit (2026-10-16 `collect_eve` `investor_flow_ls` 2873.6 MB of 3 GiB = 93 % → SEV3);
-heartbeat `snapshot_date` = `D`, `open_issues []`; outbox 0. Crashes before `cb6df6e` logged no traceback; from it on the
+heartbeat `snapshot_date` = `D`, `open_issues []`; outbox 0. A manual late seal shows as the last `morning_late`
+line `DEGRADED late_seal`. SEV1 `late_seal` rule unchanged. Crashes before `cb6df6e` logged no traceback; from it on the
 journal carries `[OPS] command=<job> status=DEGRADED reason=<Exc>` plus the traceback (P6 grep).
 
 ### P5. Artefact freshness, morning feature coverage, backup, weekly report

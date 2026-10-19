@@ -11,10 +11,11 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
@@ -23,6 +24,7 @@ from src.ops.guards import (
     DEFAULT_MIN_AVAILABLE_MB,
     DEFAULT_MIN_FREE_DISK_GB,
     GuardRefused,
+    exclusive_run_lock,
     require_headroom,
     trading_day,
 )
@@ -38,6 +40,8 @@ __all__ = [
     "DBSEC_COLLECT_STEPS",
     "EVENING_COLLECT_STEPS",
     "KRX_COLLECT_STEPS",
+    "MORNING_LATE_JOB",
+    "MORNING_LOCK_RELPATH",
     "MORNING_RELAY_JOBS",
     "POLL_INTERVAL_S",
     "alert",
@@ -47,6 +51,7 @@ __all__ = [
     "collect_eve",
     "main",
     "morning",
+    "morning_late",
     "weekly_report",
 ]
 
@@ -88,6 +93,8 @@ POLL_INTERVAL_S: Final = 60.0
 _DEADLINE_HOUR: Final = 8
 _DEADLINE_MINUTE: Final = 55
 _LATE_SEAL_HOUR: Final = 9
+MORNING_LOCK_RELPATH: Final = "ops/locks/morning.lock"
+MORNING_LATE_JOB: Final = "morning_late"
 _PRUNE_AFTER_DAYS: Final = 14
 _PUSH_SOURCES: Final = ("bronze", "bronze_catalog", "state", "ops")
 
@@ -206,17 +213,43 @@ def _poll_krx_once(data_root: Path, session: date, decision_time: datetime) -> b
     return _data_session_present(Path(data_root), session)
 
 
+@dataclass(frozen=True, slots=True)
+class KrxWait:
+    present: bool
+    polls: int
+    poll_errors: int
+    last_error: str | None
+    last_poll_raised: bool
+
+
 def _wait_for_krx(
-    data_root: Path, session: date, *, now: Callable[[], datetime], sleep: Callable[[float], None],
-    deadline: datetime,
-) -> bool:
+    data_root: Path, session: date, *, now: Callable[[], datetime], sleep: Callable[[float], None], deadline: datetime,
+) -> KrxWait:
+    """Poll KRX until the session is present or ``deadline``; a poll exception counts as not yet present."""
+    polls = 0
+    poll_errors = 0
+    last_error: str | None = None
+    last_poll_raised = False
     while True:
         if _aware(now()) > deadline:
-            return False
-        if _poll_krx_once(Path(data_root), session, _aware(now())):
-            return True
+            return KrxWait(False, polls, poll_errors, last_error, last_poll_raised)
+        decision_time = _aware(now())
+        try:
+            present = _poll_krx_once(Path(data_root), session, decision_time)
+        except Exception as exc:
+            polls += 1
+            poll_errors += 1
+            last_error = type(exc).__name__
+            last_poll_raised = True
+            _LOG.error("[DATA] stage=krx_poll status=error error=%s", type(exc).__name__, exc_info=exc)
+            present = False
+        else:
+            polls += 1
+            last_poll_raised = False
+            if present:
+                return KrxWait(True, polls, poll_errors, last_error, last_poll_raised)
         if _aware(now()) >= deadline:
-            return False
+            return KrxWait(False, polls, poll_errors, last_error, last_poll_raised)
         sleep(min(POLL_INTERVAL_S, (deadline - _aware(now())).total_seconds()))
 
 
@@ -605,40 +638,19 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
     return 0
 
 
-def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep: Callable[[float], None]) -> int:
-    """Wait for yesterday's KRX bars, refresh the KRX-derived nodes, seal the decision, update the shadow ledger."""
-    root = Path(data_root)
-    if not trading_day(today):
-        _record(root, "morning", "SKIPPED", today, _aware(now()), reason="non_trading_day")
-        return 0
-    refused = _guard_headroom(root)
-    if refused is not None:
-        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=str(refused)[:300],
-                metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb,
-                         "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": {}})
-        return 1
-    try:
-        data_session = _previous_session(today)
-    except PITDataError as exc:
-        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__)
-        return 1
-    started = time.monotonic()
-    deadline = datetime(today.year, today.month, today.day, _DEADLINE_HOUR, _DEADLINE_MINUTE, tzinfo=KRX_TZ)
-    try:
-        waited = _wait_for_krx(root, data_session, now=now, sleep=sleep, deadline=deadline)
-    except Exception as exc:
-        _log_job_failure("morning", exc)
-        outcome = "NO_DECISION" if isinstance(exc, PITDataError) else "DEGRADED"
-        _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__)
-        return 1
-    wait_s = time.monotonic() - started
-    if not waited:
-        _record(
-            root, "morning", "NO_DECISION", today, _aware(now()), reason="krx_absent_at_deadline",
-            metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                     "node_peak_rss_mb": {}},
-        )
-        return 1
+@dataclass(frozen=True, slots=True)
+class SealRun:
+    outcome: Literal["SEALED", "NO_DECISION", "DEGRADED"]
+    reason: str
+    metrics: dict[str, object]
+    sealed_at: datetime | None
+
+
+def _run_seal_phases(
+    root: Path, *, today: date, data_session: date, now: Callable[[], datetime],
+    base_metrics: Mapping[str, object],
+) -> SealRun:
+    """Relay import, build, decide and shadow for ``today``; maps every failure to a (outcome, reason, metrics) triple."""
     mark = time.monotonic()
     relay = _import_kind_relay(root, now=_aware(now()))
     relay_s = time.monotonic() - mark
@@ -663,47 +675,205 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     except StaleInvestorFlowError as exc:
         from dataclasses import asdict
 
-        _record(root, "morning", "NO_DECISION", today, _aware(now()), reason=exc.reason,
-                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay,
-                         "flow_freshness": [
-                             {**asdict(item), "source_session": item.source_session.isoformat()}
-                             for item in exc.freshness
-                         ]})
-        return 1
+        return SealRun(
+            "NO_DECISION", exc.reason,
+            {"data_session": data_session.isoformat(), **dict(base_metrics),
+             "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "kind_relay": relay,
+             "flow_freshness": [{**asdict(item), "source_session": item.source_session.isoformat()}
+                                for item in exc.freshness]},
+            None,
+        )
     except PITDataError as exc:
-        outcome = "DEGRADED" if phase == "shadow" else "NO_DECISION"
-        _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__,
-                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay})
-        return 1
+        outcome: Literal["SEALED", "NO_DECISION", "DEGRADED"] = "DEGRADED" if phase == "shadow" else "NO_DECISION"
+        return SealRun(
+            outcome, type(exc).__name__,
+            {"data_session": data_session.isoformat(), **dict(base_metrics),
+             "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "kind_relay": relay},
+            None,
+        )
     except Exception as exc:
         _log_job_failure("morning", exc)
-        _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
-                metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "peak_rss_mb": _peak_rss_mb(),
-                         "node_peak_rss_mb": _node_peak_metrics(build_report), "kind_relay": relay})
+        return SealRun(
+            "DEGRADED", type(exc).__name__,
+            {"data_session": data_session.isoformat(), **dict(base_metrics),
+             "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "kind_relay": relay},
+            None,
+        )
+    return SealRun(
+        "SEALED", "",
+        {"data_session": data_session.isoformat(), **dict(base_metrics),
+         "sealed": sealed, "sealed_at": _aware(sealed_at).astimezone(KRX_TZ).isoformat(),
+         "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+         "build_s": build_s, "decide_s": decide_s, "shadow_s": shadow_s,
+         "relay_s": relay_s, "kind_relay": relay},
+        sealed_at,
+    )
+
+
+def _morning_impl(
+    root: Path, *, today: date, data_session: date, now: Callable[[], datetime],
+    started: float, wait: KrxWait, wait_s: float,
+) -> int:
+    base_metrics: dict[str, object] = {"data_session": data_session.isoformat(), "wait_s": wait_s}
+    if not wait.present:
+        reason = (
+            f"krx_poll_error_at_deadline:{wait.last_error}"
+            if wait.last_poll_raised and wait.last_error is not None
+            else "krx_absent_at_deadline"
+        )
+        _record(
+            root, "morning", "NO_DECISION", today, _aware(now()), reason=reason,
+            metrics={**base_metrics, "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": {},
+                      "polls": wait.polls, "poll_errors": wait.poll_errors,
+                      "last_poll_error": wait.last_error},
+        )
+        return 1
+    result = _run_seal_phases(root, today=today, data_session=data_session, now=now, base_metrics=base_metrics)
+    if result.outcome != "SEALED" or result.sealed_at is None:
+        _record(root, "morning", result.outcome, today, _aware(now()),
+                reason=result.reason, metrics=result.metrics)
         return 1
     elapsed_s = time.monotonic() - started
-    metrics: dict[str, object] = {
-        "data_session": data_session.isoformat(),
-        "sealed": sealed,
-        "sealed_at": _aware(sealed_at).astimezone(KRX_TZ).isoformat(),
-        "elapsed_s": elapsed_s,
-        "peak_rss_mb": _peak_rss_mb(),
-        "node_peak_rss_mb": _node_peak_metrics(build_report),
-        "wait_s": wait_s,
-        "build_s": build_s,
-        "decide_s": decide_s,
-        "shadow_s": shadow_s,
-        "relay_s": relay_s,
-        "kind_relay": relay,
-    }
+    metrics: dict[str, object] = {**result.metrics, "elapsed_s": elapsed_s}
     opened = datetime(today.year, today.month, today.day, _LATE_SEAL_HOUR, tzinfo=KRX_TZ)
-    if _aware(sealed_at).astimezone(KRX_TZ) >= opened:
+    if _aware(result.sealed_at).astimezone(KRX_TZ) >= opened:
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason="late_seal", metrics=metrics)
         return 1
     _record(root, "morning", "OK", today, _aware(now()), metrics=metrics)
     return 0
+
+
+def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep: Callable[[float], None]) -> int:
+    """Wait for yesterday's KRX bars, refresh the KRX-derived nodes, seal the decision, update the shadow ledger."""
+    root = Path(data_root)
+    if not trading_day(today):
+        _record(root, "morning", "SKIPPED", today, _aware(now()), reason="non_trading_day")
+        return 0
+    with exclusive_run_lock(root / MORNING_LOCK_RELPATH) as held:
+        if not held:
+            _record(root, "morning", "DEGRADED", today, _aware(now()), reason="morning_lock_held")
+            return 1
+        refused = _guard_headroom(root)
+        if refused is not None:
+            _record(root, "morning", "DEGRADED", today, _aware(now()), reason=str(refused)[:300],
+                    metrics={"guard": "headroom", "available_mb": refused.available_mb,
+                             "free_disk_gb": refused.free_disk_gb,
+                             "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": {}})
+            return 1
+        try:
+            data_session = _previous_session(today)
+        except PITDataError as exc:
+            _record(root, "morning", "DEGRADED", today, _aware(now()), reason=type(exc).__name__)
+            return 1
+        started = time.monotonic()
+        deadline = datetime(today.year, today.month, today.day, _DEADLINE_HOUR, _DEADLINE_MINUTE, tzinfo=KRX_TZ)
+        try:
+            wait = _wait_for_krx(root, data_session, now=now, sleep=sleep, deadline=deadline)
+        except Exception as exc:
+            _log_job_failure("morning", exc)
+            outcome = "NO_DECISION" if isinstance(exc, PITDataError) else "DEGRADED"
+            _record(root, "morning", outcome, today, _aware(now()), reason=type(exc).__name__)
+            return 1
+        wait_s = time.monotonic() - started
+        return _morning_impl(root, today=today, data_session=data_session, now=now,
+                             started=started, wait=wait, wait_s=wait_s)
+
+
+def morning_late(data_root: Path, *, today: date, now: Callable[[], datetime]) -> int:
+    """Seal a missed morning decision after the deadline; records DEGRADED late_seal, never OK; returns the exit code."""
+    from src.ops.run_outcome import load_run_outcomes
+
+    root = Path(data_root)
+    if not trading_day(today):
+        _record(root, MORNING_LATE_JOB, "SKIPPED", today, _aware(now()), reason="non_trading_day")
+        return 0
+    if today != _aware(now()).astimezone(KRX_TZ).date():
+        _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason="date_not_current")
+        return 1
+    with exclusive_run_lock(root / MORNING_LOCK_RELPATH) as held:
+        if not held:
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason="morning_lock_held")
+            return 1
+        started = _aware(now())
+        mono_start = time.monotonic()
+        try:
+            already = _sealed_at_for(_research_paths(root).decisions, today)
+        except (ValueError, PITDataError) as exc:
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason=type(exc).__name__)
+            return 1
+        if already is not None:
+            _record(root, MORNING_LATE_JOB, "SKIPPED", today, _aware(now()), reason="already_sealed",
+                    metrics={"sealed_at": _aware(already).astimezone(KRX_TZ).isoformat()})
+            return 0
+        refused = _guard_headroom(root)
+        if refused is not None:
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason=str(refused)[:300],
+                    metrics={"guard": "headroom", "available_mb": refused.available_mb,
+                             "free_disk_gb": refused.free_disk_gb,
+                             "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": {}})
+            return 1
+        try:
+            data_session = _previous_session(today)
+        except PITDataError as exc:
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason=type(exc).__name__)
+            return 1
+        try:
+            rerun_of: object = load_run_outcomes(root / "ops" / "events", today).get("morning")
+        except Exception:
+            rerun_of = None
+        poll_start = time.monotonic()
+        try:
+            present = _poll_krx_once(root, data_session, started)
+        except PITDataError as exc:
+            wait_s = time.monotonic() - poll_start
+            _record(root, MORNING_LATE_JOB, "NO_DECISION", today, _aware(now()), reason=type(exc).__name__,
+                    metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "late": True,
+                             "rerun_of": rerun_of, "peak_rss_mb": _peak_rss_mb(),
+                             "node_peak_rss_mb": {}})
+            return 1
+        except Exception as exc:
+            wait_s = time.monotonic() - poll_start
+            _log_job_failure(MORNING_LATE_JOB, exc)
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason=type(exc).__name__,
+                    metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "late": True,
+                             "rerun_of": rerun_of, "peak_rss_mb": _peak_rss_mb(),
+                             "node_peak_rss_mb": {}})
+            return 1
+        wait_s = time.monotonic() - poll_start
+        if not present:
+            _record(root, MORNING_LATE_JOB, "NO_DECISION", today, _aware(now()), reason="krx_absent_late",
+                    metrics={"data_session": data_session.isoformat(), "wait_s": wait_s, "late": True,
+                             "rerun_of": rerun_of, "peak_rss_mb": _peak_rss_mb(),
+                             "node_peak_rss_mb": {}})
+            return 1
+        base_metrics: dict[str, object] = {
+            "data_session": data_session.isoformat(), "rerun_of": rerun_of,
+            "late": True, "wait_s": wait_s,
+        }
+        result = _run_seal_phases(root, today=today, data_session=data_session, now=now,
+                                  base_metrics=base_metrics)
+        if result.outcome != "SEALED" or result.sealed_at is None:
+            _record(root, MORNING_LATE_JOB, result.outcome, today, _aware(now()),
+                    reason=result.reason, metrics=result.metrics)
+            return 1
+        sealed_at = _aware(result.sealed_at).astimezone(KRX_TZ)
+        if sealed_at < started:
+            _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()),
+                    reason="sealed_at_before_start", metrics=result.metrics)
+            return 1
+        opened = datetime(today.year, today.month, today.day, _LATE_SEAL_HOUR, tzinfo=KRX_TZ)
+        elapsed_s = time.monotonic() - mono_start
+        metrics: dict[str, object] = {
+            **result.metrics, "elapsed_s": elapsed_s, "late": True,
+            "sealed_at": sealed_at.isoformat(), "rerun_of": rerun_of,
+            "sealed_before_open": sealed_at < opened, "data_session": data_session.isoformat(),
+        }
+        _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason="late_seal",
+                metrics=metrics)
+        return 0
 
 
 def _tool_path() -> Path:
@@ -988,6 +1158,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     sub.add_parser("collect-eve")
     sub.add_parser("collect-dbsec")
     sub.add_parser("morning")
+    sub.add_parser("morning-late")
     prune = sub.add_parser("backup")
     prune.add_argument("--no-lock", action="store_true")
     sub.add_parser("audit")
@@ -1012,6 +1183,8 @@ def main(argv: list[str] | None = None) -> int:
         return collect_dbsec(data_root, today=today, now=moment)
     if args.command == "morning":
         return morning(data_root, today=today, now=lambda: datetime.now(KRX_TZ), sleep=time.sleep)
+    if args.command == "morning-late":
+        return morning_late(data_root, today=today, now=lambda: datetime.now(KRX_TZ))
     if args.command == "backup":
         return backup(data_root, now=moment, no_lock=args.no_lock)
     if args.command == "audit":

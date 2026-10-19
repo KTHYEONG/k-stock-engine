@@ -25,14 +25,15 @@ IMAGE = "ghcr.io/kthyeong/k-stock-engine:latest"
 DRIVE_SLOTS = {(9, 15), (21, 0), (21, 30), (22, 15), (23, 30)}
 SIBLING_WINDOWS = [((8, 50), (9, 40)), ((15, 10), (15, 43))]
 UNIT_JOBS = {
+    "kse-alert@.service": "alert",
     "kse-auction-open.service": "auction-open",
     "kse-backup.service": "backup",
     "kse-collect-dbsec.service": "collect-dbsec",
     "kse-collect-eve.service": "collect-eve",
     "kse-daily-audit.service": "daily-audit",
     "kse-morning.service": "morning",
+    "kse-morning-late.service": "morning-late",
     "kse-weekly-report.service": "weekly-report",
-    "kse-alert@.service": "alert",
 }
 
 
@@ -164,7 +165,10 @@ def test_effective_command_equivalent_to_legacy() -> None:
         uidgid = subprocess.run(["id", "-u"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         uidgid += ":" + subprocess.run(["id", "-g"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         assert len(json.loads(FIXTURE.read_text(encoding="utf-8"))) == 8
+        assert set(UNIT_JOBS) - set(json.loads(FIXTURE.read_text(encoding="utf-8"))) == {"kse-morning-late.service"}
         for unit in UNIT_JOBS:
+            if unit not in json.loads(FIXTURE.read_text(encoding="utf-8")):
+                continue
             effective = _normalize(_unit_effective(unit, home=home))
             legacy = _legacy_normalized(unit, home, uidgid)
             assert effective["scalars"] == legacy["scalars"], unit
@@ -225,11 +229,12 @@ def test_wrapper_exec_preserves_argv_stdin_pid_and_exit_status(tmp_path: Path) -
 
 def test_non_alert_jobs_reject_extra_args() -> None:
     env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp/fakehome"}  # noqa: S108
-    result = subprocess.run(["bash", str(WRAPPER), "--print", "morning", "extra"],  # noqa: S603,S607
-                            capture_output=True, env=env, check=False)
-    assert result.returncode == 64
-    assert result.stdout == b""
-    assert b"status=USAGE" in result.stderr
+    for job in ("morning", "morning-late"):
+        result = subprocess.run(["bash", str(WRAPPER), "--print", job, "extra"],  # noqa: S603,S607
+                                capture_output=True, env=env, check=False)
+        assert result.returncode == 64
+        assert result.stdout == b""
+        assert b"status=USAGE" in result.stderr
 
 
 def test_usage_errors_fail_before_external_commands(tmp_path: Path) -> None:
@@ -264,7 +269,7 @@ def test_swap_equals_memory_for_every_job() -> None:
 
 def test_units_carry_no_docker_flags() -> None:
     units = sorted(SYSTEMD.glob("kse-*.service"))
-    assert len(units) == 8
+    assert len(units) == 9
     for path in units:
         text = path.read_text(encoding="utf-8")
         assert "docker run" not in text, path.name
@@ -374,7 +379,7 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
             "import json, os, pathlib, sys\n"
             "home = pathlib.Path(os.environ['HOME'])\n"
             "assert (home / '.local/lib/kse/kse-run').stat().st_mode & 0o111\n"
-            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 8\n"
+            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 9\n"
             "with open(os.environ['EVENT_LOG'], 'a') as log:\n"
             "    log.write(json.dumps([pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')\n",
             encoding="utf-8",
@@ -411,9 +416,24 @@ def test_morning_timeout_is_within_late_seal_window() -> None:
     assert norm["scalars"]["memory-swap"] == "4g"
 
 
+def test_morning_late_profile_mirrors_morning_without_scheduling() -> None:
+    morning = _normalize(_unit_effective("kse-morning.service"))
+    late = _normalize(_unit_effective("kse-morning-late.service"))
+    assert late["scalars"]["name"] == "kse-morning-late"
+    assert late["tail"][-1] == "morning-late"
+    late["scalars"]["name"] = morning["scalars"]["name"]
+    late["tail"][-1] = morning["tail"][-1]
+    assert late == morning
+    text = (SYSTEMD / "kse-morning-late.service").read_text()
+    assert "[Install]" not in text
+    assert "ExecStartPre=" not in text
+    assert "TimeoutStartSec=30min" in text
+    assert not (SYSTEMD / "kse-morning-late.timer").exists()
+
+
 def test_units_are_safe_by_construction() -> None:
     services = _services()
-    assert len(services) == 7
+    assert len(services) == 8
     with tempfile.TemporaryDirectory() as home:
         prefixes = (home + "/k-stock-engine/data:", home + "/k-stock-engine/logs:",
                     home + "/.cache/kis:", home + "/.cache/dbsec:", home + "/.config/rclone:")
@@ -616,6 +636,7 @@ def test_dbsec_legacy_mount_is_read_only() -> None:
     with tempfile.TemporaryDirectory() as home:
         holders: dict[str, list[str]] = {}
         for unit in ("kse-collect-dbsec.service", "kse-collect-eve.service", "kse-morning.service",
+                     "kse-morning-late.service",
                      "kse-auction-open.service", "kse-backup.service", "kse-daily-audit.service",
                      "kse-weekly-report.service"):
             norm = _normalize(_unit_effective(unit, home=home))
@@ -647,7 +668,7 @@ def test_broker_dir_units_share_one_container_path() -> None:
     found = False
     for unit in ("kse-auction-open.service", "kse-backup.service", "kse-collect-dbsec.service",
                  "kse-collect-eve.service", "kse-daily-audit.service", "kse-morning.service",
-                 "kse-weekly-report.service"):
+                 "kse-morning-late.service", "kse-weekly-report.service"):
         norm = _normalize(_unit_effective(unit))
         kis_mounts = [mount for mount in norm["vols"] if "/.cache/kis:" in mount]
         if not kis_mounts:

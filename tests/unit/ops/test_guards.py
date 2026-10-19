@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.ops import guards
-from src.ops.guards import GuardRefused, require_headroom, trading_day
+from src.ops.guards import GuardRefused, exclusive_run_lock, require_headroom, trading_day
 
 
 def test_trading_day_distinguishes_session_and_holiday() -> None:
@@ -69,3 +69,53 @@ def test_headroom_fails_closed_on_unreadable_sources(
     monkeypatch.setattr(guards, "_mem_available_mb", lambda: 8000.0)
     with pytest.raises(GuardRefused, match="free disk"):
         require_headroom(min_available_mb=3500, min_free_disk_gb=25.0, data_root=tmp_path / "missing")
+
+
+def test_exclusive_lock_acquired_and_released(tmp_path: Path) -> None:
+    path = tmp_path / "nested" / "morning.lock"
+    with exclusive_run_lock(path) as first:
+        assert first is True
+    assert path.is_file()
+    with exclusive_run_lock(path) as second:
+        assert second is True
+    assert path.is_file()
+
+
+def test_exclusive_lock_second_holder_refused(tmp_path: Path) -> None:
+    path = tmp_path / "morning.lock"
+    with exclusive_run_lock(path) as outer:
+        assert outer is True
+        with exclusive_run_lock(path) as inner:
+            assert inner is False
+
+
+def test_exclusive_lock_released_on_exception(tmp_path: Path) -> None:
+    path = tmp_path / "morning.lock"
+    with pytest.raises(RuntimeError, match="boom"), exclusive_run_lock(path):
+        raise RuntimeError("boom")
+    with exclusive_run_lock(path) as again:
+        assert again is True
+
+
+def test_exclusive_lock_survives_no_unlink(tmp_path: Path) -> None:
+    path = tmp_path / "morning.lock"
+    with exclusive_run_lock(path):
+        pass
+    assert path.is_file()
+
+
+def test_exclusive_lock_os_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fcntl as _fcntl
+
+    path = tmp_path / "morning.lock"
+    real_flock = _fcntl.flock
+
+    def _boom(handle: object, flags: int) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(_fcntl, "flock", _boom)
+    with pytest.raises(OSError, match="read-only"), exclusive_run_lock(path):
+        pass
+    monkeypatch.setattr(_fcntl, "flock", real_flock)
+    with exclusive_run_lock(path) as held:
+        assert held is True
