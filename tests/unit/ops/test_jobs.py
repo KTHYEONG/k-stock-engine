@@ -65,7 +65,7 @@ def test_holiday_is_clean_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     _trading(monkeypatch, False)
     calls: list[str] = []
     monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: calls.append("refresh"))
-    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: calls.append("wait") or True)
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: calls.append("wait") or jobs.KrxWait(True, 1, 0, None, False))
     assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
     clock = _Clock(_morning_now())
     assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
@@ -155,6 +155,11 @@ def test_krx_never_arrives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert "decide" not in calls
     assert "shadow" not in calls
     assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "NO_DECISION"}
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["reason"] == "krx_absent_at_deadline"
+    assert event["metrics"]["polls"] >= 1
+    assert event["metrics"]["poll_errors"] == 0
+    assert event["metrics"]["last_poll_error"] is None
 
 
 def test_late_seal_is_degraded_not_hidden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -222,11 +227,11 @@ def test_wait_for_krx_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     deadline = datetime(2026, 10, 8, 8, 55, tzinfo=KRX_TZ)
     answers = iter([False, True])
     monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: next(answers))
-    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline) is True
+    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline).present is True
     assert clock.sleeps == [60.0]
     clock = _Clock(deadline + timedelta(seconds=1))
     monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: False)
-    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline) is False
+    assert jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline).present is False
 
 
 def test_backup_failure_removes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -478,13 +483,15 @@ def test_main_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         jobs, "morning", lambda root, **kwargs: seen.append("morning") or 3
     )
     assert main(["--data-root", str(tmp_path), "morning"]) == 3
+    monkeypatch.setattr(jobs, "morning_late", lambda root, **kwargs: seen.append("morning-late") or 0)
+    assert main(["--data-root", str(tmp_path), "morning-late"]) == 0
     monkeypatch.setattr(jobs, "backup", lambda root, **kwargs: seen.append("backup") or 0)
     assert main(["--data-root", str(tmp_path), "backup", "--no-lock"]) == 0
     monkeypatch.setattr(jobs, "audit", lambda root, **kwargs: seen.append("audit") or 0)
     assert main(["--data-root", str(tmp_path), "audit"]) == 0
     monkeypatch.setattr(jobs, "weekly_report", lambda root, **kwargs: seen.append("weekly-report") or 0)
     assert main(["--data-root", str(tmp_path), "weekly-report"]) == 0
-    assert seen == ["collect-eve", "morning", "backup", "audit", "weekly-report"]
+    assert seen == ["collect-eve", "morning", "morning-late", "backup", "audit", "weekly-report"]
     assert jobs._as_int(3) == 3
     assert jobs._as_int(True) == 0
     assert jobs._as_int("x") == 0
@@ -494,7 +501,7 @@ def test_main_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_morning_poll_failure_and_missing_seal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     _morning_stubs(monkeypatch, calls, _morning_now())
-    clock = _Clock(_morning_now())
+    clock = _Clock(datetime(2026, 10, 8, 8, 32, tzinfo=KRX_TZ))
 
     def fail(*args: object, **kwargs: object) -> bool:
         raise PITDataError("token=do-not-persist")
@@ -502,6 +509,11 @@ def test_morning_poll_failure_and_missing_seal(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(jobs, "_poll_krx_once", fail)
     assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
     assert load_run_outcomes(tmp_path / "ops" / "events", DAY)["morning"] == "NO_DECISION"
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["reason"] == "krx_poll_error_at_deadline:PITDataError"
+    assert event["metrics"]["poll_errors"] >= 2
+    assert event["metrics"]["last_poll_error"] == "PITDataError"
+    assert clock.sleeps
     monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
     monkeypatch.setattr(jobs, "_sealed_at_for", lambda *a: None)
     assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
@@ -968,7 +980,10 @@ def test_morning_records_peak_rss(
 ) -> None:
     seal = datetime(2026, 10, 8, 9 if mode == "late" else 8, 31, tzinfo=KRX_TZ)
     _morning_stubs(monkeypatch, [], seal)
-    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: mode != "absent")
+    monkeypatch.setattr(
+        jobs, "_wait_for_krx",
+        lambda *a, **k: jobs.KrxWait(mode != "absent", 1, 0, None, False),
+    )
     monkeypatch.setattr(jobs, "_peak_rss_mb", lambda: 123.5)
     if mode == "guard":
         monkeypatch.setattr(jobs, "_guard_headroom", lambda root: GuardRefused("low memory"))
@@ -1557,7 +1572,10 @@ def test_morning_imports_relay_after_wait_before_build(tmp_path: Path, monkeypat
     assert MORNING_RELAY_JOBS == ("kind_notice_search", "kind_notice_documents")
     calls: list[str] = []
     _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
-    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: calls.append("wait") or True)
+    monkeypatch.setattr(
+        jobs, "_wait_for_krx",
+        lambda *a, **k: calls.append("wait") or jobs.KrxWait(True, 1, 0, None, False),
+    )
     seen: dict[str, datetime] = {}
     clock = _Clock(_morning_now())
 
@@ -1582,7 +1600,7 @@ def test_morning_imports_relay_after_wait_before_build(tmp_path: Path, monkeypat
 def test_morning_absent_krx_skips_relay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     _morning_stubs(monkeypatch, calls, _morning_now())
-    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: False)
+    monkeypatch.setattr(jobs, "_wait_for_krx", lambda *a, **k: jobs.KrxWait(False, 1, 0, None, False))
     monkeypatch.setattr(jobs, "_import_kind_relay", _raiser(AssertionError("relay must not run without KRX bars")))
     clock = _Clock(_morning_now())
     assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
@@ -1709,3 +1727,471 @@ def test_relay_helper_resolution_failure_yields_two_failed(
     assert all(item[key] == 0 for item in summaries for key in ("unchanged", "rejected", "pending_left"))
     for job in MORNING_RELAY_JOBS:
         assert f"[DATA] stage=relay_import job={job} status=failed error=PITDataError" in caplog.text
+
+
+def _late_stubs(monkeypatch: pytest.MonkeyPatch, sealed_at: datetime | None) -> list[str]:
+    calls: list[str] = []
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_previous_session", lambda day: date(2026, 10, 7))
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **kwargs: calls.append("build"))
+    monkeypatch.setattr(jobs, "_decide_phase", lambda root: calls.append("decide") or ["2026-10-07"])
+    monkeypatch.setattr(jobs, "_shadow_phase", lambda root: calls.append("shadow"))
+    def _sealed(decisions: object, execution: object) -> datetime | None:
+        return sealed_at if "decide" in calls else None
+
+    monkeypatch.setattr(jobs, "_sealed_at_for", _sealed)
+    return calls
+
+
+def _late_stubs_sealed(monkeypatch: pytest.MonkeyPatch, sealed_at: datetime) -> list[str]:
+    calls: list[str] = []
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_previous_session", lambda day: date(2026, 10, 7))
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **kwargs: calls.append("build"))
+    monkeypatch.setattr(jobs, "_decide_phase", lambda root: calls.append("decide") or ["2026-10-07"])
+    monkeypatch.setattr(jobs, "_shadow_phase", lambda root: calls.append("shadow"))
+    monkeypatch.setattr(jobs, "_sealed_at_for", lambda decisions, execution: sealed_at)
+    return calls
+
+
+def test_poll_exception_retried_until_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning
+
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    polls = iter([RuntimeError("x"), PITDataError("y"), True])
+
+    def _poll(*a: object, **k: object) -> bool:
+        value = next(polls)
+        if isinstance(value, Exception):
+            raise value
+        return bool(value)
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", _poll)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert clock.sleeps == [60.0, 60.0]
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "OK"}
+
+
+def test_poll_exception_until_deadline_records_last_class(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+
+    def _fail(*a: object, **k: object) -> bool:
+        raise PITDataError("token=x")
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", _fail)
+    clock = _Clock(datetime(2026, 10, 8, 8, 32, tzinfo=KRX_TZ))
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "NO_DECISION"
+    assert event["reason"] == "krx_poll_error_at_deadline:PITDataError"
+    assert event["metrics"]["poll_errors"] >= 2
+    assert event["metrics"]["last_poll_error"] == "PITDataError"
+    assert "token=x" not in (tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text()
+
+
+def test_earlier_poll_error_then_clean_absence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    answers: list[object] = [RuntimeError("boom"), False]
+
+    def _poll(*a: object, **k: object) -> bool:
+        if answers:
+            value = answers.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return bool(value)
+        return False
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", _poll)
+    clock = _Clock(datetime(2026, 10, 8, 8, 54, tzinfo=KRX_TZ))
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["reason"] == "krx_absent_at_deadline"
+    assert event["metrics"]["poll_errors"] == 1
+    assert event["metrics"]["last_poll_error"] == "RuntimeError"
+
+
+def test_post_deadline_start_does_not_poll(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    spy: list[str] = []
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: spy.append("poll") or False)
+    clock = _Clock(datetime(2026, 10, 8, 9, 0, tzinfo=KRX_TZ))
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["reason"] == "krx_absent_at_deadline"
+    assert event["metrics"]["polls"] == 0
+    assert spy == []
+
+
+def test_poll_keyboard_interrupt_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    deadline = datetime(2026, 10, 8, 8, 55, tzinfo=KRX_TZ)
+
+    def _poll(*a: object, **k: object) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", _poll)
+    clock = _Clock(_morning_now())
+    with pytest.raises(KeyboardInterrupt):
+        jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline)
+
+
+@pytest.mark.parametrize("source", ["clock", "sleep"])
+def test_wait_does_not_retry_clock_or_sleep_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+) -> None:
+    clock = _Clock(_morning_now())
+    polls: list[str] = []
+    clock_calls = 0
+
+    def now() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        if source == "clock" and clock_calls == 2:
+            raise RuntimeError("clock failed")
+        return clock.now()
+
+    def sleep(seconds: float) -> None:
+        raise RuntimeError("sleep failed")
+
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a: polls.append("poll") or False)
+    with pytest.raises(RuntimeError, match=f"{source} failed"):
+        jobs._wait_for_krx(
+            tmp_path, DAY, now=now, sleep=sleep,
+            deadline=datetime(2026, 10, 8, 8, 55, tzinfo=KRX_TZ),
+        )
+    assert polls == ([] if source == "clock" else ["poll"])
+
+
+def test_wait_result_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    deadline = datetime(2026, 10, 8, 8, 55, tzinfo=KRX_TZ)
+    answers = iter([False, True])
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: next(answers))
+    clock = _Clock(_morning_now())
+    result = jobs._wait_for_krx(tmp_path, DAY, now=clock.now, sleep=clock.sleep, deadline=deadline)
+    assert result.present is True
+    assert (result.polls, result.poll_errors, result.last_error, result.last_poll_raised) == (2, 0, None, False)
+    assert clock.sleeps == [60.0]
+
+
+def test_morning_holds_lock_for_whole_body(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.guards import exclusive_run_lock
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    with exclusive_run_lock(tmp_path / MORNING_LOCK_RELPATH):
+        clock = _Clock(_morning_now())
+        assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "morning_lock_held")
+
+
+def test_morning_releases_lock_on_every_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.guards import exclusive_run_lock
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    with exclusive_run_lock(tmp_path / MORNING_LOCK_RELPATH) as held:
+        assert held is True
+
+
+def test_non_trading_day_takes_no_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning, morning_late
+
+    _trading(monkeypatch, False)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert morning_late(tmp_path, today=DAY, now=clock.now) == 0
+    assert not (tmp_path / MORNING_LOCK_RELPATH).exists()
+
+
+def test_morning_late_seals_when_nothing_sealed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    calls = _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: calls.append("poll") or True)
+    monkeypatch.setattr(jobs, "_import_kind_relay", lambda *a, **k: calls.append("relay") or [])
+    jobs._record(tmp_path, "morning", "NO_DECISION", DAY, _morning_now(), reason="krx_absent_at_deadline")
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    assert calls == ["poll", "relay", "build", "decide", "shadow"]
+    events = [json.loads(line) for line in (tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text().splitlines()]
+    event = events[-1]
+    assert events[0]["outcome"] == "NO_DECISION"
+    assert event["job"] == "morning_late"
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "late_seal")
+    assert event["metrics"]["late"] is True
+    assert event["metrics"]["sealed_before_open"] is False
+    assert event["metrics"]["sealed_at"] == "2026-10-08T10:58:00+09:00"
+    assert event["metrics"]["rerun_of"] == "NO_DECISION"
+
+
+def test_morning_late_sealed_before_open_still_late_seal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 8, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    now = datetime(2026, 10, 8, 8, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "late_seal")
+    assert event["metrics"]["sealed_before_open"] is True
+
+
+def test_morning_late_never_records_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    events = (tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text()
+    assert '"morning_late"' in events
+    for line in events.splitlines():
+        assert json.loads(line)["outcome"] != "OK"
+
+
+def test_morning_late_already_sealed_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    calls = _late_stubs_sealed(monkeypatch, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", _raiser(AssertionError("poll must not run")))
+    monkeypatch.setattr(jobs, "_build_all", _raiser(AssertionError("build must not run")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("SKIPPED", "already_sealed")
+    assert calls == []
+
+
+def test_morning_late_refuses_while_morning_holds_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.guards import exclusive_run_lock
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning_late
+
+    _late_stubs(monkeypatch, None)
+    with exclusive_run_lock(tmp_path / MORNING_LOCK_RELPATH):
+        now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+        assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "morning_lock_held")
+
+
+def test_morning_late_ignores_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    seen: list[str] = []
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: seen.append("poll") or True)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    assert seen == ["poll"]
+
+
+def test_morning_late_krx_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    calls = _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: False)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("NO_DECISION", "krx_absent_late")
+    assert "decide" not in calls
+
+
+@pytest.mark.parametrize(("error", "outcome"), [(PITDataError("x"), "NO_DECISION"), (RuntimeError("y"), "DEGRADED")])
+def test_morning_late_poll_exception_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, outcome: str,
+) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", _raiser(error))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == (outcome, type(error).__name__)
+
+
+def test_morning_late_build_structural_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    calls = _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_build_all", _raiser(PITDataError("cash missing")))
+    monkeypatch.setattr(jobs, "_shadow_phase", _raiser(AssertionError("shadow must not run")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("NO_DECISION", "PITDataError")
+    assert "shadow" not in calls
+
+
+def test_morning_late_stale_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.investor_flow_freshness import FlowFreshness, StaleInvestorFlowError
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    freshness = (FlowFreshness(date(2026, 10, 7), 10, 9, 1, 1, 0.1),)
+    monkeypatch.setattr(jobs, "_decide_phase", _raiser(StaleInvestorFlowError(freshness)))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("NO_DECISION", "stale_investor_flow")
+
+
+def test_morning_late_shadow_failure_after_seal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_shadow_phase", _raiser(PITDataError("shadow changed")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "PITDataError")
+
+
+def test_morning_late_no_backdating_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 50, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "sealed_at_before_start")
+
+
+def test_morning_late_date_mismatch_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", _raiser(AssertionError("no phase")))
+    now = datetime(2026, 10, 9, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "date_not_current")
+    assert not (tmp_path / MORNING_LOCK_RELPATH).exists()
+
+
+def test_morning_late_broken_chain_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_sealed_at_for", _raiser(ValueError("broken")))
+    monkeypatch.setattr(jobs, "_poll_krx_once", _raiser(AssertionError("no poll")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "ValueError")
+
+
+def test_morning_late_headroom_refused_releases_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.guards import exclusive_run_lock
+    from src.ops.jobs import MORNING_LOCK_RELPATH, morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_guard_headroom", lambda root: GuardRefused("low memory"))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "DEGRADED"
+    with exclusive_run_lock(tmp_path / MORNING_LOCK_RELPATH) as held:
+        assert held is True
+
+
+def test_morning_late_second_invocation_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    calls = _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    first = len(calls)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["reason"] == "already_sealed"
+    assert len(calls) == first
+
+
+def test_morning_late_generic_seal_error_is_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_build_all", _raiser(RuntimeError("scorer missing")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "RuntimeError")
+
+
+def test_morning_late_missing_seal_after_decide(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("NO_DECISION", "PITDataError")
+
+
+@pytest.mark.parametrize(("error", "outcome"), [(PITDataError("x"), "NO_DECISION"), (RuntimeError("y"), "DEGRADED")])
+def test_morning_wait_wrapper_error_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, outcome: str,
+) -> None:
+    from src.ops.jobs import morning
+
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_wait_for_krx", _raiser(error))
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == (outcome, type(error).__name__)
+
+
+def test_morning_late_previous_session_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, None)
+
+    def _no_prev(day: date) -> date:
+        raise PITDataError("no session before")
+
+    monkeypatch.setattr(jobs, "_previous_session", _no_prev)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "PITDataError")
+
+
+def test_morning_late_rerun_of_read_error_still_seals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops import run_outcome
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(run_outcome, "load_run_outcomes", _raiser(OSError("unreadable")))
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
+    assert (event["outcome"], event["reason"]) == ("DEGRADED", "late_seal")
+    assert event["metrics"]["rerun_of"] is None
