@@ -1576,6 +1576,7 @@ def test_relay_helper_is_file_only_under_direct_transport(
 
     assert [call["job"] for call in calls] == ["kind_notice_search", "kind_notice_documents"]
     assert all(call["dry_run"] is False and call["now"] == now for call in calls)
+    assert all(call["now"].utcoffset() == timedelta(0) for call in calls)
     assert [item["job"] for item in summaries] == ["kind_notice_search", "kind_notice_documents"]
     assert all(item["fetched_at"] == "2026-10-07T12:00:00+00:00" for item in summaries)
 
