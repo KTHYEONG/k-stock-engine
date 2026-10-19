@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import shutil
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 from typing import Final
@@ -11,6 +14,7 @@ __all__ = [
     "DEFAULT_MIN_AVAILABLE_MB",
     "DEFAULT_MIN_FREE_DISK_GB",
     "GuardRefused",
+    "exclusive_run_lock",
     "require_headroom",
     "trading_day",
 ]
@@ -33,6 +37,30 @@ def trading_day(day: date) -> bool:
 
     sessions = xkrx_calendar_through(day).sessions
     return any(moment.astimezone(KRX_TZ).date() == day for moment in sessions)
+
+
+@contextlib.contextmanager
+def exclusive_run_lock(path: Path) -> Iterator[bool]:
+    """Yield True while holding a non-blocking exclusive flock on ``path``, False when another holder has it."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = target.open("a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        yield False
+        return
+    except OSError:
+        handle.close()
+        raise
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _mem_available_mb() -> float:

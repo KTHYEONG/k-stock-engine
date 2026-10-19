@@ -82,6 +82,14 @@ case "$JOB" in
     EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
     MODULE_ARGV=(src.ops.jobs morning)
     ;;
+  morning-late)
+    NAME="kse-morning-late"; MEM="4g"; CPUS="1.8"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")
+    WANT_KIS=1; WANT_MALLOC=1
+    EXTRA_E=("BROKER_ADMISSION_CLASS=bulk")
+    EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs morning-late)
+    ;;
   weekly-report)
     NAME="kse-weekly-report"; MEM="2g"; CPUS="1.0"
     EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env")

@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE late morning seal (operator-triggered, no timer)
+OnFailure=kse-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=30min
+ExecStart=%h/.local/lib/kse/kse-run morning-late
+ExecStopPost=-/usr/bin/docker rm -f kse-morning-late
