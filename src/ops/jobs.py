@@ -521,16 +521,22 @@ def _reconcile_dbsec_sessions(
     )
 
 
+# Matched by name: the ops layer may not import the integrations contract module.
+_BROKER_DIR_ERROR_NAME: Final = "HostBrokerDirNotSharedError"
+
+
 def _surface_config_errors(step: Callable[..., Any], sink: list[Exception]) -> Callable[..., Any]:
     """Wrap a collection step so config/broker-dir errors are recorded before the runner downgrades them to 'failed'."""
     from src.config.errors import ConfigError
-    from src.integrations.host_broker_contract import HostBrokerDirNotSharedError
 
     def run(*args: Any, **kwargs: Any) -> Any:
         try:
             return step(*args, **kwargs)
-        except (ConfigError, HostBrokerDirNotSharedError) as exc:
-            sink.append(exc)
+        except Exception as exc:
+            if isinstance(exc, ConfigError) or any(
+                cls.__name__ == _BROKER_DIR_ERROR_NAME for cls in type(exc).__mro__
+            ):
+                sink.append(exc)
             raise
 
     return run
