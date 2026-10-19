@@ -253,7 +253,9 @@ def _import_kind_relay(data_root: Path, *, now: datetime) -> list[dict[str, obje
     summaries: list[dict[str, object]] = []
     for job in MORNING_RELAY_JOBS:
         try:
-            report = import_relay_bundle(runtime=runtime, provider=provider, job=job, now=now, dry_run=False)
+            report = import_relay_bundle(
+                runtime=runtime, provider=provider, job=job, now=now.astimezone(UTC), dry_run=False
+            )
         except Exception as exc:
             summaries.append(_relay_failure_summary(job, exc))
             continue
