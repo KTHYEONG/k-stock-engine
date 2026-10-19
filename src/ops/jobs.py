@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
@@ -521,6 +521,21 @@ def _reconcile_dbsec_sessions(
     )
 
 
+def _surface_config_errors(step: Callable[..., Any], sink: list[Exception]) -> Callable[..., Any]:
+    """Wrap a collection step so config/broker-dir errors are recorded before the runner downgrades them to 'failed'."""
+    from src.config.errors import ConfigError
+    from src.integrations.host_broker_contract import HostBrokerDirNotSharedError
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return step(*args, **kwargs)
+        except (ConfigError, HostBrokerDirNotSharedError) as exc:
+            sink.append(exc)
+            raise
+
+    return run
+
+
 def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
     """Collect DB Securities fallback evidence only; returns the process exit code."""
     from src.data.pipeline_graph import _default_collection_steps, build_refresh_context, run_collection_jobs
@@ -528,13 +543,18 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
 
     root = Path(data_root)
     moment = _aware(now)
+    config_errors: list[Exception] = []
     if not trading_day(today):
         _record(root, "collect_dbsec", "SKIPPED", today, moment, reason="non_trading_day")
         return 0
     try:
         runtime = resolve_data_runtime(data_root=root)
         ctx = build_refresh_context(runtime, decision_time=moment)
-        steps = tuple(step for step in _default_collection_steps() if step[0] in DBSEC_COLLECT_STEPS)
+        steps = tuple(
+            (name, _surface_config_errors(step, config_errors))
+            for name, step in _default_collection_steps()
+            if name in DBSEC_COLLECT_STEPS
+        )
         report = run_collection_jobs(
             ctx, dry_run=False, emit=lambda payload: _LOG.debug("refresh %s", dict(payload)), steps=steps,
         )
@@ -542,11 +562,22 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
         _log_job_failure("collect_dbsec", exc)
         _record(root, "collect_dbsec", "DEGRADED", today, moment, reason=type(exc).__name__)
         return 1
+    if config_errors:
+        _log_job_failure("collect_dbsec", config_errors[0])
+        _record(root, "collect_dbsec", "DEGRADED", today, moment, reason=f"config:{type(config_errors[0]).__name__}")
+        return 1
     metrics = {
-        step.job: {"done": step.done, "pending_left": step.pending_left, "requests_used": step.requests_used}
+        step.job: {
+            "status": step.status,
+            "done": step.done,
+            "pending_left": step.pending_left,
+            "requests_used": step.requests_used,
+        }
         for step in report.steps
     }
-    failed = [step.job for step in report.steps if step.status == "failed"]
+    incomplete = [
+        f"{step.job}={step.status}" for step in report.steps if step.status != "complete" or step.pending_left > 0
+    ]
     try:
         reconciled, fallback_ready = _reconcile_dbsec_sessions(runtime, now=moment)
     except Exception as exc:
@@ -558,10 +589,10 @@ def collect_dbsec(data_root: Path, *, today: date, now: datetime) -> int:
         )
         return 0
     reconcile_metrics: dict[str, object] = {"reconciled": reconciled, "fallback_ready": fallback_ready}
-    if failed:
+    if incomplete:
         _record(
             root, "collect_dbsec", "DEGRADED", today, moment,
-            reason=f"failed:{','.join(failed)}"[:300], metrics={**metrics, **reconcile_metrics},
+            reason=f"incomplete:{','.join(incomplete)}"[:300], metrics={**metrics, **reconcile_metrics},
         )
         return 0
     _record(root, "collect_dbsec", "OK", today, moment, metrics={**metrics, **reconcile_metrics})
