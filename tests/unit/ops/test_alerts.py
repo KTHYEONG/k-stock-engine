@@ -77,23 +77,44 @@ def test_unit_failure_subject_and_hint() -> None:
         "kse-backup.service", result="failed", exit_status="1",
         journal_tail="line1\nline2", now=_now(),
     )
-    assert message.subject == "[kse] 유닛 실행 실패: kse-backup.service"
-    assert "journalctl --user -u kse-backup.service -n 50 --no-pager" in message.body
+    assert message.subject == "[kse][실패] kse-backup.service"
+    assert message.body.splitlines() == [
+        "• 무엇: kse-backup.service 실패 (Result failed, exit 1)",
+        "• 언제: 2026-10-08T10:00:00+09:00",
+        "• 원인: line2",
+        "• 증거: journalctl --user -u kse-backup.service -n 200 --no-pager · ~/k-stock-engine/logs",
+    ]
     assert message.key == "unit|kse-backup.service|2026-10-08"
 
 
-def test_journal_tail_is_bounded() -> None:
+def test_journal_tail_never_dumped_and_cause_bounded() -> None:
     tail = "\n".join(f"L{i:05d}-" + "x" * 1000 for i in range(500))
     message = build_unit_failure(
         "u.service", result="failed", exit_status="1", journal_tail=tail, now=_now(),
     )
-    assert len(message.body) <= 4000
-    assert "L00499-" in message.body
-    assert "L00000-" not in message.body
-    assert "journalctl --user -u u.service -n 50 --no-pager" in message.body
-    journal_lines = [line for line in message.body.splitlines() if line.startswith("L")]
-    assert journal_lines
-    assert all(len(line) <= 300 for line in journal_lines)
+    assert len(message.body.splitlines()) == 4
+    assert "L00498-" not in message.body
+    cause = message.body.splitlines()[2]
+    assert cause.startswith("• 원인: L00499-")
+    assert len(cause) <= len("• 원인: ") + 300
+
+
+def test_cause_prefers_last_error_line_over_trailing_noise() -> None:
+    tail = "\n".join([
+        "starting job",
+        "Traceback (most recent call last):",
+        "ValueError: snapshot missing for 2026-10-08",
+        "kse-backup.service: Main process exited, code=exited, status=1/FAILURE",
+        "   ",
+    ])
+    message = build_unit_failure("u.service", result="exit-code", exit_status="1", journal_tail=tail, now=_now())
+    assert "• 원인: kse-backup.service: Main process exited, code=exited, status=1/FAILURE" in message.body
+    quiet = build_unit_failure("u.service", result="exit-code", exit_status="1",
+                               journal_tail="a\nValueError: boom\nbye", now=_now())
+    assert "• 원인: ValueError: boom" in quiet.body
+    plain = build_unit_failure("u.service", result="exit-code", exit_status="1",
+                               journal_tail="a\nlast words", now=_now())
+    assert "• 원인: last words" in plain.body
 
 
 def test_secrets_never_survive(tmp_path: Path) -> None:
@@ -164,9 +185,13 @@ def test_audit_summary_lists_issues() -> None:
     }
     message = build_audit_summary(heartbeat)
     assert message is not None
-    assert message.subject == "[kse] 일일 감사 경고 2건: backup, morning"
-    assert "- backup: backup is older than 26 h" in message.body
-    assert "- morning: no outcome for morning" in message.body
+    assert message.subject == "[kse][경고] 일일 감사 경고 2건: backup, morning"
+    assert message.body.splitlines() == [
+        "• 무엇: 일일 감사 WARNING — 미해결 2건",
+        "• 언제: 2026-10-08 (trading)",
+        "• 원인: backup: backup is older than 26 h; morning: no outcome for morning",
+        "• 증거: ~/k-stock-engine/data/ops/heartbeat/daily_audit.json",
+    ]
     assert message.key == "audit|2026-10-08|backup,morning"
 
 
@@ -184,14 +209,15 @@ def test_holiday_skip_with_issue_still_alerts() -> None:
         "open_issues": [{"key": "backup", "text": "backup is older than 26 h"}],
     })
     assert message is not None
-    assert message.subject.startswith("[kse] ")
+    assert message.subject.startswith("[kse][경고] ")
 
 
 def test_audit_missing_issues_and_subject_edge() -> None:
     assert build_audit_summary({"severity": "WARNING", "snapshot_date": "d"}) is not None
     message = build_audit_summary({"severity": "WARNING", "snapshot_date": "d", "subject": ""})
     assert message is not None
-    assert message.subject.startswith("[kse] ")
+    assert message.subject == "[kse][경고] 일일 감사 WARNING"
+    assert "• 원인: (이슈 목록 없음)" in message.body
     assert build_audit_summary({"severity": "OK"}) is None
 
 
@@ -253,7 +279,7 @@ def test_drain_oldest_first_stops_on_failure(tmp_path: Path) -> None:
     delivered = drain_outbox(sender=sender, alerts_dir=tmp_path)
     assert delivered == 1
     assert count_undelivered(tmp_path) == 2
-    assert sender.subjects == ["[kse] 유닛 실행 실패: a.service", "[kse] 유닛 실행 실패: b.service"]
+    assert sender.subjects == ["[kse][실패] a.service", "[kse][실패] b.service"]
     remaining = [json.loads(path.read_text(encoding="utf-8"))["key"]
                  for path in (tmp_path / "outbox").glob("*.json")]
     assert sorted(remaining) == ["unit|b.service|2026-10-08", "unit|c.service|2026-10-08"]
@@ -317,7 +343,7 @@ def test_edge_journal_and_naive_now(tmp_path: Path) -> None:
         now=naive, open_issues=[{"key": "backup", "text": "old"}],
     )
     assert "(no journal output)" in message.body
-    assert "- backup: old" in message.body
+    assert "• 미해결 이슈(1): backup: old" in message.body
     assert message.key == "unit|u.service|2026-10-08"
     ctrl = build_unit_failure(
         "u.service", result="failed", exit_status="1", journal_tail="a\x00b\x1f\x7f",
@@ -601,3 +627,39 @@ def test_programmer_errors_are_not_swallowed(tmp_path: Path) -> None:
                  alerts_dir=tmp_path, now=_now())
     assert sender.calls == 1
     assert count_undelivered(tmp_path) == 0
+
+
+def test_drain_drops_queued_copy_of_cause_already_sent(tmp_path: Path) -> None:
+    message = build_unit_failure("u.service", result="failed", exit_status="1", journal_tail="x", now=_now())
+    assert dispatch(message, sender=None, alerts_dir=tmp_path, now=_now()) == DispatchOutcome.QUEUED
+    sender = _Recording()
+    later = _now() + timedelta(minutes=5)
+    assert dispatch(message, sender=sender, alerts_dir=tmp_path, now=later) == DispatchOutcome.SENT
+    assert drain_outbox(sender=sender, alerts_dir=tmp_path, now=later + timedelta(minutes=1)) == 0
+    assert len(sender.calls) == 1
+    assert count_undelivered(tmp_path) == 0
+    assert drain_outbox(sender=sender, alerts_dir=tmp_path, now=later) == 0
+
+
+def test_drain_resends_queued_cause_after_window(tmp_path: Path) -> None:
+    message = build_unit_failure("u.service", result="failed", exit_status="1", journal_tail="x", now=_now())
+    sender = _Recording()
+    assert dispatch(message, sender=sender, alerts_dir=tmp_path, now=_now()) == DispatchOutcome.SENT
+    assert dispatch(message, sender=None, alerts_dir=tmp_path, now=_now() + timedelta(days=2)) == DispatchOutcome.QUEUED
+    assert drain_outbox(sender=sender, alerts_dir=tmp_path, now=_now() + timedelta(days=2)) == 1
+    assert len(sender.calls) == 2
+
+
+def test_drain_stops_when_suppressed_copy_cannot_be_deleted(tmp_path: Path, monkeypatch: object) -> None:
+    message = build_unit_failure("u.service", result="failed", exit_status="1", journal_tail="x", now=_now())
+    assert dispatch(message, sender=None, alerts_dir=tmp_path, now=_now()) == DispatchOutcome.QUEUED
+    sender = _Recording()
+    assert dispatch(message, sender=sender, alerts_dir=tmp_path, now=_now()) == DispatchOutcome.SENT
+
+    def _boom(self: Path, *a: object, **k: object) -> None:
+        raise OSError("ro")
+
+    monkeypatch.setattr(Path, "unlink", _boom)  # type: ignore[attr-defined]
+    assert drain_outbox(sender=sender, alerts_dir=tmp_path, now=_now()) == 0
+    assert len(sender.calls) == 1
+    assert count_undelivered(tmp_path) == 1
