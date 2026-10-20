@@ -156,8 +156,8 @@ Expected kse files (`<sha12>` = sha256(app key)[:12]): `token_ls_<sha12>.json`, 
 `token_dbsec_<sha12>.json`, `token_issue_dbsec_<sha12>.state`, `admission_dbsec_<sha12>[_chart|_quote].state`, KIS slot-5
 `token_<sha12>.json`/`tps_<sha12>.state`; `toss`/`kiwoom` belong to siblings. PASS: marker present, dir `700 ubuntu`,
 `non_contract: none` except the known `token_ls_e6e24902d4c9.json.stale-20261006`, zero grep lines and the pattern absent
-from event `reason`s. From the first run on `94d99a7`+ (2026-10-19) `admission_dbsec_*`/`token_dbsec_*` mtimes move to
-`collect_dbsec` time while `~/.cache/dbsec/*` and `logs/ls_token_prod.json` stop changing (last 2026-10-16 20:40 / 18:31
+from event `reason`s. From the first run on `94d99a7`+ (2026-10-19) `admission_dbsec_*` mtimes move to `collect_dbsec` time (`token_dbsec_*` and
+`token_issue_dbsec_*` keep their mtime while a valid token is reused: 2026-10-19 15:45 KST) while `~/.cache/dbsec/*` and `logs/ls_token_prod.json` stop changing (last 2026-10-16 20:40 / 18:31
 KST); a newer mtime there = the legacy path is still used. `LEGACY_FALLBACK` = SEV3 this release. Map a digest to a key
 name only by hashing inside a heredoc and printing the 12-hex digest.
 
@@ -177,11 +177,12 @@ du -sh bronze/kr_swing_2019_v1/* | sort -h | tail -5; du -sh silver/*/ gold/*/ s
 cd bronze/kr_swing_2019_v1 && nice -n 19 find . -path ./_packs -prune -o -path ./catalog -prune -o -type f -newermt "$(date -d '-15 days' +%F)" -printf '%TY-%Tm-%Td %P %s\n' | awk '{split($2,a,"/"); k=$1" "a[1]; s[k]+=$3; n[k]++} END{for(x in s) printf "%s n=%d MiB=%.1f\n",x,n[x],s[x]/2^20}' | sort | tail -16
 du -sh ~/k-stock-engine/scratch ~/k-stock-engine/.deploy; journalctl --user --disk-usage
 ```
-Loose Bronze is packed and pruned by `kse-backup` only when older than 14 days **and** confirmed offsite. 2026-10-18: total
-6.00 GiB; `investor_flow` loose +536 MiB/business day (9 676 files); first prunable loose day 2026-10-12 → removal from the
-2026-10-27 02:30 backup. Projection: `total + 0.54 GiB × business days until the first prune` → ≈ 9.2 GiB on 2026-10-26
-(SEV3 while the projected 10 GiB crossing is < 10 business days; SEV2 when crossed). Backup `removed > 0` must appear from
-2026-10-27; still 0 then = SEV2.
+Loose Bronze is packed and pruned by `kse-backup` only when older than 14 days **and** confirmed offsite. 2026-10-20: total
+6.02 GiB. LS t1702 is requested one day per call (`start=end`, commits `00af995`/`010836a`), so loose `investor_flow` growth
+fell from +536 MiB/business day (9 676 files, 2026-10-12..16) to about 1.6 MiB/day (4 838 files, 2026-10-19); the old
+0.54 GiB/day projection no longer applies. Project growth from the last 3 business days of `total`
+(SEV3 while a projected 10 GiB crossing is < 10 business days; SEV2 when crossed). First prunable loose day 2026-10-12 →
+backup `removed > 0` must appear from the 2026-10-27 02:30 run (the 10-12..16 files are the large ones); still 0 then = SEV2.
 
 ### P9. Catalog coverage by dataset (read-only SQLite)
 ```bash
@@ -354,7 +355,7 @@ PY
 | K4 | auction `D` | file present when a decision was sealed; event `slots_captured == slots_expected`, `failed == {}`, `persist_error None`; `expected` = event `expected_rows` (after a same-day rerun: file `expected` ≥ event `expected_rows`); `open` = event `symbols`; slots ⊂ {08:40, 08:50, 08:55, 08:58, 08:59} and after `sealed_at`; `expected_after_0900` 0; `px_null_or_le0` 0; `px_vs_ref_gt30` 0; `dup` 0; `session_bad` 0. Event side: `jq '.metrics | {slots_expected, slots_captured, failed, expected_rows, persist_error}'` | missing/mismatch/late → SEV2; px → SEV3 | 84 = 63 + 21; slots 08:55/08:58/08:59; last expected 08:59:20 (≈ 1 s/symbol: > ~55 symbols spills past 09:00) |
 | K5 | flow | `flow_last` = prev(`P`) (flow of `s` needs `next(s)` in the daily calendar); `coverage` ≥ 0.98 (live gate); `identity_bad` 0 (individual + foreign + institution + other = 0); `dup` 0; last `rows_tail` within ±2 %; `blocked on dart_*`인 `collect_eve`와 무관하게 `ranges`·K5를 독립 확인 (DART 차단은 플로우 선행 체인을 막지 않음) | coverage < 0.98 → SEV1 for next morning; else SEV2 | 10-14, coverage 1.0000 (2 419/2 419), identity_bad 0, LS 2 419 + KIS 1 |
 | K6 | quota `D` | per label ≤ 80 % of `config/providers.toml`: `OpenDART` (shared primary key) budget 16 000, `OpenDART#<sha8>` 19 500, `LS` 10 000, `KIS` 20 000, `KRX` 10 000, `DBSEC` 50 000, `KIND` 5 000 | > 80 % → SEV2; > limit → SEV1 | DBSEC 5 569, KIS 2 419, LS 2 423, KRX 19, `OpenDART#54f13cf9` 131 |
-| K7 | receipts / ranges / dbsec / reconcile | KST day `D`: `krx_*` 1 success each, `dart_disclosure_windows` 4; ranges `ls_`/`kis_investor_flow` count ≥ 0.98 × K5 `targets`, `max(end)` = `P`; `dbsec_daily_chart` success within ±2 % of K1 rows; `dbsec_closing_bar` success + empty = daily_chart, empty ≤ 10 %; from run 2026-10-19 one new report per run for `D-1`: `verdict pass`, `coverage` ≥ 0.995, `close_match_rate` ≥ 0.999 | → SEV2 | ranges 2 419/2 419 end 10-15; daily_chart 2 764; closing_bar 2 558 + 206 empty (7.5 %); reconcile n 0 (first due 2026-10-19 for 10-16) |
+| K7 | receipts / ranges / dbsec / reconcile | KST day `D`: `krx_*` 1 success each, `dart_disclosure_windows` 4; ranges `ls_investor_flow` count ≥ 0.98 × K5 `targets`, `max(end)` = `P` (`kis_investor_flow` ranges may be 0 while `phase=defer deferred_tail_cells=<targets>` — KIS defers the tail session and LS covers it; K6 then shows no `KIS` label); `dbsec_daily_chart` success within ±2 % of K1 rows; `dbsec_closing_bar` success + empty = daily_chart, empty ≤ 10 %; from run 2026-10-19 one new report per run for `D-1`: `verdict pass`, `coverage` ≥ 0.995, `close_match_rate` ≥ 0.999 | → SEV2 | ranges 2 419/2 419 end 10-15; daily_chart 2 764; closing_bar 2 558 + 206 empty (7.5 %); reconcile n 0 (first due 2026-10-19 for 10-16) |
 
 ## 5. Known items (as of 2026-10-18)
 
@@ -367,7 +368,8 @@ PY
 | `.deploy/staging-<sha>`, `sha-*` image tags | `deploy.yml` never removes them (22 dirs / 1.8 MB, 23 tags on 2026-10-18). SEV3. |
 | First trading day on `c65833b` = 2026-10-19 | Expect `gate=investor_flow` lines (P5), `collect_dbsec` on the shared DB token (P6), first `dbsec_reconcile/2026-10-16.json` after the 20:40 run (K7). |
 | KIND relay lands after `collect_eve` | GitHub cron starts 4–5 h late (21:07–23:28 KST), so the next `morning D` imports the `D-1` night bundle before `market_actions` (expected `kind_stale_sessions` 0 when it arrived). After one missed night, the remaining bundle can still be within 36 h at morning (about 33–35 h old), with a one-session lag; import refuses bundles older than 36 h, and `market_actions` still refuses lag > 5 observed sessions. |
-| Footprint growth | ~0.54 GiB per business day of loose flow Bronze until the first 14-day prune (2026-10-27 backup); P8 projection. |
+| Footprint growth | ~1.6 MiB per business day of loose flow Bronze since LS t1702 went to one-day requests (2026-10-19); the 10-12..16 loose files (536 MiB/day) are removed from the 2026-10-27 backup. |
+| `investor_flow_ls_resolve conflict_cells` | 2026-10-19 19:26: `conflict_cells=3` (`year=2026`); conflicting cells are excluded from Silver (`src/data/investor_flow_silver.py` `_distinct==1` filter). Session unidentified; prev(P) coverage stayed 1.0. Investigate when it exceeds 3. |
 | Auction snapshots | Seal 08:51–08:54 ⇒ 08:40/08:50 snapshots never captured (`expected_rows = 3 × symbols`). |
 | `kse-backup.service.d` drop-in | Removed by `install_systemd.sh` (`2884942`); absent 2026-10-18. Reappearance = SEV2. |
 
