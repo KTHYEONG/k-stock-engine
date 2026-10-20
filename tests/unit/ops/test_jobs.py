@@ -624,7 +624,7 @@ def test_alert_command_exit_semantics(tmp_path: Path, monkeypatch: pytest.Monkey
     _alert_sender(monkeypatch, sender)
     assert jobs.alert(tmp_path, unit="kse-backup.service", result="exit-code", exit_status="1",
                        journal_tail="boom", now=_morning_now()) == 0
-    assert sender.calls[0][0] == "[kse] 유닛 실행 실패: kse-backup.service"
+    assert sender.calls[0][0] == "[kse][실패] kse-backup.service"
     assert jobs.alert(tmp_path, unit="kse-backup.service", result="exit-code", exit_status="1",
                        journal_tail="boom", now=_morning_now()) == 0
     assert len(sender.calls) == 1
@@ -672,7 +672,7 @@ def test_alert_audit_unit_carries_issues(tmp_path: Path, monkeypatch: pytest.Mon
     target.write_text(json.dumps({"open_issues": [{"key": "backup", "text": "backup is older than 26 h"}]}))
     assert jobs.alert(tmp_path, unit="kse-daily-audit.service", result="failed", exit_status="1",
                        journal_tail="tail", now=_morning_now()) == 0
-    assert "- backup: backup is older than 26 h" in sender.calls[0][1]
+    assert "• 미해결 이슈(1): backup: backup is older than 26 h" in sender.calls[0][1]
     sender.calls.clear()
     (tmp_path / "ops" / "alerts" / "sent.jsonl").unlink(missing_ok=True)
     def _unexpected_read(root: Path) -> list[dict[str, str]]:

@@ -44,6 +44,12 @@ _MAX_BODY: Final = 4000
 _SUPPRESS_WINDOW: Final = timedelta(hours=24)
 _GMAIL_HOST: Final = "smtp.gmail.com"
 _GMAIL_PORT: Final = 465
+_CAUSE_MAX_CHARS: Final = 300
+_EVIDENCE_JOURNAL_LINES: Final = 200
+# Host-side evidence locations named in mail bodies; the alert container itself mounts neither path.
+_HOST_LOG_DIR: Final = "~/k-stock-engine/logs"
+_HOST_AUDIT_HEARTBEAT: Final = "~/k-stock-engine/data/ops/heartbeat/daily_audit.json"
+_CAUSE_RE: Final = re.compile(r"(Error|Exception|Traceback|CRITICAL|FATAL|FAIL)", re.IGNORECASE)
 
 _BEARER_RE: Final = re.compile(r"(Bearer\s+)[^\s\"'`,;}\]]+", re.IGNORECASE)
 _CRED_RE: Final = re.compile(
@@ -156,7 +162,7 @@ def _as_kst(now: datetime) -> datetime:
 
 def _normalize_subject(subject: str) -> str:
     single = _sanitize_line(" ".join(subject.split()))
-    if not single.startswith("[kse] "):
+    if not single.startswith("[kse]"):
         single = "[kse] " + single
     return single[:_MAX_SUBJECT]
 
@@ -164,6 +170,15 @@ def _normalize_subject(subject: str) -> str:
 def _sanitize_line(line: str) -> str:
     cleaned = line.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
     return "".join(ch if ch == "\t" or category(ch) not in ("Cc", "Cs") else "?" for ch in cleaned)
+
+
+def _failure_cause(lines: Sequence[str]) -> str:
+    """Last error-looking journal line, else the last non-empty one."""
+    stripped = [line.strip() for line in lines if line.strip()]
+    if not stripped:
+        return "(no journal output)"
+    matches = [line for line in stripped if _CAUSE_RE.search(line)]
+    return (matches[-1] if matches else stripped[-1])[:_CAUSE_MAX_CHARS]
 
 
 def build_unit_failure(
@@ -175,36 +190,28 @@ def build_unit_failure(
     now: datetime,
     open_issues: Sequence[Mapping[str, str]] = (),
 ) -> AlertMessage:
-    """Failure message for one systemd unit."""
+    """Short failure card for one systemd unit; the journal stays on the host and is only pointed to."""
     moment = _as_kst(now)
     key = f"unit|{unit}|{moment.date().isoformat()}"
-    subject = _normalize_subject(redact(f"[kse] 유닛 실행 실패: {unit}", ()))
-    lines = redact(journal_tail, ()).splitlines()
-    kept = [_sanitize_line(line)[:300] for line in lines[-40:]]
-    if not journal_tail.strip() or not kept:
-        kept = ["(no journal output)"]
+    subject = _normalize_subject(redact(f"[kse][실패] {unit}", ()))
+    lines = [_sanitize_line(line) for line in redact(journal_tail, ()).splitlines()]
     parts = [
-        f"unit: {unit}",
-        f"Result: {result}",
-        f"ExecMainStatus: {exit_status}",
-        f"time(KST): {moment.isoformat()}",
+        f"• 무엇: {unit} 실패 (Result {result}, exit {exit_status})",
+        f"• 언제: {moment.isoformat(timespec='seconds')}",
+        f"• 원인: {_failure_cause(lines)}",
     ]
     if open_issues:
-        parts.append(f"open issues ({len(open_issues)}):")
-        parts.extend(f"- {item.get('key', '')}: {item.get('text', '')}" for item in open_issues)
-    parts.append("journal (last 40 lines):")
-    journal_start = len(parts)
-    parts.extend(kept)
-    parts.append(f"hint: journalctl --user -u {unit} -n 50 --no-pager")
-    body = redact("\n".join(parts), ())
-    while len(body) > _MAX_BODY and len(parts) > journal_start + 1:
-        del parts[journal_start]
-        body = redact("\n".join(parts), ())
-    return AlertMessage(subject=subject, body=body[:_MAX_BODY], key=key)
+        listed = "; ".join(f"{item.get('key', '')}: {item.get('text', '')}" for item in open_issues)
+        parts.append(f"• 미해결 이슈({len(open_issues)}): {listed}")
+    parts.append(
+        f"• 증거: journalctl --user -u {unit} -n {_EVIDENCE_JOURNAL_LINES} --no-pager · {_HOST_LOG_DIR}"
+    )
+    body = redact("\n".join(parts), ())[:_MAX_BODY]
+    return AlertMessage(subject=subject, body=body, key=key)
 
 
 def build_audit_summary(heartbeat: Mapping[str, object]) -> AlertMessage | None:
-    """Audit summary with the open issue list; None when healthy."""
+    """Audit warning card with the open issue list; None when healthy."""
     severity = str(heartbeat.get("severity", ""))
     raw_issues = heartbeat.get("open_issues", [])
     issues: list[Mapping[str, object]] = (
@@ -217,18 +224,18 @@ def build_audit_summary(heartbeat: Mapping[str, object]) -> AlertMessage | None:
         raw_subject = raw_subject[4:].lstrip()
     if not raw_subject:
         raw_subject = f"일일 감사 {severity}"
-    subject = _normalize_subject(redact(f"[kse] {raw_subject}", ()))
+    subject = _normalize_subject(redact(f"[kse][경고] {raw_subject}", ()))
     snapshot_date = str(heartbeat.get("snapshot_date", ""))
     day_kind = str(heartbeat.get("day_kind", ""))
     keys = sorted({str(item.get("key", "")) for item in issues})
     key = f"audit|{snapshot_date}|{','.join(keys)}"
+    causes = "; ".join(f"{item.get('key', '')}: {item.get('text', '')}" for item in issues) or "(이슈 목록 없음)"
     lines = [
-        f"severity: {severity}",
-        f"snapshot_date: {snapshot_date}",
-        f"day_kind: {day_kind}",
-        f"open issues ({len(issues)}):",
+        f"• 무엇: 일일 감사 {severity} — 미해결 {len(issues)}건",
+        f"• 언제: {snapshot_date} ({day_kind})",
+        f"• 원인: {causes}",
+        f"• 증거: {_HOST_AUDIT_HEARTBEAT}",
     ]
-    lines.extend(f"- {item.get('key', '')}: {item.get('text', '')}" for item in issues)
     body = redact("\n".join(lines), ())[:_MAX_BODY]
     return AlertMessage(subject=subject, body=body, key=key)
 
@@ -394,6 +401,16 @@ def drain_outbox(
         except (OSError, ValueError, KeyError, TypeError):
             _LOG.debug("[SYS] alert outbox corrupt file skipped")
             continue
+        moment = now if now is not None else datetime.now(KRX_TZ)
+        if _is_suppressed(key, alerts_dir, moment):
+            # The same cause already reached the operator inside the window; re-sending only adds noise.
+            try:
+                path.unlink()
+            except OSError:
+                _LOG.debug("[SYS] alert outbox delete failed")
+                break
+            _LOG.info("[SYS] alert outcome=SUPPRESSED source=outbox")
+            continue
         try:
             sender.send(subject, body)
         except (smtplib.SMTPException, OSError, TimeoutError):
@@ -401,7 +418,7 @@ def drain_outbox(
             break
         delivered += 1
         try:
-            _append_ledger(alerts_dir, now if now is not None else datetime.now(KRX_TZ), key, subject)
+            _append_ledger(alerts_dir, moment, key, subject)
         except (OSError, ValueError, TypeError):
             _LOG.debug("[SYS] alert ledger append failed")
         try:
