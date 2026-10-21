@@ -492,8 +492,9 @@ def test_persist_failure_isolated_and_reconciled(tmp_path, monkeypatch):  # type
     (_full_result(failed={"005930": "RuntimeError"}), "symbol_failed"),
     (_full_result(persist_error="OSError"), "persist_failed"),
     (_full_result(unresolved=["005930"]), "unresolved_auction"),
-    (_full_result(slots_captured=0, slots_expected=2, failed={"005930": "RuntimeError"}, unresolved=["005930"]),
-     "slots_incomplete,symbol_failed,unresolved_auction"),
+    (_full_result(symbols=10, unresolved=["005930", "000660", "035420"], open_resolved=7), "unresolved_auction"),
+    (_full_result(slots_captured=0, slots_expected=2, failed={"005930": "RuntimeError"}, unresolved=["005930", "000660"],
+                  symbols=2), "slots_incomplete,symbol_failed,unresolved_auction"),
 ])
 def test_scheduled_degraded_reasons(tmp_path, monkeypatch, metrics, reason):  # type: ignore[no-untyped-def]
     import json as _json
@@ -629,3 +630,27 @@ def test_invalid_margin_rejected_before_empty_chain(tmp_path, monkeypatch, capsy
         "--out", str(tmp_path / "out"), "--slot-margin-s", margin,
     ]) == 1
     assert "slot_margin_s" in json.loads(capsys.readouterr().out)["error"]
+
+
+@pytest.mark.parametrize("metrics", [
+    _full_result(symbols=10, unresolved=["104620"], open_resolved=9),
+    _full_result(symbols=10, unresolved=["104620", "038950"], open_resolved=8),
+])
+def test_few_untraded_names_do_not_degrade_the_run(tmp_path, monkeypatch, metrics):  # type: ignore[no-untyped-def]
+    from datetime import datetime
+
+    from src.execution import cli
+    from src.ops.run_outcome import load_run_outcomes
+
+    day = date(2026, 10, 8)
+    open_at = datetime(2026, 10, 8, 9, 0, tzinfo=KRX_TZ)
+    monkeypatch.setattr(cli, "_today", lambda: day)
+    monkeypatch.setattr("src.ops.guards.trading_day", lambda _: True)
+    monkeypatch.setattr(cli, "_session_open", lambda _: open_at)
+    monkeypatch.setattr(cli, "_await_execution_decision", lambda *a: True)
+    monkeypatch.setattr(cli, "_run_auction_open", lambda args: dict(metrics))
+    events = tmp_path / "events"
+    rc = cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path),
+                   "--out", str(tmp_path / "o"), "--events-root", str(events)])
+    assert rc == 0
+    assert load_run_outcomes(events, day) == {"auction_open": "OK"}

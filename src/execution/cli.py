@@ -22,6 +22,8 @@ __all__ = ["main"]
 _LOG = logging.getLogger(__name__)
 
 _DEFAULT_SLOT_MARGIN_S: Final = 0.0
+# Share of captured symbols with no open print beyond which the open counts as delayed, not a few untraded names.
+_UNRESOLVED_MAX_RATIO: Final = 0.2
 
 
 def _today() -> date:
@@ -401,7 +403,8 @@ def _scheduled_capture(args: argparse.Namespace) -> int:
             reasons.append("symbol_failed")
         if result.get("persist_error") is not None:
             reasons.append("persist_failed")
-        if result.get("unresolved"):
+        unexplained = set(result.get("unresolved", ())) - set(result.get("failed", {}))
+        if len(unexplained) > _UNRESOLVED_MAX_RATIO * result.get("symbols", 0):
             reasons.append("unresolved_auction")
         if reasons:
             record("DEGRADED", ",".join(reasons), result)
