@@ -60,6 +60,13 @@ windows = ["15:20-15:29"]
 [[assignment]]
 slot = 5
 project = "krx"
+purpose = "minute_history_rest"
+channel = "rest"
+windows = ["23:30-24:00", "00:00-05:30"]
+
+[[assignment]]
+slot = 5
+project = "krx"
 purpose = "premarket_ws"
 channel = "ws"
 windows = ["07:58-08:50"]
