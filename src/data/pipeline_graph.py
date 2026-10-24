@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ, SessionCalendar
@@ -180,6 +180,7 @@ class CollectionReport:
 OPTIONAL_COLLECTION_JOBS: Final[frozenset[str]] = frozenset({
     "kind_notice_search",
     "kind_notice_documents",
+    "kis_industry",
     "dbsec_ticker_master",
     "dbsec_daily_chart",
     "dbsec_closing_bar",
@@ -1616,6 +1617,58 @@ def _run_kis_flow_collection_step(
     )
 
 
+def _run_industry_collection_step(
+    ctx: RefreshContext, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
+) -> CollectionStepReport:
+    """Top up this ISO week's KIS industry snapshot for current-universe tickers that lack one.
+
+    KIS serves only the current classification, so the weekly snapshot is the point-in-time
+    record. Reruns within the week fetch only missing tickers, so a covered week costs no request.
+    ``pending_left`` counts tickers skipped this run (retried on the next run of the week).
+    """
+    from functools import partial
+
+    import src.integrations.kis as kis
+    from src.data.industry_collection import (
+        collect_classification_with_isolation,
+        current_universe_tickers,
+        tickers_missing_weekly_snapshot,
+    )
+    from src.data.scoped_ingestion import ScopedBronzeWriter
+    from src.integrations.kis import industry as kis_industry
+
+    _ = emit
+    universe = ctx.runtime.workspace.silver_root / ctx.registry.require("ordinary_universe")
+    pending = tickers_missing_weekly_snapshot(
+        ctx.catalog, current_universe_tickers(universe), today=datetime.now(UTC).date()
+    )
+    if not pending or dry_run:
+        return CollectionStepReport(
+            job="kis_industry", status="dry_run" if pending else "complete",
+            done=0, pending_left=len(pending), requests_used=0,
+        )
+    summary = collect_classification_with_isolation(
+        stage="kis_industry",
+        collector_cls=partial(kis_industry.KisIndustryCollector, client=kis.default_client()),
+        fetch_attr="fetch_industry_classification",
+        bronze_root=ctx.runtime.workspace.bronze_root,
+        writer=ScopedBronzeWriter(runtime=ctx.runtime, catalog=ctx.catalog),
+        symbols=pending,
+        # One shared client: its transport already enforces KisPolicy.min_interval_seconds per call.
+        pace_seconds=0.0,
+    )
+    skipped = sorted(cast("dict[str, str]", summary["skipped"]))
+    if skipped:
+        _LOG.warning(
+            "[DATA] stage=kis_industry status=partial requested=%d skipped=%d head=%s",
+            len(pending), len(skipped), ",".join(skipped[:20]),
+        )
+    return CollectionStepReport(
+        job="kis_industry", status="partial" if skipped else "complete",
+        done=cast(int, summary["pages_collected"]), pending_left=len(skipped), requests_used=len(pending),
+    )
+
+
 CollectionStep = tuple[str, Callable[..., CollectionStepReport]]
 
 
@@ -1692,6 +1745,7 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
         ),
         ("ls_investor_flow", _run_ls_flow_collection_step),
         ("kis_investor_flow", _run_kis_flow_collection_step),
+        ("kis_industry", _run_industry_collection_step),
         (
             "dbsec_ticker_master",
             lambda ctx, *, dry_run, emit: _run_dbsec_collection_step(

@@ -582,14 +582,14 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 17
+    assert len(report.collection) == 18
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
         "earnings_releases",
         "krx_daily_market", "krx_security_master",
         "krx_hedge_series", "krx_trend_series", "krx_cash_series",
         "kind_notice_search", "kind_notice_documents",
-        "ls_investor_flow", "kis_investor_flow",
+        "ls_investor_flow", "kis_investor_flow", "kis_industry",
         "dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar",
     }
 
@@ -2027,6 +2027,103 @@ def test_default_collection_steps_end_with_dbsec_in_registry_order(tmp_path: Pat
 
     assert names[-3:] == ["dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar"]
     assert "dbsec_ticker_master" in graph.OPTIONAL_COLLECTION_JOBS
+
+
+def test_industry_snapshot_runs_after_flow_steps_and_before_dbsec() -> None:
+    from src.data import pipeline_graph as graph
+
+    names = [name for name, _ in graph._default_collection_steps()]
+
+    assert names.index("kis_industry") == names.index("kis_investor_flow") + 1
+    assert names.index("kis_industry") < names.index("dbsec_ticker_master")
+    assert "kis_industry" in graph.OPTIONAL_COLLECTION_JOBS
+
+
+class _IndustryQuoteClient:
+    def __init__(self, failing: frozenset[str] = frozenset()) -> None:
+        self.calls: list[str] = []
+        self._failing = failing
+
+    def inquire_price(self, symbol: str) -> dict[str, object]:
+        self.calls.append(symbol)
+        if symbol in self._failing:
+            return {"rprs_mrkt_kor_name": "KOSPI"}
+        return {"bstp_kor_isnm": "전기전자", "rprs_mrkt_kor_name": "KOSPI"}
+
+
+def _industry_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client: _IndustryQuoteClient) -> RefreshContext:
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    ctx.registry.register("ordinary_universe", graph._build_ordinary_universe(ctx, {}).dataset_id)
+    monkeypatch.setattr("src.integrations.kis.default_client", lambda: client)
+    return ctx
+
+
+def test_industry_step_snapshots_once_per_week_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.data import pipeline_graph as graph
+
+    client = _IndustryQuoteClient()
+    ctx = _industry_ctx(tmp_path, monkeypatch, client)
+
+    dry = graph._run_industry_collection_step(ctx, dry_run=True, emit=lambda payload: None)
+    first = graph._run_industry_collection_step(ctx, dry_run=False, emit=lambda payload: None)
+    second = graph._run_industry_collection_step(ctx, dry_run=False, emit=lambda payload: None)
+
+    assert dry == CollectionStepReport(job="kis_industry", status="dry_run", done=0, pending_left=1, requests_used=0)
+    assert first == CollectionStepReport(job="kis_industry", status="complete", done=1, pending_left=0, requests_used=1)
+    assert second == CollectionStepReport(job="kis_industry", status="complete", done=0, pending_left=0, requests_used=0)
+    assert client.calls == ["005930"]
+    today = datetime.now(UTC).date().isoformat()
+    assert ctx.catalog.successful_keys(source="kis_industry") == frozenset({f"inquire-price:005930:{today}"})
+
+
+def test_industry_step_reports_partial_and_retries_only_skipped_tickers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.data import pipeline_graph as graph
+
+    client = _IndustryQuoteClient(failing=frozenset({"000660"}))
+    ctx = _industry_ctx(tmp_path, monkeypatch, client)
+    monkeypatch.setattr(
+        "src.data.industry_collection.current_universe_tickers", lambda path: ("000660", "005930")
+    )
+
+    with caplog.at_level("WARNING"):
+        first = graph._run_industry_collection_step(ctx, dry_run=False, emit=lambda payload: None)
+    retry = graph.run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None, steps=(("kis_industry", graph._run_industry_collection_step),),
+    )
+
+    assert first == CollectionStepReport(job="kis_industry", status="partial", done=1, pending_left=1, requests_used=2)
+    assert any("stage=kis_industry status=partial" in message and "000660" in message for message in caplog.messages)
+    assert client.calls == ["000660", "005930", "000660"]
+    assert retry.steps[0].status == "failed"
+    assert retry.blocking_job is None
+    assert retry.degraded_jobs == ("kis_industry",)
+
+
+def test_industry_step_failure_without_universe_degrades_without_blocking(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    ctx = _fixture_context(tmp_path)
+    calls: list[str] = []
+
+    def _after(inner_ctx: RefreshContext, *, dry_run: bool, emit: object) -> CollectionStepReport:
+        calls.append("after")
+        return CollectionStepReport(job="after", status="complete", done=1, pending_left=0, requests_used=0)
+
+    report = graph.run_collection_jobs(
+        ctx, dry_run=False, emit=lambda payload: None,
+        steps=(("kis_industry", graph._run_industry_collection_step), ("after", _after)),
+    )
+
+    assert [step.status for step in report.steps] == ["failed", "complete"]
+    assert calls == ["after"]
+    assert report.blocking_job is None
+    assert report.degraded_jobs == ("kis_industry",)
 
 
 def test_ls_build_passes_configured_bucket_count_and_keeps_preview_identity(
