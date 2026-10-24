@@ -20,6 +20,7 @@ from src.core.pit import PITDataError
 from src.integrations.host_broker_contract import HostBrokerDirNotSharedError
 from src.ops.guards import GuardRefused
 from src.ops.jobs import (
+    DBSEC_COLLECT_STEPS,
     EVENING_COLLECT_STEPS,
     KRX_COLLECT_STEPS,
     MORNING_RELAY_JOBS,
@@ -913,6 +914,50 @@ def test_collect_eve_required_block_exit_one(
     event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8"))
     assert event["reason"] == "blocked on kis_investor_flow"
     assert event["metrics"] == {"blocking_job": "kis_investor_flow", "degraded_jobs": list(degraded)}
+
+
+def test_industry_snapshot_is_scheduled_in_the_evening_only() -> None:
+    from src.data.pipeline_graph import OPTIONAL_COLLECTION_JOBS
+
+    assert "kis_industry" in EVENING_COLLECT_STEPS
+    assert "kis_industry" in OPTIONAL_COLLECTION_JOBS
+    assert "kis_industry" not in KRX_COLLECT_STEPS | DBSEC_COLLECT_STEPS
+
+
+@pytest.mark.parametrize(
+    ("status", "degraded", "outcome"),
+    [("complete", (), "OK"), ("failed", ("kis_industry",), "DEGRADED")],
+)
+def test_collect_eve_reports_industry_step_and_isolates_its_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, degraded: tuple[str, ...], outcome: str,
+) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    step = {"job": "kis_industry", "status": status, "done": 0, "pending_left": 0, "requests_used": 0}
+    report = SimpleNamespace(
+        blocking_job=None, degraded_jobs=degraded, planned=["a"], built=["a"],
+        collection=({"job": "ls_investor_flow", "status": "complete"}, step),
+    )
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: report)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8"))
+    assert event["outcome"] == outcome
+    assert event["reason"] == ("optional:kis_industry" if degraded else "")
+    assert event["metrics"]["kis_industry"] == {key: value for key, value in step.items() if key != "job"}
+    assert event["metrics"]["built"] == 1
+
+
+def test_collect_eve_blocked_event_carries_industry_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    step = {"job": "kis_industry", "status": "partial", "done": 3, "pending_left": 1, "requests_used": 4}
+    report = SimpleNamespace(
+        blocking_job="dart_facts", degraded_jobs=("kis_industry",), planned=[], built=[], collection=(step,),
+    )
+    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: report)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
+    event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text(encoding="utf-8"))
+    assert event["metrics"]["kis_industry"] == {"status": "partial", "done": 3, "pending_left": 1, "requests_used": 4}
 
 
 def test_collect_eve_clean_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

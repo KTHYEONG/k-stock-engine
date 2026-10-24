@@ -5,20 +5,25 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from src.core.pit import EvidenceKind, PITDataError
 from src.data.evidence_sources import KIS_INDUSTRY_SOURCE
-from src.data.receipt_catalog import EvidenceStatus
+from src.data.receipt_catalog import EvidenceStatus, ReceiptCatalog
 from src.data.runtime import DataRuntime
 from src.data.scoped_ingestion import ScopedBronzeWriter, ScopedRawPayload
 
 __all__ = [
+    "INDUSTRY_SNAPSHOT_ENDPOINT",
     "collect_classification_with_isolation",
+    "current_universe_tickers",
     "resolve_industry_symbols",
+    "tickers_missing_weekly_snapshot",
 ]
+
+INDUSTRY_SNAPSHOT_ENDPOINT: Final = "inquire-price"
 
 _LOG = logging.getLogger(__name__)
 
@@ -54,6 +59,51 @@ def eligible_universe_tickers(silver_root: Path) -> tuple[str, ...]:
     if not tickers:
         raise PITDataError("ordinary universe has no eligible tickers")
     return tuple(str(ticker) for ticker in tickers)
+
+
+def current_universe_tickers(universe_path: Path) -> tuple[str, ...]:
+    """Sorted eligible tickers on the latest session of one published ordinary-universe dataset.
+
+    Raises:
+        PITDataError: the dataset has no session partitions or no eligible ticker on its latest session.
+    """
+    import polars as pl
+
+    sessions = sorted(
+        path for path in Path(universe_path).glob("session=*") if path.is_dir() and not path.is_symlink()
+    )
+    if not sessions:
+        raise PITDataError(f"ordinary universe has no published partitions: {universe_path}")
+    files = sorted(sessions[-1].glob("*.parquet"))
+    if not files:
+        raise PITDataError(f"ordinary universe latest partition is empty: {sessions[-1]}")
+    tickers = (
+        pl.scan_parquet([str(path) for path in files], hive_partitioning=False)
+        .filter(pl.col("eligible"))
+        .select(pl.col("ticker").cast(pl.String))
+        .unique()
+        .collect()["ticker"]
+        .sort()
+        .to_list()
+    )
+    if not tickers:
+        raise PITDataError(f"ordinary universe has no eligible tickers on {sessions[-1].name}")
+    return tuple(str(ticker) for ticker in tickers)
+
+
+def tickers_missing_weekly_snapshot(
+    catalog: ReceiptCatalog, tickers: tuple[str, ...], *, today: date
+) -> tuple[str, ...]:
+    """Tickers lacking a successful ``inquire-price`` receipt dated within ``today``'s ISO week up to ``today``.
+
+    ``today`` must use the same calendar basis as the receipt natural key (the collector's UTC date).
+    """
+    week_start = today - timedelta(days=today.weekday())
+    days = tuple(week_start + timedelta(days=offset) for offset in range(today.weekday() + 1))
+    keys = {f"{INDUSTRY_SNAPSHOT_ENDPOINT}:{ticker}:{day.isoformat()}": ticker for ticker in tickers for day in days}
+    found = catalog.latest(source=KIS_INDUSTRY_SOURCE, natural_keys=keys)
+    covered = {keys[key] for key, entry in found.items() if entry.status is EvidenceStatus.SUCCESS}
+    return tuple(ticker for ticker in tickers if ticker not in covered)
 
 
 def resolve_industry_symbols(runtime: DataRuntime, symbols_from: Path | str | None) -> tuple[str, ...]:
