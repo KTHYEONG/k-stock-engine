@@ -73,6 +73,7 @@ EVENING_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
         "kind_notice_documents",
         "ls_investor_flow",
         "kis_investor_flow",
+        "kis_industry",
     }
 )
 KRX_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
@@ -138,6 +139,14 @@ def _node_peak_metrics(report: object) -> dict[str, float]:
         return {str(kind): round(float(value), 1) for kind, value in dict(raw).items()}
     except Exception:
         return {}
+
+
+def _collection_step_metrics(report: object, job: str) -> dict[str, object]:
+    """``{job: {status, done, pending_left, requests_used}}`` from the refresh collection summary; empty when absent."""
+    for item in getattr(report, "collection", ()) or ():
+        if isinstance(item, Mapping) and item.get("job") == job:
+            return {job: {key: item.get(key) for key in ("status", "done", "pending_left", "requests_used")}}
+    return {}
 
 
 def _guard_headroom(data_root: Path) -> GuardRefused | None:
@@ -409,10 +418,11 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
         return 1
     blocking = getattr(report, "blocking_job", None)
     degraded = list(getattr(report, "degraded_jobs", ()) or ())
+    industry = _collection_step_metrics(report, "kis_industry")
     if blocking is not None:
         _record(
             root, "collect_eve", "DEGRADED", today, moment, reason=f"blocked on {blocking}"[:300],
-            metrics={"blocking_job": str(blocking), "degraded_jobs": degraded},
+            metrics={"blocking_job": str(blocking), "degraded_jobs": degraded, **industry},
         )
         return 1
     planned = list(getattr(report, "planned", ()))
@@ -435,7 +445,7 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
             reason=f"optional:{','.join(degraded)}"[:300],
             metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **prune_metrics},
+                      **warm_metrics, **prune_metrics, **industry},
         )
         return 0
     if warm_error is not None:
@@ -443,13 +453,13 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
             root, "collect_eve", "DEGRADED", today, moment, reason="flag_cache_warm_failed",
             metrics={"planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **prune_metrics},
+                      **warm_metrics, **prune_metrics, **industry},
         )
         return 0
     _record(
         root, "collect_eve", "OK", today, moment,
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(),
-                 "node_peak_rss_mb": node_peaks, **warm_metrics, **prune_metrics},
+                 "node_peak_rss_mb": node_peaks, **warm_metrics, **prune_metrics, **industry},
     )
     return 0
 
