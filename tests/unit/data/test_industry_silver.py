@@ -142,6 +142,20 @@ def test_fail_closed_on_unreadable_blob(tmp_path: Path) -> None:
         _materialize(bronze, catalog, tmp_path / "silver-tampered")
 
 
+def test_builds_from_packed_blobs(tmp_path: Path) -> None:
+    """Packed Bronze blobs (loose file removed after packing) still materialize."""
+    from src.data.payload_store import pack_loose
+
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    digest = _seed(catalog, bronze, _quote("005930", T1))
+    path = bronze / "industry" / digest / "payload.json"
+    pack_loose(bronze, kinds=["industry"], offsite_paths={path.relative_to(bronze).as_posix()}, remove=True)
+    assert not path.exists()
+    result = _materialize(bronze, catalog, silver)
+    assert _frame(result.dataset_path)["industry_name"].to_list() == ["전기·전자"]
+
+
 def test_fail_closed_on_malformed_blobs(tmp_path: Path) -> None:
     from src.core.pit import PITDataError
 
