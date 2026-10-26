@@ -14,6 +14,7 @@ import polars as pl
 from src.core.pit import PITDataError
 from src.data.datasets import DatasetIdentity, DatasetLayer, dataset_digest, publish_dataset
 from src.data.industry_ksic_map import learn_ksic_industry_mapping
+from src.data.payload_store import read_payload
 from src.data.receipt_catalog import ReceiptCatalog
 
 REVISION = "kis-industry-classification-v2"
@@ -48,10 +49,10 @@ class IndustryClassificationResult:
     mapping_disagreements: int
 
 
-def _load_payload(payload_path: Path) -> dict[str, Any]:
+def _load_payload(raw: bytes, payload_path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
         raise PITDataError(f"invalid verified KIS industry payload {payload_path}") from exc
     if not isinstance(payload, dict):
         raise PITDataError(f"invalid verified KIS industry payload {payload_path}")
@@ -146,12 +147,12 @@ def materialize_industry_classification_silver(
     stock_parsed: list[tuple[str, str, datetime, str, str, date | None]] = []
     for entry in blobs:
         try:
-            raw = Path(entry.payload_path).read_bytes()
-        except OSError as exc:
+            raw = read_payload(Path(entry.payload_path))
+        except (OSError, PITDataError) as exc:
             raise PITDataError(f"industry Bronze payload is unreadable: {entry.payload_path}") from exc
         if hashlib.sha256(raw).hexdigest() != entry.content_hash:
             raise PITDataError(f"industry Bronze hash mismatch: {entry.payload_path}")
-        payload = _load_payload(Path(entry.payload_path))
+        payload = _load_payload(raw, Path(entry.payload_path))
         endpoint = payload.get("endpoint")
         if endpoint == "inquire-price":
             symbol, collected_at = _parse_symbol_and_time(payload, Path(entry.payload_path))
