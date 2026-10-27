@@ -1617,6 +1617,9 @@ def _run_kis_flow_collection_step(
     )
 
 
+_INDUSTRY_SKIP_REASON_LINES = 20
+
+
 def _run_industry_collection_step(
     ctx: RefreshContext, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
@@ -1657,12 +1660,15 @@ def _run_industry_collection_step(
         # One shared client: its transport already enforces KisPolicy.min_interval_seconds per call.
         pace_seconds=0.0,
     )
-    skipped = sorted(cast("dict[str, str]", summary["skipped"]))
+    reasons = cast("dict[str, str]", summary["skipped"])
+    skipped = sorted(reasons)
     if skipped:
         _LOG.warning(
             "[DATA] stage=kis_industry status=partial requested=%d skipped=%d head=%s",
             len(pending), len(skipped), ",".join(skipped[:20]),
         )
+        for ticker in skipped[:_INDUSTRY_SKIP_REASON_LINES]:
+            _LOG.warning("[DATA] stage=kis_industry_skip ticker=%s reason=%s", ticker, reasons[ticker])
     return CollectionStepReport(
         job="kis_industry", status="partial" if skipped else "complete",
         done=cast(int, summary["pages_collected"]), pending_left=len(skipped), requests_used=len(pending),

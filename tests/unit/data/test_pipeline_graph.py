@@ -2099,6 +2099,10 @@ def test_industry_step_reports_partial_and_retries_only_skipped_tickers(
 
     assert first == CollectionStepReport(job="kis_industry", status="partial", done=1, pending_left=1, requests_used=2)
     assert any("stage=kis_industry status=partial" in message and "000660" in message for message in caplog.messages)
+    assert any(
+        "stage=kis_industry_skip ticker=000660" in message and "missing bstp_kor_isnm" in message
+        for message in caplog.messages
+    )
     assert client.calls == ["000660", "005930", "000660"]
     assert retry.steps[0].status == "failed"
     assert retry.blocking_job is None
