@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800" role="img" style="font-family:Pretendard, 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', -apple-system, 'Segoe UI', sans-serif">
+  <title>K-Stock Engine 시스템 아키텍처</title>
+  <desc>외부 연동, 백테스트·수집 코어, 배치·검증·백업, 서비스·가드로 이어지는 4단계 단방향 파이프라인과 호스트 공유 가드, 패키지 계층</desc>
+  <defs><filter id="shadow" x="-8%" y="-8%" width="116%" height="124%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.07" data-paint-static="true"/></filter></defs>
+  <rect width="1200" height="800" fill="#F7F7F5" data-fill-role="canvas"/>
+  <rect x="48" y="44" width="6" height="64" rx="3" fill="#2E6DA4" data-fill-role="focus"/>
+  <text x="70" y="50" font-size="13.5" font-weight="700" fill="#2F3846" data-fill-role="ink" text-anchor="start" dominant-baseline="central" letter-spacing="0.08em">SYSTEM ARCHITECTURE</text>
+  <text x="70" y="78" font-size="28" font-weight="700" fill="#1B212B" data-fill-role="ink" text-anchor="start" dominant-baseline="central">외부 연동에서 백테스트 &amp; 가드된 실행까지, 4단계 파이프라인</text>
+  <text x="70" y="108" font-size="15" font-weight="600" fill="#2F3846" data-fill-role="ink" text-anchor="start" dominant-baseline="central">모든 외부 호출은 호스트 공유 가드를 통과하고, 결정은 무누출 시점 분리와 정수 원장을 거칩니다</text>
+  <rect x="48" y="140" width="249" height="372" rx="16" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.5" data-stroke-role="edge-line" filter="url(#shadow)"/>
+  <rect x="64" y="156" width="97" height="28" rx="14" fill="#EAF0F6" stroke="#2E6DA4" stroke-width="1" data-fill-role="blue-fill" data-stroke-role="blue-line"/>
+  <text x="112.5" y="170.0" font-size="12.5" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="middle" dominant-baseline="central" letter-spacing="0.04em">ZONE 01</text>
+  <text x="64" y="206" font-size="20" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">외부 연동 &amp; 쿼터</text>
+  <rect x="62" y="232" width="221" height="56" rx="10" fill="#EAF0F6" data-fill-role="blue-fill" stroke="#2E6DA4" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="74" y="251" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">KRX · KIND</text>
+  <text x="74" y="272" font-size="14.5" font-weight="600" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">시세 · 시장조치 릴레이</text>
+  <rect x="62" y="298" width="221" height="56" rx="10" fill="#EAF0F6" data-fill-role="blue-fill" stroke="#2E6DA4" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="74" y="317" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">OpenDART</text>
+  <text x="74" y="338" font-size="14.5" font-weight="600" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">공시 · 재무 (접수시각)</text>
+  <rect x="62" y="364" width="221" height="56" rx="10" fill="#EAF0F6" data-fill-role="blue-fill" stroke="#2E6DA4" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="74" y="383" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">LS증권 · KIS</text>
+  <text x="74" y="404" font-size="14.5" font-weight="600" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">투자자 수급 · 호가</text>
+  <rect x="62" y="430" width="221" height="56" rx="10" fill="#EAF0F6" data-fill-role="blue-fill" stroke="#2E6DA4" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="74" y="449" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">DB금융투자</text>
+  <text x="74" y="470" font-size="14.5" font-weight="600" fill="#12324E" data-fill-role="blue-ink" text-anchor="start" dominant-baseline="central">분봉 폴백 수집</text>
+  <path d="M303 326.0 L327 326.0 M320 319.0 L327 326.0 L320 333.0" fill="none" stroke="#636A75" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="gray-line"/>
+  <rect x="333" y="140" width="249" height="372" rx="16" fill="#FFFFFF" data-fill-role="surface" stroke="#3F8F72" stroke-width="1.5" data-stroke-role="edge-line" filter="url(#shadow)"/>
+  <rect x="349" y="156" width="97" height="28" rx="14" fill="#ECF4F1" stroke="#3F8F72" stroke-width="1" data-fill-role="green-fill" data-stroke-role="green-line"/>
+  <text x="397.5" y="170.0" font-size="12.5" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="middle" dominant-baseline="central" letter-spacing="0.04em">ZONE 02</text>
+  <text x="349" y="206" font-size="20" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">백테스트 &amp; 코어</text>
+  <rect x="347" y="232" width="221" height="56" rx="10" fill="#ECF4F1" data-fill-role="green-fill" stroke="#3F8F72" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="359" y="251" font-size="15.5" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">Point-in-Time</text>
+  <text x="359" y="272" font-size="14.5" font-weight="600" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">접수시각 격리 패널</text>
+  <rect x="347" y="298" width="221" height="56" rx="10" fill="#ECF4F1" data-fill-role="green-fill" stroke="#3F8F72" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="359" y="317" font-size="15.5" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">Integer Ledger</text>
+  <text x="359" y="338" font-size="14.5" font-weight="600" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">원 단위 정수 회계 원장</text>
+  <rect x="347" y="364" width="221" height="56" rx="10" fill="#ECF4F1" data-fill-role="green-fill" stroke="#3F8F72" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="359" y="383" font-size="15.5" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">5-슬리브 결합북</text>
+  <text x="359" y="404" font-size="14.5" font-weight="600" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">요일 운 제거 주식북</text>
+  <rect x="347" y="430" width="221" height="56" rx="10" fill="#ECF4F1" data-fill-role="green-fill" stroke="#3F8F72" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="359" y="449" font-size="15.5" font-weight="700" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">추세 오버레이</text>
+  <text x="359" y="470" font-size="14.5" font-weight="600" fill="#17402F" data-fill-role="green-ink" text-anchor="start" dominant-baseline="central">KOSPI 200 선물 헤지</text>
+  <path d="M588 326.0 L612 326.0 M605 319.0 L612 326.0 L605 333.0" fill="none" stroke="#636A75" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="gray-line"/>
+  <rect x="618" y="140" width="249" height="372" rx="16" fill="#FFFFFF" data-fill-role="surface" stroke="#5B54A8" stroke-width="1.5" data-stroke-role="edge-line" filter="url(#shadow)"/>
+  <rect x="634" y="156" width="97" height="28" rx="14" fill="#EFEEF6" stroke="#5B54A8" stroke-width="1" data-fill-role="purple-fill" data-stroke-role="purple-line"/>
+  <text x="682.5" y="170.0" font-size="12.5" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="middle" dominant-baseline="central" letter-spacing="0.04em">ZONE 03</text>
+  <text x="634" y="206" font-size="20" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">배치 · 검증 · 백업</text>
+  <rect x="632" y="232" width="221" height="56" rx="10" fill="#EFEEF6" data-fill-role="purple-fill" stroke="#5B54A8" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="644" y="251" font-size="15.5" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">신선도 게이트</text>
+  <text x="644" y="272" font-size="14.5" font-weight="600" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">전일 수급 결측 2% 이하</text>
+  <rect x="632" y="298" width="221" height="56" rx="10" fill="#EFEEF6" data-fill-role="purple-fill" stroke="#5B54A8" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="644" y="317" font-size="15.5" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">결정 봉인</text>
+  <text x="644" y="338" font-size="14.5" font-weight="600" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">SHA-256 해시 체인</text>
+  <rect x="632" y="364" width="221" height="56" rx="10" fill="#EFEEF6" data-fill-role="purple-fill" stroke="#5B54A8" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="644" y="383" font-size="15.5" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">일일 감사</text>
+  <text x="644" y="404" font-size="14.5" font-weight="600" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">봉인 · 체인 · 백업 점검</text>
+  <rect x="632" y="430" width="221" height="56" rx="10" fill="#EFEEF6" data-fill-role="purple-fill" stroke="#5B54A8" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="644" y="449" font-size="15.5" font-weight="700" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">원격 백업</text>
+  <text x="644" y="470" font-size="14.5" font-weight="600" fill="#28244F" data-fill-role="purple-ink" text-anchor="start" dominant-baseline="central">rclone → Google Drive</text>
+  <path d="M873 326.0 L897 326.0 M890 319.0 L897 326.0 L890 333.0" fill="none" stroke="#636A75" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="gray-line"/>
+  <rect x="903" y="140" width="249" height="372" rx="16" fill="#FFFFFF" data-fill-role="surface" stroke="#B08434" stroke-width="1.5" data-stroke-role="edge-line" filter="url(#shadow)"/>
+  <rect x="919" y="156" width="97" height="28" rx="14" fill="#FBF3E3" stroke="#B08434" stroke-width="1" data-fill-role="amber-fill" data-stroke-role="amber-line"/>
+  <text x="967.5" y="170.0" font-size="12.5" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="middle" dominant-baseline="central" letter-spacing="0.04em">ZONE 04</text>
+  <text x="919" y="206" font-size="20" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">서비스 · 실전 가드</text>
+  <rect x="917" y="232" width="221" height="56" rx="10" fill="#FBF3E3" data-fill-role="amber-fill" stroke="#B08434" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="929" y="251" font-size="15.5" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">SubmissionGate</text>
+  <text x="929" y="272" font-size="14.5" font-weight="600" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">라이브는 4중 증거 필요</text>
+  <rect x="917" y="298" width="221" height="56" rx="10" fill="#FBF3E3" data-fill-role="amber-fill" stroke="#B08434" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="929" y="317" font-size="15.5" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">주문 순서</text>
+  <text x="929" y="338" font-size="14.5" font-weight="600" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">매도 선행 · 멱등 키</text>
+  <rect x="917" y="364" width="221" height="56" rx="10" fill="#FBF3E3" data-fill-role="amber-fill" stroke="#B08434" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="929" y="383" font-size="15.5" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">PaperBroker 기본</text>
+  <text x="929" y="404" font-size="14.5" font-weight="600" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">default_mode = paper</text>
+  <rect x="917" y="430" width="221" height="56" rx="10" fill="#FBF3E3" data-fill-role="amber-fill" stroke="#B08434" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="929" y="449" font-size="15.5" font-weight="700" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">운영 알림 메일</text>
+  <text x="929" y="470" font-size="14.5" font-weight="600" fill="#503606" data-fill-role="amber-ink" text-anchor="start" dominant-baseline="central">실패 유닛 원인 요약</text>
+  <rect x="48" y="540" width="1104" height="108" rx="16" fill="#F1F2F3" data-fill-role="surface-tint" stroke="#636A75" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="72" y="566" font-size="18" font-weight="700" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">호스트 공유 가드 &amp; 무결성 엔진 (공통 인프라)</text>
+  <rect x="72" y="584" width="336" height="52" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#636A75" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="86" y="602" font-size="15.5" font-weight="700" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">HostPacedLimiter · 18 req/s</text>
+  <text x="86" y="622" font-size="14.5" font-weight="600" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">KIS 풀 슬롯 예약 · 우선순위 3단계</text>
+  <rect x="432" y="584" width="336" height="52" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#636A75" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="446" y="602" font-size="15.5" font-weight="700" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">ProviderQuotaStateStore</text>
+  <text x="446" y="622" font-size="14.5" font-weight="600" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">일일 예산 원장 · KST 자정 리셋</text>
+  <rect x="792" y="584" width="336" height="52" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#636A75" stroke-width="1.1" data-stroke-role="edge-line"/>
+  <text x="806" y="602" font-size="15.5" font-weight="700" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">ReceiptCatalog · SQLite WAL</text>
+  <text x="806" y="622" font-size="14.5" font-weight="600" fill="#2B3038" data-fill-role="data-ink" text-anchor="start" dominant-baseline="central">173,849건 영수증 단일 트랜잭션</text>
+  <rect x="48" y="668" width="1104" height="100" rx="16" fill="#EAF0F6" data-fill-role="blue-fill" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="72" y="694" font-size="18" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="start" dominant-baseline="central">패키지 계층 · AST 검사로 하향 단방향 강제 (execution은 core만 참조)</text>
+  <rect x="72" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="138.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">core</text>
+  <path d="M211.0 725 L219.0 733 L211.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="226" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="292.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">config</text>
+  <path d="M365.0 725 L373.0 733 L365.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="380" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="446.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">integrations</text>
+  <path d="M519.0 725 L527.0 733 L519.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="534" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="600.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">data</text>
+  <path d="M673.0 725 L681.0 733 L673.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="688" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="754.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">backtest</text>
+  <path d="M827.0 725 L835.0 733 L827.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="842" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="908.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">research</text>
+  <path d="M981.0 725 L989.0 733 L981.0 741" fill="none" stroke="#2E6DA4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" data-stroke-role="blue-line"/>
+  <rect x="996" y="714" width="132" height="38" rx="10" fill="#FFFFFF" data-fill-role="surface" stroke="#2E6DA4" stroke-width="1.2" data-stroke-role="edge-line"/>
+  <text x="1062.0" y="733" font-size="15.5" font-weight="700" fill="#12324E" data-fill-role="edge-ink" text-anchor="middle" dominant-baseline="central">ops</text>
+</svg>
