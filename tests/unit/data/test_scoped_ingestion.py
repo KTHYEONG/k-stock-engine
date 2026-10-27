@@ -797,3 +797,41 @@ def test_only_the_writer_module_imports_bronze_store() -> None:
     assert "collection.py" not in importers
     assert "industry_collection.py" not in importers
 
+
+
+def test_industry_skip_reason_keeps_the_wrapped_cause(tmp_path: Path) -> None:
+    from src.core.pit import PITDataError
+    from src.data.industry_collection import collect_classification_with_isolation
+
+    writer, _ = _writer(tmp_path)
+
+    class _Collector:
+        def __init__(self, symbols: tuple[str, ...]) -> None:
+            self.symbols = symbols
+
+        def fetch_industry_classification(self, *, bronze_root: Path):  # type: ignore[no-untyped-def]
+            if self.symbols[0] == "0001A0":
+                try:
+                    raise KeyError("output")
+                except KeyError as exc:
+                    raise PITDataError(f"KIS industry classification collection failed for {self.symbols[0]}") from exc
+            yield {
+                "endpoint": "inquire-price",
+                "collected_at": "2024-06-01T09:00:00+09:00",
+                "output": {"price": 70100},
+                "records": [{"ticker": self.symbols[0], "industry": "전자"}],
+            }
+
+    report = collect_classification_with_isolation(
+        stage="test-industry",
+        collector_cls=_Collector,
+        fetch_attr="fetch_industry_classification",
+        bronze_root=tmp_path / "data" / "bronze" / "kr_swing_2019_v1",
+        writer=writer,
+        symbols=("0001A0", "005930"),
+        pace_seconds=0.0,
+    )
+
+    assert report["skipped"] == {
+        "0001A0": "KIS industry classification collection failed for 0001A0 cause=KeyError: 'output'"
+    }

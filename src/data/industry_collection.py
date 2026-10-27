@@ -157,6 +157,16 @@ def _industry_scoped_payload(
     )
 
 
+_SKIP_REASON_CHARS = 240
+
+
+def _skip_reason(exc: BaseException) -> str:
+    """One-line reason including the wrapped cause, which the adapter message alone hides."""
+    cause = exc.__cause__
+    text = str(exc) if cause is None else f"{exc} cause={type(cause).__name__}: {cause}"
+    return " ".join(text.split())[:_SKIP_REASON_CHARS]
+
+
 def collect_classification_with_isolation(
     *,
     stage: str,
@@ -191,7 +201,7 @@ def collect_classification_with_isolation(
             writer.persist_many(tuple(payloads))
             pages += len(payloads)
         except (PITDataError, ProviderError) as exc:
-            skipped[symbol] = str(exc)
+            skipped[symbol] = _skip_reason(exc)
         if index % 100 == 0:
             _LOG.info(
                 "[DATA] stage=%s done=%d/%d ok=%d skipped=%d",
