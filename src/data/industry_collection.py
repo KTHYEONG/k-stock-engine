@@ -158,6 +158,7 @@ def _industry_scoped_payload(
 
 
 _SKIP_REASON_CHARS = 240
+_SKIP_REASON_LINES = 20
 
 
 def _skip_reason(exc: BaseException) -> str:
@@ -212,6 +213,9 @@ def collect_classification_with_isolation(
                 len(skipped),
             )
         time.sleep(pace_seconds)
+    # Logged before the all-skipped raise: the caller only sees the exception type, not the reasons.
+    for symbol in sorted(skipped)[:_SKIP_REASON_LINES]:
+        _LOG.warning("[DATA] stage=%s_skip ticker=%s reason=%s", stage, symbol, skipped[symbol])
     if pages == 0:
         raise PITDataError(f"{stage} collected nothing ({total} requested, {len(skipped)} skipped)")
     return {
