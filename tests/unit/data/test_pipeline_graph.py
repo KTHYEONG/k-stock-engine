@@ -2093,12 +2093,20 @@ def test_industry_step_reports_partial_and_retries_only_skipped_tickers(
 
     with caplog.at_level("WARNING"):
         first = graph._run_industry_collection_step(ctx, dry_run=False, emit=lambda payload: None)
-    retry = graph.run_collection_jobs(
-        ctx, dry_run=False, emit=lambda payload: None, steps=(("kis_industry", graph._run_industry_collection_step),),
-    )
+    first_messages = list(caplog.messages)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        retry = graph.run_collection_jobs(
+            ctx, dry_run=False, emit=lambda payload: None, steps=(("kis_industry", graph._run_industry_collection_step),),
+        )
 
     assert first == CollectionStepReport(job="kis_industry", status="partial", done=1, pending_left=1, requests_used=2)
-    assert any("stage=kis_industry status=partial" in message and "000660" in message for message in caplog.messages)
+    assert any("stage=kis_industry status=partial" in message and "000660" in message for message in first_messages)
+    assert any(
+        "stage=kis_industry_skip ticker=000660" in message and "missing bstp_kor_isnm" in message
+        for message in first_messages
+    )
+    # The all-skipped retry raises, so its reasons must already be in the log.
     assert any(
         "stage=kis_industry_skip ticker=000660" in message and "missing bstp_kor_isnm" in message
         for message in caplog.messages
