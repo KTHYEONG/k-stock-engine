@@ -27,6 +27,9 @@ INDUSTRY_SNAPSHOT_ENDPOINT: Final = "inquire-price"
 
 _LOG = logging.getLogger(__name__)
 
+# An empty snapshot is KIS answering "no industry" for the ticker; re-asking within the week returns the same.
+_ANSWERED: Final = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY})
+
 
 def eligible_universe_tickers(silver_root: Path) -> tuple[str, ...]:
     """Eligible tickers from the scope's certified ordinary universe.
@@ -94,7 +97,7 @@ def current_universe_tickers(universe_path: Path) -> tuple[str, ...]:
 def tickers_missing_weekly_snapshot(
     catalog: ReceiptCatalog, tickers: tuple[str, ...], *, today: date
 ) -> tuple[str, ...]:
-    """Tickers lacking a successful ``inquire-price`` receipt dated within ``today``'s ISO week up to ``today``.
+    """Tickers lacking an answered (success or empty) ``inquire-price`` receipt dated within ``today``'s ISO week up to ``today``.
 
     ``today`` must use the same calendar basis as the receipt natural key (the collector's UTC date).
     """
@@ -102,7 +105,7 @@ def tickers_missing_weekly_snapshot(
     days = tuple(week_start + timedelta(days=offset) for offset in range(today.weekday() + 1))
     keys = {f"{INDUSTRY_SNAPSHOT_ENDPOINT}:{ticker}:{day.isoformat()}": ticker for ticker in tickers for day in days}
     found = catalog.latest(source=KIS_INDUSTRY_SOURCE, natural_keys=keys)
-    covered = {keys[key] for key, entry in found.items() if entry.status is EvidenceStatus.SUCCESS}
+    covered = {keys[key] for key, entry in found.items() if entry.status in _ANSWERED}
     return tuple(ticker for ticker in tickers if ticker not in covered)
 
 
@@ -188,6 +191,7 @@ def collect_classification_with_isolation(
 
     total = len(symbols)
     pages = 0
+    empty: list[str] = []
     skipped: dict[str, str] = {}
     for index, symbol in enumerate(symbols, start=1):
         collector = collector_cls((symbol,))
@@ -201,6 +205,8 @@ def collect_classification_with_isolation(
                 )
             writer.persist_many(tuple(payloads))
             pages += len(payloads)
+            if any(payload.status is EvidenceStatus.EMPTY for payload in payloads):
+                empty.append(symbol)
         except (PITDataError, ProviderError) as exc:
             skipped[symbol] = _skip_reason(exc)
         if index % 100 == 0:
@@ -216,11 +222,14 @@ def collect_classification_with_isolation(
     # Logged before the all-skipped raise: the caller only sees the exception type, not the reasons.
     for symbol in sorted(skipped)[:_SKIP_REASON_LINES]:
         _LOG.warning("[DATA] stage=%s_skip ticker=%s reason=%s", stage, symbol, skipped[symbol])
+    if empty:
+        _LOG.info("[DATA] stage=%s_empty count=%d head=%s", stage, len(empty), ",".join(empty[:_SKIP_REASON_LINES]))
     if pages == 0:
         raise PITDataError(f"{stage} collected nothing ({total} requested, {len(skipped)} skipped)")
     return {
         "symbols_requested": total,
         "pages_collected": pages,
+        "empty_count": len(empty),
         "skipped_count": len(skipped),
         "skipped": skipped,
     }

@@ -156,6 +156,9 @@ def materialize_industry_classification_silver(
         endpoint = payload.get("endpoint")
         if endpoint == "inquire-price":
             symbol, collected_at = _parse_symbol_and_time(payload, Path(entry.payload_path))
+            if payload.get("records") == []:
+                # KIS assigns this ticker no industry; KSIC inference or null applies instead.
+                continue
             industry, market = _parse_quote_record(
                 _parse_records(payload, Path(entry.payload_path)), Path(entry.payload_path)
             )

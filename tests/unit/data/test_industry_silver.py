@@ -179,3 +179,18 @@ def test_fail_closed_on_malformed_blobs(tmp_path: Path) -> None:
         )
         with pytest.raises(PITDataError):
             _materialize(bronze, catalog, tmp_path / f"silver-bad-{index}")
+
+
+def test_empty_quote_snapshot_contributes_no_observation(tmp_path: Path) -> None:
+    bronze, silver = tmp_path / "bronze", tmp_path / "silver"
+    catalog = ReceiptCatalog(bronze / "catalog")
+    _seed(catalog, bronze, _quote("005930", T1))
+    _seed(catalog, bronze, _stock("005930", T1))
+    empty = _quote("0001A0", T2)
+    empty["records"] = []
+    _seed(catalog, bronze, empty)
+    _seed(catalog, bronze, _stock("0001A0", T2))
+    frame = _frame(_materialize(bronze, catalog, silver).dataset_path).sort("ticker")
+    assert frame["ticker"].to_list() == ["0001A0", "005930"]
+    assert frame["industry_basis"].to_list()[0] != frame["industry_basis"].to_list()[1]
+    assert frame["industry_name"].to_list() == ["전기·전자", "전기·전자"]
