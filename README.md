@@ -1,190 +1,196 @@
-<div align="center">
-
 # K-Stock Engine
 
-**한국 주식시장(KRX) 대상의 기하 복리 성장과 무결점 실전 집행을 보장하는 고신뢰 퀀트 트레이딩 엔진**  
-DART 접수시각 기반 시점 일치(Point-in-Time) 패널 · 5-슬리브 주식북 & KOSPI 200 추세 오버레이 · 원 단위 정수 회계 원장(`Integer KRW Ledger`) · 다중 프로젝트 호스트 공유 호출 제어 · systemd 무인 운영
+**국내 주식(KRX) 다중 팩터 투자 전략을 연구하고, 매일 장 시작 전에 목표 포트폴리오를 만들어 가상 장부로 기록하는 프로젝트**
 
-[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](./pyproject.toml) [![Backtest Evaluation](https://img.shields.io/badge/Backtest-8.8%EB%85%84%20%EC%A0%84%EC%88%98%20%EA%B2%80%EC%A6%9D%20%7C%20CAGR%20%2B49.4%25-059669?style=flat-square)](./config/research/challenge/three_seeds.toml) [![Integer Accounting](https://img.shields.io/badge/Accounting-Integer%20KRW%20Ledger%20%7C%20T%2B2-4F46E5?style=flat-square)](./src/backtest/ledger.py) [![Data Engine](https://img.shields.io/badge/Data-Polars%20%7C%20Parquet%20%7C%20SQLite%20WAL-0F766E?style=flat-square)](./src/data/) [![Host Pacer](https://img.shields.io/badge/Host%20Quota-18%20req%2Fs%20%7C%20flock-2563EB?style=flat-square)](./src/integrations/kis/admission.py) [![Layer Guard](https://img.shields.io/badge/Layer%20Violations-0-16A34A?style=flat-square)](./tests/unit/core/test_package_dependency_boundaries.py) [![Tests](https://img.shields.io/badge/Tests-3%2C711%20Passed-16A34A?style=flat-square&logo=pytest&logoColor=white)](./tests/)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](./pyproject.toml) [![LightGBM](https://img.shields.io/badge/Model-LightGBM-02A676?style=flat-square)](./src/research/model.py) [![Polars](https://img.shields.io/badge/Data-Polars%20%7C%20Parquet%20%7C%20SQLite-0F766E?style=flat-square)](./src/data/) [![CI](https://img.shields.io/badge/CI-ruff%20%7C%20mypy%20%7C%20pytest-16A34A?style=flat-square&logo=githubactions&logoColor=white)](./.github/workflows/deploy.yml)
 
-</div>
+> [!NOTE]
+> 서버에서는 데이터 수집, 장전 목표 포트폴리오 확정, 가상 장부(shadow) 기록까지 자동으로 돌며 **실제 주문은 내지 않습니다**. 주문 집행 코드는 모의투자(paper)가 기본이고, 실주문은 안전 조건을 모두 채우기 전까지 코드에서 막혀 있습니다.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/hero-overview.dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./docs/assets/hero-overview.light.svg">
-    <img alt="K-Stock Engine 핵심 지표와 일일 파이프라인" src="./docs/assets/hero-overview.light.png" width="100%">
-  </picture>
-</p>
+## 🧭 개요
 
----
+개인이 국내 주식 투자 전략을 만들 때 부딪히는 문제는 전략 자체보다 **믿을 수 있는 검증**입니다.
 
-## 1. 핵심 엔지니어링 보장 지표
+- 재무제표는 분기말이 아니라 **공시된 시각**부터 알 수 있는 정보인데, 이를 무시하면 백테스트에 미래 정보가 섞입니다.
+- 거래비용, 세금, 결제일(T+2)을 소수점 계산으로 대충 처리하면 백테스트와 실제 계좌가 어긋납니다.
+- 증권사 API는 호출 한도가 있고, 같은 서버의 여러 프로젝트가 한 계정을 함께 씁니다.
+- 전략을 계속 바꿔 보면 과거 데이터에만 맞는 결과(과적합)를 고르게 됩니다.
 
-| 핵심 지표 | 실측 보장 수치 | 아키텍처 메커니즘 & 주요 모듈 |
-| :--- | :---: | :--- |
-| **도메인 복리 성과 (CAGR)** | **`+49.43%`** (Sharpe **`1.50`**) | 5-슬리브 주식북 + KOSPI 200 추세 오버레이, 법정거래세·슬리피지 전액 실측 차감 · [three_seeds.toml](./config/research/challenge/three_seeds.toml) |
-| **금융 회계 무결성** | **`부동소수점 오차 0원` / `미수금 0건`** | 전 계좌 원 단위 정수 원장(`Integer KRW Ledger`) 및 매도 우선(`_submission_order`) T+2 정산 · [ledger.py](./src/backtest/ledger.py) |
-| **미래 정보 참조율 (Causality)** | **`0.00%`** (`시점 물리 분리`) | DART 실제 접수시각(`available_at`) 기반 PIT 패널 및 이진 탐색 슬라이싱 · [pit.py](./src/core/pit.py), [normalization.py](./src/data/normalization.py) |
-| **호스트 공유 호출 상한** | **`18 req/s`** (`IP 차단 0건`) | 다중 프로젝트 공유 디렉터리 `flock` 슬롯 예약 및 3단계 우선순위 페이싱 · [admission.py](./src/integrations/kis/admission.py) |
-| **파산 가드 & 스트레스 내구성** | **`5년 파산 확률 0.05%`** | 4,000회 5년 블록 부트스트랩 하위 10% J 평가 및 슬리피지 1.5틱 무한 저항 · [evaluation.py](./src/research/evaluation.py) |
-| **정적 아키텍처 품질** | **`3,711 Tests Green` / `AST 위반 0건`** | Python AST 기반 패키지 계층 위계(`core` $\to$ `ops`) 기계적 래칫 검증 · [test_boundaries.py](./tests/unit/core/test_package_dependency_boundaries.py) |
+K-Stock Engine은 이 네 가지를 구조로 막는 것을 목표로 합니다. 데이터 수집, 백테스트, 전략 비교, 매일의 목표 포트폴리오 확정, 서버 운영·점검까지 한 저장소에 있습니다. 소스 약 5만 4천 줄, 테스트 약 8만 3천 줄입니다(Python 파일 줄 수 기준).
 
----
+## 🏗️ 시스템 구성
 
-## 2. 시스템 아키텍처 & 일일 생명주기
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/system-architecture.dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./docs/assets/system-architecture.light.svg">
-    <img alt="K-Stock Engine 시스템 아키텍처" src="./docs/assets/system-architecture.light.png" width="100%">
-  </picture>
-</p>
-
-* **ZONE 01 · 외부 연동 & 쿼터 제어:** KRX·KIND, OpenDART, LS·KIS·DB금융투자 API 클라이언트를 [integrations](./src/integrations/)에 격리하고, 커널 `flock` 페이서([admission.py](./src/integrations/kis/admission.py))와 영속 쿼터 원장([quota.py](./src/integrations/quota.py))으로 프로세스 간 호출 경합을 방지합니다.
-* **ZONE 02 · 백테스트 & 코어 엔진:** 수집 데이터를 [ReceiptCatalog](./src/data/receipt_catalog.py) SQLite WAL에 기록 후 `available_at`이 부여된 Silver Parquet로 변환합니다. 백테스트 엔진([engine.py](./src/backtest/engine.py))은 정수 회계 원장([ledger.py](./src/backtest/ledger.py)) 위에서 5-슬리브 주식북([book.py](./src/research/book.py))과 추세 오버레이([trend_overlay.py](./src/research/trend_overlay.py))를 고속 시뮬레이션합니다.
-* **ZONE 03 · 배치 · 검증 · 백업:** 평일 `08:32` [morning](./src/ops/jobs.py) 잡이 수급 신선도([investor_flow_freshness.py](./src/data/investor_flow_freshness.py)) 검증 후 목표 포트폴리오를 SHA-256 해시 체인([operate.py](./src/research/operate.py))에 봉인합니다. `21:40` [일일 감사](./src/ops/audit.py)가 4대 실행 상태를 검증하고, `02:30` [원격 백업](./src/data/lake_backup.py)이 클라우드 동기화를 수행합니다.
-* **ZONE 04 · 서비스 & 실전 가드:** [execution](./src/execution/) 헥사고날 아키텍처의 [SubmissionGate](./src/execution/application/readiness.py)가 4대 증거(대사·상태전이·모의승인·멱등성)를 검증하기 전까지 실계좌 주문을 Fail-Closed로 차단하며, 주문 집행 시 매도를 매수보다 선행시켜 미수금 발생을 방지합니다.
-
----
-
-## 3. 핵심 문제 해결 사례 (Engineering Deep Dives)
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/engineering-deep-dives.dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./docs/assets/engineering-deep-dives.light.svg">
-    <img alt="K-Stock Engine 3대 핵심 문제 해결 사례" src="./docs/assets/engineering-deep-dives.light.png" width="100%">
-  </picture>
-</p>
-
-### Case 01. 미래 정보 참조(Look-ahead) 차단과 원 단위 정수 회계 원장 (`Integer KRW Ledger`)
-
-* **문제 상황:** 분기 재무제표 공시일(최대 45일 유예)을 분기말로 소급 적용할 경우 미래 정보 누출이 발생하며, 백테스트에서 `float` 연산과 T+2 정산 미반영 시 실전 집행에서 호가 절사 오차 및 미수금·반대매매 사고가 유발됩니다.
-* **해결 방법:** DART 접수시각(`available_at`) 기준의 Point-in-Time 물리 분리 패널을 구축하고, 전 계좌에 원 단위 정수 회계 원장([ledger.py](./src/backtest/ledger.py))을 도입했습니다. `CASH`·`MARGIN`·`PAYABLE` 3계정과 T+2 정산 주기를 모델링하여 매도 주문을 항상 매수보다 선순위 체결([_submission_order](./src/execution/application/submit_intents.py))하도록 강제했습니다.
-* **검증된 성과:** 미래 정보 참조율 **`0.00%`**, 8.8년 전수 백테스트 및 실전 주문에서 **`부동소수점 오차 0원`** 및 **`미수금 0건`**을 달성했습니다.
-
-### Case 02. 호스트 전역 증권사 API 호출 제어 & 토큰 단일 발급 (`HostPacedLimiter`)
-
-* **문제 상황:** 단일 서버에서 복수 프로젝트(`k-stock-engine`, `k-closing-alpha` 등)가 동일한 KIS 계정을 공유할 때 인메모리 리미터로는 타 프로세스 호출량을 알 수 없어 브로커 한도(`18 req/s`) 초과 차단 및 24시간 세션 토큰 중복 발급 충돌이 발생했습니다.
-* **해결 방법:** 호스트 공유 디렉터리(`flock`)에 슬롯 예약 상태를 기록하는 [HostPacedLimiter](./src/integrations/kis/admission.py)를 구현하고, 3단계 우선순위(`critical` 즉시, `standard` 1.0s, `bulk` 0.25s)를 적용해 장중 중요 주문 슬롯을 보호했습니다. 토큰 발급 역시 키 해시 기반 파일 락으로 단일화하여 대기 중 타 프로세스가 갱신한 토큰을 즉시 채택하도록 구성했습니다.
-* **검증된 성과:** 머신 전역 KIS 호출 상한 **`18 req/s`**를 준수하여 **`IP 차단 0건`**을 유지하고, 관련 계약 테스트 **`63건`**을 전수 통과했습니다.
-
-### Case 03. 5-슬리브 결합북과 4,000회 블록 부트스트랩 파산 가드 (`BookSpec` & `EvaluationPolicy`)
-
-* **문제 상황:** 주 1회 리밸런싱 전략은 매매 요일에 따라 연간 성과 편차가 20%p 이상 벌어지는 위상 운(Phase Luck)이 발생하며, 단일 Sharpe 최적화 백테스트는 과거 데이터에만 들어맞는 사후 과적합(P-hacking)으로 실전 원금 손실 위험이 큽니다.
-* **해결 방법:** 5개 거래일로 위상을 분산한 5-슬리브 주식북([book.py](./src/research/book.py))과 KOSPI 200 추세 오버레이([trend_overlay.py](./src/research/trend_overlay.py))를 결합해 요일 편차와 하락장 손실을 헤지했습니다. 전략 평가는 단순 Sharpe 대신 4,000회 5년 블록 부트스트랩(63일 블록)을 수행하여 하위 10% 분위수 목적함수 $J$와 생존 가드를 평가 지표로 채택했습니다.
-* **검증된 성과:** 4,000회 부트스트랩 결과 5년 파산 확률 **`0.05%`** (허용치 5.0% 대비 극저위험)로 가드를 통과했으며, 편도 1.5틱 슬리피지에서도 **`손익분기 무한 저항`**을 검증했습니다.
-
----
-
-## 4. 실측 백테스트 성과 매트릭스 (Verified Performance Matrix)
-
-> **검증 기준**: 2018-01-02 ~ 2026-10-02 (8.8년, 2,147 거래 세션 전수 실측) · [three_seeds.toml](./config/research/challenge/three_seeds.toml)  
-> **비용 반영**: KRX 법정거래세(18~23bp) + 편도 1.0틱 시가 슬리피지 + 시장 충격 비용 + 선물/인버스 세금 전액 실측 차감
-
-### 4.1 챔피언 전략 vs 벤치마크 대조군
-
-| 전략 및 벤치마크 모델 | 연복리 수익률 (CAGR) | Sharpe | Calmar | 최대 낙폭 (MDD) | 하위 10% J | 승격 판정 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| 🏆 **현행 챔피언 (Three-Seed LGBM + Trend Overlay)** | **`+49.43%`** | **`1.50`** | **`2.11`** | **`-23.47%`** | **`+22.57%`** | **`CHAMPION (Promoted)`** |
-| 📊 **무헤지 순수 주식북 (Unhedged Stock Book)** | `+34.74%` | `1.12` | `0.94` | `-36.85%` | `+14.20%` | Baseline |
-| 🏛️ **시장 지수 벤치마크 (KOSPI/KOSDAQ Index)** | `+0.95%` | `0.08` | `0.02` | `-43.20%` | `-` | Market Index |
-| 🌐 **전종목 동일가중 (Universe Equal-Weight)** | `+0.47%` | `0.05` | `0.01` | `-48.60%` | `-` | Broad Market |
-| 🎲 **플라시보 무작위 신호 (Placebo Signal)** | `-3.17%` | `-0.21` | `-0.06` | `-54.10%` | `-` | Control |
-
-### 4.2 시장 국면별 위기 방어력 & 비용 내구성
-
-* **하락장 알파 방어력:** 시장 지수 하락 연도에도 연평균 **`+28.88%`** 복리 성장 (KOSPI가 -24.9% 폭락한 **2022년 실측 +18.92%** 순성장).
-* **연도별 성장 실측:**  
-  `2018 (+18.8%)` $\to$ `2019 (+34.2%)` $\to$ `2020 (+84.6%)` $\to$ `2021 (+42.5%)` $\to$ `2022 (+18.9%)` $\to$ `2023 (+15.6%)` $\to$ `2024 (+12.1%)` $\to$ `2025 (+85.4%)` $\to$ `2026 YTD (+52.2%)`
-* **슬리피지 비용 그리드 스트레스 테스트:**
-  * 0.0틱(`43.93%`) $\to$ 0.5틱(`41.67%`) $\to$ 1.0틱 기준(`40.17%`) $\to$ 1.5틱 극가혹(`38.42%`)으로 슬리피지 마찰을 1.5틱까지 가중해도 높은 복리 성장률을 유지합니다.
-
----
-
-## 5. 기술 스택 & 계층 구조
-
-| 분류 | 기술 스택 | 채택 근거 및 엔지니어링 활용 |
-| :--- | :--- | :--- |
-| **Language & Tooling** | **Python 3.11**, **`uv`** | `uv.lock` 기반 결정론적 가상환경 재현 및 초고속 의존성 동기화 |
-| **Backtest & Accounting** | **NumPy MarketArrays**, **Integer Ledger** | 조밀 행렬 기반 고속 백테스트 시뮬레이션 및 부동소수점 오차 없는 원 단위 정수 회계 원장 |
-| **ML & Scoring** | **LightGBM 4.3**, **`exchange-calendars`** | 52개 피처 세트 기반 다중 시계열(5, 10, 21일) 랭커 및 KRX 공식 영업일 달력 모델링 |
-| **Data Engine & Storage** | **Polars 1.43**, **PyArrow**, **SQLite WAL** | SIMD 컬럼형 벡터 연산, Zstandard 압축 Parquet 및 173,849건 영수증 단일 트랜잭션 색인 |
-| **Integration & Concurrency** | **`fcntl` flock**, **Pydantic 2** | 커널 파일 락 기반 호스트 전역 슬롯 예약 및 외부 API 응답 경계 스키마 검증 |
-| **Deploy & Ops** | **Docker**, **systemd**, **`rclone`** | 컨테이너 격리 래퍼, 24시간 무인 스케줄링 타이머 및 Google Drive 원격 암호화 백업 |
-| **Verification & Quality** | **pytest (3,711 Tests)**, **Python AST** | 불변식 단위·통합 검증, 계층 의존성 정적 검사 및 `verify.py` 100% diff-coverage 게이트 |
-
-### 디렉터리 및 레이어 구조
-
-5개 계층은 엄격한 하향식 단방향 참조만을 허용하며, [AST 계층 검사](./tests/unit/core/test_package_dependency_boundaries.py)를 통해 정적으로 감시됩니다 (`KNOWN_VIOLATIONS` 0건).
-
-```text
-k-stock-engine/
-├── src/
-│   ├── core/          # 시간·KRX 달력·호가 규칙·PIT 계약 등 순수 도메인 불변식 (의존성 0건)
-│   ├── config/        # 공급자 정책(providers.toml), 라이브 게이트, 런타임 설정
-│   ├── integrations/  # KRX·KIND·DART·LS·KIS·DB금융투자 클라이언트, 호스트 공유 페이서, 쿼터 원장
-│   ├── data/          # Bronze 영수증 카탈로그(ReceiptCatalog), Silver 빌더, 신선도 게이트, 백업
-│   ├── backtest/      # 정수 원장(Integer Ledger), 마찰비용 모델, 시장 조밀 행렬, 체결 엔진
-│   ├── research/      # 팩터 큐브, LightGBM 점수 모델, 5-슬리브 북, 추세 오버레이, 챔피언 평가
-│   ├── ops/           # systemd 잡(morning·collect·audit·backup), 4-state 실행 결과 기록, 알림
-│   └── execution/     # ports · adapters · application · domain (core만 참조하는 헥사고날 구조)
-├── tests/             # 3,711개 단위(unit) 및 통합(integration) 불변식 테스트 스위트
-├── config/            # providers.toml, runtime.toml, research/ 전략 명세 및 챌린지 프로토콜
-├── deploy/            # systemd 타이머·서비스 유닛, Dockerfile, kse-run 컨테이너 래퍼
-├── tools/             # verify.py 통합 품질 게이트
-└── docs/              # 브로커 API 명세, 운영 점검 런북, 시각 자산 (docs/assets/)
+```mermaid
+flowchart LR
+    subgraph SRC["외부 데이터"]
+        A["KRX · KIND 공시"]
+        B["OpenDART 재무"]
+        C["LS · KIS · DB금융투자 API"]
+    end
+    SRC --> D["Bronze<br/>원본 영수증 + SQLite 색인"]
+    D --> E["Silver<br/>공개 시각 부여 Parquet"]
+    E --> F["Gold<br/>시장 패널 · 팩터 큐브"]
+    F --> G["연구<br/>LightGBM 점수 · 5개 슬리브 · 추세 오버레이"]
+    G --> H["챔피언 평가<br/>부트스트랩 리포트 카드"]
+    G --> I["장전 확정<br/>해시 체인에 목표 봉인"]
+    I --> J["가상 장부 shadow"]
+    I -.-> K["주문 집행 · 모의투자 기본<br/>실주문 게이트로 차단"]
 ```
 
----
+저장소는 계층 순서가 정해진 패키지로 나뉩니다. 아래 계층은 위 계층을 가져다 쓸 수 없고, 이 규칙은 [AST 검사 테스트](./tests/unit/core/test_package_dependency_boundaries.py)가 모든 import를 읽어 확인합니다.
 
-## 6. 빠른 시작 및 검증
+```text
+core → config → integrations → data → backtest → research → ops
+                  execution (core만 참조, 조립 지점에서만 다른 계층 연결)
+```
 
-### 개발 환경 동기화 & 정적 검증
+서버에서는 systemd 타이머가 정해진 시각에 Docker 컨테이너로 작업을 실행합니다(시각은 KST, [유닛 파일](./deploy/systemd/)).
+
+| 시각 | 작업 | 하는 일 |
+| :--- | :--- | :--- |
+| 평일 08:32 | morning | 전일 데이터 확정, 목표 포트폴리오 봉인, 가상 장부 갱신 |
+| 평일 08:39 | auction-open | 장전 동시호가 호가 수집 |
+| 평일 18:30 / 20:40 | collect-eve / collect-dbsec | 수급·공시·재무 수집 / 시세 보조 수집 |
+| 평일 21:40, 주말 12:00 | daily-audit | 당일 작업 결과 점검 |
+| 매일 02:30 | backup | 원격 저장소(Google Drive) 백업 |
+| 토 10:30 | weekly-report | 주간 운영 리포트 |
+
+## 🔧 핵심 설계 결정
+
+각 결정을 **문제 → 분석(대안 비교) → 선택 → 결과** 순서로 정리했습니다.
+
+### ⏱️ 1. 공시 시각 기준으로 데이터를 쓰는 이유
+
+- **문제:** 분기 재무제표는 분기말 기준 값이지만 실제로는 최대 45일 뒤에 공시됩니다. 분기말 날짜로 합치면 백테스트가 그 시점에는 몰랐던 정보를 씁니다.
+- **분석:** 분기말 날짜에 며칠 지연을 두는 방법은 간단하지만, 종목마다 공시 시점이 달라 지연 값을 일률로 정할 수 없습니다. 실제 접수 시각을 알면 지연 가정이 필요 없습니다.
+- **선택:** 수집물마다 받은 시각을 영수증([ReceiptCatalog](./src/data/receipt_catalog.py))으로 남기고, 정규화 단계에서 접수 시각 다음 거래일 장 시작을 `available_at`으로 계산합니다([normalization.py](./src/data/normalization.py)). 연구와 평가는 `available_at` 이전 데이터만 봅니다. 데이터 계약은 [pit.py](./src/core/pit.py)에 있습니다.
+- ✅ **결과:** 모든 데이터가 "언제부터 알 수 있었는지"를 갖습니다. 이 규칙은 단위 테스트로 검증합니다.
+
+### 🧮 2. 정수 원 단위 회계 장부
+
+- **문제:** 부동소수점으로 현금과 수량을 계산하면 오차가 쌓이고, 결제일(T+2)과 증거금을 빼먹으면 백테스트가 실제 계좌보다 낙관적이 됩니다.
+- **분석:** 허용 오차를 두고 비교하는 방법은 오차가 어디서 생겼는지 추적하기 어렵습니다. 모든 금액을 정수 원으로 두면 장부가 맞는지 정확히 비교할 수 있습니다.
+- **선택:** 현금(CASH)·증거금(MARGIN)·미결제(PAYABLE) 3개 계정과 거래 종류별 분개를 가진 장부([ledger.py](./src/backtest/ledger.py))에서 주식, 선물, 인버스 ETF, 배당, 세금을 함께 처리합니다. 주문 집행에서는 매도 주문을 매수보다 먼저 제출해([submit_intents.py](./src/execution/application/submit_intents.py)) 결제 자금이 부족해지는 일을 줄입니다.
+- ✅ **결과:** 백테스트와 가상 장부가 같은 장부 코드를 씁니다([ledger_bridge.py](./src/research/ledger_bridge.py)). 장부 불변식은 단위 테스트로 검증합니다.
+
+### 🚦 3. 증권사 호출 한도를 서버 전체에서 공유
+
+- **문제:** 한 서버의 여러 프로젝트가 같은 KIS 계정을 씁니다. 프로세스 안에서만 속도를 제한하면 서로의 호출량을 몰라 한도를 넘고, 토큰 발급도 동시에 겹칩니다.
+- **분석:** 프로세스 안 제한기는 구현이 쉽지만 다른 프로세스를 보지 못합니다. 별도 중앙 서버는 운영 부담이 큽니다.
+- **선택:** 공유 디렉터리의 파일 락(`flock`)에 다음 호출 가능 시각을 기록하는 [HostPacedLimiter](./src/integrations/kis/admission.py)를 만들었습니다. 초당 18건을 넘지 않게 슬롯을 예약하고, 우선순위 3단계(critical은 즉시, standard는 최대 1.0초, bulk는 최대 0.25초까지만 앞당겨 예약)로 중요한 호출을 보호합니다. 토큰은 키 해시별 락으로 한 번만 발급하고, 기다리는 동안 다른 프로세스가 받은 토큰을 재사용합니다.
+- ✅ **결과:** 한도와 토큰 처리를 테스트로 검증합니다. 공유 디렉터리 표식이 없으면 실행을 거부해, 제한이 공유되지 않은 채 돌아가는 상황을 막습니다.
+
+### 📊 4. 전략 평가: 단일 Sharpe 대신 부트스트랩 리포트 카드
+
+- **문제:** 전략을 계속 바꿔 보면 점수 하나로는 과적합을 구분하기 어렵습니다. 주 1회 리밸런싱은 매매 요일에 따라 성과가 달라지기도 합니다.
+- **분석:** 평균 수익이 아니라 나쁜 경우의 성장률을 목적 값으로 삼고, 매매일은 분산하기로 했습니다.
+- **선택:** 주식 자금을 5개 슬리브로 나눠 매매 요일을 분산하고([book.py](./src/research/book.py)), KOSPI 200 이동평균 추세에 따라 선물 포지션을 얹는 오버레이([trend_overlay.py](./src/research/trend_overlay.py))를 결합했습니다. 평가([evaluation.py](./src/research/evaluation.py))는 63거래일 블록 부트스트랩 4,000회로 5년 경로를 만들어 하위 10% 성장률을 목적 값으로 쓰고, 파산 확률 가드와 슬리피지 비용 격자(0, 0.5, 1.0, 1.5틱)를 함께 봅니다([protocol.toml](./config/research/protocol.toml)). 새 전략이 챔피언이 되려면 같은 구간에서 짝지은 부트스트랩 비교와 다중 검정 보정을 통과해야 합니다([champion.py](./src/research/champion.py)). 점수 모델은 시드 11·12·13 평균을 써서 시드 운을 줄입니다([three_seeds.toml](./config/research/challenge/three_seeds.toml)).
+- ✅ **결과:** 전략 변경이 "더 좋아 보인다"가 아니라 정해진 통계 기준으로 승격됩니다. 기준 값에 대한 근거는 설정 파일 주석에 남깁니다.
+
+### 🔒 5. 실주문을 코드 단계에서 막는 안전 게이트
+
+- **문제:** 자동매매는 버그 하나가 곧바로 돈 문제가 됩니다.
+- **분석:** 설정 한 줄로 켜지는 방식은 실수로 켜지기 쉽습니다. 검증 증거를 요구하는 방식이 더 안전합니다.
+- **선택:** 주문 집행은 헥사고날 구조(포트·어댑터)로 나누고, [SubmissionGate](./src/execution/application/readiness.py)가 실주문 요청에 네 가지 증거(증권사 대사, 주문 상태 전이, 모의투자 통과, 중복 주문 방지)를 모두 요구합니다. 하나라도 없으면 예외를 냅니다. 같은 멱등성 키의 주문은 두 번 처리하지 않습니다. 실행 설정의 기본 모드는 `paper`입니다([settings.py](./src/execution/settings.py)).
+- ✅ **결과:** 서버는 장전 호가 수집과 가상 장부 기록만 하고 주문을 내지 않습니다.
+
+### 🛠️ 6. 무인 운영: 작업 결과 4상태 기록과 점검
+
+- **문제:** 자동 작업이 "성공"이라고 기록해도 실제 데이터가 비었거나 일부만 쓰인 경우가 있습니다.
+- **분석:** 예외가 없으면 성공으로 보는 방식은 부분 실패를 놓칩니다.
+- **선택:** 모든 작업은 `OK / DEGRADED / NO_DECISION / SKIPPED` 중 하나로 결과를 기록하고([run_outcome.py](./src/ops/run_outcome.py)), 일일 감사([audit.py](./src/ops/audit.py))가 기록과 산출물을 대조합니다. 장 시작 전까지 목표를 확정하지 못하면 늦게 확정해도 `OK`가 아니라 `DEGRADED`로 남깁니다.
+- ✅ **결과:** 실패 알림은 원인 한 줄 요약 메일로 보내고, 같은 원인은 24시간 동안 중복 발송하지 않습니다([alerts.py](./src/ops/alerts.py)).
+
+## 📊 결과
+
+> [!IMPORTANT]
+> **원본 실행 결과 파일이 저장소에 포함되어 있지 않아 아래 수치는 이 저장소만으로 재현해 확인할 수 없습니다.** 결과를 만든 설정은 [`three_seeds.toml`](./config/research/challenge/three_seeds.toml)과 [`protocol.toml`](./config/research/protocol.toml)입니다.
+
+| 항목 | 값 | 기준 |
+| :--- | :---: | :--- |
+| 평가 구간 | 2018-01 ~ 2026-10 | 백테스트(워크포워드), 비용·세금 반영 |
+| 연복리 수익률(CAGR) | +49.43% | 백테스트 |
+| Sharpe / 최대 낙폭 | 1.50 / -23.47% | 백테스트 |
+
+백테스트 수익률은 실제 계좌 수익이 아닙니다. 이 프로젝트는 실주문을 내지 않습니다.
+
+## ⚠️ 한계
+
+- 위 성과는 **백테스트 값**입니다. 실계좌 운용 기록이 없습니다.
+- 결과 파일이 저장소에 없어, 외부에서 같은 수치를 재현하려면 데이터를 직접 수집해야 합니다. 수집에는 증권사·OpenDART 계정이 필요합니다.
+- 점수 모델을 8년 넘는 구간에서 여러 번 조정했기 때문에, 부트스트랩 기준을 써도 과적합 가능성이 완전히 사라지지는 않습니다.
+- 실주문 경로는 증권사 대사·상태 전이 증거가 없어 막혀 있고, 실제 체결과 백테스트 가정(슬리피지, 시장 충격)의 차이는 검증하지 못했습니다.
+- 단일 개발자, 단일 서버 운영이며 서버 이중화는 없습니다.
+
+## 🧱 기술 스택
+
+| 구분 | 사용 기술 |
+| :--- | :--- |
+| 언어·도구 | Python 3.11, uv(잠금 파일로 환경 고정), ruff, mypy |
+| 데이터 | Polars, PyArrow(Parquet), SQLite, pandas, numpy, numba |
+| 모델 | LightGBM(5·10·21일 앞 수익률 예측, 52개 팩터), scikit-learn |
+| 연동 | KRX, KIND, OpenDART, LS증권, 한국투자증권(KIS), DB금융투자, aiohttp, pydantic |
+| 배포·운영 | Docker, GitHub Actions(테스트 후 이미지 빌드·서버 배포), systemd 타이머, rclone |
+| 테스트 | pytest(테스트 함수 약 3,300개, 정적 집계), 변경분 커버리지 검사 [verify.py](./tools/verify.py) |
+
+## 📂 프로젝트 구조
+
+```text
+src/
+├── core/          # 시간, KRX 달력, 호가 규칙, 공개 시각(PIT) 계약. 다른 패키지에 의존하지 않음
+├── config/        # 공급자 정책, 런타임 설정, 데이터 신선도 기준
+├── integrations/  # KRX·KIND·OpenDART·LS·KIS·DB금융투자 클라이언트, 호출 한도 제어, 쿼터 기록
+├── data/          # Bronze 영수증 카탈로그, Silver 변환, 시장 패널, 백업
+├── backtest/      # 정수 장부, 거래비용, 시장 배열, 체결 엔진
+├── research/      # 팩터 큐브, LightGBM 점수, 슬리브 북, 추세 오버레이, 평가, 챔피언, shadow
+├── ops/           # systemd 작업, 결과 4상태 기록, 일일 감사, 알림
+└── execution/     # 주문 계획·검증·제출, 모의/증권사 어댑터, 실주문 게이트
+config/            # 공급자, 런타임, 전략·평가 프로토콜
+deploy/            # systemd 유닛, 컨테이너 실행 래퍼, 설치 스크립트
+tests/             # 단위·통합 테스트
+tools/             # verify.py 통합 검사
+docs/              # 증권사 API 정리
+legacy/            # 이전 세대 코드(참고용, 린트 대상에서 제외)
+```
+
+## 🚀 시작하기
+
+Python 3.11과 [uv](https://docs.astral.sh/uv/)가 필요합니다. 데이터 수집에는 각 증권사·OpenDART API 키가 필요하며, 키는 저장소에 포함되어 있지 않습니다.
 
 ```bash
-# 가상환경 동기화 및 린트/타입 검증
 uv sync
 uv run ruff check src tests
 uv run mypy src
-
-# 전수 3,711개 테스트 및 통합 품질 게이트 (diff-coverage 100%)
 uv run pytest
-uv run python tools/verify.py
-```
+uv run python tools/verify.py      # 린트·타입·테스트·변경분 커버리지
 
-### 핵심 파이프라인 단계별 실행 예시
-
-```bash
-# [리서치] 팩터 큐브 빌드 및 현행 챔피언 전략 리포트 카드 평가
+# 연구
 uv run python -m src.research build-cube
 uv run python -m src.research evaluate --spec config/research/challenge/three_seeds.toml
 
-# [데이터] 저녁 시세 수집 및 시점 일치(PIT) 패널 생성
+# 데이터
 uv run python -m src.data.cli collect-krx-daily-market
 uv run python -m src.data.cli build-market-panel
 
-# [주문집행] 장전 10호가 경매 수집 및 주문 리허설 (Paper 기본)
+# 주문 집행 (모의투자 기본)
 uv run python -m src.execution auction-open
 uv run python -m src.execution rehearse
 
-# [운영] 12대 금융 무결성 일일 전수 감사
+# 운영 작업
 uv run python -m src.ops.jobs audit
 ```
 
-### 참고 문서
+증권사별 API 특성과 한도는 [브로커 API 종합 명세](./docs/architecture/brokers/api_master.md)와 같은 폴더의 문서에 정리했습니다.
 
-| 문서 | 내용 |
+## 🤖 개발 과정에서의 AI 활용
+
+AI 코딩 도구를 코드 작성에 주로 사용했고, 아이디어 정리와 금융 도메인 학습에도 활용했습니다. **수치와 동작은 직접 검증했습니다.**
+
+| AI에 맡긴 일 | 직접 한 일 |
 | :--- | :--- |
-| [브로커 API 종합 명세](./docs/architecture/brokers/api_master.md) | 4대 공급원(DART, KIND, LS, KIS) API 특성, 쿼터, 레이트리밋 종합 명세서 |
-| [KIS 연동 명세](./docs/architecture/brokers/broker_kis.md) | 한국투자증권 호스트 전역 공유 리미터(`HostPacedLimiter`) 및 장전 경매 수집 명세서 |
-| [LS증권 연동 명세](./docs/architecture/brokers/broker_ls.md) | LS증권 1.05s 단일 뮤텍스 락 및 투자자 수급(`t1405`) 수집 명세서 |
-| [DB금융투자 연동 명세](./docs/architecture/brokers/broker_db.md) | DB금융투자 1분봉 폴백 수집 및 세션 데이터 정합성 검증 명세서 |
-| [OpenDART 연동 명세](./docs/architecture/brokers/provider_dart.md) | OpenDART 16,000건/일 쿼터 원장 및 Point-in-Time 재무 데이터 정규화 명세서 |
-| [KRX KIND 릴레이 명세](./docs/architecture/brokers/provider_kind.md) | KRX KIND 공시 릴레이 번들 수집 및 임포터 인박스 파이프라인 명세서 |
-| [VPS 운영 점검 런북](./docs/vps-checklist.md) | 24/7 VPS 무인 자동화 운영 점검 및 일일 감사 런북 |
+| 코드 작성 | 전략·검증 방식과 구조 결정 |
+| 아이디어 정리, 도메인 개념 학습 보조 | 결과 수치와 동작 확인 |
 
-> **시스템 경계 및 가드**: 주문 집행 엔진은 모의투자(`paper`)가 기본값이며, 라이브 주문 제출은 [readiness.py](./src/execution/application/readiness.py)의 4대 증거(대사·상태전이·모의승인·멱등성)가 모두 충족되기 전까지 Fail-Closed로 차단됩니다.
+## 📚 참고
 
+- 증권사·공급자 연동 명세: [`docs/architecture/brokers/`](./docs/architecture/brokers/)
