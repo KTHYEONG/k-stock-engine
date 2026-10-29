@@ -16,7 +16,9 @@ class KisIndustryCollector:
 
     The mapped record's ``industry_name`` is copied verbatim from the raw
     ``bstp_kor_isnm`` field — never normalized, translated, or bucketed into
-    a code taxonomy at this layer. Transport-only: pages are returned and
+    a code taxonomy at this layer. KIS omits the field (or leaves it blank) for
+    tickers it assigns no industry; such a page carries no records and is kept
+    as an answered-empty snapshot. Transport-only: pages are returned and
     nothing is persisted here; the data layer owns Bronze writes.
     """
 
@@ -28,10 +30,12 @@ class KisIndustryCollector:
         self._client = client if client is not None else default_client()
 
     @staticmethod
-    def _map_output(symbol: str, output: dict[str, Any]) -> dict[str, object]:
+    def _map_output(symbol: str, output: dict[str, Any]) -> dict[str, object] | None:
         industry = output.get("bstp_kor_isnm")
-        if not isinstance(industry, str) or not industry.strip():
-            raise PITDataError(f"KIS industry classification missing bstp_kor_isnm for {symbol}")
+        if industry is None or (isinstance(industry, str) and not industry.strip()):
+            return None
+        if not isinstance(industry, str):
+            raise PITDataError(f"KIS industry classification has non-text bstp_kor_isnm for {symbol}")
         return {
             "ticker": symbol,
             "industry_name": industry,
@@ -58,7 +62,7 @@ class KisIndustryCollector:
                 "symbol": symbol,
                 "collected_at": moment.isoformat(),
                 "output": dict(output),
-                "records": [record],
+                "records": [] if record is None else [record],
             }
 
 

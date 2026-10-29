@@ -71,7 +71,7 @@ def _catalog_with(tmp_path: Path, receipts: list[tuple[str, date, EvidenceStatus
     return catalog
 
 
-def test_weekly_snapshot_counts_only_successful_receipts_from_this_iso_week_up_to_today(tmp_path: Path) -> None:
+def test_weekly_snapshot_counts_answered_receipts_from_this_iso_week_up_to_today(tmp_path: Path) -> None:
     monday = THURSDAY - timedelta(days=THURSDAY.weekday())
     catalog = _catalog_with(
         tmp_path,
@@ -81,12 +81,39 @@ def test_weekly_snapshot_counts_only_successful_receipts_from_this_iso_week_up_t
             ("000030", monday - timedelta(days=1), EvidenceStatus.SUCCESS),
             ("000040", THURSDAY + timedelta(days=1), EvidenceStatus.SUCCESS),
             ("000050", monday, EvidenceStatus.EMPTY),
+            ("000070", monday, EvidenceStatus.PROVIDER_ERROR),
         ],
     )
-    tickers = ("000010", "000020", "000030", "000040", "000050", "000060")
+    tickers = ("000010", "000020", "000030", "000040", "000050", "000060", "000070")
 
     assert tickers_missing_weekly_snapshot(catalog, tickers, today=THURSDAY) == (
-        "000030", "000040", "000050", "000060",
+        "000030", "000040", "000060", "000070",
     )
     assert tickers_missing_weekly_snapshot(catalog, ("000030",), today=monday - timedelta(days=1)) == ()
     assert tickers_missing_weekly_snapshot(catalog, (), today=THURSDAY) == ()
+
+
+def test_run_of_only_unassigned_industries_completes_and_covers_the_week(tmp_path: Path) -> None:
+    from src.data.industry_collection import collect_classification_with_isolation
+    from src.integrations.kis.industry import KisIndustryCollector
+
+    class _Client:
+        def inquire_price(self, symbol: str) -> dict[str, object]:
+            return {"rprs_mrkt_kor_name": "KOSDAQ"}
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    catalog = ReceiptCatalog(runtime.workspace.bronze_root / "catalog")
+    summary = collect_classification_with_isolation(
+        stage="kis_industry",
+        collector_cls=lambda symbols: KisIndustryCollector(symbols, client=_Client()),
+        fetch_attr="fetch_industry_classification",
+        bronze_root=runtime.workspace.bronze_root,
+        writer=ScopedBronzeWriter(runtime=runtime, catalog=catalog),
+        symbols=("0001A0", "001000"),
+        pace_seconds=0.0,
+    )
+
+    assert summary["skipped_count"] == 0
+    assert summary["empty_count"] == 2
+    today = datetime.now(UTC).date()
+    assert tickers_missing_weekly_snapshot(catalog, ("0001A0", "001000"), today=today) == ()

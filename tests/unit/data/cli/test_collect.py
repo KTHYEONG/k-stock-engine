@@ -37,7 +37,7 @@ def test_collect_industry_classification_from_symbols_file(tmp_path, monkeypatch
         "--pace-seconds", "0",
     ]) == 0
     emitted = json.loads(capsys.readouterr().out)
-    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "skipped_count": 0, "skipped": {}}
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "empty_count": 0, "skipped_count": 0, "skipped": {}}
     assert _StubIndustryCollector.calls == [("005930",), ("000660",)]
 
 
@@ -69,7 +69,7 @@ def test_collect_industry_classification_defaults_to_universe(tmp_path, monkeypa
         "--pace-seconds", "0",
     ]) == 0
     emitted = json.loads(capsys.readouterr().out)
-    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "skipped_count": 0, "skipped": {}}
+    assert emitted == {"symbols_requested": 2, "pages_collected": 2, "empty_count": 0, "skipped_count": 0, "skipped": {}}
     assert _StubIndustryCollector.calls == [("000660",), ("005930",)]
 
 
