@@ -2047,7 +2047,9 @@ class _IndustryQuoteClient:
     def inquire_price(self, symbol: str) -> dict[str, object]:
         self.calls.append(symbol)
         if symbol in self._failing:
-            return {"rprs_mrkt_kor_name": "KOSPI"}
+            from src.integrations.errors import ProviderError
+
+            raise ProviderError("quote unavailable", provider="KIS", endpoint="inquire-price")
         return {"bstp_kor_isnm": "전기전자", "rprs_mrkt_kor_name": "KOSPI"}
 
 
@@ -2103,12 +2105,12 @@ def test_industry_step_reports_partial_and_retries_only_skipped_tickers(
     assert first == CollectionStepReport(job="kis_industry", status="partial", done=1, pending_left=1, requests_used=2)
     assert any("stage=kis_industry status=partial" in message and "000660" in message for message in first_messages)
     assert any(
-        "stage=kis_industry_skip ticker=000660" in message and "missing bstp_kor_isnm" in message
+        "stage=kis_industry_skip ticker=000660" in message and "quote unavailable" in message
         for message in first_messages
     )
     # The all-skipped retry raises, so its reasons must already be in the log.
     assert any(
-        "stage=kis_industry_skip ticker=000660" in message and "missing bstp_kor_isnm" in message
+        "stage=kis_industry_skip ticker=000660" in message and "quote unavailable" in message
         for message in caplog.messages
     )
     assert client.calls == ["000660", "005930", "000660"]

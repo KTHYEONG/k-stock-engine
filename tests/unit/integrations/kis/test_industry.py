@@ -50,30 +50,29 @@ def test_fetch_maps_industry_name_verbatim(tmp_path) -> None:
     ]
 
 
-def test_fetch_rejects_missing_industry_field(tmp_path) -> None:
+@pytest.mark.parametrize("output", [{"rprs_mrkt_kor_name": "KOSDAQ"}, _output("   "), _output(None)])
+def test_fetch_keeps_unassigned_industry_as_empty_page(tmp_path, output) -> None:
     bronze_root = tmp_path / "bronze"
 
-    with pytest.raises(PITDataError, match="bstp_kor_isnm"):
-        tuple(
-            KisIndustryCollector(("000001",), client=_StubClient({"000001": {"rprs_mrkt_kor_name": "KOSPI"}})).fetch_industry_classification(
-                bronze_root=bronze_root, retrieved_at=RETRIEVED_AT
-            )
+    pages = tuple(
+        KisIndustryCollector(("0001A0",), client=_StubClient({"0001A0": output})).fetch_industry_classification(
+            bronze_root=bronze_root, retrieved_at=RETRIEVED_AT
         )
+    )
 
+    assert len(pages) == 1
+    assert pages[0]["records"] == []
+    assert pages[0]["output"] == output
     assert not (bronze_root / "industry").exists()
 
 
-def test_fetch_rejects_empty_industry_field(tmp_path) -> None:
-    bronze_root = tmp_path / "bronze"
-
+def test_fetch_rejects_non_text_industry_field(tmp_path) -> None:
     with pytest.raises(PITDataError, match="bstp_kor_isnm"):
         tuple(
-            KisIndustryCollector(("000001",), client=_StubClient({"000001": _output("   ")})).fetch_industry_classification(
-                bronze_root=bronze_root, retrieved_at=RETRIEVED_AT
+            KisIndustryCollector(("000001",), client=_StubClient({"000001": _output(7)})).fetch_industry_classification(
+                bronze_root=tmp_path / "bronze", retrieved_at=RETRIEVED_AT
             )
         )
-
-    assert not (bronze_root / "industry").exists()
 
 
 def test_fetch_returns_one_page_per_symbol_without_writing(tmp_path) -> None:
