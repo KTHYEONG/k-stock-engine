@@ -232,3 +232,6 @@ __marimo__/
 
 # Serena AI Assistant
 .serena/
+
+# 서버 점검표(로컬 운영 문서)
+docs/vps-checklist.md
