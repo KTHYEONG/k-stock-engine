@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
-from src.ops.audit import run_daily_audit
+from src.ops.audit import BRONZE_PRUNE_AFTER, run_daily_audit
 from src.ops.guards import (
     DEFAULT_MIN_AVAILABLE_MB,
     DEFAULT_MIN_FREE_DISK_GB,
@@ -96,7 +96,6 @@ _DEADLINE_MINUTE: Final = 55
 _LATE_SEAL_HOUR: Final = 9
 MORNING_LOCK_RELPATH: Final = "ops/locks/morning.lock"
 MORNING_LATE_JOB: Final = "morning_late"
-_PRUNE_AFTER_DAYS: Final = 14
 _PUSH_SOURCES: Final = ("bronze", "bronze_catalog", "state", "ops")
 
 
@@ -924,7 +923,7 @@ def _prune_bronze(data_root: Path, *, now: datetime, confirmed: set[str] | None 
     offsite = set(confirmed) if confirmed is not None else _confirmed_bronze_paths(
         config_path=_backup_config_path(), work_root=Path(data_root) / "state" / "lake_tmp"
     )
-    cutoff = _aware(now).timestamp() - float(_PRUNE_AFTER_DAYS * 24 * 3600)
+    cutoff = _aware(now).timestamp() - BRONZE_PRUNE_AFTER.total_seconds()
     eligible: set[str] = set()
     for rel in offsite:
         try:

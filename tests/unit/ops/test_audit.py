@@ -13,6 +13,7 @@ import pytest
 
 import src.ops.audit as audit_mod
 from src.ops.audit import (
+    BRONZE_PRUNE_AFTER,
     AUDIT_HEARTBEAT_RELPATH,
     EXPECTED_JOBS,
     _backup_issue,
@@ -154,6 +155,21 @@ def test_divergence_bronze_and_backup_issues(tmp_path: Path, monkeypatch: pytest
     assert _stale_loose_bronze(bronze, _morning()) == ["daily_market/loose.bin"]
     assert _stale_loose_bronze(tmp_path / "missing", _morning()) == []
     assert _fresh_divergences(tmp_path / "missing", DAY) == []
+
+
+def test_loose_bronze_pending_prune_is_not_stale(tmp_path: Path) -> None:
+    kind = tmp_path / "daily_market"
+    kind.mkdir()
+    now = _morning()
+    for name, age in (
+        ("pending.bin", BRONZE_PRUNE_AFTER + timedelta(hours=19)),
+        ("survivor.bin", BRONZE_PRUNE_AFTER + timedelta(days=1, minutes=1)),
+    ):
+        path = kind / name
+        path.write_bytes(b"x")
+        stamp = (now - age).timestamp()
+        os.utime(path, (stamp, stamp))
+    assert _stale_loose_bronze(tmp_path, now) == ["daily_market/survivor.bin"]
 
 
 def test_backup_issue_branches(tmp_path: Path) -> None:
