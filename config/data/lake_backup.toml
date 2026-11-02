@@ -21,11 +21,16 @@ root = "data/bronze/kr_swing_2019_v1/catalog"
 exclude = ["*-wal", "*-shm"]
 
 # Registry, champion history, quota ledgers and fact quarantine; rebuildable caches are left out.
+# cache/parse_*.sqlite and cache/daily_admin_flags.parquet are keyed by Bronze content hash and refilled by the next
+# build with identical results; the ~440 MB LS parse cache was otherwise re-archived whole after every collection.
 [[source]]
 name = "state"
 daily = true
 root = "data/state/kr_swing_2019_v1"
-exclude = ["research/cube/*", "research/market_cache/*", "research/scores/*", "dart_fact_staging/*", "*.lock"]
+exclude = [
+    "research/cube/*", "research/market_cache/*", "research/scores/*", "dart_fact_staging/*", "*.lock",
+    "cache/parse_*.sqlite", "cache/parse_*.sqlite-*", "cache/daily_admin_flags.parquet",
+]
 
 # Legacy pre-scope Bronze. security_master is excluded: every one of its 2,621 sessions equals the scoped page byte-for-byte
 # (checked 2026-10-10). daily_market stays: 83 sessions of 2015 exist only here.
