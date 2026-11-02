@@ -222,3 +222,39 @@ def test_provision_dry_run_lists_db_keys_without_values(
     output = capsys.readouterr().out
     assert "DB_APP_KEY,DB_APP_SECRET" in output
     assert "private-db" not in output
+
+
+def _gc_argv(tmp_path: Path, *extra: str) -> list[str]:
+    config = tmp_path / "backup.toml"
+    config.write_text('remote="unused"\n[[source]]\nname="bronze"\nroot="data/bronze"\n')
+    return ["lake_backup", "gc", "--config", str(config), "--data-root", str(tmp_path / "data"),
+            "--store-dir", str(tmp_path / "remote"), *extra]
+
+
+def test_gc_cli_prints_a_dry_run_plan_and_apply_requires_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "remote" / "bronze").mkdir(parents=True)
+    (tmp_path / "remote" / "bronze" / "seg-00000000000000cc.tar.zst").write_bytes(b"x")
+    monkeypatch.setattr(sys, "argv", _gc_argv(tmp_path, "--no-lock"))
+    assert backup_tool.main() == 0
+    plan = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["bronze"]
+    assert plan["orphans"] == 1
+    assert plan["applied"] is False
+    assert plan["states"] == 0
+    assert (tmp_path / "remote" / "bronze" / "seg-00000000000000cc.tar.zst").exists()
+    monkeypatch.setattr(sys, "argv", _gc_argv(tmp_path, "--apply", "--no-lock"))
+    with pytest.raises(SystemExit, match="requires the shared Drive lock"):
+        backup_tool.main()
+    monkeypatch.setattr(sys, "argv", _gc_argv(tmp_path, "--apply", "--lock-file", str(tmp_path / "gdrive.lock")))
+    assert backup_tool.main() == 0
+    assert not (tmp_path / "remote" / "bronze" / "seg-00000000000000cc.tar.zst").exists()
+
+
+def test_restore_at_parses_state_numbers_and_aware_timestamps() -> None:
+    from datetime import UTC, datetime
+
+    assert backup_tool._parse_at("3") == 3
+    assert backup_tool._parse_at("2026-10-30T17:30:00+00:00") == datetime(2026, 10, 30, 17, 30, tzinfo=UTC)
+    with pytest.raises(Exception, match="UTC offset"):
+        backup_tool._parse_at("2026-10-30T17:30:00")
