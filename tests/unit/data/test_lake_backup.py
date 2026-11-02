@@ -631,3 +631,221 @@ def test_manifest_totals_follow_latest_path_with_zero_size(env: tuple[Path, Path
     lb._save_state(store, work, summary, entries, manifest, NOW)
     assert manifest["files"] == 2
     assert manifest["raw_bytes"] == 9
+
+
+def _push_on(source: BackupSource, remote: Path, work: Path, day: datetime) -> None:
+    """Push and stamp the archives it uploaded with ``day`` as their remote upload time."""
+    before = {p.name for p in _archives(remote)} if remote.is_dir() else set()
+    push(source, LocalDirStore(remote), work, now=day)
+    for archive in _archives(remote):
+        if archive.name not in before:
+            stamp = day.timestamp()
+            import os
+
+            os.utime(archive, (stamp, stamp))
+
+
+def _days(*numbers: int) -> list[datetime]:
+    return [datetime(2026, 10, n, 17, 30, tzinfo=UTC) for n in numbers]
+
+
+def _history(env: tuple[Path, Path, Path], days: list[datetime]) -> tuple[BackupSource, dict[datetime, dict[str, bytes]]]:
+    """One state per day: ``stable.bin`` never changes, ``live.sqlite`` changes every day."""
+    root, remote, work = env
+    _write(root, "stable.bin", b"S" * 64)
+    source = BackupSource("s", root)
+    trees: dict[datetime, dict[str, bytes]] = {}
+    for n, day in enumerate(days):
+        _write(root, "live.sqlite", f"version-{n}".encode() * 8)
+        _push_on(source, remote, work, day)
+        trees[day] = _tree(root)
+    return source, trees
+
+
+def test_index_versions_close_one_state_per_upload_day(env: tuple[Path, Path, Path]) -> None:
+    root, remote, work = env
+    days = _days(1, 2, 3)
+    _history(env, days)
+    _write(root, "copy.bin", b"S" * 64)
+    push(BackupSource("s", root), LocalDirStore(remote), work, now=days[-1])
+    versions = lb.index_versions(LocalDirStore(remote), work)
+    assert [(v.number, v.day, v.lines) for v in versions] == [
+        (1, days[0].date(), 2), (2, days[1].date(), 3), (3, days[2].date(), 5),
+    ]
+    assert versions[-1].uploaded_at == days[2]
+    assert lb.index_versions(LocalDirStore(remote / "absent"), work) == []
+
+
+def test_restore_at_returns_each_historical_state(env: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    _, remote, work = env
+    days = _days(1, 2, 3)
+    source, trees = _history(env, days)
+    for number, day in enumerate(days, start=1):
+        by_number, by_time = tmp_path / f"n{number}", tmp_path / f"t{number}"
+        restore(source, LocalDirStore(remote), by_number, work, at=number)
+        restore(source, LocalDirStore(remote), by_time, work, at=day.replace(hour=23))
+        assert _tree(by_number) == _tree(by_time) == trees[day]
+    with pytest.raises(BackupError, match="no backup state number 9"):
+        restore(source, LocalDirStore(remote), tmp_path / "x", work, at=9)
+    with pytest.raises(BackupError, match="at or before"):
+        restore(source, LocalDirStore(remote), tmp_path / "x", work, at=datetime(2026, 9, 1, tzinfo=UTC))
+    with pytest.raises(BackupError, match="timezone-aware"):
+        restore(source, LocalDirStore(remote), tmp_path / "x", work, at=datetime(2026, 10, 2))  # noqa: DTZ001
+
+
+def test_gc_dry_run_plans_without_touching_the_remote(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    _history(env, _days(1, 2, 3, 4))
+    before = _tree(remote)
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=2, keep_monthly=0)
+    assert _tree(remote) == before
+    assert not plan.applied
+    assert [v.number for v in plan.retained] == [3, 4]
+    # Day 1's archive also holds the unchanged stable.bin, so only day 2's archive is superseded.
+    assert (plan.versions, plan.index_lines, plan.dropped_lines) == (4, 5, 1)
+    assert len(plan.delete) == 1
+    assert len(plan.keep) == 3
+    assert plan.missing == ()
+    assert plan.orphans == ()
+    assert plan.delete_bytes == sum((remote / name).stat().st_size for name in plan.delete)
+
+
+def test_gc_apply_keeps_every_retained_state_restorable_and_drops_the_rest(
+    env: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _, remote, work = env
+    days = _days(1, 2, 3, 4)
+    source, trees = _history(env, days)
+    stray = remote / "seg-00000000000000aa.tar.zst"
+    stray.write_bytes(b"interrupted upload")
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=2, keep_monthly=0, apply=True)
+    assert plan.applied
+    assert plan.orphans == (stray.name,)
+    assert {p.name for p in _archives(remote)} == set(plan.keep)
+    assert verify(LocalDirStore(remote), work, "s") == []
+    manifest = json.loads((remote / "MANIFEST.json").read_text())
+    assert manifest["gc"]["deleted_archives"] == 2
+    assert manifest["gc"]["dropped_lines"] == 1
+    for day in days[2:]:
+        dest = tmp_path / day.strftime("%d")
+        restore(source, LocalDirStore(remote), dest, work, at=day.replace(hour=23))
+        assert _tree(dest) == trees[day]
+    latest = tmp_path / "latest"
+    restore(source, LocalDirStore(remote), latest, work)
+    assert _tree(latest) == trees[days[-1]]
+    collected = tmp_path / "collected"
+    restore(source, LocalDirStore(remote), collected, work, at=days[1].replace(hour=23))
+    assert _tree(collected) == trees[days[0]] != trees[days[1]]
+    again = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=2, keep_monthly=0, apply=True)
+    assert not again.applied
+    assert again.delete == ()
+    assert again.orphans == ()
+
+
+def test_gc_monthly_retention_keeps_each_month_end_state(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    root = env[0]
+    _write(root, "stable.bin", b"S")
+    source = BackupSource("s", root)
+    days = [datetime(2026, 8, 30, tzinfo=UTC), datetime(2026, 8, 31, tzinfo=UTC), datetime(2026, 9, 30, tzinfo=UTC),
+            datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, tzinfo=UTC)]
+    for n, day in enumerate(days):
+        _write(root, "live.bin", bytes([n]) * 10)
+        _push_on(source, remote, work, day)
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=1, keep_monthly=2)
+    assert [v.day for v in plan.retained] == [days[2].date(), days[4].date()]
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=0, keep_monthly=3)
+    assert [v.day for v in plan.retained] == [days[1].date(), days[2].date(), days[4].date()]
+    with pytest.raises(BackupError, match=">= 0"):
+        lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=-1)
+
+
+def test_gc_apply_refuses_missing_or_altered_retained_archives(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    _history(env, _days(1, 2, 3))
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=1, keep_monthly=0)
+    kept = remote / plan.keep[0]
+    original = kept.read_bytes()
+    kept.write_bytes(b"tampered")
+    with pytest.raises(BackupError, match="differs from the manifest"):
+        lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=1, keep_monthly=0, apply=True)
+    kept.unlink()
+    with pytest.raises(BackupError, match="retained archive"):
+        lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=1, keep_monthly=0, apply=True)
+    kept.write_bytes(original)
+    assert {p.name for p in _archives(remote)} >= set(plan.delete)
+
+
+def test_gc_apply_refuses_when_the_index_changes_after_planning(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    _history(env, _days(1, 2, 3))
+    fetches: list[str] = []
+
+    class Racing(LocalDirStore):
+        def fetch(self, name: str, dest: Path) -> bool:
+            fetches.append(name)
+            found = super().fetch(name, dest)
+            if name == lb.INDEX_NAME and fetches.count(name) == 2:
+                dest.write_bytes(dest.read_bytes() + b"concurrent push")
+            return found
+
+    before = _tree(remote)
+    with pytest.raises(BackupError, match="changed since planning"):
+        lb.gc("s", Racing(remote), work, now=NOW, keep_daily=1, keep_monthly=0, apply=True)
+    assert _tree(remote) == before
+
+
+def test_gc_apply_refuses_an_index_rewrite_that_would_change_the_latest_state(
+    env: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, remote, work = env
+    _history(env, _days(1, 2, 3))
+    monkeypatch.setattr(lb, "_reachable_archives", lambda pairs, boundaries: {pairs[0][1]})
+    with pytest.raises(BackupError, match="change the latest state"):
+        lb.gc("s", LocalDirStore(remote), work, now=NOW, keep_daily=1, keep_monthly=0, apply=True)
+
+
+def test_gc_of_an_empty_remote_deletes_only_orphans(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    remote.mkdir()
+    (remote / "seg-00000000000000bb.tar.zst").write_bytes(b"x")
+    plan = lb.gc("s", LocalDirStore(remote), work, now=NOW, apply=True)
+    assert plan.applied
+    assert plan.versions == 0
+    assert not _archives(remote)
+    assert lb.index_versions(LocalDirStore(remote), work) == []
+
+
+def test_store_listing_and_delete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert LocalDirStore(tmp_path / "absent").listing() == {}
+    (tmp_path / "a").write_bytes(b"12")
+    (tmp_path / "b.part").write_bytes(b"x")
+    local = LocalDirStore(tmp_path)
+    assert set(local.listing()) == {"a"}
+    assert local.listing()["a"].size == 2
+    local.delete("a")
+    assert local.listing() == {}
+    rows = json.dumps([{"Name": "seg-a.tar.zst", "Size": 7, "ModTime": "2026-10-31T02:33:03.496000123+09:00"}])
+    calls = _fake_rclone(monkeypatch, {"lsjson": (0, rows, ""), "deletefile": (0, "", "")})
+    store = RcloneStore("gdrive:lake/s/", rclone_bin="rc")
+    obj = store.listing()["seg-a.tar.zst"]
+    assert obj.size == 7
+    assert obj.modified == datetime(2026, 10, 30, 17, 33, 3, 496000, tzinfo=UTC)
+    store.delete("seg-a.tar.zst")
+    assert calls[-1] == ["rc", "deletefile", "gdrive:lake/s/seg-a.tar.zst"]
+    _fake_rclone(monkeypatch, {"lsjson": (3, "", "not found")})
+    assert RcloneStore("gdrive:lake/s").listing() == {}
+    _fake_rclone(monkeypatch, {"lsjson": (1, "", "quota"), "deletefile": (1, "", "denied")})
+    with pytest.raises(BackupError, match="lsjson failed"):
+        RcloneStore("gdrive:lake/s").listing()
+    with pytest.raises(BackupError, match="delete failed"):
+        RcloneStore("gdrive:lake/s").delete("x")
+
+
+def test_gc_refuses_to_delete_manifest_archives_behind_an_empty_index(env: tuple[Path, Path, Path]) -> None:
+    _, remote, work = env
+    _history(env, _days(1))
+    lb_empty = pa.Codec("zstd").compress(b"", asbytes=True)
+    (remote / lb.INDEX_NAME).write_bytes(lb_empty)
+    with pytest.raises(BackupError, match="index is empty"):
+        lb.gc("s", LocalDirStore(remote), work, now=NOW, apply=True)
