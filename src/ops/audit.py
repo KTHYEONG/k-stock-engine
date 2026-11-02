@@ -14,13 +14,17 @@ from src.data.runtime import resolve_data_runtime
 from src.ops.guards import trading_day
 from src.ops.run_outcome import load_run_outcomes
 
-__all__ = ["AUDIT_HEARTBEAT_RELPATH", "EXPECTED_JOBS", "run_daily_audit"]
+__all__ = ["AUDIT_HEARTBEAT_RELPATH", "BRONZE_PRUNE_AFTER", "EXPECTED_JOBS", "run_daily_audit"]
 
 AUDIT_HEARTBEAT_RELPATH: Final = "ops/heartbeat/daily_audit.json"
 EXPECTED_JOBS: Final[tuple[str, ...]] = ("collect_eve", "collect_dbsec", "morning", "auction_open", "backup")
 
 _BACKUP_MAX_AGE: Final = timedelta(hours=26)
-_LOOSE_BRONZE_MAX_AGE: Final = timedelta(days=14)
+BRONZE_PRUNE_AFTER: Final = timedelta(days=14)
+# The audit runs ~19h after the daily prune, so files just past the prune age at audit
+# time are legitimately pending; only a file that survived a full prune cycle is stale.
+_BRONZE_PRUNE_CYCLE: Final = timedelta(days=1)
+_LOOSE_BRONZE_MAX_AGE: Final = BRONZE_PRUNE_AFTER + _BRONZE_PRUNE_CYCLE
 _MAX_FOOTPRINT_BYTES: Final = 10 * 1024**3
 _PACK_DIRNAME: Final = "_packs"
 _CATALOG_DIRNAME: Final = "catalog"
