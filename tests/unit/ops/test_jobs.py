@@ -322,7 +322,8 @@ def test_push_backup_sources_branches(tmp_path: Path, monkeypatch: pytest.Monkey
     def _ok(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert "--no-lock" in command
         assert "--status" in command
-        assert command.count("--source") == 4
+        pushed = [command[i + 1] for i, arg in enumerate(command) if arg == "--source"]
+        assert pushed == list(jobs.daily_push_sources(jobs._backup_config_path()))
         assert str(jobs._tool_path()) in command[1]
         payload = json.dumps({"bronze": {"scanned": 1}})
         return subprocess.CompletedProcess(command, 0, stdout=payload + "\n", stderr="")
@@ -350,6 +351,31 @@ def test_push_backup_sources_branches(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(jobs.subprocess, "run", _bad)
     with pytest.raises(PITDataError, match="no report"):
         jobs._push_backup_sources(status_path=status, no_lock=True)
+
+
+def test_daily_push_covers_every_required_source() -> None:
+    import tomllib
+
+    config = tomllib.loads(jobs._backup_config_path().read_text(encoding="utf-8"))
+    rows = {str(row["name"]): row for row in config["source"]}
+    daily = set(jobs.daily_push_sources(jobs._backup_config_path()))
+    assert {"bronze", "bronze_catalog", "state", "ops", "silver", "gold"} <= daily
+    required = {name for name, row in rows.items() if not row.get("optional", False)}
+    assert required <= daily, f"required sources missing from the daily push: {sorted(required - daily)}"
+
+
+def test_daily_push_sources_order_and_empty(tmp_path: Path) -> None:
+    config = tmp_path / "lake_backup.toml"
+    config.write_text(
+        'remote = "x:y"\n[[source]]\nname = "b"\ndaily = true\nroot = "data/b"\n'
+        '[[source]]\nname = "skip"\nroot = "data/s"\n'
+        '[[source]]\nname = "a"\ndaily = true\nroot = "data/a"\n',
+        encoding="utf-8",
+    )
+    assert jobs.daily_push_sources(config) == ("b", "a")
+    config.write_text('remote = "x:y"\n[[source]]\nname = "b"\nroot = "data/b"\n', encoding="utf-8")
+    with pytest.raises(PITDataError, match="no daily source"):
+        jobs.daily_push_sources(config)
 
 
 def test_confirmed_paths_and_session_presence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

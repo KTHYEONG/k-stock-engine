@@ -96,7 +96,6 @@ _DEADLINE_MINUTE: Final = 55
 _LATE_SEAL_HOUR: Final = 9
 MORNING_LOCK_RELPATH: Final = "ops/locks/morning.lock"
 MORNING_LATE_JOB: Final = "morning_late"
-_PUSH_SOURCES: Final = ("bronze", "bronze_catalog", "state", "ops")
 
 
 def _events_root(data_root: Path) -> Path:
@@ -946,10 +945,25 @@ def _prune_bronze(data_root: Path, *, now: datetime, confirmed: set[str] | None 
     }
 
 
+def daily_push_sources(config_path: Path) -> tuple[str, ...]:
+    """Names of the backup sources marked ``daily = true`` in the lake backup config, in config order.
+
+    Raises:
+        PITDataError: no source is marked daily.
+    """
+    import tomllib
+
+    config = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
+    names = tuple(str(row["name"]) for row in config.get("source", ()) if row.get("daily") is True)
+    if not names:
+        raise PITDataError(f"lake backup config marks no daily source: {config_path}")
+    return names
+
+
 def _push_backup_sources(*, status_path: Path, no_lock: bool) -> dict[str, object]:
     command = [sys.executable, str(_tool_path()), "push", "--status", str(status_path),
                "--data-root", str(status_path.parent.parent)]
-    for name in _PUSH_SOURCES:
+    for name in daily_push_sources(_backup_config_path()):
         command += ["--source", name]
     if no_lock:
         command += ["--no-lock"]
@@ -1004,7 +1018,7 @@ def _failure_detail(exc: BaseException) -> str:
 
 
 def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
-    """Push Bronze, catalog, state and ops to Drive, then pack and prune loose Bronze confirmed offsite."""
+    """Push the config's daily sources to Drive, then pack and prune loose Bronze confirmed offsite."""
     root = Path(data_root)
     moment = _aware(now)
     run_date = moment.astimezone(KRX_TZ).date()

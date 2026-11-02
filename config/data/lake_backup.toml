@@ -2,10 +2,12 @@
 remote = "gdrive:quant-lake/live/k-stock-engine/lake"
 
 # optional = true: the root may be absent on some hosts (VPS has no legacy trees, local has no ops); push skips it.
+# daily = true: pushed by the scheduled `backup` job. Every non-optional source must be daily (decision inputs live in silver/gold).
 
 # Bronze payloads are append-only: a path already in the remote index is never re-hashed.
 [[source]]
 name = "bronze"
+daily = true
 root = "data/bronze/kr_swing_2019_v1"
 immutable = true
 exclude = ["catalog/*", "_packs/*"]
@@ -14,12 +16,14 @@ segment_mib = 128
 # SQLite catalogs change on every collection; they are snapshotted through the SQLite backup API.
 [[source]]
 name = "bronze_catalog"
+daily = true
 root = "data/bronze/kr_swing_2019_v1/catalog"
 exclude = ["*-wal", "*-shm"]
 
 # Registry, champion history, quota ledgers and fact quarantine; rebuildable caches are left out.
 [[source]]
 name = "state"
+daily = true
 root = "data/state/kr_swing_2019_v1"
 exclude = ["research/cube/*", "research/market_cache/*", "research/scores/*", "dart_fact_staging/*", "*.lock"]
 
@@ -49,6 +53,7 @@ exclude = ["*.tmp"]
 # Operations events, heartbeats and reports; mutable by design.
 [[source]]
 name = "ops"
+daily = true
 root = "data/ops"
 optional = true
 exclude = ["*.tmp"]
@@ -56,10 +61,12 @@ exclude = ["*.tmp"]
 # Derived releases are immutable once written.
 [[source]]
 name = "silver"
+daily = true
 root = "data/silver/kr_swing_2019_v1"
 immutable = true
 
 [[source]]
 name = "gold"
+daily = true
 root = "data/gold/kr_swing_2019_v1"
 immutable = true
