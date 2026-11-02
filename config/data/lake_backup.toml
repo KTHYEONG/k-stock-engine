@@ -32,23 +32,8 @@ exclude = [
     "cache/parse_*.sqlite", "cache/parse_*.sqlite-*", "cache/daily_admin_flags.parquet",
 ]
 
-# Legacy pre-scope Bronze. security_master is excluded: every one of its 2,621 sessions equals the scoped page byte-for-byte
-# (checked 2026-10-10). daily_market stays: 83 sessions of 2015 exist only here.
-[[source]]
-name = "legacy_stocks"
-root = "data/bronze/stocks"
-optional = true
-immutable = true
-exclude = ["security_master/*"]
-segment_mib = 512
-
-# Silver root bound by the 2026-09-11 run manifests (reproduction anchor) and the run manifests themselves.
-[[source]]
-name = "silver_provenance"
-root = "data/silver/stocks_provenance_20260911"
-optional = true
-immutable = true
-
+# Pre-scope legacy Bronze (`legacy_stocks`) and the 2026-09-11 silver provenance anchor were retired 2026-11-02:
+# unused by scope kr_swing_2019_v1 (evidence_start 2016-01-01), re-collectable, removed from the remote lake.
 [[source]]
 name = "artifacts"
 root = "data/artifacts"
