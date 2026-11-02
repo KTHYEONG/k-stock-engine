@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import itertools
 import json
 import logging
 import mmap
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import threading
-from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -24,11 +28,16 @@ import pyarrow as pa
 __all__ = [
     "BackupError",
     "BackupSource",
+    "GcPlan",
+    "IndexVersion",
     "LocalDirStore",
     "PushReport",
     "RcloneStore",
+    "RemoteObject",
     "RemoteStore",
     "RestoreReport",
+    "gc",
+    "index_versions",
     "push",
     "restore",
     "verify",
@@ -44,6 +53,8 @@ _INDEX_CHUNK: Final = 8 * 1024 * 1024
 _ZSTD_LEVEL: Final = 10
 _SQLITE_SUFFIX: Final = ".sqlite3"
 _RCLONE_DIR_NOT_FOUND: Final = 3
+_ARCHIVE_RE: Final = re.compile(r"^seg-[0-9a-f]{16}\.tar\.zst$")
+_FRACTION_RE: Final = re.compile(r"(\.\d{6})\d+")
 
 
 class BackupError(RuntimeError):
@@ -84,6 +95,12 @@ class RestoreReport:
     archives: int
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteObject:
+    size: int
+    modified: datetime
+
+
 class RemoteStore(Protocol):
     """Flat object namespace; names are relative to the source prefix."""
 
@@ -96,6 +113,12 @@ class RemoteStore(Protocol):
     def sha256(self, name: str) -> str | None:
         """Remote content hash, or None when the object does not exist."""
         ...
+
+    def listing(self) -> dict[str, RemoteObject]:
+        """Top-level objects with size and upload time; empty when the prefix does not exist."""
+        ...
+
+    def delete(self, name: str) -> None: ...
 
 
 class LocalDirStore:
@@ -121,6 +144,19 @@ class LocalDirStore:
     def sha256(self, name: str) -> str | None:
         src = self._root / name
         return _file_sha256(src) if src.is_file() else None
+
+    def listing(self) -> dict[str, RemoteObject]:
+        if not self._root.is_dir():
+            return {}
+        out: dict[str, RemoteObject] = {}
+        for path in self._root.iterdir():
+            if path.is_file() and not path.name.endswith(".part"):
+                stat = path.stat()
+                out[path.name] = RemoteObject(stat.st_size, datetime.fromtimestamp(stat.st_mtime, UTC))
+        return out
+
+    def delete(self, name: str) -> None:
+        (self._root / name).unlink()
 
 
 class RcloneStore:
@@ -169,6 +205,24 @@ class RcloneStore:
         if not digest:
             raise BackupError(f"remote reports no sha256 for {name}")
         return str(digest)
+
+    def listing(self) -> dict[str, RemoteObject]:
+        res = self._run("lsjson", "--files-only", self._remote)
+        if res.returncode == _RCLONE_DIR_NOT_FOUND:
+            return {}
+        if res.returncode != 0:
+            raise BackupError(f"rclone lsjson failed for listing: {res.stderr.strip()[-300:]}")
+        return {
+            str(row["Name"]): RemoteObject(
+                int(row["Size"]), datetime.fromisoformat(_FRACTION_RE.sub(r"\1", str(row["ModTime"]))).astimezone(UTC)
+            )
+            for row in json.loads(res.stdout or "[]")
+        }
+
+    def delete(self, name: str) -> None:
+        res = self._run("deletefile", f"{self._remote}/{name}")
+        if res.returncode != 0:
+            raise BackupError(f"rclone delete failed for {name}: {res.stderr.strip()[-300:]}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,16 +657,28 @@ def _extract(local: Path, archive: str, members: dict[str, list[_Entry]], dest: 
 
 
 def restore(
-    source: BackupSource, store: RemoteStore, dest: Path, workdir: Path, *, patterns: Sequence[str] = ()
+    source: BackupSource,
+    store: RemoteStore,
+    dest: Path,
+    workdir: Path,
+    *,
+    patterns: Sequence[str] = (),
+    at: datetime | int | None = None,
 ) -> RestoreReport:
-    """Write the latest backed-up version of each selected path under ``dest``; matching files are left alone.
+    """Write the backed-up version of each selected path under ``dest``; matching files are left alone.
+
+    ``at`` selects a historical state (``index_versions`` number, or the last state uploaded at or before a
+    timestamp); None restores the latest state.
 
     Raises:
-        BackupError: an archive hash differs from the manifest, a member is missing, a restored file's hash
-            differs from the index, or an index path would escape ``dest``.
+        BackupError: no state matches ``at``, an archive is missing or differs from the manifest, a member is
+            missing, a restored file's hash differs from the index, or an index path would escape ``dest``.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     entries = _load_index(store, workdir)
+    if at is not None:
+        version = _select_version(_derive_versions([entry.archive for entry in entries], store.listing()), at)
+        entries = entries[: version.lines]
     manifest = _load_manifest(store, workdir, source.name)
     by_archive: dict[str, dict[str, list[_Entry]]] = {}
     skipped = 0
@@ -651,3 +717,237 @@ def verify(store: RemoteStore, workdir: Path, source_name: str) -> list[str]:
     orphans = {entry.archive for entry in entries} - set(manifest["archives"])
     problems.extend(f"{name}: referenced by the index but absent from the manifest" for name in sorted(orphans))
     return problems
+
+
+@dataclass(frozen=True, slots=True)
+class IndexVersion:
+    """A restorable state: the first ``lines`` index entries, one per UTC day of archive uploads.
+
+    The index carries no timestamps, so a state ends where an entry first names an archive uploaded on a later
+    day; reference-only pushes, which upload no archive, fold into the preceding day's state.
+    """
+
+    number: int
+    lines: int
+    day: date | None
+    uploaded_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class GcPlan:
+    source: str
+    versions: int
+    retained: tuple[IndexVersion, ...]
+    keep: tuple[str, ...]
+    keep_bytes: int
+    delete: tuple[str, ...]
+    delete_bytes: int
+    orphans: tuple[str, ...]
+    orphan_bytes: int
+    index_lines: int
+    dropped_lines: int
+    missing: tuple[str, ...]
+    applied: bool = False
+
+
+def _derive_versions(archives: Sequence[str], objects: Mapping[str, RemoteObject]) -> list[IndexVersion]:
+    """Day-closed states over index entries given each entry's archive in index order."""
+    versions: list[IndexVersion] = []
+    seen: set[str] = set()
+    day: date | None = None
+    newest: datetime | None = None
+    for position, archive in enumerate(archives):
+        if archive in seen:
+            continue
+        seen.add(archive)
+        found = objects.get(archive)
+        if found is None:
+            continue
+        uploaded = found.modified.astimezone(UTC)
+        if day is not None and newest is not None and uploaded.date() > day:
+            versions.append(IndexVersion(len(versions) + 1, position, day, newest))
+            day, newest = uploaded.date(), uploaded
+            continue
+        if day is None:
+            day = uploaded.date()
+        newest = uploaded if newest is None else max(newest, uploaded)
+    if archives:
+        versions.append(IndexVersion(len(versions) + 1, len(archives), day, newest))
+    return versions
+
+
+def _select_version(versions: Sequence[IndexVersion], at: datetime | int) -> IndexVersion:
+    if isinstance(at, int):
+        match = [version for version in versions if version.number == at]
+        if not match:
+            raise BackupError(f"no backup state number {at}; {len(versions)} exist")
+        return match[0]
+    if at.tzinfo is None:
+        raise BackupError("restore timestamp must be timezone-aware")
+    eligible = [version for version in versions if version.uploaded_at is not None and version.uploaded_at <= at]
+    if not eligible:
+        raise BackupError(f"no backup state uploaded at or before {at.isoformat()}")
+    return eligible[-1]
+
+
+def _retained_versions(versions: Sequence[IndexVersion], *, keep_daily: int, keep_monthly: int) -> list[IndexVersion]:
+    """Latest state, the last ``keep_daily`` day states, and the last state of each of the last ``keep_monthly`` months."""
+    if not versions:
+        return []
+    keep = {versions[-1].number}
+    dated = [version for version in versions if version.day is not None]
+    if keep_daily > 0:
+        keep |= {version.number for version in dated[-keep_daily:]}
+    by_month: dict[tuple[int, int], IndexVersion] = {}
+    for version in dated:
+        assert version.day is not None
+        by_month[(version.day.year, version.day.month)] = version
+    if keep_monthly > 0:
+        keep |= {by_month[month].number for month in sorted(by_month)[-keep_monthly:]}
+    return [version for version in versions if version.number in keep]
+
+
+def _reachable_archives(entries: Iterable[tuple[str, str]], boundaries: set[int]) -> set[str]:
+    """Archives holding the latest version of some path in any state ending at a boundary line count."""
+    latest: dict[str, str] = {}
+    refs: Counter[str] = Counter()
+    reachable: set[str] = set()
+    for count, (path, archive) in enumerate(entries, start=1):
+        previous = latest.get(path)
+        if previous is not None:
+            refs[previous] -= 1
+        latest[path] = archive
+        refs[archive] += 1
+        if count in boundaries:
+            reachable.update(name for name, held in refs.items() if held > 0)
+    return reachable
+
+
+def _fetch_digest(store: RemoteStore, name: str, dest: Path) -> str | None:
+    dest.unlink(missing_ok=True)
+    return _file_sha256(dest) if store.fetch(name, dest) else None
+
+
+def _index_pairs(local: Path | None) -> list[tuple[str, str]]:
+    if local is None:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for line in _iter_index_lines(local):
+        obj = json.loads(line)
+        pairs.append((sys.intern(obj["path"]), sys.intern(obj["archive"])))
+    return pairs
+
+
+def index_versions(store: RemoteStore, workdir: Path) -> list[IndexVersion]:
+    """Restorable states of one remote source, oldest first."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    local = workdir / INDEX_NAME
+    present = _fetch_digest(store, INDEX_NAME, local) is not None
+    pairs = _index_pairs(local if present else None)
+    return _derive_versions([archive for _, archive in pairs], store.listing())
+
+
+def gc(
+    source_name: str,
+    store: RemoteStore,
+    workdir: Path,
+    *,
+    now: datetime,
+    keep_daily: int = 14,
+    keep_monthly: int = 12,
+    apply: bool = False,
+) -> GcPlan:
+    """Plan, and with ``apply`` perform, deletion of archives no retained state needs.
+
+    Retained states are the latest one plus ``keep_daily`` day states and ``keep_monthly`` month-end states. An
+    archive is kept when it holds the latest version of any path in a retained state; index entries naming deleted
+    archives are dropped, which leaves every retained state byte-identical on restore. ``apply`` rewrites index and
+    manifest first and deletes afterwards, so an interruption only leaves orphans for the next run.
+
+    Raises:
+        BackupError: on ``apply`` when a retained archive is missing or differs from the manifest, the remote
+            index or manifest changed since planning, or the rewritten index would change the latest state.
+    """
+    if keep_daily < 0 or keep_monthly < 0:
+        raise BackupError("retention counts must be >= 0")
+    workdir.mkdir(parents=True, exist_ok=True)
+    index_local = workdir / INDEX_NAME
+    index_digest = _fetch_digest(store, INDEX_NAME, index_local)
+    manifest_digest = _fetch_digest(store, MANIFEST_NAME, workdir / MANIFEST_NAME)
+    manifest: dict[str, Any] = (
+        json.loads((workdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+        if manifest_digest is not None
+        else {"source": source_name, "archives": {}}
+    )
+    archives: dict[str, Any] = dict(manifest.get("archives", {}))
+    pairs = _index_pairs(index_local if index_digest is not None else None)
+    objects = store.listing()
+    versions = _derive_versions([archive for _, archive in pairs], objects)
+    retained = _retained_versions(versions, keep_daily=keep_daily, keep_monthly=keep_monthly)
+    keep = _reachable_archives(pairs, {version.lines for version in retained})
+    delete = sorted(set(archives) - keep)
+    orphans = sorted(name for name in objects if _ARCHIVE_RE.match(name) and name not in archives and name not in keep)
+    missing = sorted(name for name in keep if name not in objects or name not in archives)
+    plan = GcPlan(
+        source=source_name,
+        versions=len(versions),
+        retained=tuple(retained),
+        keep=tuple(sorted(keep)),
+        keep_bytes=sum(int(archives[name]["bytes"]) for name in keep if name in archives),
+        delete=tuple(delete),
+        delete_bytes=sum(int(archives[name]["bytes"]) for name in delete),
+        orphans=tuple(orphans),
+        orphan_bytes=sum(objects[name].size for name in orphans),
+        index_lines=len(pairs),
+        dropped_lines=sum(1 for _, archive in pairs if archive not in keep),
+        missing=tuple(missing),
+    )
+    if not apply or not (delete or orphans):
+        return plan
+    if missing:
+        raise BackupError(f"refusing gc of {source_name}: {len(missing)} retained archive(s) missing, first {missing[0]}")
+    for name in sorted(keep):
+        if store.sha256(name) != archives[name]["sha256"]:
+            raise BackupError(f"refusing gc of {source_name}: {name} differs from the manifest")
+    recheck = workdir / "recheck"
+    recheck.mkdir(exist_ok=True)
+    if (
+        _fetch_digest(store, INDEX_NAME, recheck / INDEX_NAME) != index_digest
+        or _fetch_digest(store, MANIFEST_NAME, recheck / MANIFEST_NAME) != manifest_digest
+    ):
+        raise BackupError(f"refusing gc of {source_name}: remote index or manifest changed since planning")
+    if not pairs:
+        if delete:
+            raise BackupError(f"refusing gc of {source_name}: manifest lists archives but the index is empty")
+        for name in orphans:
+            store.delete(name)
+        return replace(plan, applied=True)
+    kept_pairs = [pair for pair in pairs if pair[1] in keep]
+    if dict(kept_pairs) != dict(pairs):
+        raise BackupError(f"refusing gc of {source_name}: rewritten index would change the latest state")
+    raw = workdir / (INDEX_NAME + ".gc.raw")
+    rewritten = workdir / (INDEX_NAME + ".gc")
+    try:
+        with raw.open("wb") as out:
+            for line in _iter_index_lines(index_local):
+                if json.loads(line)["archive"] in keep:
+                    out.write(line + b"\n")
+        with raw.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            _compress_mapped(mapped, rewritten)
+    finally:
+        raw.unlink(missing_ok=True)
+    manifest["archives"] = {name: meta for name, meta in archives.items() if name in keep}
+    manifest["gc"] = {
+        "at": now.isoformat(),
+        "deleted_archives": len(delete) + len(orphans),
+        "dropped_lines": plan.dropped_lines,
+        "retained_states": [version.number for version in retained],
+    }
+    manifest_path = workdir / (MANIFEST_NAME + ".gc")
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=1), encoding="utf-8")
+    store.put(rewritten, INDEX_NAME)
+    store.put(manifest_path, MANIFEST_NAME)
+    for name in itertools.chain(delete, orphans):
+        store.delete(name)
+        _LOG.info("[DATA] lake_backup command=gc source=%s deleted=%s", source_name, name)
+    return replace(plan, applied=True)

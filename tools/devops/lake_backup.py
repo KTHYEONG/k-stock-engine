@@ -3,10 +3,12 @@
 Usage:
   uv run python tools/devops/lake_backup.py push [--source NAME ...]
   uv run python tools/devops/lake_backup.py verify [--source NAME ...]
-  uv run python tools/devops/lake_backup.py restore --source NAME --dest DIR [--pattern GLOB ...]
+  uv run python tools/devops/lake_backup.py restore --source NAME --dest DIR [--pattern GLOB ...] [--at N|ISO]
+  uv run python tools/devops/lake_backup.py gc [--source NAME ...] [--keep-daily 14] [--keep-monthly 12] [--apply]
   uv run python tools/devops/lake_backup.py push --name alt_pilot --root scratch/alt --exclude '*.npy'
 
-Runs under the cross-project Drive lock so it never overlaps another project's rclone job.
+Runs under the cross-project Drive lock so it never overlaps another project's rclone job. `gc` only prints its
+plan unless --apply is given, and --apply refuses --no-lock.
 """
 from __future__ import annotations
 
@@ -32,9 +34,11 @@ from src.config.secrets import read_secret  # noqa: E402
 from src.data.lake_backup import (  # noqa: E402
     BackupError,
     BackupSource,
+    GcPlan,
     LocalDirStore,
     RcloneStore,
     RemoteStore,
+    gc,
     push,
     restore,
     verify,
@@ -125,9 +129,36 @@ def _acquire_shared_lock(lock: object, wait_s: int, log: logging.Logger) -> bool
             _time.sleep(1.0)
 
 
+def _parse_at(value: str) -> datetime | int:
+    if value.isdigit():
+        return int(value)
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        raise argparse.ArgumentTypeError("--at timestamp needs a UTC offset")
+    return moment
+
+
+def _plan_summary(plan: GcPlan) -> dict[str, object]:
+    mib = 1024 * 1024
+    return {
+        "states": plan.versions,
+        "retained": [[v.number, v.day.isoformat() if v.day else None, v.lines] for v in plan.retained],
+        "keep": len(plan.keep),
+        "keep_mib": round(plan.keep_bytes / mib, 1),
+        "delete": len(plan.delete),
+        "delete_mib": round(plan.delete_bytes / mib, 1),
+        "orphans": len(plan.orphans),
+        "orphan_mib": round(plan.orphan_bytes / mib, 1),
+        "index_lines": plan.index_lines,
+        "dropped_lines": plan.dropped_lines,
+        "missing": list(plan.missing[:5]),
+        "applied": plan.applied,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["push", "verify", "restore"])
+    parser.add_argument("command", choices=["push", "verify", "restore", "gc"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--source", action="append")
     parser.add_argument("--name", default="adhoc")
@@ -141,6 +172,10 @@ def main() -> int:
     parser.add_argument("--no-lock", action="store_true")
     parser.add_argument("--status", type=Path, default=None)
     parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--at", type=_parse_at, default=None)
+    parser.add_argument("--keep-daily", type=int, default=14)
+    parser.add_argument("--keep-monthly", type=int, default=12)
+    parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     log = logging.getLogger("lake_backup")
@@ -148,6 +183,8 @@ def main() -> int:
     sources = _sources(args, config)
     if args.command == "restore" and (args.dest is None or len(sources) != 1):
         raise SystemExit("restore needs exactly one --source (or --root) and --dest")
+    if args.apply and (args.command != "gc" or args.no_lock):
+        raise SystemExit("--apply is only valid for gc and requires the shared Drive lock")
     status_path = Path(args.status) if args.status is not None else STATUS_PATH
 
     rc = 0
@@ -192,12 +229,16 @@ def _run_sources(
             if args.command == "push":
                 report = push(source, store, work, now=datetime.now(UTC))
                 results[source.name] = asdict(report)
+            elif args.command == "gc":
+                plan = gc(source.name, store, work, now=datetime.now(UTC), keep_daily=int(args.keep_daily),
+                          keep_monthly=int(args.keep_monthly), apply=bool(args.apply))
+                results[source.name] = _plan_summary(plan)
             elif args.command == "verify":
                 problems = verify(store, work, source.name)
                 results[source.name] = {"problems": problems}
                 rc = rc or (1 if problems else 0)
             else:
-                restore_report = restore(source, store, args.dest, work, patterns=tuple(args.pattern or ()))
+                restore_report = restore(source, store, args.dest, work, patterns=tuple(args.pattern or ()), at=args.at)
                 results[source.name] = asdict(restore_report)
             log.info("[DATA] lake_backup command=%s source=%s result=%s", args.command, source.name, results[source.name])
         except Exception as exc:
