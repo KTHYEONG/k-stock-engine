@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -109,10 +110,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     spec = load_budget_spec(_SPEC_PATH)
     measure = measure_instructions(root, spec)
     violations = [*check_budget(measure, spec), *check_retention(root, spec)]
-    print(_render_table(measure, spec))
-    for violation in violations:
-        print(f"VIOLATION {violation}")
-    print(f"RESULT {'FAIL' if violations else 'OK'} violations={len(violations)}")
+    lines = [_render_table(measure, spec), *(f"VIOLATION {v}" for v in violations)]
+    lines.append(f"RESULT {'FAIL' if violations else 'OK'} violations={len(violations)}")
+    sys.stdout.write("\n".join(lines) + "\n")
     return 1 if violations else 0
 
 
