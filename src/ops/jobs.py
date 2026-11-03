@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     import polars as pl
 
     from src.data.runtime import DataRuntime
+    from src.ops.alert_policy import IncidentKind
     from src.ops.alerts import AlertSender
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "MORNING_RELAY_JOBS",
     "POLL_INTERVAL_S",
     "alert",
+    "alert_drain",
     "audit",
     "backup",
     "collect_dbsec",
@@ -1052,22 +1054,18 @@ def _alerts_dir(data_root: Path) -> Path:
     return Path(data_root) / "ops" / "alerts"
 
 
-def _heartbeat_open_issues(data_root: Path) -> list[dict[str, str]]:
+def _heartbeat_critical(data_root: Path, today: date) -> list[str]:
+    """Critical incidents of today's audit heartbeat; empty when missing, stale or malformed."""
     from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
 
     try:
         payload = json.loads((Path(data_root) / AUDIT_HEARTBEAT_RELPATH).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("snapshot_date") != today.isoformat():
         return []
-    raw = payload.get("open_issues")
-    if not isinstance(raw, list):
-        return []
-    return [
-        {"key": str(item.get("key", "")), "text": str(item.get("text", ""))}
-        for item in raw if isinstance(item, Mapping)
-    ]
+    raw = payload.get("critical_incidents")
+    return [str(item) for item in raw] if isinstance(raw, list) else []
 
 
 def _alert_sender() -> tuple[AlertSender | None, frozenset[str]]:
@@ -1088,27 +1086,69 @@ def _drain_best_effort(
         _LOG.debug("[OPS] alert drain best-effort failed")
 
 
+def _page(
+    data_root: Path,
+    kinds: tuple[IncidentKind, ...],
+    *,
+    sender: AlertSender | None,
+    secrets: frozenset[str],
+    today: date,
+    moment: datetime,
+) -> bool:
+    """Mail each critical incident once per day; True when any page could only be queued."""
+    from src.ops.alert_policy import build_page, load_open_incidents, save_open_incidents
+    from src.ops.alerts import DispatchOutcome, dispatch
+
+    alerts_dir = _alerts_dir(data_root)
+    queued = False
+    opened = load_open_incidents(data_root)
+    for kind in kinds:
+        outcome = dispatch(build_page(kind, today), sender=sender, alerts_dir=alerts_dir, now=moment,
+                           secret_values=secrets)
+        queued = queued or outcome is DispatchOutcome.QUEUED
+        opened.setdefault(kind, today.isoformat())
+        _LOG.info("[OPS] command=page incident=%s outcome=%s", kind.value, outcome.name)
+    if kinds:
+        try:
+            save_open_incidents(data_root, opened)
+        except OSError:
+            _LOG.debug("[OPS] incident state write failed")
+    return queued
+
+
 def alert(data_root: Path, *, unit: str, result: str, exit_status: str, journal_tail: str, now: datetime) -> int:
-    """Deliver one unit-failure alert; 0 when sent or suppressed, 1 when it could only be queued."""
-    from src.ops.alerts import DispatchOutcome, build_unit_failure, dispatch, redact
+    """Record one unit failure and page only critical incidents; 1 only when a page could just be queued."""
+    from src.ops.alert_policy import record_unit_failure, unit_incidents
+    from src.ops.alerts import failure_cause, redact
 
     root = Path(data_root)
     moment = _aware(now)
-    alerts_dir = _alerts_dir(root)
-    issues = _heartbeat_open_issues(root) if unit == "kse-daily-audit.service" else []
+    today = moment.astimezone(KRX_TZ).date()
     sender, secrets = _alert_sender()
-    message = build_unit_failure(
-        unit, result=result, exit_status=exit_status, journal_tail=redact(journal_tail, secrets), now=moment,
-        open_issues=issues,
-    )
-    _drain_best_effort(sender, alerts_dir, secrets, moment)
-    outcome = dispatch(message, sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
-    return 0 if outcome in (DispatchOutcome.SENT, DispatchOutcome.SUPPRESSED) else 1
+    _drain_best_effort(sender, _alerts_dir(root), secrets, moment)
+    try:
+        record_unit_failure(root, unit=unit, result=result, exit_status=exit_status,
+                            cause=failure_cause(redact(journal_tail, secrets)), now=moment)
+    except OSError:
+        _LOG.debug("[OPS] failure ledger append failed")
+    critical = _heartbeat_critical(root, today) if unit == "kse-daily-audit.service" else []
+    kinds = unit_incidents(unit, today=today, data_root=root, audit_critical=critical)
+    if not kinds:
+        _LOG.info("[OPS] command=alert unit=%s class=SILENT result=%s", unit, result)
+        return 0
+    return 1 if _page(root, kinds, sender=sender, secrets=secrets, today=today, moment=moment) else 0
 
 
 def audit(data_root: Path, *, today: date, now: datetime) -> int:
-    """Run the daily audit and deliver its summary; 0 unless an open issue could not be delivered."""
-    from src.ops.alerts import DispatchOutcome, build_audit_summary, count_undelivered, dispatch
+    """Run the daily audit, page critical incidents and announce resolved ones; 1 only when a page was queued."""
+    from src.ops.alert_policy import (
+        IncidentKind,
+        build_resolved,
+        evaluated_kinds,
+        load_open_incidents,
+        save_open_incidents,
+    )
+    from src.ops.alerts import count_undelivered, dispatch
 
     root = Path(data_root)
     moment = _aware(now)
@@ -1116,15 +1156,36 @@ def audit(data_root: Path, *, today: date, now: datetime) -> int:
     sender, secrets = _alert_sender()
     _drain_best_effort(sender, alerts_dir, secrets, moment)
     heartbeat = run_daily_audit(root, today=today, now=moment, undelivered_alerts=count_undelivered(alerts_dir))
-    message = build_audit_summary(heartbeat)
-    if message is None:
-        _LOG.info("[OPS] command=audit severity=%s issues=0", str(heartbeat.get("severity", "")))
-        return 0
-    outcome = dispatch(message, sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
+    raw = heartbeat.get("critical_incidents")
+    kinds = tuple(IncidentKind(value) for value in raw) if isinstance(raw, list) else ()
+    queued = _page(root, kinds, sender=sender, secrets=secrets, today=today, moment=moment)
+    opened = load_open_incidents(root)
+    checked = evaluated_kinds(str(heartbeat.get("day_kind", "")))
+    resolved = [kind for kind in opened if kind in checked and kind not in kinds]
+    for kind in resolved:
+        dispatch(build_resolved(kind, today), sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
+        del opened[kind]
+    if resolved:
+        try:
+            save_open_incidents(root, opened)
+        except OSError:
+            _LOG.debug("[OPS] incident state write failed")
     issues = heartbeat.get("open_issues")
-    count = len(issues) if isinstance(issues, list) else 0
-    _LOG.info("[OPS] command=audit severity=%s issues=%d outcome=%s", str(heartbeat.get("severity", "")), count, outcome.name)
-    return 0 if outcome in (DispatchOutcome.SENT, DispatchOutcome.SUPPRESSED) else 1
+    _LOG.info("[OPS] command=audit severity=%s issues=%d critical=%d resolved=%d queued=%s",
+              str(heartbeat.get("severity", "")), len(issues) if isinstance(issues, list) else 0,
+              len(kinds), len(resolved), queued)
+    return 1 if queued else 0
+
+
+def alert_drain(data_root: Path, *, now: datetime) -> int:
+    """Re-deliver queued alerts without waiting for a new incident; always 0 so a drain never pages."""
+    from src.ops.alerts import count_undelivered
+
+    root = Path(data_root)
+    sender, secrets = _alert_sender()
+    _drain_best_effort(sender, _alerts_dir(root), secrets, _aware(now))
+    _LOG.info("[OPS] command=alert-drain undelivered=%d", count_undelivered(_alerts_dir(root)))
+    return 0
 
 
 def weekly_report(data_root: Path, *, today: date, now: datetime) -> int:
@@ -1190,6 +1251,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     failure.add_argument("--unit", required=True)
     failure.add_argument("--result", default="unknown")
     failure.add_argument("--exit-status", default="unknown")
+    sub.add_parser("alert-drain")
     return parser.parse_args(argv)
 
 
@@ -1219,6 +1281,8 @@ def main(argv: list[str] | None = None) -> int:
             data_root, unit=str(args.unit), result=str(args.result),
             exit_status=str(args.exit_status), journal_tail=_read_journal_tail(), now=moment,
         )
+    if args.command == "alert-drain":
+        return alert_drain(data_root, now=moment)
     raise SystemExit(f"unknown command {args.command}")  # pragma: no cover - argparse rejects unknown commands
 
 

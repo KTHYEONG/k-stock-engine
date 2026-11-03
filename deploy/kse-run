@@ -98,6 +98,14 @@ case "$JOB" in
     EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
     MODULE_ARGV=(src.ops.jobs weekly-report)
     ;;
+  alert-drain)
+    NAME="kse-alert-drain"; MEM="256m"; CPUS="0.5"
+    EXTRA_ENVS=("${HOME}/quant-secrets/kse-alert.env")
+    WANT_KIS=0; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=(); WANT_LOG=0; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs alert-drain)
+    ;;
   alert)
     NAME="kse-alert-notify"; MEM="256m"; CPUS="0.5"
     EXTRA_ENVS=("${HOME}/quant-secrets/kse-alert.env")

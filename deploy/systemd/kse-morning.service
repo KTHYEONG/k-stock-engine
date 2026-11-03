@@ -1,6 +1,7 @@
 [Unit]
 Description=KSE morning seal (wait KRX bars, build, decide, shadow-run)
-OnFailure=kse-alert@%n.service
+# A failed seal starts the late seal at once; only its failure pages (src/ops/alert_policy.py).
+OnFailure=kse-alert@%n.service kse-morning-late.service
 
 [Service]
 Type=oneshot

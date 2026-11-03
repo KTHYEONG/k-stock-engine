@@ -54,6 +54,7 @@ core → config → integrations → data → backtest → research → ops
 | 평일 21:40, 주말 12:00 | daily-audit | 당일 작업 결과 점검 |
 | 매일 02:30 | backup | 원격 저장소(Google Drive) 백업 |
 | 토 10:30 | weekly-report | 주간 운영 리포트 |
+| 15분마다 | alert-drain | 발송 대기 중인 긴급 메일 재전송(대기 메일이 없으면 컨테이너를 띄우지 않음) |
 
 ## 🔧 핵심 설계 결정
 
@@ -99,7 +100,7 @@ core → config → integrations → data → backtest → research → ops
 - **문제:** 자동 작업이 "성공"이라고 기록해도 실제 데이터가 비었거나 일부만 쓰인 경우가 있습니다.
 - **분석:** 예외가 없으면 성공으로 보는 방식은 부분 실패를 놓칩니다.
 - **선택:** 모든 작업은 `OK / DEGRADED / NO_DECISION / SKIPPED` 중 하나로 결과를 기록하고([run_outcome.py](./src/ops/run_outcome.py)), 일일 감사([audit.py](./src/ops/audit.py))가 기록과 산출물을 대조합니다. 장 시작 전까지 목표를 확정하지 못하면 늦게 확정해도 `OK`가 아니라 `DEGRADED`로 남깁니다.
-- ✅ **결과:** 실패 알림은 원인 한 줄 요약 메일로 보내고, 같은 원인은 24시간 동안 중복 발송하지 않습니다([alerts.py](./src/ops/alerts.py)).
+- ✅ **결과:** 사람이 지금 개입해야 하는 사건(장전 결정 미봉인, 작업 기록 판독 불가, 백업 2일 이상 중단, 같은 작업 3거래일 연속 실패)만 세 줄 메일로 보내고, 나머지 실패는 기록만 남깁니다. 아침 봉인이 실패하면 늦은 봉인을 자동으로 먼저 실행하고, 같은 사건은 하루 한 번만 보내며 해결되면 한 줄로 알립니다([alert_policy.py](./src/ops/alert_policy.py)).
 
 ## 📊 결과
 

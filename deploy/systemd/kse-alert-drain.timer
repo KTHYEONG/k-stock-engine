@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE queued alert re-delivery (every 15 min)
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 Asia/Seoul
+AccuracySec=1min
+Persistent=false
+Unit=kse-alert-drain.service
+
+[Install]
+WantedBy=timers.target

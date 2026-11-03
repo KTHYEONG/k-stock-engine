@@ -11,6 +11,14 @@ from typing import Final
 
 from src.core.time import KRX_TZ
 from src.data.runtime import resolve_data_runtime
+from src.ops.alert_policy import (
+    DEFAULT_ALERT_POLICY,
+    AlertPolicy,
+    audit_incidents,
+    backup_is_stale,
+    consecutive_failure_days,
+    streak_issue_key,
+)
 from src.ops.guards import trading_day
 from src.ops.run_outcome import load_run_outcomes
 
@@ -122,6 +130,25 @@ def _backup_issue(status_path: Path, now: datetime) -> str | None:
     return None
 
 
+def _backup_stale_issue(status_path: Path, now: datetime, policy: AlertPolicy) -> dict[str, str] | None:
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not backup_is_stale(payload, now, policy):
+        return None
+    return {"key": "backup_stale", "text": "last successful backup is older than the stale limit"}
+
+
+def _streak_issues(data_root: Path, today: date, policy: AlertPolicy) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for unit, (job, _kind) in policy.streak_units.items():
+        days = consecutive_failure_days(job, unit, today=today, data_root=data_root, policy=policy)
+        if days >= policy.streak_threshold:
+            issues.append({"key": streak_issue_key(job), "text": f"{job} failed {days} consecutive run days"})
+    return issues
+
+
 def _decision_issues(decisions_dir: Path, today: date) -> list[tuple[str, str]]:
     from src.research.operate import read_chain
 
@@ -140,8 +167,15 @@ def _decision_issues(decisions_dir: Path, today: date) -> list[tuple[str, str]]:
     return []
 
 
-def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_alerts: int = 0) -> dict[str, object]:
-    """Check the day's outcomes and artefacts, write the heartbeat, and return it."""
+def run_daily_audit(
+    data_root: Path,
+    *,
+    today: date,
+    now: datetime,
+    undelivered_alerts: int = 0,
+    policy: AlertPolicy = DEFAULT_ALERT_POLICY,
+) -> dict[str, object]:
+    """Check the day's outcomes and artefacts, write the heartbeat with its critical incidents, and return it."""
     root = Path(data_root)
     moment = now if now.tzinfo is not None else now.replace(tzinfo=KRX_TZ)
     queued = undelivered_alerts if isinstance(undelivered_alerts, int) and not isinstance(undelivered_alerts, bool) and undelivered_alerts >= 0 else 0
@@ -167,6 +201,7 @@ def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_
         problem = _backup_issue(_backup_status_path(root), moment)
         if problem is not None:
             open_issues.append({"key": "backup", "text": problem})
+        open_issues.extend(_streak_issues(root, today, policy))
         stale = _stale_loose_bronze(bronze_root, moment)
         if stale:
             open_issues.append({"key": "bronze_loose", "text": f"{len(stale)} loose Bronze file(s) older than 14 days"})
@@ -179,6 +214,9 @@ def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_
         if problem is not None:
             open_issues.append({"key": "backup", "text": problem})
         severity = "HOLIDAY_SKIP"
+    stale_backup = _backup_stale_issue(_backup_status_path(root), moment, policy)
+    if stale_backup is not None:
+        open_issues.append(stale_backup)
     if open_issues:
         subject = f"kse 일일 감사 경고 {len(open_issues)}건: " + ", ".join(item["key"] for item in open_issues)
     elif day_kind == "closed":
@@ -194,6 +232,7 @@ def run_daily_audit(data_root: Path, *, today: date, now: datetime, undelivered_
         "snapshot_date": today.isoformat(),
         "undelivered_alerts": queued,
         "open_issues": open_issues,
+        "critical_incidents": [kind.value for kind in audit_incidents(open_issues, policy)],
     }
     target = _heartbeat_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
