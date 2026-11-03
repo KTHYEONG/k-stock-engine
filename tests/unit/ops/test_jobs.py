@@ -493,6 +493,12 @@ def test_audit_and_weekly_report_commands(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(
         jobs, "run_daily_audit", lambda root, **kwargs: {"severity": "WARNING", "open_issues": [{"key": "x"}]}
     )
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    monkeypatch.setattr(
+        jobs, "run_daily_audit",
+        lambda root, **kwargs: {"severity": "WARNING", "open_issues": [{"key": "events"}],
+                                "critical_incidents": ["events_unreadable"], "day_kind": "trading"},
+    )
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
     assert weekly_report(tmp_path, today=DAY, now=_morning_now()) == 0
     target = tmp_path / "ops" / "reports" / "weekly-2026-10-08.json"
@@ -518,7 +524,9 @@ def test_main_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert main(["--data-root", str(tmp_path), "audit"]) == 0
     monkeypatch.setattr(jobs, "weekly_report", lambda root, **kwargs: seen.append("weekly-report") or 0)
     assert main(["--data-root", str(tmp_path), "weekly-report"]) == 0
-    assert seen == ["collect-eve", "morning", "morning-late", "backup", "audit", "weekly-report"]
+    monkeypatch.setattr(jobs, "alert_drain", lambda root, **kwargs: seen.append("alert-drain") or 0)
+    assert main(["--data-root", str(tmp_path), "alert-drain"]) == 0
+    assert seen == ["collect-eve", "morning", "morning-late", "backup", "audit", "weekly-report", "alert-drain"]
     assert jobs._as_int(3) == 3
     assert jobs._as_int(True) == 0
     assert jobs._as_int("x") == 0
@@ -616,16 +624,19 @@ class _AlertRecorder:
         self.calls.append((subject, body))
 
 
+_REAL_ALERT_SENDER = jobs._alert_sender
+
+
 def _alert_sender(monkeypatch: pytest.MonkeyPatch, sender: object | None) -> None:
     monkeypatch.setattr(jobs, "_alert_sender", lambda: (sender, frozenset()))
 
 
-def _write_backup_status(root: Path, *, stale: bool = False) -> None:
+def _write_backup_status(root: Path, *, stale: bool = False, hours: float | None = None) -> None:
     from zoneinfo import ZoneInfo as _Zone
 
     target = root / "state" / "lake_backup_status.json"
     target.parent.mkdir(parents=True, exist_ok=True)
-    age = timedelta(hours=30.0) if stale else timedelta(hours=1.0)
+    age = timedelta(hours=hours) if hours is not None else timedelta(hours=30.0) if stale else timedelta(hours=1.0)
     finished = (_morning_now() - age).astimezone(_Zone("UTC"))
     target.write_text(json.dumps({"finished_at": finished.isoformat(), "rc": 0,
                                   "last_ok_at": finished.isoformat(), "sources": {}}))
@@ -646,165 +657,200 @@ def _healthy_audit_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     _write_backup_status(tmp_path)
 
 
-def test_alert_command_exit_semantics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _alert(root: Path, unit: str, now: datetime | None = None, journal_tail: str = "boom") -> int:
+    return jobs.alert(root, unit=unit, result="exit-code", exit_status="1", journal_tail=journal_tail,
+                      now=now or _morning_now())
+
+
+def _failures(root: Path) -> list[dict[str, object]]:
+    from src.ops.alert_policy import FAILURE_LEDGER_RELPATH
+
+    path = root / FAILURE_LEDGER_RELPATH
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def _outbox(root: Path) -> list[Path]:
+    return sorted((root / "ops" / "alerts" / "outbox").glob("*.json"))
+
+
+@pytest.mark.parametrize("unit", [
+    "kse-backup.service", "kse-collect-eve.service", "kse-collect-dbsec.service", "kse-auction-open.service",
+    "kse-weekly-report.service", "kse-daily-audit.service", "kse-morning.service", "kse-alert-drain.service",
+])
+def test_silent_unit_failure_is_recorded_not_mailed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit: str,
+) -> None:
     sender = _AlertRecorder()
     _alert_sender(monkeypatch, sender)
-    assert jobs.alert(tmp_path, unit="kse-backup.service", result="exit-code", exit_status="1",
-                       journal_tail="boom", now=_morning_now()) == 0
-    assert sender.calls[0][0] == "[kse][실패] kse-backup.service"
-    assert jobs.alert(tmp_path, unit="kse-backup.service", result="exit-code", exit_status="1",
-                       journal_tail="boom", now=_morning_now()) == 0
-    assert len(sender.calls) == 1
-
+    assert _alert(tmp_path, unit) == 0
     _alert_sender(monkeypatch, None)
-    assert jobs.alert(tmp_path / "no-creds", unit="kse-backup.service", result="exit-code",
-                       exit_status="1", journal_tail="boom", now=_morning_now()) == 1
-    assert len(list((tmp_path / "no-creds" / "ops" / "alerts" / "outbox").glob("*.json"))) == 1
+    assert _alert(tmp_path, unit) == 0
+    assert sender.calls == []
+    assert _outbox(tmp_path) == []
+    assert [item["unit"] for item in _failures(tmp_path)] == [unit, unit]
+    assert _failures(tmp_path)[0]["cause"] == "boom"
 
 
-def test_alert_recovery_drains_without_duplicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.ops.alerts import count_undelivered
+def test_morning_late_failure_pages_three_lines_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import IncidentKind, load_open_incidents
 
-    _alert_sender(monkeypatch, None)
-    kwargs = {"unit": "kse-backup.service", "result": "failed", "exit_status": "1", "journal_tail": "tail"}
-    assert jobs.alert(tmp_path, now=_morning_now(), **kwargs) == 1
     sender = _AlertRecorder()
     _alert_sender(monkeypatch, sender)
-    assert jobs.alert(tmp_path, now=_morning_now() + timedelta(minutes=1), **kwargs) == 0
+    assert _alert(tmp_path, "kse-morning-late.service") == 0
+    assert _alert(tmp_path, "kse-morning-late.service", now=_morning_now() + timedelta(hours=1)) == 0
     assert len(sender.calls) == 1
-    assert count_undelivered(tmp_path / "ops" / "alerts") == 0
+    subject, body = sender.calls[0]
+    assert subject == "[긴급][kse] 장전 매매 결정 미봉인"
+    assert [line.split(": ", 1)[0] for line in body.split("\n")] == ["무슨 일", "자동 조치", "지금 할 일"]
+    assert "boom" not in body
+    assert load_open_incidents(tmp_path) == {IncidentKind.NO_SEAL: DAY.isoformat()}
 
 
-def test_alert_redacts_the_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import src.ops.alerts as alerts_mod
-
+def test_only_a_queued_critical_page_fails_the_alert_unit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _alert_sender(monkeypatch, None)
+    assert _alert(tmp_path, "kse-morning.service") == 0
+    assert _alert(tmp_path, "kse-morning-late.service") == 1
+    assert len(_outbox(tmp_path)) == 1
     sender = _AlertRecorder()
-    secret = "hunter22-secret-value"
-    monkeypatch.setenv("ALERT_GMAIL_APP_PASSWORD", secret)
-    monkeypatch.setattr(alerts_mod, "sender_from_env", lambda: sender)
-    assert jobs.alert(tmp_path, unit="kse-morning.service", result="failed", exit_status="1",
-                       journal_tail="x" * 290 + f" leak {secret}", now=_morning_now()) == 0
-    assert secret not in sender.calls[0][1]
-    assert "hunter22" not in sender.calls[0][1]
-    assert "***" in sender.calls[0][1]
+    _alert_sender(monkeypatch, sender)
+    assert _alert(tmp_path, "kse-morning-late.service", now=_morning_now() + timedelta(minutes=1)) == 0
+    assert len(sender.calls) == 1
+    assert _outbox(tmp_path) == []
 
 
-def test_alert_audit_unit_carries_issues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_third_consecutive_failure_escalates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    unit = "kse-collect-dbsec.service"
+    for offset in (2, 1):
+        assert _alert(tmp_path, unit, now=_morning_now() - timedelta(days=offset)) == 0
+    assert sender.calls == []
+    assert _alert(tmp_path, unit) == 0
+    assert sender.calls[0][0] == "[긴급][kse] DB증권 수집 3거래일 연속 실패"
+
+
+def test_audit_unit_failure_pages_only_today_critical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
 
     sender = _AlertRecorder()
     _alert_sender(monkeypatch, sender)
     target = tmp_path / AUDIT_HEARTBEAT_RELPATH
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"open_issues": [{"key": "backup", "text": "backup is older than 26 h"}]}))
-    assert jobs.alert(tmp_path, unit="kse-daily-audit.service", result="failed", exit_status="1",
-                       journal_tail="tail", now=_morning_now()) == 0
-    assert "• 미해결 이슈(1): backup: backup is older than 26 h" in sender.calls[0][1]
-    sender.calls.clear()
-    (tmp_path / "ops" / "alerts" / "sent.jsonl").unlink(missing_ok=True)
-    def _unexpected_read(root: Path) -> list[dict[str, str]]:
-        pytest.fail("non-audit alert must not read the heartbeat")
-
-    monkeypatch.setattr(jobs, "_heartbeat_open_issues", _unexpected_read)
-    assert jobs.alert(tmp_path, unit="kse-morning.service", result="failed", exit_status="1",
-                       journal_tail="tail", now=_morning_now()) == 0
-    assert "backup is older than 26 h" not in sender.calls[0][1]
-    assert not (tmp_path / "ops" / "events").exists()
-
-
-def test_audit_warning_delivered_exits_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import src.ops.audit as audit_mod
-    from src.ops.run_outcome import record_run_outcome
-
-    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
-    monkeypatch.setattr("src.research.operate.read_chain",
-                        lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
-                                                      execution_session=DAY,
-                                                      sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
-        record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
-    _write_backup_status(tmp_path, stale=True)
-    sender = _AlertRecorder()
-    _alert_sender(monkeypatch, sender)
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert len(sender.calls) == 1
-    assert "backup" in sender.calls[0][1]
-
-
-def test_audit_warning_undeliverable_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import src.ops.audit as audit_mod
-    from src.ops.run_outcome import record_run_outcome
-
-    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
-    monkeypatch.setattr("src.research.operate.read_chain",
-                        lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
-                                                      execution_session=DAY,
-                                                      sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
-        record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
-    _write_backup_status(tmp_path, stale=True)
-    _alert_sender(monkeypatch, None)
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
-    assert len(list((tmp_path / "ops" / "alerts" / "outbox").glob("*.json"))) == 1
-    assert json.loads((tmp_path / "ops" / "heartbeat" / "daily_audit.json").read_text())["undelivered_alerts"] == 0
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
-    assert json.loads((tmp_path / "ops" / "heartbeat" / "daily_audit.json").read_text())["undelivered_alerts"] == 1
-
-
-def test_healthy_audit_stays_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _healthy_audit_state(tmp_path, monkeypatch)
-    sender = _AlertRecorder()
-    _alert_sender(monkeypatch, sender)
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    stale = json.dumps({"snapshot_date": "2026-10-07", "critical_incidents": ["backup_stale"]})
+    malformed = json.dumps({"snapshot_date": DAY.isoformat(), "critical_incidents": {}})
+    for payload in ("[1, 2]", "{", stale, malformed):
+        target.write_text(payload, encoding="utf-8")
+        assert _alert(tmp_path, "kse-daily-audit.service") == 0
     assert sender.calls == []
-    assert not (tmp_path / "ops" / "alerts" / "outbox").exists() or \
-        len(list((tmp_path / "ops" / "alerts" / "outbox").glob("*.json"))) == 0
+    target.write_text(json.dumps({"snapshot_date": DAY.isoformat(), "critical_incidents": ["backup_stale"]}))
+    assert _alert(tmp_path, "kse-daily-audit.service") == 0
+    assert sender.calls[0][0] == "[긴급][kse] 오프사이트 백업 2일 이상 중단"
 
 
-def test_repeat_audit_same_day_is_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import src.ops.audit as audit_mod
-    from src.ops.run_outcome import record_run_outcome
+def test_alert_redacts_the_failure_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.ops.alerts as alerts_mod
 
-    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
-    monkeypatch.setattr("src.research.operate.read_chain",
-                        lambda path: (SimpleNamespace(data_session=DAY - timedelta(days=1),
-                                                      execution_session=DAY,
-                                                      sealed_at=datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ)),))
-    for job_name in ("collect_eve", "collect_dbsec", "morning", "auction_open"):
-        record_run_outcome(tmp_path / "ops" / "events", job_name, "OK", run_date=DAY, now=_morning_now())
-    _write_backup_status(tmp_path, stale=True)
-    sender = _AlertRecorder()
-    _alert_sender(monkeypatch, sender)
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert len(sender.calls) == 1
+    secret = "hunter22-secret-value"
+    monkeypatch.setenv("ALERT_GMAIL_APP_PASSWORD", secret)
+    monkeypatch.setattr(alerts_mod, "sender_from_env", lambda: _AlertRecorder())
+    assert _alert(tmp_path, "kse-backup.service", journal_tail="x" * 290 + f" leak {secret}") == 0
+    stored = json.dumps(_failures(tmp_path))
+    assert "hunter22" not in stored
 
 
-def test_holiday_backup_issue_alerts_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import src.ops.audit as audit_mod
-
-    monkeypatch.setattr(audit_mod, "trading_day", lambda day: False)
-    _write_backup_status(tmp_path, stale=True)
-    sender = _AlertRecorder()
-    _alert_sender(monkeypatch, sender)
-    assert audit(tmp_path, today=date(2026, 10, 10), now=_morning_now()) == 0
-    assert len(sender.calls) == 1
-    assert "backup" in sender.calls[0][1]
-
-
-def test_audit_recovery_counts_after_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_audit_silent_for_noncritical_issues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
 
     _healthy_audit_state(tmp_path, monkeypatch)
     _write_backup_status(tmp_path, stale=True)
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, None)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    _alert_sender(monkeypatch, sender)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert sender.calls == []
+    assert _outbox(tmp_path) == []
+    heartbeat = json.loads((tmp_path / AUDIT_HEARTBEAT_RELPATH).read_text())
+    assert [item["key"] for item in heartbeat["open_issues"]] == ["backup"]
+    assert heartbeat["critical_incidents"] == []
+
+
+def test_audit_pages_stale_backup_once_then_announces_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.ops.alert_policy import load_open_incidents
+
+    _healthy_audit_state(tmp_path, monkeypatch)
+    _write_backup_status(tmp_path, hours=72.0)
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [subject for subject, _ in sender.calls] == ["[긴급][kse] 오프사이트 백업 2일 이상 중단"]
+    _write_backup_status(tmp_path)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert sender.calls[-1] == ("[해결][kse] 오프사이트 백업 2일 이상 중단", "해결됨: 오프사이트 백업 2일 이상 중단")
+    assert load_open_incidents(tmp_path) == {}
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert len(sender.calls) == 2
+
+
+def test_audit_page_undeliverable_exits_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
+
+    _healthy_audit_state(tmp_path, monkeypatch)
+    _write_backup_status(tmp_path, hours=72.0)
     _alert_sender(monkeypatch, None)
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert len(_outbox(tmp_path)) == 1
+    assert json.loads((tmp_path / AUDIT_HEARTBEAT_RELPATH).read_text())["undelivered_alerts"] == 0
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 1
+    assert json.loads((tmp_path / AUDIT_HEARTBEAT_RELPATH).read_text())["undelivered_alerts"] == 1
     sender = _AlertRecorder()
     _alert_sender(monkeypatch, sender)
     assert audit(tmp_path, today=DAY, now=_morning_now() + timedelta(minutes=1)) == 0
     assert len(sender.calls) == 1
-    assert "backup is older than 26 h" in sender.calls[0][1]
     assert json.loads((tmp_path / AUDIT_HEARTBEAT_RELPATH).read_text())["undelivered_alerts"] == 0
+
+
+def test_unit_and_audit_share_one_incident_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_audit_state(tmp_path, monkeypatch)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: ())
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    assert _alert(tmp_path, "kse-morning-late.service") == 0
+    assert audit(tmp_path, today=DAY, now=_morning_now() + timedelta(hours=13)) == 0
+    assert [subject for subject, _ in sender.calls] == ["[긴급][kse] 장전 매매 결정 미봉인"]
+
+
+def test_closed_day_audit_resolves_only_what_it_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.ops.audit as audit_mod
+    from src.ops.alert_policy import IncidentKind, load_open_incidents, save_open_incidents
+
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: False)
+    save_open_incidents(tmp_path, {IncidentKind.NO_SEAL: "2026-10-09"})
+    _write_backup_status(tmp_path, hours=72.0)
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    saturday = date(2026, 10, 10)
+    assert audit(tmp_path, today=saturday, now=_morning_now()) == 0
+    assert [subject for subject, _ in sender.calls] == ["[긴급][kse] 오프사이트 백업 2일 이상 중단"]
+    _write_backup_status(tmp_path)
+    assert audit(tmp_path, today=saturday, now=_morning_now()) == 0
+    assert sender.calls[-1][0] == "[해결][kse] 오프사이트 백업 2일 이상 중단"
+    assert load_open_incidents(tmp_path) == {IncidentKind.NO_SEAL: "2026-10-09"}
+
+
+def test_alert_drain_delivers_without_new_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _alert_sender(monkeypatch, None)
+    assert _alert(tmp_path, "kse-morning-late.service") == 1
+    assert jobs.alert_drain(tmp_path, now=_morning_now()) == 0
+    assert len(_outbox(tmp_path)) == 1
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    assert jobs.alert_drain(tmp_path, now=_morning_now() + timedelta(minutes=15)) == 0
+    assert len(sender.calls) == 1
+    assert _outbox(tmp_path) == []
 
 
 def test_alert_cli_reads_stdin_with_byte_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -841,51 +887,51 @@ def test_alert_cli_reads_stdin_with_byte_cap(tmp_path: Path, monkeypatch: pytest
 
 def test_alert_best_effort_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import src.ops.alerts as alerts_mod
-    from src.ops.audit import AUDIT_HEARTBEAT_RELPATH
+    from src.ops.alert_policy import FAILURE_LEDGER_RELPATH, INCIDENT_STATE_RELPATH
 
-    real_sender = jobs._alert_sender
     sender = _AlertRecorder()
     _alert_sender(monkeypatch, sender)
-    assert jobs.alert(tmp_path, unit="kse-daily-audit.service", result="failed", exit_status="1",
-                       journal_tail="tail", now=_morning_now()) == 0
-    assert "open issues" not in sender.calls[0][1]
-
-    target = tmp_path / AUDIT_HEARTBEAT_RELPATH
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("[1, 2]", encoding="utf-8")
-    sender.calls.clear()
-    (tmp_path / "ops" / "alerts" / "sent.jsonl").unlink(missing_ok=True)
-    assert jobs.alert(tmp_path, unit="kse-daily-audit.service", result="failed", exit_status="1",
-                       journal_tail="tail", now=_morning_now()) == 0
-    target.write_text(json.dumps({"open_issues": {}}), encoding="utf-8")
-    sender.calls.clear()
-    (tmp_path / "ops" / "alerts" / "sent.jsonl").unlink(missing_ok=True)
-    assert jobs.alert(tmp_path, unit="kse-daily-audit.service", result="failed", exit_status="1",
-                       journal_tail="tail", now=_morning_now()) == 0
+    (tmp_path / FAILURE_LEDGER_RELPATH).mkdir(parents=True)
+    (tmp_path / INCIDENT_STATE_RELPATH).mkdir(parents=True)
+    assert _alert(tmp_path, "kse-morning-late.service") == 0
+    assert len(sender.calls) == 1
 
     def _boom_secrets(environ: object) -> frozenset[str]:
         raise RuntimeError("env gone")
 
-    monkeypatch.setattr(jobs, "_alert_sender", real_sender)
+    monkeypatch.setattr(jobs, "_alert_sender", _REAL_ALERT_SENDER)
     monkeypatch.setattr(alerts_mod, "sender_from_env", lambda: sender)
     monkeypatch.setattr(alerts_mod, "collect_secret_values", _boom_secrets)
     sender.calls.clear()
     with pytest.raises(RuntimeError, match="env gone"):
-        jobs.alert(tmp_path / "delegated", unit="kse-morning.service", result="failed",
-                   exit_status="1", journal_tail="sensitive journal", now=_morning_now())
+        _alert(tmp_path / "delegated", "kse-morning-late.service", journal_tail="sensitive journal")
     assert sender.calls == []
     assert not (tmp_path / "delegated" / "ops" / "alerts").exists()
 
     def _boom_drain(**kwargs: object) -> int:
         raise OSError("drain gone")
 
-    monkeypatch.setattr(alerts_mod, "sender_from_env", lambda *a, **k: sender)
     monkeypatch.setattr(alerts_mod, "collect_secret_values", lambda environ: frozenset())
     monkeypatch.setattr(alerts_mod, "drain_outbox", _boom_drain)
-    sender.calls.clear()
-    assert jobs.alert(tmp_path / "drain-fail", unit="kse-morning.service", result="failed",
-                       exit_status="1", journal_tail="tail", now=_morning_now()) == 0
+    assert _alert(tmp_path / "drain-fail", "kse-morning-late.service") == 0
     assert len(sender.calls) == 1
+
+
+def test_audit_resolution_state_write_failure_is_nonfatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.ops.alert_policy as policy_mod
+    from src.ops.alert_policy import IncidentKind, save_open_incidents
+
+    _healthy_audit_state(tmp_path, monkeypatch)
+    save_open_incidents(tmp_path, {IncidentKind.BACKUP_STALE: "2026-10-07"})
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+
+    def _ro(root: Path, incidents: object) -> None:
+        raise OSError("ro")
+
+    monkeypatch.setattr(policy_mod, "save_open_incidents", _ro)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert sender.calls == [("[해결][kse] 오프사이트 백업 2일 이상 중단", "해결됨: 오프사이트 백업 2일 이상 중단")]
 
 
 def _collect_report(blocking: str | None, degraded: tuple[str, ...]) -> SimpleNamespace:

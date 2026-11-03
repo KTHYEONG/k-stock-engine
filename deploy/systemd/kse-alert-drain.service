@@ -1,0 +1,13 @@
+[Unit]
+Description=KSE queued alert re-delivery (runs only when the outbox is non-empty)
+OnFailure=kse-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=5min
+# Exit 1 skips the run without a container, so the frequent timer costs nothing while the outbox is empty.
+ExecCondition=/bin/sh -c 'for f in %h/k-stock-engine/data/ops/alerts/outbox/*.json; do [ -e "$$f" ] && exit 0; done; exit 1'
+ExecStart=%h/.local/lib/kse/kse-run alert-drain
+ExecStopPost=-/usr/bin/docker rm -f kse-alert-drain

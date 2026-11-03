@@ -1,5 +1,5 @@
 [Unit]
-Description=KSE late morning seal (operator-triggered, no timer)
+Description=KSE late morning seal (auto-started on kse-morning failure or by the operator, no timer)
 OnFailure=kse-alert@%n.service
 
 [Service]
