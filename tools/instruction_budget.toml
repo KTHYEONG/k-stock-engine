@@ -1,0 +1,109 @@
+agents_file = "AGENTS.md"
+rules_dir = ".agents/rules"
+agents_max_lines = 100
+always_loaded_max_bytes = 6000
+scoped_rules_max_bytes = 12000
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Zero Lookahead"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Perturbation Invariance"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Historical Universe Reconstruction"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Net Friction Integrity"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Zero Magic Numbers"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Conservation Law"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Deterministic Fail-Closed"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Strict Out-of-Sample Isolation"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Statistical Humility"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[SYS]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[DATA]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[ALGO]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[PORTFOLIO]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[RISK]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "[EXEC]"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "Strict Credential Redaction"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Process-Isolated Temp Workspaces"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Hermetic Environment Invariant"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Test Integrity"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Diff-Coverage"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Strict Temporal Causality"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Integer Accounting Conservation"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "16,000 req/day"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "`core` -> `backtest`"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "scratch/"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Core Quant Invariants"

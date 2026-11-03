@@ -1,20 +1,20 @@
+---
+paths:
+  - "src/**"
+---
 # Performance & Optimization Directives (Physical Invariants)
 
-> **Performance is an architectural invariant, not an afterthought. Never fake speed by silently truncating date ranges, universe constituents, or numerical precision. Correctness strictly precedes speed. Maximize hardware throughput within four physical boundaries.**
+> **Performance is an architectural invariant: never fake speed by truncating date ranges, universe constituents, or precision; correctness precedes speed.**
 
-## 1. Bounded Resource Scaling & Memory Discipline
-- **Bounded Resource Scaling:** Memory consumption must remain safely bounded within available host physical RAM. Select data structures and processing patterns whose memory footprint scales predictably with workload size; prevent unconstrained accumulation of intermediate state.
-- **Eliminate Unnecessary Duplication:** Eliminate redundant in-memory data copies, intermediate full-collection materializations, and unneeded conversions. Prefer views, zero-copy operations, or memory-efficient formats when handling substantial datasets.
-- **Deterministic Resource Reclamation:** Heavy memory buffers, file descriptors, network connections, and worker pools must be deterministically released or closed when exiting their operational scope.
+## 1. Memory Discipline
+- **Bounded Resource Scaling:** Keep memory safely within host physical RAM, scaling predictably with workload; never accumulate intermediate state unboundedly.
 
-## 2. Algorithmic Locality & Hot Path Efficiency
-- **Hot Path Algorithmic Efficiency:** In computationally intensive loops or hot iteration paths, eliminate nested linear scans and repetitive collection filtering ($O(N^2)$ pitfalls). Use pre-indexed structures, hashing, grouping, or cursor positioning where lookup frequency is high.
-- **I/O Locality & Pushdown:** Prohibit repetitive text parsing or deserialization in hot computational paths. Leverage efficient binary or columnar storage with column pruning and predicate pushdown for substantial data I/O.
+## 2. Locality & Hot Paths
+- **I/O Locality & Pushdown:** No repeated text parsing or deserialization in hot paths; prefer binary or columnar storage with column pruning and predicate pushdown.
 
-## 3. Separation of Invariant Features and Dynamic State
-- **One-Pass Invariant Materialization:** Where compute scale warrants and working memory budgets permit, compute state-independent features and indicators once upstream across the historical timeline. For massive datasets exceeding comfortable in-memory working sets, process in bounded chronological chunks.
-- **Minimal Hot Paths:** Confine inner sequential iteration strictly to state-dependent transitions. Never recompute static or historical invariants inside simulation loops or across optimization folds.
+## 3. Invariant Features vs. Dynamic State
+- **One-Pass Invariant Materialization & Minimal Hot Paths:** Compute state-independent features once upstream (chunked chronologically when data exceeds the working set); keep inner loops to state-dependent transitions, never recomputing historical invariants inside simulation loops or optimization folds.
 
-## 4. Hardware Saturation & Observable Throughput
-- **Balanced Parallelism:** When verified compute bottlenecks exist on parallelizable workloads, saturate available CPU cores while ensuring compute granularity heavily amortizes inter-process communication (IPC) overhead. Avoid unnecessary multiprocessing setup for lightweight operations.
-- **Continuous Progress Telemetry:** Long-running workloads must emit deterministic progress heartbeats. A silent pipeline is indistinguishable from a deadlocked system.
+## 4. Parallelism & Telemetry
+- **Balanced Parallelism:** After a parallelizable bottleneck is verified, saturate cores with coarse granularity that amortizes IPC; skip multiprocessing for lightweight work.
+- **Continuous Progress Telemetry:** Long-running workloads emit deterministic progress heartbeats; a silent pipeline looks like a deadlock.

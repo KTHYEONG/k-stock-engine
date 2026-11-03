@@ -1,0 +1,6 @@
+forbidden_force_push_flags = ["--force", "-f", "--force-with-lease", "--mirror"]
+coarse_risk_pattern = '\b(rm|git\s+push)\b'
+forbidden_staged_prefixes = ["scratch/", "tmp/", "docs/specs/"]
+forbidden_name_globs = [".env", ".env.*", ".envrc", "*.pem", "*.key"]
+allowed_staged_names = [".gitkeep"]
+max_staged_bytes = 5000000
