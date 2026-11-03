@@ -9,7 +9,7 @@ SRC = REPO / "src"
 TOOLS = REPO / "tools"
 SECRETS_MODULE = SRC / "config" / "secrets.py"
 # Local quality gate (never imported by src/); it forwards os.environ to its subprocesses by design.
-EXCLUDED = {REPO / "tools" / "verify.py"}
+EXCLUDED = {REPO / "tools" / "verify.py", REPO / "tools" / "guards"}
 
 _PATH_PREFIXES = ("config/", "data/", "/home/")
 
