@@ -14,12 +14,11 @@ from src.ops.alerts import (
     AlertMessage,
     DispatchOutcome,
     GmailSender,
-    build_audit_summary,
-    build_unit_failure,
     collect_secret_values,
     count_undelivered,
     dispatch,
     drain_outbox,
+    failure_cause,
     redact,
     sender_from_env,
 )
@@ -29,6 +28,17 @@ KRX_TZ = ZoneInfo("Asia/Seoul")
 
 def _now() -> datetime:
     return datetime(2026, 10, 8, 10, 0, tzinfo=KRX_TZ)
+
+
+def build_unit_failure(
+    unit: str, *, result: str, exit_status: str, journal_tail: str, now: datetime,
+) -> AlertMessage:
+    moment = now if now.tzinfo is not None else now.replace(tzinfo=KRX_TZ)
+    return AlertMessage(
+        subject=f"[kse][실패] {unit}",
+        body=f"{result} {exit_status} {failure_cause(journal_tail)}",
+        key=f"unit|{unit}|{moment.astimezone(KRX_TZ).date().isoformat()}",
+    )
 
 
 class _Recording:
@@ -72,31 +82,12 @@ class _Flaky:
             raise OSError("boom")
 
 
-def test_unit_failure_subject_and_hint() -> None:
-    message = build_unit_failure(
-        "kse-backup.service", result="failed", exit_status="1",
-        journal_tail="line1\nline2", now=_now(),
-    )
-    assert message.subject == "[kse][실패] kse-backup.service"
-    assert message.body.splitlines() == [
-        "• 무엇: kse-backup.service 실패 (Result failed, exit 1)",
-        "• 언제: 2026-10-08T10:00:00+09:00",
-        "• 원인: line2",
-        "• 증거: journalctl --user -u kse-backup.service -n 200 --no-pager · ~/k-stock-engine/logs",
-    ]
-    assert message.key == "unit|kse-backup.service|2026-10-08"
-
-
-def test_journal_tail_never_dumped_and_cause_bounded() -> None:
+def test_failure_cause_is_bounded_single_line() -> None:
     tail = "\n".join(f"L{i:05d}-" + "x" * 1000 for i in range(500))
-    message = build_unit_failure(
-        "u.service", result="failed", exit_status="1", journal_tail=tail, now=_now(),
-    )
-    assert len(message.body.splitlines()) == 4
-    assert "L00498-" not in message.body
-    cause = message.body.splitlines()[2]
-    assert cause.startswith("• 원인: L00499-")
-    assert len(cause) <= len("• 원인: ") + 300
+    cause = failure_cause(tail)
+    assert cause.startswith("L00499-")
+    assert len(cause) == 300
+    assert "\n" not in cause
 
 
 def test_cause_prefers_last_error_line_over_trailing_noise() -> None:
@@ -107,14 +98,11 @@ def test_cause_prefers_last_error_line_over_trailing_noise() -> None:
         "kse-backup.service: Main process exited, code=exited, status=1/FAILURE",
         "   ",
     ])
-    message = build_unit_failure("u.service", result="exit-code", exit_status="1", journal_tail=tail, now=_now())
-    assert "• 원인: kse-backup.service: Main process exited, code=exited, status=1/FAILURE" in message.body
-    quiet = build_unit_failure("u.service", result="exit-code", exit_status="1",
-                               journal_tail="a\nValueError: boom\nbye", now=_now())
-    assert "• 원인: ValueError: boom" in quiet.body
-    plain = build_unit_failure("u.service", result="exit-code", exit_status="1",
-                               journal_tail="a\nlast words", now=_now())
-    assert "• 원인: last words" in plain.body
+    assert failure_cause(tail) == "kse-backup.service: Main process exited, code=exited, status=1/FAILURE"
+    assert failure_cause("a\nValueError: boom\nbye") == "ValueError: boom"
+    assert failure_cause("a\nlast words") == "last words"
+    assert failure_cause("") == "(no journal output)"
+    assert "\x00" not in failure_cause("a\x00b\x1f\x7f")
 
 
 def test_secrets_never_survive(tmp_path: Path) -> None:
@@ -172,53 +160,17 @@ def test_collect_secret_values() -> None:
     assert mixed == frozenset()
 
 
-def test_audit_summary_lists_issues() -> None:
-    heartbeat = {
-        "subject": "kse 일일 감사 경고 2건: backup, morning",
-        "severity": "WARNING",
-        "day_kind": "trading",
-        "snapshot_date": "2026-10-08",
-        "open_issues": [
-            {"key": "backup", "text": "backup is older than 26 h"},
-            {"key": "morning", "text": "no outcome for morning"},
-        ],
-    }
-    message = build_audit_summary(heartbeat)
-    assert message is not None
-    assert message.subject == "[kse][경고] 일일 감사 경고 2건: backup, morning"
-    assert message.body.splitlines() == [
-        "• 무엇: 일일 감사 WARNING — 미해결 2건",
-        "• 언제: 2026-10-08 (trading)",
-        "• 원인: backup: backup is older than 26 h; morning: no outcome for morning",
-        "• 증거: ~/k-stock-engine/data/ops/heartbeat/daily_audit.json",
-    ]
-    assert message.key == "audit|2026-10-08|backup,morning"
+@pytest.mark.parametrize("subject", ["[kse] x", "[긴급][kse] 요약", "[해결][kse] 요약"])
+def test_tagged_subjects_keep_their_tag(tmp_path: Path, subject: str) -> None:
+    sender = _Recording()
+    dispatch(AlertMessage(subject=subject, body="b", key=subject), sender=sender, alerts_dir=tmp_path, now=_now())
+    assert sender.calls[0][0] == subject
 
 
-def test_healthy_audit_sends_nothing() -> None:
-    base = {"subject": "kse 일일 감사 정상", "day_kind": "trading", "snapshot_date": "2026-10-08",
-            "open_issues": []}
-    assert build_audit_summary({**base, "severity": "OK"}) is None
-    assert build_audit_summary({**base, "severity": "HOLIDAY_SKIP"}) is None
-
-
-def test_holiday_skip_with_issue_still_alerts() -> None:
-    message = build_audit_summary({
-        "subject": "kse 일일 감사 경고 1건: backup", "severity": "HOLIDAY_SKIP",
-        "day_kind": "closed", "snapshot_date": "2026-10-10",
-        "open_issues": [{"key": "backup", "text": "backup is older than 26 h"}],
-    })
-    assert message is not None
-    assert message.subject.startswith("[kse][경고] ")
-
-
-def test_audit_missing_issues_and_subject_edge() -> None:
-    assert build_audit_summary({"severity": "WARNING", "snapshot_date": "d"}) is not None
-    message = build_audit_summary({"severity": "WARNING", "snapshot_date": "d", "subject": ""})
-    assert message is not None
-    assert message.subject == "[kse][경고] 일일 감사 WARNING"
-    assert "• 원인: (이슈 목록 없음)" in message.body
-    assert build_audit_summary({"severity": "OK"}) is None
+def test_untagged_subject_gets_kse_tag(tmp_path: Path) -> None:
+    sender = _Recording()
+    dispatch(AlertMessage(subject="plain", body="b", key="k"), sender=sender, alerts_dir=tmp_path, now=_now())
+    assert sender.calls[0][0] == "[kse] plain"
 
 
 def test_same_cause_sent_once_per_day(tmp_path: Path) -> None:
@@ -338,17 +290,6 @@ def test_retry_then_success_and_ledger_failure(tmp_path: Path) -> None:
 
 def test_edge_journal_and_naive_now(tmp_path: Path) -> None:
     naive = datetime(2026, 10, 8, 10, 0)
-    message = build_unit_failure(
-        "u.service", result="failed", exit_status="1", journal_tail="",
-        now=naive, open_issues=[{"key": "backup", "text": "old"}],
-    )
-    assert "(no journal output)" in message.body
-    assert "• 미해결 이슈(1): backup: old" in message.body
-    assert message.key == "unit|u.service|2026-10-08"
-    ctrl = build_unit_failure(
-        "u.service", result="failed", exit_status="1", journal_tail="a\x00b\x1f\x7f",
-        now=naive)
-    assert "\x00" not in ctrl.body
     long_subject = AlertMessage(subject="s\nline2 " + "y" * 200, body="b", key="k")
     outcome = dispatch(long_subject, sender=_Recording(), alerts_dir=tmp_path, now=naive)
     assert outcome == DispatchOutcome.SENT
@@ -544,11 +485,11 @@ def test_drain_negative_limit_does_not_send(tmp_path: Path) -> None:
 
 def test_journal_masks_credentials_before_line_cut() -> None:
     journal = "x" * 280 + ' APP_PASSWORD="abcd efgh ijkl mnop"\x7f\x85'
-    message = build_unit_failure("u.service", result="failed", exit_status="1", journal_tail=journal, now=_now())
-    assert "abcd" not in message.body
-    assert "efgh" not in message.body
-    assert "\x7f" not in message.body
-    assert "\x85" not in message.body
+    cause = failure_cause(redact(journal, ()))
+    assert "abcd" not in cause
+    assert "efgh" not in cause
+    assert "\x7f" not in cause
+    assert "\x85" not in cause
 
 
 def test_gmail_recipient_refusal_is_delivery_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

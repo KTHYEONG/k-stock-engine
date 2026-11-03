@@ -9,7 +9,7 @@ import os
 import re
 import smtplib
 import tempfile
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
@@ -26,12 +26,11 @@ __all__ = [
     "AlertSender",
     "DispatchOutcome",
     "GmailSender",
-    "build_audit_summary",
-    "build_unit_failure",
     "collect_secret_values",
     "count_undelivered",
     "dispatch",
     "drain_outbox",
+    "failure_cause",
     "redact",
     "sender_from_env",
 ]
@@ -45,10 +44,7 @@ _SUPPRESS_WINDOW: Final = timedelta(hours=24)
 _GMAIL_HOST: Final = "smtp.gmail.com"
 _GMAIL_PORT: Final = 465
 _CAUSE_MAX_CHARS: Final = 300
-_EVIDENCE_JOURNAL_LINES: Final = 200
-# Host-side evidence locations named in mail bodies; the alert container itself mounts neither path.
-_HOST_LOG_DIR: Final = "~/k-stock-engine/logs"
-_HOST_AUDIT_HEARTBEAT: Final = "~/k-stock-engine/data/ops/heartbeat/daily_audit.json"
+_SUBJECT_TAGS: Final = ("[kse]", "[긴급][kse]", "[해결][kse]")
 _CAUSE_RE: Final = re.compile(r"(Error|Exception|Traceback|CRITICAL|FATAL|FAIL)", re.IGNORECASE)
 
 _BEARER_RE: Final = re.compile(r"(Bearer\s+)[^\s\"'`,;}\]]+", re.IGNORECASE)
@@ -162,7 +158,7 @@ def _as_kst(now: datetime) -> datetime:
 
 def _normalize_subject(subject: str) -> str:
     single = _sanitize_line(" ".join(subject.split()))
-    if not single.startswith("[kse]"):
+    if not single.startswith(_SUBJECT_TAGS):
         single = "[kse] " + single
     return single[:_MAX_SUBJECT]
 
@@ -172,72 +168,14 @@ def _sanitize_line(line: str) -> str:
     return "".join(ch if ch == "\t" or category(ch) not in ("Cc", "Cs") else "?" for ch in cleaned)
 
 
-def _failure_cause(lines: Sequence[str]) -> str:
-    """Last error-looking journal line, else the last non-empty one."""
+def failure_cause(journal_tail: str) -> str:
+    """Last error-looking journal line, else the last non-empty one, sanitized and length-bounded."""
+    lines = [_sanitize_line(line) for line in journal_tail.splitlines()]
     stripped = [line.strip() for line in lines if line.strip()]
     if not stripped:
         return "(no journal output)"
     matches = [line for line in stripped if _CAUSE_RE.search(line)]
     return (matches[-1] if matches else stripped[-1])[:_CAUSE_MAX_CHARS]
-
-
-def build_unit_failure(
-    unit: str,
-    *,
-    result: str,
-    exit_status: str,
-    journal_tail: str,
-    now: datetime,
-    open_issues: Sequence[Mapping[str, str]] = (),
-) -> AlertMessage:
-    """Short failure card for one systemd unit; the journal stays on the host and is only pointed to."""
-    moment = _as_kst(now)
-    key = f"unit|{unit}|{moment.date().isoformat()}"
-    subject = _normalize_subject(redact(f"[kse][실패] {unit}", ()))
-    lines = [_sanitize_line(line) for line in redact(journal_tail, ()).splitlines()]
-    parts = [
-        f"• 무엇: {unit} 실패 (Result {result}, exit {exit_status})",
-        f"• 언제: {moment.isoformat(timespec='seconds')}",
-        f"• 원인: {_failure_cause(lines)}",
-    ]
-    if open_issues:
-        listed = "; ".join(f"{item.get('key', '')}: {item.get('text', '')}" for item in open_issues)
-        parts.append(f"• 미해결 이슈({len(open_issues)}): {listed}")
-    parts.append(
-        f"• 증거: journalctl --user -u {unit} -n {_EVIDENCE_JOURNAL_LINES} --no-pager · {_HOST_LOG_DIR}"
-    )
-    body = redact("\n".join(parts), ())[:_MAX_BODY]
-    return AlertMessage(subject=subject, body=body, key=key)
-
-
-def build_audit_summary(heartbeat: Mapping[str, object]) -> AlertMessage | None:
-    """Audit warning card with the open issue list; None when healthy."""
-    severity = str(heartbeat.get("severity", ""))
-    raw_issues = heartbeat.get("open_issues", [])
-    issues: list[Mapping[str, object]] = (
-        [item for item in raw_issues if isinstance(item, Mapping)] if isinstance(raw_issues, (list, tuple)) else []
-    )
-    if severity in ("OK", "HOLIDAY_SKIP") and not issues:
-        return None
-    raw_subject = str(heartbeat.get("subject", "")).strip()
-    if raw_subject[:4].lower() == "kse ":
-        raw_subject = raw_subject[4:].lstrip()
-    if not raw_subject:
-        raw_subject = f"일일 감사 {severity}"
-    subject = _normalize_subject(redact(f"[kse][경고] {raw_subject}", ()))
-    snapshot_date = str(heartbeat.get("snapshot_date", ""))
-    day_kind = str(heartbeat.get("day_kind", ""))
-    keys = sorted({str(item.get("key", "")) for item in issues})
-    key = f"audit|{snapshot_date}|{','.join(keys)}"
-    causes = "; ".join(f"{item.get('key', '')}: {item.get('text', '')}" for item in issues) or "(이슈 목록 없음)"
-    lines = [
-        f"• 무엇: 일일 감사 {severity} — 미해결 {len(issues)}건",
-        f"• 언제: {snapshot_date} ({day_kind})",
-        f"• 원인: {causes}",
-        f"• 증거: {_HOST_AUDIT_HEARTBEAT}",
-    ]
-    body = redact("\n".join(lines), ())[:_MAX_BODY]
-    return AlertMessage(subject=subject, body=body, key=key)
 
 
 def _ledger_path(alerts_dir: Path) -> Path:

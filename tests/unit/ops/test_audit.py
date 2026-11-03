@@ -76,6 +76,7 @@ def test_heartbeat_matches_dashboard_contract(
     assert heartbeat["snapshot_date"] == DAY.isoformat()
     assert heartbeat["undelivered_alerts"] == 0
     assert heartbeat["open_issues"] == []
+    assert heartbeat["critical_incidents"] == []
     assert isinstance(heartbeat["subject"], str)
     assert "경고" not in str(heartbeat["subject"])
     assert datetime.fromisoformat(str(heartbeat["finished_at"])).tzinfo is not None
@@ -280,3 +281,36 @@ def test_heartbeat_carries_undelivered_count(tmp_path: Path, monkeypatch: pytest
     assert run_daily_audit(tmp_path, today=DAY, now=_morning(), undelivered_alerts=2)["undelivered_alerts"] == 2
     assert run_daily_audit(tmp_path, today=DAY, now=_morning())["undelivered_alerts"] == 0
     assert run_daily_audit(tmp_path, today=DAY, now=_morning(), undelivered_alerts=-1)["undelivered_alerts"] == 0
+
+
+def test_backup_page_needs_two_days_not_26_hours(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: False)
+    saturday = date(2026, 10, 10)
+    _write_status(tmp_path, age_h=30.0)
+    heartbeat = run_daily_audit(tmp_path, today=saturday, now=_morning())
+    assert [item["key"] for item in heartbeat["open_issues"]] == ["backup"]
+    assert heartbeat["critical_incidents"] == []
+    _write_status(tmp_path, rc=1, age_h=48.0)
+    heartbeat = run_daily_audit(tmp_path, today=saturday, now=_morning())
+    assert [item["key"] for item in heartbeat["open_issues"]] == ["backup", "backup_stale"]
+    assert heartbeat["critical_incidents"] == ["backup_stale"]
+    _write_status(tmp_path, broken=True)
+    assert run_daily_audit(tmp_path, today=saturday, now=_morning())["critical_incidents"] == []
+    (tmp_path / "state" / "lake_backup_status.json").write_text("[]", encoding="utf-8")
+    assert run_daily_audit(tmp_path, today=saturday, now=_morning())["critical_incidents"] == []
+
+
+def test_failure_streak_becomes_critical_issue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import record_unit_failure
+
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (_decision(DAY, 8, 31),))
+    _record_all_ok(tmp_path, _morning())
+    _write_status(tmp_path)
+    for offset in (2, 1, 0):
+        record_unit_failure(tmp_path, unit="kse-auction-open.service", result="exit-code", exit_status="1",
+                            cause="c", now=_morning() - timedelta(days=offset))
+    record_run_outcome(tmp_path / "ops" / "events", "auction_open", "NO_DECISION", run_date=DAY, now=_morning())
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning())
+    assert {"key": "auction_open_streak", "text": "auction_open failed 3 consecutive run days"} in heartbeat["open_issues"]
+    assert heartbeat["critical_incidents"] == ["auction_open_streak"]

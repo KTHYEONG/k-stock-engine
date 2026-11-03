@@ -26,6 +26,7 @@ DRIVE_SLOTS = {(9, 15), (21, 0), (21, 30), (22, 15), (23, 30)}
 SIBLING_WINDOWS = [((8, 50), (9, 40)), ((15, 10), (15, 43))]
 UNIT_JOBS = {
     "kse-alert@.service": "alert",
+    "kse-alert-drain.service": "alert-drain",
     "kse-auction-open.service": "auction-open",
     "kse-backup.service": "backup",
     "kse-collect-dbsec.service": "collect-dbsec",
@@ -165,7 +166,9 @@ def test_effective_command_equivalent_to_legacy() -> None:
         uidgid = subprocess.run(["id", "-u"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         uidgid += ":" + subprocess.run(["id", "-g"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         assert len(json.loads(FIXTURE.read_text(encoding="utf-8"))) == 8
-        assert set(UNIT_JOBS) - set(json.loads(FIXTURE.read_text(encoding="utf-8"))) == {"kse-morning-late.service"}
+        assert set(UNIT_JOBS) - set(json.loads(FIXTURE.read_text(encoding="utf-8"))) == {
+        "kse-morning-late.service", "kse-alert-drain.service",
+    }
         for unit in UNIT_JOBS:
             if unit not in json.loads(FIXTURE.read_text(encoding="utf-8")):
                 continue
@@ -269,7 +272,7 @@ def test_swap_equals_memory_for_every_job() -> None:
 
 def test_units_carry_no_docker_flags() -> None:
     units = sorted(SYSTEMD.glob("kse-*.service"))
-    assert len(units) == 9
+    assert len(units) == 10
     for path in units:
         text = path.read_text(encoding="utf-8")
         assert "docker run" not in text, path.name
@@ -308,7 +311,7 @@ def test_mount_allowlist_on_effective_argv() -> None:
 def test_alert_credentials_reach_only_audit_and_alert_units() -> None:
     holders = sorted(unit for unit in UNIT_JOBS
                      if any("quant-secrets/kse-alert.env" in env for env in _normalize(_unit_effective(unit))["env_files"]))
-    assert holders == ["kse-alert@.service", "kse-daily-audit.service"]
+    assert holders == ["kse-alert-drain.service", "kse-alert@.service", "kse-daily-audit.service"]
     installer = INSTALLER.read_text(encoding="utf-8")
     assert 'touch "${HOME}/quant-secrets/kse-alert.env"' in installer
     assert 'chmod 600 "${HOME}/quant-secrets/kse-alert.env"' in installer
@@ -379,7 +382,7 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
             "import json, os, pathlib, sys\n"
             "home = pathlib.Path(os.environ['HOME'])\n"
             "assert (home / '.local/lib/kse/kse-run').stat().st_mode & 0o111\n"
-            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 9\n"
+            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 10\n"
             "with open(os.environ['EVENT_LOG'], 'a') as log:\n"
             "    log.write(json.dumps([pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')\n",
             encoding="utf-8",
@@ -431,9 +434,35 @@ def test_morning_late_profile_mirrors_morning_without_scheduling() -> None:
     assert not (SYSTEMD / "kse-morning-late.timer").exists()
 
 
+def test_morning_failure_starts_late_seal_automatically() -> None:
+    text = (SYSTEMD / "kse-morning.service").read_text(encoding="utf-8")
+    on_failure = [line.split("=", 1)[1].split() for line in text.splitlines() if line.startswith("OnFailure=")]
+    assert on_failure == [["kse-alert@%n.service", "kse-morning-late.service"]]
+    late = (SYSTEMD / "kse-morning-late.service").read_text(encoding="utf-8")
+    assert [line for line in late.splitlines() if line.startswith("OnFailure=")] == ["OnFailure=kse-alert@%n.service"]
+
+
+def test_alert_drain_runs_only_with_queued_mail() -> None:
+    text = (SYSTEMD / "kse-alert-drain.service").read_text(encoding="utf-8")
+    conditions = [line for line in text.splitlines() if line.startswith("ExecCondition=")]
+    assert conditions == [
+        "ExecCondition=/bin/sh -c 'for f in %h/k-stock-engine/data/ops/alerts/outbox/*.json; "
+        "do [ -e \"$$f\" ] && exit 0; done; exit 1'"
+    ]
+    norm = _normalize(_unit_effective("kse-alert-drain.service"))
+    assert norm["scalars"]["name"] == "kse-alert-drain"
+    assert norm["scalars"]["memory"] == "256m"
+    assert norm["stdin"] is False
+    assert not any("kis-data.env" in env for env in norm["env_files"])
+    assert norm["tail"][4:] == ["src.ops.jobs", "alert-drain"]
+    timer = (SYSTEMD / "kse-alert-drain.timer").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:00/15:00 Asia/Seoul" in timer
+    assert "Unit=kse-alert-drain.service" in timer
+
+
 def test_units_are_safe_by_construction() -> None:
     services = _services()
-    assert len(services) == 8
+    assert len(services) == 9
     with tempfile.TemporaryDirectory() as home:
         prefixes = (home + "/k-stock-engine/data:", home + "/k-stock-engine/logs:",
                     home + "/.cache/kis:", home + "/.cache/dbsec:", home + "/.config/rclone:")
@@ -502,6 +531,8 @@ def _calendars(path: Path) -> list[tuple[int, int]]:
         spec = line[len("OnCalendar="):]
         clock = spec.split()[-2]
         hour, minute, *_ = clock.split(":")
+        if not hour.isdigit():
+            continue
         marks.append((int(hour), int(minute)))
     return marks
 
@@ -512,8 +543,12 @@ def _in_window(mark: tuple[int, int], window: tuple[tuple[int, int], tuple[int, 
 
 def test_timers_avoid_sibling_windows() -> None:
     timers = sorted(SYSTEMD.glob("kse-*.timer"))
-    assert len(timers) == 7
+    assert len(timers) == 8
     for path in timers:
+        if path.name == "kse-alert-drain.timer":
+            # Wildcard-hour drain is exempt: its ExecCondition starts no container while the outbox is empty.
+            assert _calendars(path) == []
+            continue
         for mark in _calendars(path):
             assert mark not in DRIVE_SLOTS, f"{path.name}: {mark}"
             if path.name == "kse-auction-open.timer":
