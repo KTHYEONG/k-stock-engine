@@ -14,7 +14,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any, TextIO
 from zoneinfo import ZoneInfo
@@ -62,10 +62,51 @@ _RM_LITERAL_TARGETS = frozenset({"/", ".", "..", ".git"})
 _RM_EXPANSION_MARKERS = ("~", "$", "`")
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 _SHELL_COMMAND_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*$")
-_SSH_VALUE_OPTIONS = frozenset("-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w".split())
+_SSH_VALUE_OPTIONS = frozenset(
+    {
+        "-b",
+        "-c",
+        "-D",
+        "-E",
+        "-e",
+        "-F",
+        "-I",
+        "-i",
+        "-J",
+        "-L",
+        "-l",
+        "-m",
+        "-O",
+        "-o",
+        "-p",
+        "-Q",
+        "-R",
+        "-S",
+        "-W",
+        "-w",
+    }
+)
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir"})
 _TEXT_COMMANDS = frozenset(
-    {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "head", "tail", "sed", "awk", "less", "more", "wc", "git", "diff", "tee"}
+    {
+        "echo",
+        "printf",
+        "cat",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "head",
+        "tail",
+        "sed",
+        "awk",
+        "less",
+        "more",
+        "wc",
+        "git",
+        "diff",
+        "tee",
+    }
 )
 _HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _DYNAMIC_COMMAND_WORD = re.compile(
@@ -222,7 +263,10 @@ def _evaluate(command: str, now: datetime, project_dir: Path, spec: GuardSpec, d
 
     payloads = _nested_payloads(commands)
     if payloads and depth >= _MAX_NESTING_DEPTH:
-        return _deny("internal_error", "Blocked: shell, ssh, or eval nesting is too deep to verify. Run the inner command directly.")
+        return _deny(
+            "internal_error",
+            "Blocked: shell, ssh, or eval nesting is too deep to verify. Run the inner command directly.",
+        )
     for payload in payloads:
         inner = _evaluate(payload, now, project_dir, spec, depth + 1)
         if not inner.allow:
@@ -236,7 +280,10 @@ def _evaluate(command: str, now: datetime, project_dir: Path, spec: GuardSpec, d
     except ValueError:
         return _unparsed_decision(parse_text, spec)
     if bodies and depth >= _MAX_NESTING_DEPTH:
-        return _deny("internal_error", "Blocked: command substitution nesting is too deep to verify. Run the inner command directly.")
+        return _deny(
+            "internal_error",
+            "Blocked: command substitution nesting is too deep to verify. Run the inner command directly.",
+        )
     for body in bodies:
         inner = _evaluate(body, now, project_dir, spec, depth + 1)
         if not inner.allow:
@@ -371,7 +418,7 @@ def _staged_entries(repo_root: Path, git: Callable[[Sequence[str]], bytes]) -> l
 def _run_pretool() -> int:
     spec = load_guard_spec(_SPEC_PATH)
     project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR") or str(Path.cwd())).absolute()
-    return main_pretool(sys.stdin, sys.stderr, datetime.now(timezone.utc), project_dir, spec)
+    return main_pretool(sys.stdin, sys.stderr, datetime.now(UTC), project_dir, spec)
 
 
 def _run_precommit() -> int:
@@ -760,9 +807,7 @@ def _order_reason(commands: Sequence[_SimpleCommand], spec: GuardSpec) -> str | 
         if not _order_invocation(command.argv, spec):
             continue
         modes = [
-            assignment.partition("=")[2]
-            for assignment in command.assignments
-            if assignment.startswith(f"{mode_env}=")
+            assignment.partition("=")[2] for assignment in command.assignments if assignment.startswith(f"{mode_env}=")
         ]
         if modes and all(mode in spec.allowed_exec_modes for mode in modes):
             continue
