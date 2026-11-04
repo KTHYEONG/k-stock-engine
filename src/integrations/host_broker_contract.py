@@ -81,6 +81,10 @@ class TokenIssueThrottled(RuntimeError):  # noqa: N818 - spec-mandated protocol 
     """Issuance refused locally (min-issue interval) or by the vendor's issuance limit."""
 
 
+class TokenStoreReadError(OSError):
+    """An existing token record or issuance guard cannot be trusted."""
+
+
 @dataclass(frozen=True)
 class IssuedToken:
     access_token: str = field(repr=False)
@@ -214,22 +218,15 @@ def _read_record_file(path: Path) -> TokenRecord | None:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeError) as exc:
-        logger.warning(
-            "[SYS] stage=shared_token status=UNREADABLE path=%s reason=%s",
-            path.name,
-            type(exc).__name__,
-        )
-        return None
+    except (OSError, UnicodeError):
+        raise TokenStoreReadError("token record is unreadable") from None
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError, TypeError):
-        logger.warning("[SYS] stage=shared_token status=SCHEMA_INVALID path=%s", path.name)
-        return None
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        raise TokenStoreReadError("token record is malformed") from None
     record = _parse_record(payload)
     if record is None:
-        logger.warning("[SYS] stage=shared_token status=SCHEMA_INVALID path=%s", path.name)
-        return None
+        raise TokenStoreReadError("token record schema is invalid")
     return record
 
 
@@ -297,23 +294,28 @@ def _guard_path_for_token(token_path: Path, vendor: str) -> Path:
 def _read_guard_value(guard_path: Path) -> float | None:
     try:
         fd = os.open(str(guard_path), os.O_RDONLY)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        raise TokenStoreReadError("token issuance guard is unreadable") from None
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
         try:
-            raw = os.read(fd, 64).decode("ascii", errors="replace").strip()
+            payload = os.read(fd, 65)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
-        if not raw:
-            return None
-        try:
-            value = float(raw)
-            return value if math.isfinite(value) else None
-        except ValueError:
-            return None
+    except OSError:
+        raise TokenStoreReadError("token issuance guard is unreadable") from None
     finally:
         os.close(fd)
+    try:
+        raw = payload.decode("ascii").strip()
+        value = float(raw)
+    except (UnicodeError, ValueError):
+        raise TokenStoreReadError("token issuance guard is malformed") from None
+    if len(payload) > 64 or not math.isfinite(value) or value < 0:
+        raise TokenStoreReadError("token issuance guard is malformed")
+    return value
 
 
 def _write_guard_value(guard_path: Path, now_epoch: float) -> None:
@@ -382,7 +384,7 @@ class AsyncTokenStore:
         return _is_usable(record, now, self._expiry_margin_seconds, self._unknown_expiry_max_age_seconds)
 
     def read(self) -> TokenRecord | None:
-        """Return the stored record, or None when absent/unreadable/schema-invalid (logged, never raised)."""
+        """Return the stored record or None if absent; raise TokenStoreReadError if unreadable or invalid."""
         return _read_record_file(self._path)
 
     def _publish(self, record: TokenRecord) -> None:
@@ -500,7 +502,7 @@ class TokenStore:
         return _is_usable(record, now, self._expiry_margin_seconds, self._unknown_expiry_max_age_seconds)
 
     def read(self) -> TokenRecord | None:
-        """Return the stored record, or None when absent/unreadable/schema-invalid (logged, never raised)."""
+        """Return the stored record or None if absent; raise TokenStoreReadError if unreadable or invalid."""
         return _read_record_file(self._path)
 
     def _hold_lock(self) -> int:
@@ -763,6 +765,7 @@ __all__ = [
     "TokenRecord",
     "TokenStore",
     "TokenStoreLockTimeout",
+    "TokenStoreReadError",
     "admission_state_path",
     "credential_digest",
     "issue_guard_path",

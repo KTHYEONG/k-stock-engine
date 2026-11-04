@@ -28,10 +28,12 @@ def test_paths_and_rate_validation(tmp_path):
 
 
 def test_unreadable_record_and_atomic_publish_failure(tmp_path, monkeypatch):
-    assert c._read_record_file(tmp_path) is None
+    with pytest.raises(c.TokenStoreReadError, match="record is unreadable"):
+        c._read_record_file(tmp_path)
     path = tmp_path / "token.json"
     path.write_bytes(b"\xff")
-    assert c._read_record_file(path) is None
+    with pytest.raises(c.TokenStoreReadError, match="record is unreadable"):
+        c._read_record_file(path)
     original = path.read_bytes()
 
     def fail_replace(*_args):
