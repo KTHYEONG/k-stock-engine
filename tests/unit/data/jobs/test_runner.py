@@ -328,6 +328,21 @@ def test_budget_exhausted_when_headroom_covers_nothing(tmp_path: Path) -> None:
     assert spec.fetch_calls == 0
 
 
+def test_failed_unit_is_named_in_the_journal(tmp_path: Path, caplog) -> None:  # type: ignore[no-untyped-def]
+    """A swallowed provider error must leave unit key and error type behind for later diagnosis."""
+    ctx = _ctx(_runtime(tmp_path), _provider())
+    spec = _FakeSpec([_unit("u0"), _unit("u1")], behavior={"u1": "transport"})
+
+    with caplog.at_level("WARNING"):
+        report, _ = _run(spec, ctx)
+
+    assert (report.done, report.pending_left) == (1, 1)
+    line = next(r.getMessage() for r in caplog.records if "phase=unit_failed" in r.getMessage())
+    assert "unit=u1" in line
+    assert "error_type=ProviderRetryableError" in line
+    assert "transport failed" in line
+
+
 def test_transient_failures_reset_breaker_and_stay_pending(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     ctx = _ctx(runtime, _provider())

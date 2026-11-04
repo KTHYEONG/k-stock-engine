@@ -424,8 +424,17 @@ def _run_locked(
             except ProviderQuotaExhaustedError:
                 quota_blocked = True
                 break
-            except _ProviderError:
+            except _ProviderError as exc:
                 failures += 1
+                _LOG.warning(
+                    "[DATA] job=%s phase=unit_failed source=%s unit=%s failures=%d error_type=%s error=%s",
+                    spec.name,
+                    unit.source,
+                    unit.natural_key,
+                    failures,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
                 if fail_fast or failures >= threshold:
                     break
                 continue
