@@ -20,6 +20,7 @@ from src.integrations.host_broker_contract import (
     TokenIssueThrottled,
     TokenStore,
     TokenStoreLockTimeout,
+    TokenStoreReadError,
     token_record_path,
 )
 
@@ -69,7 +70,8 @@ def test_schema_strict(tmp_path) -> None:
     store, path = _store(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"a": 1}), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     payload = {
         "schema_version": 2,
         "access_token": "t",
@@ -78,7 +80,8 @@ def test_schema_strict(tmp_path) -> None:
         "generation": 1,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     extra = {
         "schema_version": 1,
         "access_token": "t",
@@ -88,7 +91,8 @@ def test_schema_strict(tmp_path) -> None:
         "extra": 1,
     }
     path.write_text(json.dumps(extra), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
 
 
 def test_single_issuance_under_contention(tmp_path) -> None:
@@ -278,7 +282,7 @@ def test_vendored_copy_hash_pinned() -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "# canonical: krx-alpha/deploy/shared/host_broker_contract.py contract=v1"
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    assert digest == "0bfab4ccae0f0921a32493492683014e1e080e708db3d92473731a5c4eb0b0c1"
+    assert digest == "f1d63e22493355082d1afadb87fbe1a8eed3c8f6aedd8123cd8f5598691637a7"
 
 
 def test_contract_branches(tmp_path) -> None:
@@ -289,7 +293,11 @@ def test_contract_branches(tmp_path) -> None:
     bad = tmp_path / "bad.state"
     for text in ("", "garbage", "nan", "inf", "123.5"):
         bad.write_text(text, encoding="utf-8")
-        assert _read_guard_value(bad) == (123.5 if text == "123.5" else None)
+        if text == "123.5":
+            assert _read_guard_value(bad) == 123.5
+        else:
+            with pytest.raises(TokenStoreReadError, match="guard is malformed"):
+                _read_guard_value(bad)
     for rate in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="positive"):
             HostPacer(tmp_path / "s.state", rate)
@@ -306,11 +314,14 @@ def test_token_parse_branches(tmp_path) -> None:
     store, path = _store(tmp_path, vendor="ls")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("not json", encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     path.write_text("[1,2]", encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     base = {
         "schema_version": 1,
         "access_token": "t",
@@ -320,29 +331,37 @@ def test_token_parse_branches(tmp_path) -> None:
     }
     bad_token = dict(base, access_token="")
     path.write_text(json.dumps(bad_token), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_gen = dict(base, generation=True)
     path.write_text(json.dumps(bad_gen), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_gen2 = dict(base, generation=0)
     path.write_text(json.dumps(bad_gen2), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_issued = dict(base, issued_at="not-a-date")
     path.write_text(json.dumps(bad_issued), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     naive = datetime.now().isoformat()
     bad_tz = dict(base, issued_at=naive)
     path.write_text(json.dumps(bad_tz), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_exp_type = dict(base, expires_at=123)
     path.write_text(json.dumps(bad_exp_type), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_exp_naive = dict(base, expires_at=naive)
     path.write_text(json.dumps(bad_exp_naive), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
     bad_issued_type = dict(base, issued_at=123)
     path.write_text(json.dumps(bad_issued_type), encoding="utf-8")
-    assert store.read() is None
+    with pytest.raises(TokenStoreReadError):
+        store.read()
 
 
 def test_lock_timeout(tmp_path) -> None:
