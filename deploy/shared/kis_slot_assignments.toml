@@ -72,6 +72,20 @@ channel = "ws"
 windows = ["07:58-08:50"]
 
 [[assignment]]
+slot = 5
+project = "krx"
+purpose = "regular_kis_dynamic_ws"
+channel = "ws"
+windows = ["09:00-15:32"]
+
+[[assignment]]
+slot = 5
+project = "kse"
+purpose = "kse slot-5 REST windows (checklist K3)"
+channel = "rest"
+windows = ["08:39-09:03", "18:30-20:45"]
+
+[[assignment]]
 slot = 1
 project = "krx"
 purpose = "regular_kis_ws"

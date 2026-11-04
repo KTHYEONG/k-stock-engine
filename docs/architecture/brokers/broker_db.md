@@ -20,14 +20,9 @@ DB Securities operates over standard HTTPS/WSS protocols on Linux 64-bit environ
 
 ### 1.2 OAuth2 Token Issuance (`POST /oauth2/token`)
 * **Headers:** `Content-Type: application/x-www-form-urlencoded`
-* **Payload:**
-  ```python
-  payload = {
-      "grant_type": "client_credentials",
-      "appkey": "<DB_APP_KEY>",
-      "appsecretkey": "<DB_APP_SECRET>",
-      "scope": "oob",
-  }
+* **Body:**
+  ```text
+  grant_type=client_credentials&appkey=<DB_APP_KEY>&appsecretkey=<DB_APP_SECRET>&scope=oob
   ```
 * **Response:**
   ```json
@@ -41,7 +36,7 @@ DB Securities operates over standard HTTPS/WSS protocols on Linux 64-bit environ
 * **Token Rate Limit & Lifecycle Invariants:**
   * **Strict 1 TPM Issuance Throttle:** The gateway limits token issuance to **1 request per minute (1 TPM)** per AppKey. Exceeding this triggers error HTTP 403 `{"error_code": "IGW00201", "error_description": "호출 거래건수를 초과하였습니다."}`.
   * **24-Hour Validity (86,400s):** Reissuing before expiration returns the identical cached token from DB server.
-  * **Mandatory Host-Shared Caching:** All processes must coordinate token access via a host-level shared token cache (e.g. `SharedTokenStore` or local JSON cache). Stale or redundant in-flight token requests will cause severe pipeline cascading lockout due to the 1 TPM rate limit.
+  * **Mandatory Host-Shared Caching:** All processes must coordinate token access via a host-level shared token cache with CAS locks. Stale or redundant in-flight token requests will cause severe pipeline cascading lockout due to the 1 TPM rate limit.
 
 ### 1.3 Common Request & Response Headers
 * **Request Headers:**
@@ -86,7 +81,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 
 ---
 
-## 2. Market Quotation TRs (`/api/v1/quote/kr-stock`)
+## 2. Market Quotation TRs (`/api/v1/quote/kr-stock` or `/v1/quote/kr-stock`)
 
 ### 2.1 `PRICE` — 주식 현재가 시세 조회 (Current Price Quote)
 * **Path:** `POST /api/v1/quote/kr-stock/inquiry/price`
@@ -151,15 +146,15 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
   * `InputHourClsCode`: Time window selection code:
     * `"4"`: Regular continuous session (장중)
     * **`"8"`: Closing auction match price / Indicative auction (`예상` — MOC capture)**
-    * `"1"`: After-hours single price (시간외단일가체결)
-    * `"2"`: Pre-market + Regular + Post-market (장전+장중+장후)
-    * `"5"`: All sessions including expected match (장전+장중+장후+장종료 예상포함)
+    * `"1"`: Aftermarket single price (post-close single-price execution)
+    * `"2"`: Pre-market + Regular + Post-market
+    * `"5"`: All sessions including expected match
 * **Output (`Out` array):**
   * `Hour`: Timestamp (`HHMMSS`)
   * `Prpr`: Executed price or indicative auction match price
   * `PrdyVrssSign` / `PrdyVrss`: Sign and change vs previous day
   * `ShnuCnqn` / `SelnCnqn`: Buy / Sell execution volumes
-* **Domain Significance:** **Crucial empirical research data source for KRX 15:20 ~ 15:30 MOC indicative match auction progression.**
+* **Domain Significance:** Crucial empirical research data source for KRX 15:20 ~ 15:30 MOC indicative match auction progression.
 
 ### 2.5 `CONCLUSION` — 시간대별 체결 조회 (Intraday Time-Slice Executions)
 * **Path:** `POST /api/v1/quote/kr-stock/inquiry/hour-price`
@@ -181,10 +176,10 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 
 ---
 
-## 3. Intraday & Historical Chart TRs (`/api/v1/quote/kr-chart`)
+## 3. Intraday & Historical Chart TRs (`/api/v1/quote/kr-chart` or `/v1/quote/kr-chart`)
 
 ### 3.1 `CHARTMIN` — 주식 분차트 조회 (High-Capacity Minute Bar Chart)
-* **Path:** `POST /api/v1/quote/kr-chart/min`
+* **Path:** `POST /api/v1/quote/kr-chart/min` (or `POST /v1/quote/kr-chart/min`)
 * **TPS:** 4
 * **Capacity:** **Up to 2,000 bars per call** (Default: 400 bars)
 * **Request Body:**
@@ -219,7 +214,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
   * `Lprc`: Low price
   * `Prpr`: Close price
   * `CntgVol`: Bar volume
-* **High-Leverage Advantage:** A single request captures **2,000 bars** (~5 full regular sessions of 390 bars each). Highest single-call minute bar capacity among all 5 brokers (surpassing Kiwoom 900, LS 500, Toss 200, KIS 30/120).
+* **High-Leverage Advantage:** A single request captures **2,000 bars** (~5 full regular sessions of 390 bars each). Highest single-call minute bar capacity among all 5 brokers.
 
 ### 3.2 `CHARTTICK` — 주식 틱차트 조회 (Tick Bar Chart)
 * **Path:** `POST /api/v1/quote/kr-chart/tick`
@@ -228,7 +223,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 * **Parameters:** `InputDivXtick` (e.g. `"100"` for 100-tick bars), `InputDate1`, `InputOrgAdjPrc`.
 
 ### 3.3 `CHARTDAY` / `WEEK` / `MONTH` — 주기별 차트 (Daily / Weekly / Monthly Chart)
-* **Path:** `POST /api/v1/quote/kr-chart/day`
+* **Path:** `POST /v1/quote/kr-chart/day` (or `POST /api/v1/quote/kr-chart/day`)
 * **TPS:** 4
 * **Parameters:** `InputDate1` (Start `YYYYMMDD`), `InputDate2` (End `YYYYMMDD`), `InputOrgAdjPrc` (`"0"` or `"1"`).
 * **Venue Distinction:** When querying with `InputCondMrktDivCode: "UJ"`, `Prpr` represents the Nextrade (NXT) closing price if NXT session extends past KRX close.
@@ -238,7 +233,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 ## 4. Universe Discovery & Screening TRs
 
 ### 4.1 `JCODES` — 전 종목 마스터 조회 (1-Call Full Universe Dump)
-* **Path:** `POST /api/v1/quote/kr-stock/inquiry/stock-ticker`
+* **Path:** `POST /v1/quote/kr-stock/inquiry/stock-ticker` (or `POST /api/v1/quote/kr-stock/inquiry/stock-ticker`)
 * **TPS:** 3
 * **Request Body:**
   ```json
@@ -255,7 +250,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
   * `KorIsnm`: Korean asset name (한글종목명, e.g. `"삼성전자"`)
   * `MrktClsCode`: Market division code (`1`: KOSDAQ, `4`: KOSPI)
   * `MrktClsName`: Exchange name (`"거래소"`, `"코스닥"`, `"코넥스"`, `"ETF"`, `"ETN"`)
-* **Architecture Role:** **Top-tier vendor for complete daily universe master sync alongside Toss Securities.** Retrieves active exchange tickers and ISIN mappings in a single sub-second call.
+* **Architecture Role:** Top-tier vendor for complete daily universe master sync. Retrieves active exchange tickers and ISIN mappings in a single sub-second call.
 
 ### 4.2 `RANKLIST` — 주식 조건 상승/하락 순위 (Price Fluctuation Ranking)
 * **Path:** `POST /api/v1/quote/kr-stock/inquiry/rank-list`
@@ -319,9 +314,9 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
     * `"06"`: Best Limit (최유리지정가)
     * `"07"`: First Priority Limit (최우선지정가)
     * `"14"`: Midpoint Order (중간가호가)
-    * `"61"`: Pre-Market Off-Hours (장개시전시간외)
-    * `"81"`: Post-Market Closing Price (시간외종가)
-    * `"82"`: Post-Market Single Price (시간외단일가)
+    * `"61"`: Pre-Market Off-Hours
+    * `"81"`: Post-Market Closing Price
+    * `"82"`: Post-Market Single Price
   * `MgntrnCode`: `"000"` (Cash / 일반현금주문).
   * `LoanDt`: `"00000000"` (Cash).
   * `OrdCndiTpCode`: `"0"` (None), `"1"` (IOC), `"2"` (FOK).
@@ -372,8 +367,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
     }
   }
   ```
-  *(Options: `ExecYn`: `"0"` All, `"1"` Filled, `"2"` Unfilled/Cancelable; `TrdMktCode`: `"0"` All, `"1"` KRX, `"2"` NXT).*
-* **Output (`Out1` array):** `OrdNo`, `OrgOrdNo`, `TrdMktCode`, `IsuNo`, `BnsTpCode`, `OrdQty`, `OrdPrc`, `AllExecQty`, `MrcAbleQty` (Amend/cancelable quantity), `AvrExecPrc`, `OrdTrxPtnCode` (`0`: Normal, `6`: Amended, `8`: Canceled).
+* **Output (`Out1` array):** `OrdNo`, `OrgOrdNo`, `TrdMktCode`, `IsuNo`, `BnsTpCode`, `OrdQty`, `OrdPrc`, `AllExecQty`, `MrcAbleQty`, `AvrExecPrc`, `OrdTrxPtnCode`.
 
 ---
 
@@ -398,10 +392,10 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 * **Protocol Control (`header.tr_type`):**
   * `"1"`: Subscribe real-time market data feed (`S00`, `S01`, `U00` 등).
   * `"2"`: Unsubscribe real-time market data feed.
-  * `"3"`: Register account-level notification stream (`IS0`, `IS1`). Does not require unsubscription message; connection termination cleans up the registration. `tr_key` must be `<DB_APP_KEY>`.
+  * `"3"`: Register account-level notification stream (`IS0`, `IS1`). `tr_key` must be `<DB_APP_KEY>`.
 
 ### 6.2 `S01` — 실시간 주식 호가 (Real-time L10 Orderbook & Indicative Auction)
-* **TR Code:** `S01`
+* **TR Code:** `S01` (canonical `H0STASP0` mapping)
 * **Payload Fields:**
   * `BsopHour`: Orderbook timestamp (`HHMMSS`)
   * `ShrnIscd`: 6-digit stock code
@@ -418,10 +412,10 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
     * **`AntcCnqn`:** Indicative auction match quantity (예상체결량)
     * **`CnccAsprclscode`:** Auction division code (동시호가구분코드)
     * **`CompClscode`:** Competitive auction direction code (경쟁대량 방향구분)
-* **Domain Significance:** Provides real-time streaming tick-by-tick orderbook updates with high-resolution closing auction indicative match price and quantity (`AntcCnpr` / `AntcCnqn`).
+* **Domain Significance:** Provides real-time streaming tick-by-tick orderbook updates with high-resolution closing auction indicative match price and quantity (`AntcCnpr` / `AntcCnqn`). Normalized to canonical stream `H0STASP0`.
 
 ### 6.3 `S00` — 실시간 주식 체결가 (Real-time Trade Ticks)
-* **TR Code:** `S00`
+* **TR Code:** `S00` (canonical `H0STCNT0` mapping)
 * **Payload Fields:**
   * `BsopDate`: Trade date (`YYYYMMDD`)
   * `ShrnIscd`: Stock code
@@ -433,6 +427,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
   * `CntgClscode`: Execution side (1: Buy aggressor, 5: Sell aggressor)
   * `AntcNmixclscode`: Indicative match flag (`0`: Indicative auction tick, `1`: Continuous regular trade tick)
   * `NewMkopclscode`: Market operation division code
+* **Domain Significance:** Real-time trade tick execution feed. Normalized to canonical stream `H0STCNT0`.
 
 ### 6.4 `IS0` & `IS1` — 실시간 주문 접수 / 체결 통보 (Account Notification Streams)
 * **Registration:** `header.tr_type: "3"`, `body.tr_key: "<DB_APP_KEY>"`
@@ -448,7 +443,7 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 | HTTP Code | Error Code (`rsp_cd`) | Message / Meaning | Root Cause & Operational Remediation |
 | :---: | :---: | :--- | :--- |
 | **403** | `IGW00201` | **호출 거래건수를 초과하였습니다.** | Global 20 TPS or **Token 1 TPM** rate limit exceeded. Must back off using exponential backoff or reuse cached token. |
-| **403** | `IGW00103` | 유효하지 않은 AppKey입니다. | Invalid `DB_APP_KEY`. Verify `~/.quant.env`. |
+| **403** | `IGW00103` | 유효하지 않은 AppKey입니다. | Invalid `DB_APP_KEY`. Verify environment credentials. |
 | **403** | `IGW00105` | 유효하지 않은 AppSecret입니다. | Invalid `DB_APP_SECRET`. |
 | **403** | `IGW00121` | 유효하지 않은 token 입니다. | Stale token. Refresh via CAS token cache. |
 | **403** | `IGW00123` | 기간이 만료된 token 입니다. | Token expired. Issue new token and update shared cache. |
@@ -468,24 +463,26 @@ DB Securities natively supports Nextrade (NXT) ATS alternative trading venue sid
 | `2611` | 장시작 전 또는 장마감 되었습니다. | Session closed for requested order type. |
 | `2714` | 주문수량이 매매가능수량을 초과했습니다. | Order quantity exceeds available buying/selling power. |
 | `2752` | 증거금부족으로 주문이 불가합니다. | Margin shortage. |
-| `3563` | 정규매매장이 종료되었습니다. 시간외 호가구분을 입력하십시오. | Regular session closed. Switch to off-hours order code. |
+| `3563` | 정규매매장이 종료되었습니다. (이하 호가구분 재입력 안내) | Regular session closed. Switch to off-hours order code. |
 | `3735` | 해당종목 NXT거래 불가합니다. | Target asset is not eligible for Nextrade ATS trading. |
 
 ---
 
-## 8. Integration & Architectural Role in K-Stock Engine
+## 8. Integration & Architectural Role in Multi-Broker Architecture
 
 DB Securities occupies a high-value niche within the multi-broker execution and quantitative research stack:
 
-1. **Ultra-High Minute Bar Density:**  
-   Delivers **2,000 bars per call** via `CHARTMIN` (`/quote/kr-chart/min`). A single call ingests up to ~5 full days of 1-minute regular session bars, minimizing network roundtrips and API quota consumption during historical backfill and closing bar collection (`DbsecClosingBarJob`).
-2. **Native Dual-Venue (KRX + NXT) Execution:**  
+1. **Real-Time L0 Market Data Streaming (`S00` / `S01`):**  
+   Streams tick-by-tick real-time trades (`S00`, mapped to canonical `H0STCNT0`) and Level-10 orderbook depth (`S01`, mapped to canonical `H0STASP0`) via WebSocket, supporting low-latency tick ingestion and market data multiplexing across brokers.
+2. **Ultra-High Minute Bar Density (`CHARTMIN`):**  
+   Delivers **2,000 bars per call** via `CHARTMIN` (accessible via `/api/v1/quote/kr-chart/min` or `/v1/quote/kr-chart/min`). A single call ingests up to ~5 full days of 1-minute regular session bars, minimizing network roundtrips and API quota consumption during historical backfill.
+3. **Daily Bar Harvesting (`CHARTDAY`):**  
+   Captures unadjusted and corporate action-adjusted daily OHLCV series via `CHARTDAY` (accessible via `/v1/quote/kr-chart/day` or `/api/v1/quote/kr-chart/day`).
+4. **Native Dual-Venue (KRX + NXT) Execution:**  
    Provides dedicated endpoints for Nextrade (`/order-nxt`, `CSPAT00610`), unified combined quotes (`UJ`), and symbol master lookup (`NJ`), allowing seamless routing between primary and alternative venues.
-3. **MOC Indicative Auction Telemetry:**  
+5. **MOC Indicative Auction Telemetry:**  
    Captures granular closing auction imbalance and match evolution through:
-   * REST: `DAYTRADE` (`/quote/kr-stock/inquiry/daily-price`) with `InputHourClsCode="8"` for historical second-by-second indicative match series.
+   * REST: `DAYTRADE` (`/api/v1/quote/kr-stock/inquiry/daily-price`) with `InputHourClsCode="8"` for historical second-by-second indicative match series.
    * WebSocket: `S01` with `AntcCnpr` (indicative price) and `AntcCnqn` (indicative quantity) streaming.
-4. **1-Call Universe Master Synchronizer:**  
-   Retrieves all active listed symbols (3,940+ assets) alongside official ISIN codes (`StndIscd`) in a single call via `JCODES` (`/quote/kr-stock/inquiry/stock-ticker`), powering `DbsecTickerMasterJob`.
-5. **Fallback Daily Chart Harvesting:**  
-   Captures unadjusted/adjusted daily OHLCV series via `CHARTDAY` (`/quote/kr-chart/day`), powering `DbsecDailyChartJob`.
+6. **1-Call Universe Master Synchronizer (`JCODES`):**  
+   Retrieves all active listed symbols (3,940+ assets) alongside official ISIN codes (`StndIscd`) in a single call via `JCODES` (accessible via `/v1/quote/kr-stock/inquiry/stock-ticker` or `/api/v1/quote/kr-stock/inquiry/stock-ticker`).
