@@ -24,7 +24,7 @@ dependencies = [
     "scikit-learn>=1.5.0",
     "lightgbm>=4.3.0",
     "huggingface-hub>=1.26.0",
-    "polars>=1.43.2",
+    "polars>=2.1.0",
     "numba>=0.66.0",
     "exchange-calendars>=4.13.2",
 ]
