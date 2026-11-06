@@ -132,6 +132,7 @@ jobs:
           if [ "\$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
             echo "SKIP: superseded by \$LATEST_MAIN_SHA"
             rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+            rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA
             exit 0
           fi
           vps_stage promote
@@ -139,6 +140,10 @@ jobs:
           vps_stage converge
           bash ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/install_systemd.sh
           rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+          # install_systemd.sh copies units and kse-run out of staging, so staging trees are disposable;
+          # also reap trees left by earlier deploys (deploys are serialized by the deploy-or-vps group).
+          rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA
+          find ~/k-stock-engine/.deploy -maxdepth 1 -type d -name 'staging-*' -mmin +60 -exec rm -rf {} +
           EOF
 
       - name: Login to GHCR
