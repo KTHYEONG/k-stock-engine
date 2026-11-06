@@ -731,3 +731,12 @@ def test_vps_never_writes_to_the_registry() -> None:
     assert deploy["permissions"] == {"contents": "read", "packages": "write"}
     assert "imagetools create -t ghcr.io/kthyeong/k-stock-engine:latest" in promote
     assert 'if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]' in promote
+
+
+def test_deploy_removes_staging_trees_after_converge() -> None:
+    text = (REPO / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    install = text.index("staging-$COMMIT_SHA/install_systemd.sh")
+    assert text.index("rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA", install) > install
+    assert "-name 'staging-*' -mmin +60 -exec rm -rf {} +" in text
+    skip = text.index('echo "SKIP: superseded by')
+    assert text.index("rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA", skip) < text.index("exit 0", skip)
