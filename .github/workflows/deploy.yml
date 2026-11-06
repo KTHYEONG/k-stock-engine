@@ -73,6 +73,10 @@ jobs:
     needs: [test, build-and-push]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    # packages:write lets the runner move the registry :latest tag; the VPS GHCR_PAT stays read-only.
+    permissions:
+      contents: read
+      packages: write
     concurrency:
       group: deploy-or-vps
       cancel-in-progress: false
@@ -132,8 +136,27 @@ jobs:
           fi
           vps_stage promote
           vps_promote_latest ghcr.io/kthyeong/k-stock-engine $COMMIT_SHA
-          docker push ghcr.io/kthyeong/k-stock-engine:latest
           vps_stage converge
           bash ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/install_systemd.sh
           rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
           EOF
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote registry latest to the deployed revision
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Same supersede rule as the VPS step: only the current main head may own :latest.
+          LATEST_MAIN_SHA="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)"
+          if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
+            echo "SKIP: superseded by $LATEST_MAIN_SHA"
+            exit 0
+          fi
+          docker buildx imagetools create -t ghcr.io/kthyeong/k-stock-engine:latest ghcr.io/kthyeong/k-stock-engine:sha-$COMMIT_SHA

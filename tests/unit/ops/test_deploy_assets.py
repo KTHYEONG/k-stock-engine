@@ -716,3 +716,18 @@ def test_broker_dir_units_share_one_container_path() -> None:
         assert kis_mounts[0].endswith(".cache/kis:/app/.cache/kis")
         assert "KIS_TOKEN_CACHE_DIR=/app/.cache/kis" in norm["envs"]
     assert found
+
+
+def test_vps_never_writes_to_the_registry() -> None:
+    import yaml
+
+    workflow = yaml.safe_load((REPO / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8"))
+    deploy = workflow["jobs"]["deploy"]
+    steps = {step["name"]: step for step in deploy["steps"]}
+    vps_script = steps["Pull latest image and converge host units on VPS over Tailscale"]["run"]
+    promote = steps["Promote registry latest to the deployed revision"]["run"]
+
+    assert "docker push" not in vps_script
+    assert deploy["permissions"] == {"contents": "read", "packages": "write"}
+    assert "imagetools create -t ghcr.io/kthyeong/k-stock-engine:latest" in promote
+    assert 'if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]' in promote
