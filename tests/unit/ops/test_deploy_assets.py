@@ -628,14 +628,16 @@ def test_kind_relay_workflow_uses_only_existing_secret_names() -> None:
     text = _relay_text()
     names = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text))
     assert names
-    assert names <= {"TS_OAUTH_CLIENT_ID", "TS_OAUTH_SECRET", "SSH_PRIVATE_KEY", "HOST", "USERNAME"}
+    assert names <= {"TS_OAUTH_CLIENT_ID", "TS_OAUTH_SECRET", "SSH_OPS_KEY", "HOST", "USERNAME"}
+    assert "SSH_PRIVATE_KEY" not in names
 
 
-def test_kind_relay_delivery_is_atomic() -> None:
+def test_kind_relay_delivers_through_the_ops_gate_with_pinned_host_key() -> None:
     text = _relay_text()
-    assert ".incoming" in text
-    assert re.search(r"mv -f \S*\.incoming \S*bundle\.json", text) is not None
-    assert text.index('"mkdir -p ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox"') < text.index("          scp ")
+    assert 'ssh $SSH_OPTS "$REMOTE_USER@$HOST" kse-kind-relay-put < "$RUNNER_TEMP/kind-bundle.json"' in text
+    assert "scp " not in text
+    assert "StrictHostKeyChecking=yes" in text
+    assert "StrictHostKeyChecking=no" not in text
 
 
 def test_kind_relay_delivery_path_matches_importer_inbox() -> None:
@@ -648,7 +650,8 @@ def test_kind_relay_delivery_path_matches_importer_inbox() -> None:
     scope = load_research_scope(config.default_scope)
     root = Path("/data")
     inbox = relay_inbox_path(build_workspace(data_root=root, scope=scope).state_root).parent
-    assert f"~/k-stock-engine/data/{inbox.relative_to(root).as_posix()}" in _relay_text()
+    # The VPS side writes this inbox through krx-alpha deploy/host/ci-ops-gate.sh (KIND_INBOX), atomically.
+    assert inbox.relative_to(root).as_posix() == "state/kr_swing_2019_v1/kind_relay/inbox"
 
 
 def test_dbsec_collection_waits_for_collect_eve_and_is_enabled() -> None:
