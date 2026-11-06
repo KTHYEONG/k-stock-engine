@@ -10,6 +10,7 @@ from typing import Any
 
 from src.core.time import KRX_TZ
 from src.execution.auction_capture import (
+    OPEN_CONFIRM_UNTIL_S,
     OPEN_SNAPSHOT_OFFSETS_MIN,
     SLOT_DEADLINE_ERROR,
     AuctionCapturePolicy,
@@ -17,6 +18,12 @@ from src.execution.auction_capture import (
     capture_open_auction,
     capture_symbols,
     write_auction_rows,
+)
+from src.execution.auction_capture import (
+    _OPEN_CONFIRM_MAX_ATTEMPTS,
+    _OPEN_RETRY_PAUSE_S,
+    _OPEN_SLOW_MAX_ATTEMPTS,
+    _OPEN_SLOW_POLL_S,
 )
 
 _POLICY = AuctionCapturePolicy(call_estimate_s=1.0, slot_margin_s=0.0)
@@ -119,7 +126,7 @@ def test_open_print_resolves_or_times_out() -> None:
     client = _StubClient(
         prices={
             "005930": [{"stck_oprc": "0"}, {"stck_oprc": "0"}, {"stck_oprc": "12350", "extra": 1}],
-            "000660": [{"stck_oprc": "0"}] * 50,
+            "000660": [{"stck_oprc": "0"}] * 200,
         }
     )
     result = _capture(client, ["005930", "000660"], day, clock)
@@ -127,7 +134,7 @@ def test_open_print_resolves_or_times_out() -> None:
     opened = {row.symbol: row for row in rows if row.kind == "open"}
     assert set(opened) == {"005930"}
     assert json.loads(opened["005930"].output1)["stck_oprc"] == "12350"
-    assert clock.now() >= _open_at(day) + timedelta(seconds=180)
+    assert clock.now() >= _open_at(day) + timedelta(seconds=OPEN_CONFIRM_UNTIL_S)
 
 
 def test_raw_payload_preserved() -> None:
@@ -227,11 +234,11 @@ def test_capture_open_auction_guards() -> None:
 def test_garbled_open_output_never_resolves() -> None:
     day = date(2026, 10, 5)
     clock = _Clock(_open_at(day) - timedelta(minutes=25))
-    client = _StubClient(prices={"005930": [{"stck_oprc": "n/a"}, {"other": 1}] * 10})
+    client = _StubClient(prices={"005930": [{"stck_oprc": "n/a"}, {"other": 1}] * 40})
     result = _capture(client, ["005930"], day, clock)
     rows = result.rows
     assert [row for row in rows if row.kind == "open"] == []
-    assert clock.now() >= _open_at(day) + timedelta(seconds=180)
+    assert clock.now() >= _open_at(day) + timedelta(seconds=OPEN_CONFIRM_UNTIL_S)
 
 
 def test_non_mapping_payloads_rejected() -> None:
@@ -309,10 +316,10 @@ def test_deadline_breaks_inside_pass() -> None:
         datetime(2026, 10, 5, 9, 0, 0, tzinfo=KRX_TZ),
         datetime(2026, 10, 5, 9, 0, 31, tzinfo=KRX_TZ),
         datetime(2026, 10, 5, 9, 0, 32, tzinfo=KRX_TZ),
-        datetime(2026, 10, 5, 9, 3, 0, tzinfo=KRX_TZ),
+        datetime(2026, 10, 5, 9, 5, 0, tzinfo=KRX_TZ),
     ]
     clock = _ScriptedClock(stamps)
-    client = _StubClient(prices={"a": [{"stck_oprc": "0"}] * 50, "b": [{"stck_oprc": "0"}] * 50})
+    client = _StubClient(prices={"a": [{"stck_oprc": "0"}] * 200, "b": [{"stck_oprc": "0"}] * 200})
     result = _capture(client, ["a", "b"], day, clock)
     rows = result.rows
     assert [row for row in rows if row.kind == "open"] == []
@@ -361,7 +368,7 @@ def test_slot_batches_arrive_in_order_with_union_rows() -> None:
 def test_open_batch_only_when_resolved() -> None:
     day = date(2026, 10, 5)
     clock = _Clock(_open_at(day) - timedelta(minutes=25))
-    client = _StubClient(prices={"a": [{"stck_oprc": "0"}] * 50, "b": [{"stck_oprc": "0"}] * 50})
+    client = _StubClient(prices={"a": [{"stck_oprc": "0"}] * 200, "b": [{"stck_oprc": "0"}] * 200})
     seen: list[Any] = []
     result = _capture(client, ["a", "b"], day, clock, on_batch=seen.append)
     assert [b for b in seen if b.kind == "open"] == []
@@ -796,3 +803,94 @@ def test_batch_callback_errors_propagate() -> None:
 
     with pytest.raises(RuntimeError, match="persist callback"):
         _capture(_StubClient(), ["a"], day, clock, on_batch=fail)
+
+
+def _open_calls(client: _StubClient, symbol: str) -> int:
+    return client.calls.count(("open", symbol))
+
+
+def test_late_open_resolves_after_fast_phase() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    client = _StubClient(prices={"005930": [{"stck_oprc": "0"}] * 20 + [{"stck_oprc": "12350"}]})
+    result = _capture(client, ["005930"], day, clock)
+    opened = [row for row in result.rows if row.kind == "open"]
+    assert [json.loads(row.output1)["stck_oprc"] for row in opened] == ["12350"]
+    assert "005930" not in result.failed
+    assert _open_calls(client, "005930") == 21
+
+
+def test_never_open_symbol_stops_at_deadline_or_cap() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    client = _StubClient(prices={"005930": [{"stck_oprc": "0"}] * 1000})
+    result = _capture(client, ["005930"], day, clock)
+    assert [row for row in result.rows if row.kind == "open"] == []
+    assert "005930" not in result.failed
+    calls = _open_calls(client, "005930")
+    assert calls <= _OPEN_SLOW_MAX_ATTEMPTS
+    assert clock.now() >= _open_at(day) + timedelta(seconds=OPEN_CONFIRM_UNTIL_S) or calls == _OPEN_SLOW_MAX_ATTEMPTS
+
+
+def test_exception_symbol_capped_at_fast_attempts() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+
+    class _Raising(_StubClient):
+        def inquire_price(self, symbol: str) -> Any:
+            self.calls.append(("open", symbol))
+            raise ConnectionError("down")
+
+    client = _Raising()
+    result = _capture(client, ["005930"], day, clock)
+    assert _open_calls(client, "005930") == _OPEN_CONFIRM_MAX_ATTEMPTS
+    assert result.failed == {"005930": "ConnectionError"}
+    assert clock.now() < _open_at(day) + timedelta(seconds=60)
+
+
+def test_slow_phase_uses_slow_cadence() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    client = _StubClient(prices={"005930": [{"stck_oprc": "0"}] * 12})
+    gaps: dict[int, float] = {}
+
+    def sleep(seconds: float) -> None:
+        after = _open_calls(client, "005930")
+        if after >= 1:
+            gaps[after] = seconds
+        clock.sleep(seconds)
+
+    _capture(client, ["005930"], day, clock, sleep=sleep)
+    assert all(gaps[n] == _OPEN_RETRY_PAUSE_S for n in range(1, _OPEN_CONFIRM_MAX_ATTEMPTS))
+    assert all(gaps[n] == _OPEN_SLOW_POLL_S for n in range(_OPEN_CONFIRM_MAX_ATTEMPTS + 1, 13))
+
+
+def test_mixed_symbols_resolve_independently() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    client = _StubClient(
+        prices={
+            "b": [{"stck_oprc": "0"}] * 14,
+            "c": [{"stck_oprc": "0"}] * 1000,
+        }
+    )
+    batches: list[Any] = []
+    result = _capture(client, ["a", "b", "c"], day, clock, on_batch=batches.append)
+    opened = {row.symbol for row in result.rows if row.kind == "open"}
+    assert opened == {"a", "b"}
+    assert _open_calls(client, "a") == 1
+    assert "c" not in result.failed
+    open_batches = [batch for batch in batches if batch.kind == "open"]
+    assert len(open_batches) == 1
+    assert sorted(row.symbol for row in open_batches[0].rows) == ["a", "b"]
+
+
+def test_open_phase_call_budget() -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    symbols = [f"{i:06d}" for i in range(80)]
+    client = _StubClient(prices={symbol: [{"stck_oprc": "0"}] * 100 for symbol in symbols})
+    result = _capture(client, symbols, day, clock)
+    assert [row for row in result.rows if row.kind == "open"] == []
+    open_calls = sum(1 for kind, _ in client.calls if kind == "open")
+    assert open_calls <= 80 * _OPEN_SLOW_MAX_ATTEMPTS
