@@ -30,10 +30,12 @@ __all__ = [
 ]
 
 OPEN_CONFIRM_FROM_S: Final = 30
-OPEN_CONFIRM_UNTIL_S: Final = 180
+OPEN_CONFIRM_UNTIL_S: Final = 300
 
 _OPEN_CONFIRM_MAX_ATTEMPTS: Final = 6
 _OPEN_RETRY_PAUSE_S: Final = 1.0
+_OPEN_SLOW_POLL_S: Final = 5.0
+_OPEN_SLOW_MAX_ATTEMPTS: Final = 60
 
 SLOT_DEADLINE_ERROR: Final = "SlotDeadline"
 
@@ -146,6 +148,10 @@ def _positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _open_pollable(attempts: int, not_open: bool) -> bool:
+    return attempts < _OPEN_CONFIRM_MAX_ATTEMPTS or (not_open and attempts < _OPEN_SLOW_MAX_ATTEMPTS)
+
+
 def capture_open_auction(
     client: Any,
     symbols: Sequence[str],
@@ -225,21 +231,25 @@ def capture_open_auction(
     if wait > 0:
         sleep(wait)
     attempts = dict.fromkeys(names, 0)
+    not_open = dict.fromkeys(names, False)
     first_open_failure: dict[str, str] = {}
     unresolved = list(names)
     while unresolved:
-        if now() >= deadline:
+        active = [symbol for symbol in unresolved if _open_pollable(attempts[symbol], not_open[symbol])]
+        if not active or now() >= deadline:
             break
-        for symbol in list(unresolved):
+        for symbol in active:
             if now() >= deadline:
                 break
             attempts[symbol] += 1
+            not_open[symbol] = False
             try:
                 output = client.inquire_price(symbol)
                 if not isinstance(output, Mapping):
                     raise ValueError("open print payload must be a mapping")
                 received = now()
                 if _positive_int(output.get("stck_oprc")) is None:
+                    not_open[symbol] = True
                     continue
                 row = AuctionRow(
                     session=session,
@@ -255,11 +265,13 @@ def capture_open_auction(
                 continue
             unresolved.remove(symbol)
             rows.append(row)
-        if unresolved and now() < deadline and any(attempts[symbol] < _OPEN_CONFIRM_MAX_ATTEMPTS for symbol in unresolved):
-            sleep(_OPEN_RETRY_PAUSE_S)
-        elif unresolved and now() < deadline:
-            sleep(max(0.0, (deadline - now()).total_seconds()))
+        still = [symbol for symbol in unresolved if _open_pollable(attempts[symbol], not_open[symbol])]
+        if not still or now() >= deadline:
             break
+        if any(attempts[symbol] < _OPEN_CONFIRM_MAX_ATTEMPTS for symbol in still):
+            sleep(_OPEN_RETRY_PAUSE_S)
+        else:
+            sleep(min(_OPEN_SLOW_POLL_S, max(0.0, (deadline - now()).total_seconds())))
     for symbol in unresolved:
         if symbol in first_open_failure:
             failed.setdefault(symbol, first_open_failure[symbol])
