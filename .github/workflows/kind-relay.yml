@@ -19,10 +19,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -31,7 +31,7 @@ jobs:
         run: uv run python -m src.ops.kind_relay produce --out "$RUNNER_TEMP/kind-bundle.json"
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -39,7 +39,9 @@ jobs:
 
       - name: Deliver bundle to VPS inbox
         env:
-          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY: ${{ secrets.SSH_OPS_KEY }}
+          # or-vps SSH host key (public): pinned so a host impersonating the VPS on the tailnet is refused.
+          VPS_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII444atEBxL7GUKeZS0hpR6M2QvL5H3GeBPLhNO/fTNq
           HOST: ${{ secrets.HOST }}
           REMOTE_USER: ${{ secrets.USERNAME }}
         run: |
@@ -47,7 +49,7 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/relay_key
           chmod 600 ~/.ssh/relay_key
-          SSH_OPTS="-i $HOME/.ssh/relay_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
-          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox"
-          scp $SSH_OPTS "$RUNNER_TEMP/kind-bundle.json" "$REMOTE_USER@$HOST:~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json.incoming"
-          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mv -f ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json.incoming ~/k-stock-engine/data/state/kr_swing_2019_v1/kind_relay/inbox/bundle.json"
+          printf '* %s\n' "$VPS_HOST_KEY" > ~/.ssh/known_hosts_vps
+          SSH_OPTS="-i $HOME/.ssh/relay_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_vps -o ConnectTimeout=20"
+          # The ops key is forced through ~/bin/ci-ops-gate (krx-alpha deploy/host/ci-ops-gate.sh), which writes stdin to the inbox atomically.
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" kse-kind-relay-put < "$RUNNER_TEMP/kind-bundle.json"
