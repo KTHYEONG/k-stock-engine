@@ -10,6 +10,10 @@ updates:
       day: saturday
       time: "11:00"
       timezone: Asia/Seoul
+    # Major action bumps are reviewed by hand; SHA pins stay within the current majors.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       actions:
         patterns: ["*"]
@@ -21,11 +25,19 @@ updates:
       time: "11:00"
       timezone: Asia/Seoul
     open-pull-requests-limit: 5
+    # Majors (polars 2, pyarrow 26, ...) can change runtime behavior; adopt them via a reviewed spec.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       python-minor-patch:
         update-types: [minor, patch]
   - package-ecosystem: docker
     directory: /
+    # Interpreter upgrades (3.11 -> 3.x) are a migration, not a routine bump.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     schedule:
       interval: weekly
       day: saturday
