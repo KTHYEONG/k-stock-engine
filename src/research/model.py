@@ -22,7 +22,7 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.data.research_protocol import WindowAuthorization, WindowError
-from src.research.panel import FEATURE_SETS, FeaturePanel, feature_names_for
+from src.research.panel import FeaturePanel, feature_names_for, known_feature_set_names, resolve_feature_set
 
 __all__ = [
     "FrozenScorer",
@@ -49,7 +49,7 @@ class ScorerConfig(BaseModel):
     min_data_in_leaf=800; feature_fraction=0.7; bagging_fraction=0.7; bagging_freq=1; lambda_l2=50.0;
     seed=11; num_threads=8; min_cross_section=50; winsor_low_pct=1.0; winsor_high_pct=99.0;
     purge_extra_sessions=2; min_train_rows=20000; first_test_year=2018; feature_set="full62" — name in
-    ``FEATURE_SETS``; part of the identity; seeds=() — ensemble member seeds; empty means the single `seed`.
+    a name from ``resolve_feature_set``; part of the identity; seeds=() — ensemble member seeds; empty means the single `seed`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -112,9 +112,11 @@ class ScorerConfig(BaseModel):
 
     @field_validator("feature_set")
     @classmethod
-    def _known_feature_set(cls, value: object) -> str:
-        if not isinstance(value, str) or value not in FEATURE_SETS:
-            raise ValueError(f"feature_set must be one of {sorted(FEATURE_SETS)}, got {value!r}")
+    def _known_feature_set(cls, value: str) -> str:
+        try:
+            resolve_feature_set(value)
+        except ValueError as exc:
+            raise ValueError(f"feature_set must be one of {list(known_feature_set_names())}, got {value!r}") from exc
         return value
 
     @field_validator("horizons")

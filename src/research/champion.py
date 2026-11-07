@@ -33,7 +33,7 @@ from src.core.pit import PITDataError
 from src.data.research_protocol import ResearchProtocol
 from src.research.evaluation import EvaluationEvidence, EvaluationPolicy
 from src.research.ledger_bridge import LedgerOutcome
-from src.research.panel import FEATURE_SETS
+from src.research.panel import known_feature_set_names, resolve_feature_set
 from src.research.pipeline import EvaluationRun, StrategySpec, strategy_spec_from_canonical_json
 from src.research.stats import PairedDelta, PairedRiskDelta, paired_growth_tail_delta
 
@@ -168,10 +168,10 @@ def same_design(a: StrategySpec, b: StrategySpec) -> bool:
 
 def _canonical_feature_set_name(name: str) -> str | None:
     try:
-        members = tuple(FEATURE_SETS[name])
-    except KeyError:
+        members = tuple(resolve_feature_set(name))
+    except ValueError:
         return None
-    return next(key for key, values in FEATURE_SETS.items() if tuple(values) == members)
+    return next(key for key in known_feature_set_names() if tuple(resolve_feature_set(key)) == members)
 
 
 def with_seeds(spec: StrategySpec, seeds: tuple[int, ...]) -> StrategySpec:

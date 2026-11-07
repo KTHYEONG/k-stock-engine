@@ -235,3 +235,7 @@ __marimo__/
 
 # 서버 점검표(로컬 운영 문서)
 docs/vps-checklist.md
+
+# Strategy values live in the private store (KTHYEONG/quant-strategy-store); never commit them here.
+/config/research/champion.toml
+/config/research/challenge/

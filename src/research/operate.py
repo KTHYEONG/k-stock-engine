@@ -93,6 +93,7 @@ class SealedDecision:
     state_digest: str
     prev_hash: str
     hash: str
+    strategy_store_revision: str | None = None
 
 
 def _canonical(payload: Any) -> str:
@@ -125,7 +126,7 @@ def state_digest(state: OperateState) -> str:
 
 
 def _decision_payload(decision: SealedDecision) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "data_session": decision.data_session.isoformat(),
         "execution_session": decision.execution_session.isoformat(),
         "inputs": {key: str(value) for key, value in sorted(decision.inputs.items())},
@@ -138,6 +139,9 @@ def _decision_payload(decision: SealedDecision) -> dict[str, Any]:
         "state_digest": decision.state_digest,
         "targets": {key: float(value) for key, value in sorted(decision.targets.items())},
     }
+    if decision.strategy_store_revision is not None:
+        payload["strategy_store_revision"] = decision.strategy_store_revision
+    return payload
 
 
 def _decision_hash(prev_hash: str, payload: Mapping[str, Any]) -> str:
@@ -455,6 +459,9 @@ def _decision_from_payload(payload: Mapping[str, Any]) -> SealedDecision:
             state_digest=str(payload["state_digest"]),
             prev_hash=str(payload["prev_hash"]),
             hash=str(payload["hash"]),
+            strategy_store_revision=(
+                None if payload.get("strategy_store_revision") is None else str(payload["strategy_store_revision"])
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"malformed sealed decision: {exc}") from exc
@@ -558,6 +565,7 @@ def _seal(root: Path, decision: SealedDecision) -> SealedDecision:
         state_digest=decision.state_digest,
         prev_hash=prev,
         hash="",
+        strategy_store_revision=decision.strategy_store_revision,
     )
     digest = _decision_hash(prev, _decision_payload(staged))
     sealed = SealedDecision(
@@ -573,6 +581,7 @@ def _seal(root: Path, decision: SealedDecision) -> SealedDecision:
         state_digest=staged.state_digest,
         prev_hash=prev,
         hash=digest,
+        strategy_store_revision=staged.strategy_store_revision,
     )
     record = dict(_decision_payload(sealed))
     record["hash"] = sealed.hash

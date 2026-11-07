@@ -10,11 +10,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.config.errors import ConfigError
+from src.config.strategy_store import strategy_store_root
 
 if TYPE_CHECKING:
     from src.research.pipeline import StrategySpec
 
-__all__ = ["render_strategy_toml", "resolve_strategy_tables"]
+__all__ = [
+    "render_strategy_toml",
+    "require_production_spec",
+    "resolve_strategy_tables",
+    "split_meta_block",
+]
 
 _LOG = logging.getLogger(__name__)
 
@@ -26,7 +32,8 @@ _TABLE_ORDER = ("policy", "scorer", "book", "hedge", "trend_overlay", "regime_he
 
 _MAX_CHAIN_FILES = 4
 
-_ALLOWED_TOP = frozenset({"policy", "scorer", "book", "hedge", "trend_overlay", "regime_hedge", "extends"})
+_ALLOWED_TOP = frozenset({"policy", "scorer", "book", "hedge", "trend_overlay", "regime_hedge", "extends", "meta"})
+_NON_SPEC_TOP = frozenset({"extends", "meta"})
 
 _TAX_SECTION = "tax"
 _COST_SECTION = "cost"
@@ -188,6 +195,45 @@ def _toml_value(value: Any) -> str:
     return _toml_scalar(value)
 
 
+def split_meta_block(text: str) -> tuple[str, str]:
+    """Split a leading ``[meta]`` block (through its blank separator line) from the strategy body."""
+    if not text.startswith("[meta]"):
+        return "", text
+    end = text.find("\n\n")
+    if end == -1:
+        return text, ""
+    return text[: end + 2], text[end + 2 :]
+
+
+def require_production_spec(path: Path) -> None:
+    """Fail closed unless the store is configured and ``path`` and its ``extends`` chain are not marked example.
+
+    Raises:
+        ConfigError: ``KSE_STRATEGY_STORE`` is unset, a file in the chain is missing or invalid, or a
+            ``[meta].example`` flag is anything other than false.
+    """
+    if strategy_store_root() is None:
+        raise ConfigError("production strategy requires KSE_STRATEGY_STORE to be set")
+    current = Path(path).absolute()
+    for _ in range(_MAX_CHAIN_FILES):
+        try:
+            raw = _read_strategy_toml(current)
+        except OSError as exc:
+            raise ConfigError(f"production strategy file is missing: {current}") from exc
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        meta = raw.get("meta")
+        if isinstance(meta, dict) and meta.get("example", False) is not False:
+            raise ConfigError(f"example strategy file cannot drive production: {current}")
+        target = raw.get("extends")
+        if target is None:
+            return
+        if not isinstance(target, str) or Path(target).is_absolute():
+            raise ConfigError(f"strategy extends must be a relative path string: {current}")
+        current = current.parent / target
+    raise ConfigError(f"strategy extends chain exceeds {_MAX_CHAIN_FILES} files: {path}")
+
+
 def render_strategy_toml(spec: StrategySpec, *, futures_constants: Path) -> str:
     """Deterministic TOML text of ``spec`` that loads back to the same ``spec_hash``."""
     supply = _supply_map(_load_market_sections(Path(futures_constants)))
@@ -263,7 +309,7 @@ def resolve_strategy_tables(path: Path, *, futures_constants: Path) -> dict[str,
         )
     merged: dict[str, Any] = {}
     for doc in reversed(chain_docs):
-        child = {key: value for key, value in doc.items() if key != "extends"}
+        child = {key: value for key, value in doc.items() if key not in _NON_SPEC_TOP}
         merged = _deep_merge(merged, child)
     sections = _load_market_sections(Path(futures_constants))
     supply = _supply_map(sections)

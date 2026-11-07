@@ -1,0 +1,6 @@
+extends = "../champion.toml"
+
+[scorer]
+feature_set = "dedup52"
+seeds = [11, 12, 13]
+num_threads = 4

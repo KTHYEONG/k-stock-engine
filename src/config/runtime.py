@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from src.config.errors import ConfigError
+from src.config.strategy_store import champion_path, strategy_store_root
 
 __all__ = ["RuntimeConfig", "load_runtime_config"]
 
@@ -69,6 +70,9 @@ def load_runtime_config(path: Path | None = None, *, create_directories: bool = 
     resolved: dict[str, Path] = {"repo_root": root}
     for key, value in raw.items():
         resolved[key] = _resolve(root, key, value)
+    store = strategy_store_root()
+    if store is not None:
+        resolved["champion_file"] = champion_path(store)
     try:
         config = RuntimeConfig.model_validate(resolved)
     except ValueError as exc:

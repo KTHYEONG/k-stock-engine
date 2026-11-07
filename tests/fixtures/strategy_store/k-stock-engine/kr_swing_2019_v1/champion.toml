@@ -1,0 +1,66 @@
+# Placeholder store fixture; not a production strategy.
+[meta]
+example = false
+
+[policy]
+family = "ml_trend_cash"
+n = 7
+keep_rank_multiple = 3.0
+rebalance_every_sessions = 5
+trend_min_ret21 = 0.0
+trend_fail_weight_fraction = 0.5
+min_units_per_slot = 3
+[policy.universe]
+min_adtv20_krw = 500000000
+min_price_krw = 1000
+[scorer]
+horizons = [5, 10, 21]
+num_boost_round = 300
+learning_rate = 0.03
+num_leaves = 15
+min_data_in_leaf = 800
+feature_fraction = 0.7
+bagging_fraction = 0.7
+bagging_freq = 1
+lambda_l2 = 50.0
+seed = 11
+num_threads = 8
+min_cross_section = 50
+winsor_low_pct = 1.0
+winsor_high_pct = 99.0
+purge_extra_sessions = 2
+min_train_rows = 20000
+first_test_year = 2018
+feature_set = "dedup52"
+seeds = []
+[book]
+sleeves = 5
+stock_capital_fraction = 0.5
+rebalance_band = 0.1
+[hedge]
+hedge_ratio = 0.0
+beta_window_sessions = 60
+beta_min_sessions = 20
+beta_cap = 2.0
+rebalance_every_sessions = 5
+use_futures = false
+margin_buffer_rate = 0.1
+margin_topup_trigger_fraction = 0.75
+[trend_overlay]
+signal = "ma"
+ma_sessions = 50
+vol_cap = 0.25
+vol_window_sessions = 60
+long_fraction = 1.0
+short_fraction = 0.5
+rebalance_every_sessions = 1
+margin_buffer_rate = 0.1
+margin_topup_trigger_fraction = 0.75
+[regime_hedge]
+tsmom_horizons = [21, 63]
+target_vol = 0.1
+max_fraction = 1.0
+vol_window_sessions = 60
+rebalance_every_sessions = 1
+margin_buffer_rate = 0.1
+margin_topup_trigger_fraction = 0.75

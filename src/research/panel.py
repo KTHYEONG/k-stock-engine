@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
@@ -12,9 +14,18 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
+from src.config.strategy_store import feature_sets_path, strategy_store_root
 from src.research.cube import ResearchCube
 
-__all__ = ["FEATURE_NAMES", "FEATURE_SETS", "HORIZONS", "FeaturePanel", "build_panel", "feature_names_for"]
+__all__ = [
+    "FEATURE_NAMES",
+    "HORIZONS",
+    "FeaturePanel",
+    "build_panel",
+    "feature_names_for",
+    "known_feature_set_names",
+    "resolve_feature_set",
+]
 
 _LOG = logging.getLogger(__name__)
 
@@ -85,17 +96,10 @@ FEATURE_NAMES: Final[tuple[str, ...]] = (
     "post_ear",
 )
 
-# dedup52: greedy removal of features with mean cross-sectional rank correlation
-# >= 0.80 to an already retained feature, families ordered by ablation importance.
-# dedup52_v1 is the legacy alias of the same tuple so stored specs keep loading;
-# new files must use dedup52.
-_DEDUP52_V1: Final[tuple[str, ...]] = ()  # chosen set lives in the private strategy store
+_BUILTIN_FEATURE_SETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType({"full62": FEATURE_NAMES})
 
-_FEATURE_SETS_RAW: Final[dict[str, tuple[str, ...]]] = {
-    "full62": FEATURE_NAMES,
-    "dedup52": _DEDUP52_V1,
-    "dedup52_v1": _DEDUP52_V1,
-}
+_STORE_SETS_CACHE: dict[tuple[str, int], Mapping[str, tuple[str, ...]]] = {}
+
 
 def _validate_feature_sets(sets: Mapping[str, tuple[str, ...]]) -> None:
     for _set_name, _set_names in sets.items():
@@ -106,25 +110,76 @@ def _validate_feature_sets(sets: Mapping[str, tuple[str, ...]]) -> None:
             raise ValueError(f"feature set {_set_name!r} has names outside FEATURE_NAMES: {sorted(unknown)}")
 
 
-_validate_feature_sets(_FEATURE_SETS_RAW)
-
-FEATURE_SETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(dict(_FEATURE_SETS_RAW))
+_validate_feature_sets(_BUILTIN_FEATURE_SETS)
 
 
-def feature_names_for(feature_set: str) -> tuple[str, ...]:
-    """Ordered feature names the scorer trains on for a named, frozen feature set.
+def _store_feature_sets(path: Path) -> Mapping[str, tuple[str, ...]]:
+    """``[sets]`` table of the store's feature-set file, parsed once per (path, mtime)."""
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError as exc:
+        raise ValueError(f"feature sets are missing: {path}") from exc
+    key = (str(path), mtime)
+    cached = _STORE_SETS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with open(path, "rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"feature sets are invalid: {path}: {exc}") from exc
+    table = raw.get("sets")
+    if not isinstance(table, dict) or not table:
+        raise ValueError(f"feature sets file must declare a non-empty [sets] table: {path}")
+    parsed: dict[str, tuple[str, ...]] = {}
+    for name, names in table.items():
+        if not isinstance(names, list) or not all(isinstance(item, str) for item in names):
+            raise ValueError(f"feature set {name!r} must be a list of feature names: {path}")
+        parsed[str(name)] = tuple(names)
+    _validate_feature_sets(parsed)
+    for stale in [item for item in _STORE_SETS_CACHE if item[0] == str(path)]:
+        del _STORE_SETS_CACHE[stale]
+    _STORE_SETS_CACHE[key] = parsed
+    return parsed
+
+
+def known_feature_set_names() -> tuple[str, ...]:
+    """Built-in names, then the store's names in file order; store names are absent when no store is readable."""
+    names = tuple(_BUILTIN_FEATURE_SETS)
+    root = strategy_store_root()
+    if root is None:
+        return names
+    try:
+        store_names = tuple(_store_feature_sets(feature_sets_path(root)))
+    except ValueError:
+        return names
+    return names + tuple(item for item in store_names if item not in _BUILTIN_FEATURE_SETS)
+
+
+def resolve_feature_set(name: str) -> tuple[str, ...]:
+    """Ordered feature names of a named set: built-ins first, then the private store's ``[sets]`` table.
 
     Why named sets instead of free lists: a feature set is part of the strategy identity; a name that maps to one frozen
     ordered tuple keeps stored champion specs reproducible and makes every change an explicit new set.
     Order matters: LightGBM column sampling is seeded per column position, so a reordering is a different model.
 
     Raises:
-        ValueError: ``feature_set`` is not a key of ``FEATURE_SETS``.
+        ValueError: ``name`` is unknown, or it is not built in and no strategy store is configured.
     """
+    if name in _BUILTIN_FEATURE_SETS:
+        return _BUILTIN_FEATURE_SETS[name]
+    root = strategy_store_root()
+    if root is None:
+        raise ValueError(f"unknown feature_set {name!r}: no strategy store configured")
     try:
-        return FEATURE_SETS[feature_set]
+        return _store_feature_sets(feature_sets_path(root))[name]
     except KeyError:
-        raise ValueError(f"unknown feature_set {feature_set!r}") from None
+        raise ValueError(f"unknown feature_set {name!r}") from None
+
+
+def feature_names_for(feature_set: str) -> tuple[str, ...]:
+    """Ordered feature names the scorer trains on for a named feature set (see ``resolve_feature_set``)."""
+    return resolve_feature_set(feature_set)
 
 
 _PRICE_FEATURES: Final[frozenset[str]] = frozenset(
