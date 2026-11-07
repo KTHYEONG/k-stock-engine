@@ -9,6 +9,56 @@ env:
   IMAGE: ghcr.io/kthyeong/k-stock-engine
 
 jobs:
+  # Decides whether this push reaches the running system. Tests/docs/markdown/AI-config-only pushes
+  # still run the test job but skip build and deploy (no approval prompt).
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      runtime: ${{ steps.classify.outputs.runtime }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Classify runtime impact
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          runtime=true
+          if [ "$EVENT" = "push" ]; then
+            set +e
+            bash .github/scripts/runtime_changed.sh "$BEFORE" "$GITHUB_SHA"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 1 ]; then runtime=false; fi
+          fi
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime"
+
+      # An older run parked at the production approval gate would hold the deploy concurrency slot and
+      # block this run. This push already contains those commits, so cancel only older runs still waiting.
+      - name: Cancel older runs waiting for approval
+        if: steps.classify.outputs.runtime == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          gh run list -R "$GITHUB_REPOSITORY" -w deploy.yml -s waiting -L 20 --json databaseId -q '.[].databaseId' |
+          while read -r id; do
+            if [ -n "$id" ] && [ "$id" -lt "$GITHUB_RUN_ID" ]; then
+              echo "cancel stale waiting run $id"
+              gh run cancel "$id" -R "$GITHUB_REPOSITORY" || echo "::warning::could not cancel run $id"
+            fi
+          done
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -34,7 +84,8 @@ jobs:
         run: uv run pytest
 
   build-and-push:
-    needs: test
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
@@ -70,7 +121,8 @@ jobs:
   deploy:
     # The deploy SSH key lives only in the production environment: no owner approval, no key.
     environment: production
-    needs: [test, build-and-push]
+    needs: [changes, test, build-and-push]
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     # packages:write lets the runner move the registry :latest tag; the VPS GHCR_PAT stays read-only.
@@ -83,6 +135,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
@@ -110,6 +164,17 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           printf '* %s\n' "$VPS_HOST_KEY" > ~/.ssh/known_hosts_vps
           SSH_OPTS="-i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_vps -o ConnectTimeout=20"
+          # Superseded only when a newer main commit itself changes runtime paths; a newer tests/docs-only
+          # push skips its own deploy, so this commit must still deploy (runtime_changed.sh exit 1).
+          LATEST_MAIN_SHA="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)"
+          test -n "$LATEST_MAIN_SHA"
+          if [ "$COMMIT_SHA" != "$LATEST_MAIN_SHA" ]; then
+            set +e
+            bash .github/scripts/runtime_changed.sh "$COMMIT_SHA" "$LATEST_MAIN_SHA"
+            newer_rc=$?
+            set -e
+            if [ "$newer_rc" -ne 0 ]; then LATEST_MAIN_SHA="$COMMIT_SHA"; fi
+          fi
 
           STAGE=stage_lib
           ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-stock-engine/.deploy"
@@ -127,10 +192,8 @@ jobs:
           vps_stage preflight
           vps_stage blackout_wait
           docker run --rm --memory=512m --memory-swap=512m --cpus=0.5 -e TZ=Asia/Seoul ghcr.io/kthyeong/k-stock-engine:sha-$COMMIT_SHA uv run python -m src.ops.deploy_window --wait
-          LATEST_MAIN_SHA="\$(git ls-remote https://github.com/kthyeong/k-stock-engine refs/heads/main | cut -f1)"
-          test -n "\$LATEST_MAIN_SHA"
-          if [ "\$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
-            echo "SKIP: superseded by \$LATEST_MAIN_SHA"
+          if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
+            echo "SKIP: superseded by $LATEST_MAIN_SHA"
             rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
             rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA
             exit 0
@@ -158,8 +221,18 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Same supersede rule as the VPS step: only the current main head may own :latest.
+          # Same supersede rule as the VPS step: only the newest runtime-changing main commit owns :latest.
+          # Superseded only when a newer main commit itself changes runtime paths; a newer tests/docs-only
+          # push skips its own deploy, so this commit must still deploy (runtime_changed.sh exit 1).
           LATEST_MAIN_SHA="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)"
+          test -n "$LATEST_MAIN_SHA"
+          if [ "$COMMIT_SHA" != "$LATEST_MAIN_SHA" ]; then
+            set +e
+            bash .github/scripts/runtime_changed.sh "$COMMIT_SHA" "$LATEST_MAIN_SHA"
+            newer_rc=$?
+            set -e
+            if [ "$newer_rc" -ne 0 ]; then LATEST_MAIN_SHA="$COMMIT_SHA"; fi
+          fi
           if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
             echo "SKIP: superseded by $LATEST_MAIN_SHA"
             exit 0

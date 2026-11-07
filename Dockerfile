@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.20 /uv /uvx /bin/
 # Debian's rclone 1.60 reports no sha256 for Drive objects, which fails the upload verification.
 COPY --from=rclone/rclone:1.75.1 /usr/local/bin/rclone /usr/local/bin/rclone
 
