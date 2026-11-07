@@ -131,12 +131,15 @@ def test_no_retired_prefix_references() -> None:
         assert not pat.search(text), f"{path} contains retired prefix"
 
 
-def test_quarantined_legacy_layout() -> None:
+def test_legacy_is_untracked_and_outside_src() -> None:
+    # legacy/ holds retired strategies and run results; it stays local-only (gitignored, never tracked).
+    import subprocess
+
     root = SRC.parent
-    legacy = root / "legacy"
-    assert (legacy / "stocks").is_dir()
-    assert (legacy / "etfs").is_dir()
-    assert (legacy / "live_yeti_v1").is_dir()
+    tracked = subprocess.run(  # noqa: S603 - fixed argv
+        ["git", "ls-files", "legacy"], cwd=root, capture_output=True, text=True, check=True  # noqa: S607
+    ).stdout.split()
+    assert tracked == []
     assert not (SRC / "stocks").exists()
     assert not (SRC / "etfs").exists()
     assert not (SRC / "legacy").exists()
