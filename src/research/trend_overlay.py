@@ -25,16 +25,15 @@ class TrendOverlaySpec(BaseModel):
     """Frozen identity of the index trend overlay; canonical JSON is part of the strategy identity.
 
     The overlay holds integer index futures sized to ``long_fraction · NAV`` (long) or ``short_fraction · NAV`` (short).
-    [redacted]
-    [redacted]
-    exposure off in sustained declines.
+    Why time-series trend on the large-cap index: the stock book does not hold large-cap rallies by itself, so they
+    are owned as index exposure, and an index trend filter keeps that exposure off in sustained declines.
 
     ``signal``: ``"ma"`` (level above its ``ma_sessions`` mean -> long, else short) or ``"tsmom"`` (s = the mean over
     ``tsmom_horizons`` of sign(level_t / level_{t-h} - 1), in [-1, 1]). Why the TSMOM average: it has no length to
-    [redacted]
+    pick, so it avoids selecting an MA length in sample.
     ``vol_cap`` (None = off): annualised realised volatility above which the position shrinks by vol_cap / vol. Why
-    [redacted]
-    [redacted]
+    crisis-only and not vol targeting: always-on targeting also scales normal-regime exposure; the cap only acts in
+    turbulent regimes, where a fixed notional multiplies risk.
     ``vol_window_sessions``: sessions of daily log returns in the realised-vol estimate (required with ``vol_cap``).
 
     Fields: signal ("ma" | "tsmom"); ma_sessions (int >= 2 when ma); tsmom_horizons (tuple[int, ...] when tsmom);

@@ -29,7 +29,7 @@ def _spec(**kwargs: Any) -> RegimeHedgeSpec:
     defaults: dict[str, Any] = {
         "tsmom_horizons": (5, 10, 15, 20),
         "target_vol": 0.10,
-        [redacted]
+        "max_fraction": 1.25,
         "vol_window_sessions": 20,
         "rebalance_every_sessions": 5,
         "contract_multiplier_krw": 10000,
@@ -164,13 +164,13 @@ def test_uptrend_is_flat() -> None:
 
 
 def test_downtrend_shorts_a_vol_scaled_size() -> None:
-    [redacted]
+    """Invariant: Given a falling path (s = -1) with realised vol 20%, target_vol 0.10, max 1.25;
     contracts = round(0.5·nav/(mult·L)) > 0.
     """
     spec = _spec(
         tsmom_horizons=(5, 10),
         target_vol=0.10,
-        [redacted]
+        max_fraction=1.25,
         vol_window_sessions=20,
         rebalance_every_sessions=1,
         contract_multiplier_krw=10000,

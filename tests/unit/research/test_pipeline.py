@@ -15,6 +15,7 @@ import pytest
 
 from src.data.research_protocol import WindowError
 from src.research.cube import ResearchCube
+from tests.research_builders import policy_toml_lines, scorer_config, scorer_toml_lines, trend_cash_policy
 
 _NOW = datetime(2026, 9, 30, tzinfo=UTC)
 INSTRS = [f"KRX:{i:06d}" for i in range(1, 7)]
@@ -112,8 +113,6 @@ def _spec(**overrides: Any) -> Any:
     from src.research.book import BookSpec
     from src.research.hedge import HedgeSpec
     from src.research.pipeline import StrategySpec
-    from src.research.policy import TrendCashPolicy
-    from src.research.model import ScorerConfig
 
     policy_kw: dict[str, Any] = {"rebalance_every_sessions": 5, "min_units_per_slot": 0, "n": 2}
     scorer_kw: dict[str, Any] = {
@@ -148,8 +147,8 @@ def _spec(**overrides: Any) -> Any:
     scorer_kw.update(overrides.pop("scorer", {}))
     book_kw.update(overrides.pop("book", {}))
     hedge_kw.update(overrides.pop("hedge", {}))
-    [redacted]
-    [redacted]
+    policy = trend_cash_policy(**policy_kw)  # type: ignore[arg-type]
+    scorer = scorer_config(**scorer_kw)  # type: ignore[arg-type]
     return StrategySpec(
         policy=policy,
         scorer=scorer,
@@ -1036,9 +1035,10 @@ def test_spec_identity(tmp_path: Path) -> None:
 
     good = tmp_path / "a.toml"
     good.write_text(
-        [redacted]
-        [redacted]
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[policy]\n" + policy_toml_lines(family="ml_trend_cash", n=20, rebalance_every_sessions=5)
+        + "[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n"
+        "[scorer]\n" + scorer_toml_lines(first_test_year=2019)
+        + "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
         "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
         "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
         "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
@@ -1048,9 +1048,10 @@ def test_spec_identity(tmp_path: Path) -> None:
     )
     other = tmp_path / "b.toml"
     other.write_text(
-        [redacted]
-        [redacted]
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[policy]\n" + policy_toml_lines(family="ml_trend_cash", n=20, rebalance_every_sessions=5)
+        + "[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n"
+        "[scorer]\n" + scorer_toml_lines(first_test_year=2019, seed=99)
+        + "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
         "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
         "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
         "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
@@ -1494,8 +1495,8 @@ def _with_trend_inputs(pipe: Any, sessions: list[date]) -> Any:
 def test_pre_overlay_spec_identity_unchanged() -> None:
     from src.research.pipeline import load_strategy_spec
 
-    [redacted]
-    [redacted]
+    spec = load_strategy_spec(__import__("pathlib").Path("tests/fixtures/strategies/sleeve_hedge.toml"))
+    assert spec.spec_hash == "e22f0ea6e49375fce49be7e02ca44baefc8a2132958ead09835110a4e7850340"
 
 
 def test_one_overlay_per_account(tmp_path: Path) -> None:
@@ -1503,9 +1504,10 @@ def test_one_overlay_per_account(tmp_path: Path) -> None:
 
     path = tmp_path / "trend.toml"
     path.write_text(
-        [redacted]
-        [redacted]
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[policy]\n" + policy_toml_lines(family="ml_trend_cash", n=20, rebalance_every_sessions=5)
+        + "[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n"
+        "[scorer]\n" + scorer_toml_lines(first_test_year=2019)
+        + "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
         "[hedge]\nhedge_ratio=1.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
         "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
         "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
@@ -1532,9 +1534,10 @@ def test_invalid_trend_overlay_table_rejected(tmp_path: Path) -> None:
 
     path = tmp_path / "bad_trend.toml"
     path.write_text(
-        [redacted]
-        [redacted]
-        "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
+        "[policy]\n" + policy_toml_lines(family="ml_trend_cash", n=20, rebalance_every_sessions=5)
+        + "[policy.universe]\nmin_adtv20_krw=0\nmin_price_krw=0\n"
+        "[scorer]\n" + scorer_toml_lines(first_test_year=2019)
+        + "[book]\nsleeves=5\nstock_capital_fraction=0.75\n"
         "[hedge]\nhedge_ratio=0.0\nbeta_window_sessions=10\nbeta_min_sessions=2\nbeta_cap=2.0\n"
         "rebalance_every_sessions=5\nuse_futures=true\ncontract_multiplier_krw=10000\ninitial_margin_rate=0.2175\n"
         "margin_buffer_rate=0.10\nmargin_topup_trigger_fraction=0.75\nfutures_cost_rate=0.0003\ninverse_cost_rate=0.0007\n"
@@ -1765,7 +1768,7 @@ def _regime_spec(**overrides: Any) -> Any:
     regime_kw: dict[str, Any] = {
         "tsmom_horizons": (5, 10, 15, 20),
         "target_vol": 0.10,
-        [redacted]
+        "max_fraction": 1.25,
         "vol_window_sessions": 20,
         "rebalance_every_sessions": 5,
         "contract_multiplier_krw": 10000,
@@ -1784,9 +1787,9 @@ def _regime_spec(**overrides: Any) -> Any:
 def test_champion_identity_unchanged_with_regime_hedge_support() -> None:
     from src.research.pipeline import load_strategy_spec
 
-    [redacted]
+    champion_path = Path("tests/fixtures/strategies/grid_base.toml")
     spec = load_strategy_spec(champion_path)
-    [redacted]
+    assert spec.spec_hash == "0eac6a98fe71e7edeeabd03036d50b75affb113b1c270d22db89c61181a545a1"
     assert spec.regime_hedge is None
 
 
@@ -1797,7 +1800,7 @@ def test_regime_hedge_without_trend_overlay_rejected() -> None:
     regime = RegimeHedgeSpec(
         tsmom_horizons=(5, 10),
         target_vol=0.10,
-        [redacted]
+        max_fraction=1.25,
         vol_window_sessions=20,
         rebalance_every_sessions=5,
         contract_multiplier_krw=10000,
@@ -1930,7 +1933,7 @@ def test_perturbation_detects_a_leaking_regime_hedge_leg(tmp_path: Path, monkeyp
 def test_load_strategy_spec_invalid_regime_hedge_table(tmp_path: Path) -> None:
     from src.research.pipeline import load_strategy_spec
 
-    [redacted]
+    base_toml = Path("tests/fixtures/strategies/grid_base.toml").read_text(encoding="utf-8")
     content = base_toml + "\n[regime_hedge]\ntarget_vol = 'invalid_not_a_float'\n"
     p = tmp_path / "bad.toml"
     p.write_text(content, encoding="utf-8")
@@ -1939,13 +1942,13 @@ def test_load_strategy_spec_invalid_regime_hedge_table(tmp_path: Path) -> None:
 
 
 _STAGED_REGIME_SPECS = (
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    "regime_stage1.toml",
+    "regime_stage1_target_vol_down.toml",
+    "regime_stage1_target_vol_up.toml",
+    "regime_stage2.toml",
+    "regime_stage2_vol_cap_down.toml",
+    "regime_stage2_vol_cap_up.toml",
+    "regime_stage3.toml",
 )
 
 
@@ -1959,12 +1962,12 @@ def test_staged_strategy_tomls_load_and_differ_only_in_targeted_knobs() -> None:
     specs = {fname: load_strategy_spec(strat_dir / fname) for fname in _STAGED_REGIME_SPECS}
 
     # Stage 1: neighbors differ from challenger only in regime_hedge.target_vol
-    [redacted]
+    s1_challenger = specs["regime_stage1.toml"]
     assert s1_challenger.regime_hedge is not None
-    [redacted]
+    assert s1_challenger.regime_hedge.target_vol == pytest.approx(0.12)
     for neighbor_name, expected_tv in [
-        [redacted]
-        [redacted]
+        ("regime_stage1_target_vol_down.toml", 0.08),
+        ("regime_stage1_target_vol_up.toml", 0.16),
     ]:
         neighbor_spec = specs[neighbor_name]
         assert neighbor_spec.regime_hedge is not None
@@ -1973,12 +1976,12 @@ def test_staged_strategy_tomls_load_and_differ_only_in_targeted_knobs() -> None:
         assert diff == ("regime_hedge.target_vol",)
 
     # Stage 2: neighbors differ from challenger only in trend_overlay.vol_cap
-    [redacted]
+    s2_challenger = specs["regime_stage2.toml"]
     assert s2_challenger.trend_overlay is not None
-    [redacted]
+    assert s2_challenger.trend_overlay.vol_cap == pytest.approx(0.22)
     for neighbor_name, expected_vc in [
-        [redacted]
-        [redacted]
+        ("regime_stage2_vol_cap_down.toml", 0.18),
+        ("regime_stage2_vol_cap_up.toml", 0.27),
     ]:
         neighbor_spec = specs[neighbor_name]
         assert neighbor_spec.trend_overlay is not None
@@ -1987,17 +1990,17 @@ def test_staged_strategy_tomls_load_and_differ_only_in_targeted_knobs() -> None:
         assert diff == ("trend_overlay.vol_cap",)
 
     # Stage 3: challenger replaces ma with tsmom
-    [redacted]
+    s3_challenger = specs["regime_stage3.toml"]
     assert s3_challenger.trend_overlay is not None
     assert s3_challenger.trend_overlay.signal == "tsmom"
-    [redacted]
+    assert s3_challenger.trend_overlay.tsmom_horizons == (10, 42, 84, 168)
     assert s3_challenger.trend_overlay.ma_sessions is None
     assert knob_changes(s3_challenger, s2_challenger) == ("trend_overlay.ma_sessions",)
     assert knob_changes(s2_challenger, s1_challenger) == (
         "trend_overlay.vol_cap",
         "trend_overlay.vol_window_sessions",
     )
-    [redacted]
+    champion = load_strategy_spec(strat_dir / "grid_base.toml")
     assert set(knob_changes(s1_challenger, champion)) == {
         f"regime_hedge.{name}"
         for name in json.loads(s1_challenger.regime_hedge.canonical_json())
@@ -2019,17 +2022,17 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
         assert spec.regime_hedge.futures_cost_rate == pytest.approx(spec.trend_overlay.futures_cost_rate)
 
 
-[redacted]
-    [redacted]
+def test_subset_challenger_toml_round_trips_the_feature_set() -> None:
+    """Invariant: the feature-subset challenger TOML round-trips scorer.feature_set and policy.n."""
     from src.research.pipeline import _scores_identity, load_strategy_spec, strategy_spec_from_canonical_json
 
     strat_dir = Path("tests/fixtures/strategies")
-    [redacted]
+    spec = load_strategy_spec(strat_dir / "regime_stage2_subset.toml")
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
-    [redacted]
-    [redacted]
+    assert restored.scorer.feature_set == "subset_a"
+    assert restored.policy.n == 14
     assert restored == spec
-    [redacted]
+    champion = load_strategy_spec(strat_dir / "regime_stage2.toml")
     assert _scores_identity(spec) != _scores_identity(champion)
     assert restored.policy.model_dump() != champion.policy.model_dump()
     champion_policy = champion.policy.model_dump()
@@ -2046,16 +2049,16 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
     assert restored.trend_overlay == champion.trend_overlay
     assert restored.regime_hedge == champion.regime_hedge
     for fname, expected_n in (
-        [redacted]
-        [redacted]
-        [redacted]
+        ("regime_stage2_subset_n_down.toml", 11),
+        ("regime_stage2_subset_n_up.toml", 17),
+        ("regime_stage2_subset_n_stage2.toml", 16),
     ):
         neighbor = load_strategy_spec(strat_dir / fname)
-        [redacted]
+        assert neighbor.scorer.feature_set == "subset_a"
         assert neighbor.policy.n == expected_n
         expected = champion.model_copy(
             update={
-                [redacted]
+                "scorer": champion.scorer.model_copy(update={"feature_set": "subset_a"}),
                 "policy": champion.policy.model_copy(update={"n": expected_n}),
             }
         )
@@ -2064,21 +2067,21 @@ def test_staged_strategy_leg_tax_terms_match() -> None:
         assert _scores_identity(neighbor) == _scores_identity(spec)
 
 
-[redacted]
+def test_alt_scorer_strategy_loads_with_full62_and_three_seeds() -> None:
     from src.research.pipeline import load_strategy_spec, strategy_spec_from_canonical_json
 
     strat_dir = Path("tests/fixtures/strategies")
-    [redacted]
+    spec = load_strategy_spec(strat_dir / "regime_stage2_scorer_alt.toml")
     restored = strategy_spec_from_canonical_json(spec.canonical_json())
     assert restored == spec
     assert restored.scorer.feature_set == "full62"
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    assert restored.scorer.seeds == (7, 8, 9)
+    assert restored.scorer.num_leaves == 47
+    assert restored.scorer.min_data_in_leaf == 150
+    assert restored.scorer.learning_rate == pytest.approx(0.08)
+    assert restored.scorer.num_boost_round == 90
+    assert restored.scorer.seed == 7
+    champion = load_strategy_spec(strat_dir / "regime_stage2_subset.toml")
     assert restored.policy == champion.policy
     assert restored.book == champion.book
     assert restored.hedge == champion.hedge
@@ -2165,12 +2168,12 @@ def test_targets_through_last_row_matches_research_loop() -> None:
     from src.research.operate import bootstrap_state
     from src.research.panel import FeaturePanel
     from src.research.pipeline import Pipeline
-    [redacted]
+    from src.research.policy import UniverseRule, decision_rows, select_row, universe_mask
     from tests.fixtures.synthetic_panel import synthetic_cube, synthetic_sessions
 
     sessions = synthetic_sessions(60, start=date(2021, 1, 4))
     cube = synthetic_cube(sessions, INSTRS[:4])
-    [redacted]
+    policy = trend_cash_policy(
         family="ml_trend_cash", n=2, keep_rank_multiple=3.0, rebalance_every_sessions=2,
         universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
         trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,

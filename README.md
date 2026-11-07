@@ -85,7 +85,7 @@ core → config → integrations → data → backtest → research → ops
 
 - **문제:** 전략을 계속 바꿔 보면 점수 하나로는 과적합을 구분하기 어렵습니다. 주 1회 리밸런싱은 매매 요일에 따라 성과가 달라지기도 합니다.
 - **분석:** 평균 수익이 아니라 나쁜 경우의 성장률을 목적 값으로 삼고, 매매일은 분산하기로 했습니다.
-[redacted]
+- **선택:** 주식 자금을 5개 슬리브로 나눠 매매 요일을 분산하고([book.py](./src/research/book.py)), KOSPI 200 이동평균 추세에 따라 선물 포지션을 얹는 오버레이([trend_overlay.py](./src/research/trend_overlay.py))를 결합했습니다. 평가([evaluation.py](./src/research/evaluation.py))는 63거래일 블록 부트스트랩 4,000회로 5년 경로를 만들어 하위 10% 성장률을 목적 값으로 쓰고, 파산 확률 가드와 슬리피지 비용 격자(0, 0.5, 1.0, 1.5틱)를 함께 봅니다([protocol.toml](./config/research/protocol.toml)). 새 전략이 챔피언이 되려면 같은 구간에서 짝지은 부트스트랩 비교와 다중 검정 보정을 통과해야 합니다([champion.py](./src/research/champion.py)). 점수 모델은 시드 11·12·13 평균을 써서 시드 운을 줄입니다.
 - ✅ **결과:** 전략 변경이 "더 좋아 보인다"가 아니라 정해진 통계 기준으로 승격됩니다. 기준 값에 대한 근거는 설정 파일 주석에 남깁니다.
 
 ### 🔒 5. 실주문을 코드 단계에서 막는 안전 게이트
@@ -105,7 +105,7 @@ core → config → integrations → data → backtest → research → ops
 ## 📊 결과
 
 > [!IMPORTANT]
-[redacted]
+> **원본 실행 결과 파일이 저장소에 포함되어 있지 않아 아래 수치는 이 저장소만으로 재현해 확인할 수 없습니다.** 결과를 만든 전략 설정은 비공개 전략 저장소에 있고, 평가 규칙은 [`protocol.toml`](./config/research/protocol.toml)입니다.
 
 | 항목 | 값 | 기준 |
 | :--- | :---: | :--- |
@@ -167,7 +167,7 @@ uv run python tools/verify.py      # 린트·타입·테스트·변경분 커버
 
 # 연구
 uv run python -m src.research build-cube
-[redacted]
+uv run python -m src.research evaluate --spec config/research/champion.example.toml
 
 # 데이터
 uv run python -m src.data.cli collect-krx-daily-market

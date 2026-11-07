@@ -22,20 +22,20 @@ def _store(root: Path, sets_text: str | None) -> Path:
 def test_missing_feature_sets_file_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KSE_STRATEGY_STORE", str(_store(tmp_path / "empty", None)))
     with pytest.raises(ValueError, match="missing"):
-        [redacted]
+        feature_names_for("subset_a")
     assert known_feature_set_names() == ("full62",)
 
 
 def test_invalid_feature_sets_toml_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KSE_STRATEGY_STORE", str(_store(tmp_path / "bad", "[sets\n")))
     with pytest.raises(ValueError, match="invalid"):
-        [redacted]
+        feature_names_for("subset_a")
 
 
 def test_feature_sets_without_table_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KSE_STRATEGY_STORE", str(_store(tmp_path / "notable", "other = 1\n")))
     with pytest.raises(ValueError, match="non-empty"):
-        [redacted]
+        feature_names_for("subset_a")
 
 
 def test_non_list_feature_set_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

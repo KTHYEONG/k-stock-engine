@@ -17,7 +17,8 @@ from src.research.book import (
 from src.research.cube import ResearchCube
 from src.research.model import ScoreMatrix
 from src.research.panel import FeaturePanel
-from src.research.policy import TrendCashPolicy, build_targets, decision_rows
+from src.research.policy import build_targets, decision_rows
+from tests.research_builders import trend_cash_policy
 
 S = 24
 N = 6
@@ -63,9 +64,9 @@ def test_disabled_dev_leg_ignores_nan() -> None:
     panel = _panel()
     panel.features["dev_ma20"][5, 0] = np.float32(np.nan)
     uni = np.ones((S, N), dtype=bool)
-    [redacted]
+    off = trend_cash_policy(n=2, trend_min_dev_ma20=None, trend_min_ret21=0.0)
     assert np.asarray(build_targets(off, _cube(), panel, _scores(mat), uni, rows=[5], capital_krw=CAP, cash_buffer=0.0)[5]) == pytest.approx([0.5, 0.5, 0, 0, 0, 0])
-    [redacted]
+    on = trend_cash_policy(n=2, trend_min_dev_ma20=0.0, trend_min_ret21=0.0)
     assert build_targets(on, _cube(), panel, _scores(mat), uni, rows=[5], capital_krw=CAP, cash_buffer=0.0)[5][0] == 0.0
 
 
@@ -73,7 +74,7 @@ def test_both_legs_disabled_keep_pure_top_n() -> None:
     mat = np.full((S, N), 0.0)
     mat[5] = [0.9, 0.8, 0.7, 0.1, 0.1, 0.1]
     panel = _panel(dev=float("nan"), ret=float("nan"))
-    [redacted]
+    policy = trend_cash_policy(n=3, trend_min_dev_ma20=None, trend_min_ret21=None)
     out = build_targets(policy, _cube(), panel, _scores(mat), np.ones((S, N), dtype=bool), rows=[5], capital_krw=CAP, cash_buffer=0.0)[5]
     assert np.asarray(out) == pytest.approx([1 / 3, 1 / 3, 1 / 3, 0, 0, 0])
 
@@ -83,7 +84,7 @@ def test_ret_only_leg() -> None:
     mat[5] = [0.9, 0.8, 0.1, 0.1, 0.1, 0.1]
     panel = _panel()
     panel.features["ret_21"][5, 0] = np.float32(-0.5)
-    [redacted]
+    policy = trend_cash_policy(n=2, trend_min_dev_ma20=None, trend_min_ret21=0.0)
     out = build_targets(policy, _cube(), panel, _scores(mat), np.ones((S, N), dtype=bool), rows=[5], capital_krw=CAP, cash_buffer=0.0)[5]
     assert np.asarray(out) == pytest.approx([0.0, 0.5, 0, 0, 0, 0])
 
@@ -93,7 +94,7 @@ def test_dev_only_leg() -> None:
     mat[5] = [0.9, 0.8, 0.1, 0.1, 0.1, 0.1]
     panel = _panel()
     panel.features["dev_ma20"][5, 0] = np.float32(-0.5)
-    [redacted]
+    policy = trend_cash_policy(n=2, trend_min_dev_ma20=0.0, trend_min_ret21=None)
     out = build_targets(policy, _cube(), panel, _scores(mat), np.ones((S, N), dtype=bool), rows=[5], capital_krw=CAP, cash_buffer=0.0)[5]
     assert np.asarray(out) == pytest.approx([0.0, 0.5, 0, 0, 0, 0])
 
@@ -110,7 +111,7 @@ def test_enabled_feature_shape_mismatch() -> None:
     )
     with pytest.raises(ValueError, match="match the scores shape"):
         build_targets(
-            [redacted]
+            trend_cash_policy(n=2, trend_min_dev_ma20=None, trend_min_ret21=0.0),
             _cube(), bad, _scores(mat), np.ones((S, N), dtype=bool),
             rows=[5], capital_krw=CAP, cash_buffer=0.0,
         )
@@ -124,7 +125,7 @@ def test_enabled_feature_shape_mismatch() -> None:
     )
     with pytest.raises(ValueError, match="match the scores shape"):
         build_targets(
-            [redacted]
+            trend_cash_policy(n=2, trend_min_dev_ma20=0.0, trend_min_ret21=None),
             _cube(), bad2, _scores(mat), np.ones((S, N), dtype=bool),
             rows=[5], capital_krw=CAP, cash_buffer=0.0,
         )
@@ -132,9 +133,9 @@ def test_enabled_feature_shape_mismatch() -> None:
 
 def test_policy_threshold_validation() -> None:
     with pytest.raises(ValueError, match="trend threshold"):
-        [redacted]
-    [redacted]
-    [redacted]
+        trend_cash_policy(trend_min_ret21=float("inf"))
+    assert trend_cash_policy(trend_min_dev_ma20=None).trend_min_dev_ma20 is None
+    assert trend_cash_policy(trend_min_ret21=None).spec_hash != trend_cash_policy(trend_min_ret21=0.0).spec_hash
 
 
 def test_sleeve_capital_arithmetic() -> None:
@@ -158,7 +159,7 @@ def test_sleeves_tile_and_mismatch() -> None:
     for phase in range(5):
         union.update(decision_rows(sess, lo=5, hi=25, every=5, phase=phase))
     assert union == set(range(4, 25))
-    [redacted]
+    policy = trend_cash_policy(n=2, rebalance_every_sessions=5, trend_min_dev_ma20=None, trend_min_ret21=None)
     with pytest.raises(ValueError, match="sleeves"):
         build_sleeve_targets(
             policy, _cube(), _panel(), _scores(np.full((S, N), 0.1)), np.ones((S, N), dtype=bool),
@@ -172,7 +173,7 @@ def test_sleeves_tile_and_mismatch() -> None:
 
 
 def test_build_sleeve_targets_use_sleeve_capital() -> None:
-    [redacted]
+    policy = trend_cash_policy(n=2, rebalance_every_sessions=5, trend_min_dev_ma20=None, trend_min_ret21=None)
     mat = np.full((S, N), 0.1)
     mat[:, 0] = 0.9
     sleeves = build_sleeve_targets(
@@ -183,7 +184,7 @@ def test_build_sleeve_targets_use_sleeve_capital() -> None:
     close = np.full((S, N), 5000.0)
     close[:, 0] = 60_000.0
     poor = build_sleeve_targets(
-        [redacted]
+        trend_cash_policy(n=1, rebalance_every_sessions=5, trend_min_dev_ma20=None, trend_min_ret21=None),
         _cube(close), _panel(), _scores(mat), np.ones((S, N), dtype=bool),
         sessions=_sessions(), sleeves=5, lo=5, hi=20, sleeve_capital_krw=100_000, cash_buffer=0.0,
     )

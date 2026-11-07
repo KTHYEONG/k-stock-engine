@@ -38,7 +38,7 @@ class RegimeHedgeSpec(BaseModel):
     ``tsmom_horizons``) is negative, hold short futures of notional |s| * min(max_fraction, target_vol / sigma) * NAV,
     where sigma is the annualised realised vol of the last ``vol_window_sessions`` daily log returns. Otherwise flat.
     Why short-only and trend-gated: the stock book's beta to KOSDAQ only hurts in KOSDAQ downtrends; an always-on hedge
-    [redacted]
+    pays the index premium in up-markets as well.
 
     Fields: tsmom_horizons (non-empty ascending ints >= 1); target_vol > 0; max_fraction >= 0 (0 = flat); vol_window_sessions >= 2;
     rebalance_every_sessions >= 1; contract_multiplier_krw > 0; initial_margin_rate, margin_buffer_rate (sum < 1);

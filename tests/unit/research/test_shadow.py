@@ -13,6 +13,7 @@ import pytest
 from src.backtest.engine import DelistPolicy
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
+from tests.research_builders import scorer_config, trend_cash_policy
 
 INSTRS = ["KRX:000001", "KRX:000002"]
 CAPITAL = 10_000_000
@@ -28,12 +29,10 @@ def _spec() -> Any:
     from src.research.book import BookSpec
     from src.research.hedge import HedgeSpec
     from src.research.pipeline import StrategySpec
-    from src.research.policy import TrendCashPolicy
-    from src.research.model import ScorerConfig
 
     return StrategySpec(
-        [redacted]
-        [redacted]
+        policy=trend_cash_policy(rebalance_every_sessions=1, min_units_per_slot=0, n=2),
+        scorer=scorer_config(first_test_year=2019, min_train_rows=1, min_cross_section=1, num_boost_round=2, min_data_in_leaf=2, num_threads=1),
         book=BookSpec(sleeves=1, stock_capital_fraction=0.75),
         hedge=HedgeSpec(
             hedge_ratio=0.0, beta_window_sessions=10, beta_min_sessions=2, beta_cap=2.0,

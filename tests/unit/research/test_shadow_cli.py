@@ -15,7 +15,7 @@ import pytest
 from src.core.time import KRX_TZ
 
 INSTRS = ["KRX:000001", "KRX:000002"]
-[redacted]
+SPEC_FIXTURE = Path("tests/fixtures/strategies/sleeve_hedge.toml")
 
 
 def _pipe(tmp_path: Path, sessions: list[date]) -> Any:

@@ -28,7 +28,8 @@ from src.research.operate import (
     state_digest,
 )
 from src.research.panel import FeaturePanel, feature_names_for
-[redacted]
+from src.research.policy import UniverseRule, decision_rows, select_row
+from tests.research_builders import scorer_config, trend_cash_policy
 
 KRX = ZoneInfo("Asia/Seoul")
 
@@ -69,7 +70,7 @@ def _sessions(n: int = 60, start: date = date(2021, 1, 4)) -> list[date]:
 
 
 def _spec() -> SimpleNamespace:
-    [redacted]
+    policy = trend_cash_policy(
         family="ml_trend_cash",
         n=2,
         keep_rank_multiple=3.0,
@@ -92,7 +93,7 @@ def _spec() -> SimpleNamespace:
 
 
 def _scorer_config() -> ScorerConfig:
-    [redacted]
+    return scorer_config(horizons=(5,), min_cross_section=2, min_train_rows=1)
 
 
 def _scorer(year: int = 2021) -> FrozenScorer:

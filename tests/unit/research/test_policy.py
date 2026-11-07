@@ -11,6 +11,7 @@ from src.research.cube import ResearchCube
 from src.research.model import ScoreMatrix
 from src.research.panel import FeaturePanel
 from src.research.policy import TrendCashPolicy, UniverseRule, build_targets, decision_rows, universe_mask
+from tests.research_builders import trend_cash_policy
 
 S = 24
 N = 6
@@ -58,7 +59,7 @@ def _policy(**overrides: object) -> TrendCashPolicy:
         "trend_min_ret21": 0.0,
     }
     kwargs.update(overrides)
-    [redacted]
+    return trend_cash_policy(**kwargs)  # type: ignore[arg-type]
 
 
 def _full_scores(value: float = 0.0) -> np.ndarray:
@@ -155,7 +156,7 @@ def test_unit_price_cap() -> None:
     close = np.full((S, N), 5000.0)
     close[:, 0] = 2_000_000.0
     out = build_targets(
-        [redacted]
+        _policy(n=2, min_units_per_slot=4), _cube(close), _panel(), _scores(mat), np.ones((S, N), dtype=bool),
         rows=[5], capital_krw=CAP, cash_buffer=0.0,
     )
     assert np.asarray(out[5]) == pytest.approx([0.0, 1 / 2, 1 / 2, 0.0, 0.0, 0.0])
@@ -294,11 +295,11 @@ def test_redistribute_cap_validation() -> None:
     assert _policy(redistribute_cap_multiple=None).redistribute_cap_multiple is None
     assert _policy(redistribute_cap_multiple=1).redistribute_cap_multiple == 1.0
     with pytest.raises(ValueError, match="redistribute_cap_multiple"):
-        [redacted]
+        trend_cash_policy(redistribute_cap_multiple=0.5)
     with pytest.raises(ValueError, match="redistribute_cap_multiple"):
-        [redacted]
+        trend_cash_policy(redistribute_cap_multiple=float("nan"))
     with pytest.raises(ValueError, match="redistribute_cap_multiple"):
-        [redacted]
+        trend_cash_policy(redistribute_cap_multiple=float("inf"))
 
 
 def test_redistribute_cap_is_part_of_the_identity() -> None:
@@ -311,17 +312,17 @@ def test_rule_and_policy_validation() -> None:
     with pytest.raises(ValueError, match="non-negative int"):
         UniverseRule(min_adtv20_krw=-1, min_price_krw=1000)
     with pytest.raises(ValueError, match="family"):
-        [redacted]
+        trend_cash_policy(family="  ")
     with pytest.raises(ValueError, match="n must"):
-        [redacted]
+        trend_cash_policy(n=0)
     with pytest.raises(ValueError, match="keep_rank_multiple"):
-        [redacted]
+        trend_cash_policy(keep_rank_multiple=-1.0)
     with pytest.raises(ValueError, match="rebalance_every_sessions"):
-        [redacted]
+        trend_cash_policy(rebalance_every_sessions=0)
     with pytest.raises(ValueError, match="min_units_per_slot"):
-        [redacted]
+        trend_cash_policy(min_units_per_slot=-1)
     with pytest.raises(ValueError, match="trend threshold"):
-        [redacted]
+        trend_cash_policy(trend_min_ret21=float("nan"))
 
 
 def test_build_targets_guards() -> None:
@@ -375,7 +376,7 @@ def test_universe_mask_contract() -> None:
         exit_at=np.full(5, -1, dtype=np.int64),
         exit_halted=np.zeros(5, dtype=np.bool_),
     )
-    [redacted]
+    mask = universe_mask(cube, UniverseRule(min_adtv20_krw=300_000_000, min_price_krw=2_000))
     assert bool(np.all(mask[:, 0]))
     assert bool(np.all(~mask[:, 1:]))
 
@@ -423,9 +424,9 @@ def test_trend_fail_fraction_is_inert_when_all_pass_and_validated() -> None:
     assert np.array_equal(np.asarray(plain[5]), np.asarray(soft[5]))
     for bad in (-0.1, 1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="trend_fail_weight_fraction"):
-            [redacted]
+            trend_cash_policy(trend_fail_weight_fraction=bad)
     with pytest.raises(ValueError, match="mutually exclusive"):
-        [redacted]
+        trend_cash_policy(trend_fail_weight_fraction=0.5, redistribute_cap_multiple=2.0)
     assert _policy().spec_hash != _policy(trend_fail_weight_fraction=0.5).spec_hash
     assert json.loads(_policy().canonical_json())["trend_fail_weight_fraction"] is None
     assert _policy(trend_fail_weight_fraction=None).trend_fail_weight_fraction is None

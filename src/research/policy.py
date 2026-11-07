@@ -60,9 +60,8 @@ def universe_mask(cube: ResearchCube, rule: UniverseRule) -> NDArray[np.bool_]:
 class TrendCashPolicy(BaseModel):
     """Top-N selection by ensemble score with a per-name own-trend cash rule.
 
-    [redacted]
-    [redacted]
-    [redacted]
+    Why: drawdowns are market-driven; picks whose own 1-month trend has failed are an early, bottom-up signal of
+    a risk-off state, so holding cash for them de-risks the book without any index timing.
     ``trend_fail_weight_fraction`` (None = off, same as 0.0): a selected name that fails the trend rule keeps
     this fraction of its 1/n slot instead of going fully to cash. Why: the full cash rule leaves the book about
     half invested; partial de-risking keeps most of the drawdown protection at far less growth drag.
@@ -76,14 +75,14 @@ class TrendCashPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     family: str = "ml_trend_cash"
     n: int = 20
-    [redacted]
-    [redacted]
-    [redacted]
+    keep_rank_multiple: float
+    rebalance_every_sessions: int
+    universe: UniverseRule
     trend_min_dev_ma20: float | None = None
     trend_min_ret21: float | None = None
     redistribute_cap_multiple: float | None = None
     trend_fail_weight_fraction: float | None = None
-    [redacted]
+    min_units_per_slot: int
 
     @field_validator("family")
     @classmethod

@@ -12,16 +12,20 @@ from typing import Any
 
 import numpy as np
 import pytest
+from tests.research_builders import policy_toml_lines, scorer_config, scorer_toml_lines, trend_cash_policy
 
 
 def _write_spec(path: Path, *, n: int = 2, hedge_ratio: float = 1.0, seeds: bool = True) -> Path:
     scorer_seeds = "seeds = [11, 12, 13]\n" if seeds else ""
     path.write_text(
-        [redacted]
-        "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
-        [redacted]
-        [redacted]
-        "[book]\nsleeves = 5\nstock_capital_fraction = 0.75\n"
+        "[policy]\n" + policy_toml_lines(family="ml_trend_cash", n=n, rebalance_every_sessions=5)
+        + "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
+        "[scorer]\n" + scorer_toml_lines(
+            first_test_year=2019, min_train_rows=1, min_cross_section=1, num_boost_round=2, min_data_in_leaf=2,
+            num_threads=1,
+        )
+        + scorer_seeds
+        + "[book]\nsleeves = 5\nstock_capital_fraction = 0.75\n"
         f"[hedge]\nhedge_ratio = {hedge_ratio}\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
         "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
         "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"
@@ -882,11 +886,11 @@ def test_freeze_models_command(
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["models_dir"].endswith("2020")
     assert payload["year"] == 2020
-    [redacted]
+    assert payload["boosters"] == 6
     assert main(["freeze-models", "--spec", str(spec)]) == 0
     defaulted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert defaulted["year"] == 2021
-    [redacted]
+    assert defaulted["boosters"] == 6
     assert calls == [2020, None]
 
 
@@ -970,10 +974,10 @@ def test_decide_is_idempotent(
     from src.research.book import BookSpec, build_sleeve_targets, sleeve_capital_krw
     from src.research.cli import main
     from src.research.hedge import HedgeInputs
-    from src.research.model import FrozenScorer, ScorerConfig, ScoreMatrix, score_rows
+    from src.research.model import FrozenScorer, ScoreMatrix, score_rows
     from src.research.operate import bootstrap_state, load_state
     from src.research.panel import build_panel, feature_names_for
-    [redacted]
+    from src.research.policy import UniverseRule, decision_rows, select_row, universe_mask
 
     base = date(2021, 1, 4)
     sessions = []
@@ -1079,13 +1083,13 @@ def test_decide_is_idempotent(
     )
     cube = cube_mod.build_research_cube(inputs)
     panel = build_panel(cube, last_row=len(sessions) - 1)
-    [redacted]
+    policy = trend_cash_policy(
         family="ml_trend_cash", n=1, keep_rank_multiple=3.0, rebalance_every_sessions=2,
         universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
         trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,
     )
     book = BookSpec(sleeves=2, stock_capital_fraction=0.75)
-    [redacted]
+    config = scorer_config(horizons=(5,), min_cross_section=1, min_train_rows=1)
 
     class _Stub:
         def model_to_string(self) -> str:
@@ -1127,11 +1131,14 @@ def test_decide_is_idempotent(
 
     spec_toml = _write_spec(tmp_path / "spec.toml", n=1)
     spec_toml.write_text(
-        [redacted]
-        "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
-        [redacted]
-        [redacted]
-        "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
+        "[policy]\n"
+        + policy_toml_lines(family="ml_trend_cash", n=1, rebalance_every_sessions=2, min_units_per_slot=0)
+        + "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
+        "[scorer]\n" + scorer_toml_lines(
+            first_test_year=2019, min_train_rows=1, min_cross_section=1, num_boost_round=2, min_data_in_leaf=2,
+            num_threads=1, horizons=(5,),
+        )
+        + "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
         "[hedge]\nhedge_ratio = 1.0\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
         "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
         "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"
@@ -1506,7 +1513,7 @@ def test_decide_calendar_failure_fails_closed(tmp_path: Path, monkeypatch: pytes
 
     from src.research import cli as cli_module
     from src.research.cli import main
-    from src.research.model import FrozenScorer, ScorerConfig
+    from src.research.model import FrozenScorer
     from src.research.panel import FeaturePanel
     from src.research.pipeline import load_strategy_spec
 
@@ -1521,7 +1528,7 @@ def test_decide_calendar_failure_fails_closed(tmp_path: Path, monkeypatch: pytes
         def predict(self, data: np.ndarray) -> np.ndarray:
             return np.zeros(np.asarray(data).shape[0], dtype=np.float64)
 
-    [redacted]
+    config = scorer_config(horizons=(5,), min_cross_section=1, min_train_rows=1)
     scorer = FrozenScorer(config=config, year=2021, boosters={(int(config.seed), 5): _Stub()})  # type: ignore[dict-item]
     from src.research.panel import feature_names_for as _names_for
 
@@ -1621,10 +1628,10 @@ def test_decide_multi_year_catch_up(
     from src.research.book import BookSpec, build_sleeve_targets, sleeve_capital_krw
     from src.research.cli import main
     from src.research.hedge import HedgeInputs
-    from src.research.model import FrozenScorer, ScorerConfig, ScoreMatrix, score_rows
+    from src.research.model import FrozenScorer, ScoreMatrix, score_rows
     from src.research.operate import bootstrap_state, load_state, save_state
     from src.research.panel import build_panel, feature_names_for
-    [redacted]
+    from src.research.policy import UniverseRule, decision_rows, select_row, universe_mask
 
     base = date(2021, 12, 20)
     sessions = []
@@ -1731,13 +1738,13 @@ def test_decide_multi_year_catch_up(
     )
     cube = cube_mod.build_research_cube(inputs)
     panel = build_panel(cube, last_row=len(sessions) - 1)
-    [redacted]
+    policy = trend_cash_policy(
         family="ml_trend_cash", n=1, keep_rank_multiple=3.0, rebalance_every_sessions=2,
         universe=UniverseRule(min_adtv20_krw=0, min_price_krw=0),
         trend_min_dev_ma20=None, trend_min_ret21=None, min_units_per_slot=0,
     )
     book = BookSpec(sleeves=2, stock_capital_fraction=0.75)
-    [redacted]
+    config = scorer_config(horizons=(5,), min_cross_section=1, min_train_rows=1)
 
     class _Stub:
         def model_to_string(self) -> str:
@@ -1779,11 +1786,14 @@ def test_decide_multi_year_catch_up(
         incumb.append(carried)
     spec_toml = tmp_path / "spec.toml"
     spec_toml.write_text(
-        [redacted]
-        "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
-        [redacted]
-        [redacted]
-        "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
+        "[policy]\n"
+        + policy_toml_lines(family="ml_trend_cash", n=1, rebalance_every_sessions=2, min_units_per_slot=0)
+        + "[policy.universe]\nmin_adtv20_krw = 0\nmin_price_krw = 0\n"
+        "[scorer]\n" + scorer_toml_lines(
+            first_test_year=2019, min_train_rows=1, min_cross_section=1, num_boost_round=2, min_data_in_leaf=2,
+            num_threads=1, horizons=(5,),
+        )
+        + "[book]\nsleeves = 2\nstock_capital_fraction = 0.75\n"
         "[hedge]\nhedge_ratio = 1.0\nbeta_window_sessions = 10\nbeta_min_sessions = 2\nbeta_cap = 2.0\n"
         "rebalance_every_sessions = 5\nuse_futures = true\ncontract_multiplier_krw = 10000\n"
         "initial_margin_rate = 0.2175\nmargin_buffer_rate = 0.10\nmargin_topup_trigger_fraction = 0.75\n"

@@ -13,7 +13,7 @@ from src.research.trend_overlay import TrendOverlay, TrendOverlaySpec, trend_der
 
 def _spec(**overrides: Any) -> TrendOverlaySpec:
     values: dict[str, Any] = {
-        [redacted]
+        "ma_sessions": 80,
         "long_fraction": 1.0,
         "short_fraction": 0.5,
         "rebalance_every_sessions": 1,
@@ -168,7 +168,7 @@ def test_spec_validation() -> None:
     [
         {"signal": "invalid"},
         {"signal": "tsmom", "ma_sessions": 10},
-        [redacted]
+        {"signal": "ma", "tsmom_horizons": (20, 60)},
         {"signal": "tsmom", "tsmom_horizons": ()},
         {"signal": "tsmom", "tsmom_horizons": "not_a_tuple"},
         {"signal": "tsmom", "tsmom_horizons": (10, 5)},
@@ -177,8 +177,8 @@ def test_spec_validation() -> None:
         {"signal": "tsmom", "tsmom_horizons": (True, 10)},
         {"vol_cap": -0.5, "vol_window_sessions": 20},
         {"vol_cap": float("nan"), "vol_window_sessions": 20},
-        [redacted]
-        [redacted]
+        {"vol_cap": 0.3, "vol_window_sessions": 1},
+        {"vol_cap": 0.3, "vol_window_sessions": True},
         {"ma_sessions": True},
         {"long_fraction": float("nan")},
         {"short_fraction": float("inf")},
@@ -255,8 +255,8 @@ def test_legacy_ma_spec_is_byte_identical() -> None:
     from pathlib import Path
     from src.research.pipeline import load_strategy_spec
 
-    [redacted]
-    [redacted]
+    champion = load_strategy_spec(Path("tests/fixtures/strategies/grid_base.toml"))
+    assert champion.spec_hash == "0eac6a98fe71e7edeeabd03036d50b75affb113b1c270d22db89c61181a545a1"
     spec = champion.trend_overlay
     assert spec is not None
     # Canonical JSON does not contain "signal" or None fields
@@ -277,7 +277,7 @@ def test_tsmom_all_up_is_full_long() -> None:
     spec = _spec(
         signal="tsmom",
         ma_sessions=None,
-        [redacted]
+        tsmom_horizons=(20, 60, 120, 250),
         long_fraction=1.0,
     )
     overlay = TrendOverlay(spec, index_level=levels)
@@ -290,15 +290,15 @@ def test_tsmom_all_up_is_full_long() -> None:
 
 
 def test_tsmom_mixed_gives_fractional_size() -> None:
-    [redacted]
-    [redacted]
-    [redacted]
+    # Path where only the 250-session return is negative, shorter returns positive
+    # Horizons: (20, 60, 120, 250). 3 positive, 1 negative -> mean is (1 + 1 + 1 - 1)/4 = 0.5
+    horizons = (20, 60, 120, 250)
     levels = np.ones(300, dtype=np.float64) * 200.0
     t = 280
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    levels[t - 250] = 250.0  # past level higher -> return negative
+    levels[t - 120] = 150.0  # past level lower -> return positive
+    levels[t - 60] = 160.0   # past level lower -> return positive
+    levels[t - 20] = 170.0   # past level lower -> return positive
     levels[t] = 200.0
 
     spec = _spec(
@@ -316,12 +316,12 @@ def test_tsmom_mixed_gives_fractional_size() -> None:
 
 
 def test_missing_horizon_history_is_flat() -> None:
-    [redacted]
+    # 200 finite levels and horizon 250 -> idx 199 - 250 < 0 -> flat
     levels = 1000.0 + np.arange(200, dtype=np.float64)
     spec = _spec(
         signal="tsmom",
         ma_sessions=None,
-        [redacted]
+        tsmom_horizons=(20, 60, 120, 250),
     )
     overlay = TrendOverlay(spec, index_level=levels)
     target = overlay.target(_state(199))
@@ -340,7 +340,7 @@ def test_cap_inactive_in_calm_regimes() -> None:
     window = np.diff(np.log(levels[30:51]))
     assert np.isclose(np.std(window) * np.sqrt(252), 0.15)
     uncapped = TrendOverlay(_spec(ma_sessions=10), index_level=levels).target(_state(50))
-    [redacted]
+    capped = TrendOverlay(_spec(ma_sessions=10, vol_cap=0.3, vol_window_sessions=20), index_level=levels).target(
         _state(50)
     )
     assert uncapped is not None
@@ -357,20 +357,20 @@ def test_cap_scales_in_turbulent_regimes() -> None:
     assert np.isclose(sigma, 0.50)
     nav = 10_000_000_000
     uncapped = TrendOverlay(_spec(ma_sessions=2), index_level=levels).target(_state(20, nav=nav))
-    [redacted]
+    capped = TrendOverlay(_spec(ma_sessions=2, vol_cap=0.3, vol_window_sessions=20), index_level=levels).target(
         _state(20, nav=nav)
     )
     assert uncapped is not None
     assert capped is not None
     notional = Fraction(nav) / (50000 * Fraction(str(float(levels[20]))))
     assert uncapped.contracts == -round(notional)
-    [redacted]
-    [redacted]
+    assert capped.contracts == -round(notional * Fraction(str(0.3)) / Fraction(str(sigma)))
+    assert abs(capped.contracts) == pytest.approx(abs(uncapped.contracts) * 0.6, abs=1)
 
 
 def test_cap_requires_a_window() -> None:
     with pytest.raises(ValueError, match="vol_cap and vol_window_sessions must be set together"):
-        [redacted]
+        _spec(vol_cap=0.3, vol_window_sessions=None)
     with pytest.raises(ValueError, match="vol_cap and vol_window_sessions must be set together"):
         _spec(vol_cap=None, vol_window_sessions=20)
 
@@ -385,7 +385,7 @@ def test_causality_with_vol_cap_and_tsmom() -> None:
         signal="tsmom",
         ma_sessions=None,
         tsmom_horizons=(5, 10, 20),
-        [redacted]
+        vol_cap=0.3,
         vol_window_sessions=20,
     )
     first = _drive(spec, base)
@@ -417,7 +417,7 @@ def test_tsmom_and_vol_cap_boundary_conditions() -> None:
     # 3. vol_cap with insufficient history (< vol_window_sessions) -> flat
     spec_cap = _spec(
         ma_sessions=2,
-        [redacted]
+        vol_cap=0.3,
         vol_window_sessions=30,
     )
     levels_short = 1000.0 + np.arange(20, dtype=np.float64)

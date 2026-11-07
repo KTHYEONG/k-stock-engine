@@ -11,6 +11,7 @@ import src.research.model as model_mod
 from src.data.research_protocol import WindowAuthorization, WindowError
 from src.research.model import ScoreMatrix, ScorerConfig, _ensemble_average, walk_forward_scores
 from src.research.panel import FEATURE_NAMES, FeaturePanel, feature_names_for
+from tests.research_builders import scorer_config
 
 N_SESS = 1150
 N_INST = 6
@@ -41,13 +42,13 @@ def _tiny_config(**overrides: object) -> ScorerConfig:
         "min_data_in_leaf": 2,
         "min_train_rows": 30,
         "min_cross_section": 3,
-        [redacted]
-        [redacted]
+        "winsor_low_pct": 2.0,
+        "winsor_high_pct": 98.0,
         "first_test_year": 2018,
         "num_threads": 1,
     }
     kwargs.update(overrides)
-    [redacted]
+    return scorer_config(**kwargs)  # type: ignore[arg-type]
 
 
 def _auth(sess: tuple[date, ...], end: date | None = None) -> WindowAuthorization:
@@ -276,13 +277,13 @@ def test_ascending_years_only() -> None:
 
 def test_config_validators_reject_bad_values() -> None:
     with pytest.raises(ValueError, match="horizons"):
-        [redacted]
+        scorer_config(horizons=())
     with pytest.raises(ValueError, match="horizons"):
-        [redacted]
+        scorer_config(horizons=(0,))
     with pytest.raises(ValueError, match="winsor"):
-        [redacted]
+        scorer_config(winsor_low_pct=-1.0)
     with pytest.raises(ValueError, match="winsor"):
-        [redacted]
+        scorer_config(winsor_high_pct=101.0)
 
 
 def test_shape_and_year_guards_fail_closed() -> None:
@@ -360,8 +361,8 @@ def _scores_digest(scores: np.ndarray) -> str:
 
 
 @pytest.mark.parametrize(("seeds", "digest"), [
-    [redacted]
-    [redacted]
+    ((), "1f1f82b6db786cccf46288e613a42b73ead585507972bb9860825cc97a222f1e"),
+    ((11, 12, 13), "e14869c18c489678ef1df3147e0c11b82b028015e924f302087fd80c874ac35f"),
 ])
 def test_scores_bitwise_golden(seeds: tuple[int, ...], digest: str) -> None:
     sess = _sessions()
@@ -413,8 +414,8 @@ def test_no_full_float64_feature_copy(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_default_feature_set_keeps_config_hash() -> None:
     import json
 
-    [redacted]
-    [redacted]
+    default = scorer_config()
+    explicit = scorer_config(feature_set="full62")
     assert default.canonical_json() == explicit.canonical_json()
     assert "feature_set" not in json.loads(default.canonical_json())
     legacy_payload = default.model_dump(mode="json", exclude={"feature_set", "seeds"})
@@ -425,28 +426,28 @@ def test_default_feature_set_keeps_config_hash() -> None:
 def test_non_default_feature_set_changes_identity() -> None:
     import json
 
-    [redacted]
-    [redacted]
-    [redacted]
+    other = scorer_config(feature_set="subset_a_v1")
+    assert json.loads(other.canonical_json())["feature_set"] == "subset_a_v1"
+    assert other.config_hash != scorer_config().config_hash
 
 
 def test_feature_set_alias_keeps_written_name_with_equal_scores() -> None:
     import json
 
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    new = scorer_config(feature_set="subset_a")
+    legacy = scorer_config(feature_set="subset_a_v1")
+    assert json.loads(new.canonical_json())["feature_set"] == "subset_a"
+    assert json.loads(legacy.canonical_json())["feature_set"] == "subset_a_v1"
     assert new.config_hash != legacy.config_hash
     sess = _sessions()
     panel = _synthetic_panel()
     kwargs: dict[str, object] = {"num_boost_round": 2, "min_data_in_leaf": 2, "num_threads": 1}
     base = walk_forward_scores(
-        [redacted]
+        panel, _universe(), sess, _tiny_config(feature_set="subset_a", **kwargs),
         test_years=(2018,), authorization=_auth(sess),
     )
     aliased = walk_forward_scores(
-        [redacted]
+        panel, _universe(), sess, _tiny_config(feature_set="subset_a_v1", **kwargs),
         test_years=(2018,), authorization=_auth(sess),
     )
     assert np.isfinite(base.scores).any()
@@ -455,14 +456,14 @@ def test_feature_set_alias_keeps_written_name_with_equal_scores() -> None:
 
 def test_unknown_feature_set_rejected() -> None:
     with pytest.raises(ValueError, match="feature_set"):
-        [redacted]
+        scorer_config(feature_set="x")
 
 
 def test_scorer_uses_only_the_configured_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     sess = _sessions()
     panel = _synthetic_panel()
     widths: list[int] = []
-    [redacted]
+    names = feature_names_for("subset_a_v1")
     expected = np.stack(
         [
             ((values[:, :, None] > values[:, None, :]).sum(axis=2) + 0.5) / N_INST
@@ -477,7 +478,7 @@ def test_scorer_uses_only_the_configured_columns(monkeypatch: pytest.MonkeyPatch
     class _OrderedBooster(_StubBooster):
         def predict(self, data: np.ndarray) -> np.ndarray:
             prediction_widths.append(data.shape[1])
-            [redacted]
+            np.testing.assert_array_equal(data, expected[prediction_rows].reshape(-1, len(names)))
             return super().predict(data)
 
     def _fake(tx: np.ndarray, ty: np.ndarray, params: object, rounds: int, seed: int, rows: object = None) -> object:
@@ -492,12 +493,12 @@ def test_scorer_uses_only_the_configured_columns(monkeypatch: pytest.MonkeyPatch
         panel,
         _universe(),
         sess,
-        [redacted]
+        _tiny_config(feature_set="subset_a_v1"),
         test_years=(2018,),
         authorization=_auth(sess),
     )
     assert widths
-    [redacted]
+    assert all(w == len(names) for w in widths)
     assert prediction_widths == widths
 
 
@@ -508,7 +509,7 @@ def test_unused_features_cannot_influence_scores() -> None:
         panel,
         _universe(),
         sess,
-        [redacted]
+        _tiny_config(feature_set="subset_a_v1"),
         test_years=(2018,),
         authorization=_auth(sess),
     )
@@ -516,7 +517,7 @@ def test_unused_features_cannot_influence_scores() -> None:
     noisy_feats = dict(panel.features)
     rng = np.random.default_rng(1234)
     blown = rng.standard_normal((N_SESS, N_INST))
-    [redacted]
+    configured = set(feature_names_for("subset_a_v1"))
     unused = next(name for name in FEATURE_NAMES if name not in configured)
     noisy_feats[unused] = np.ascontiguousarray(blown, dtype=np.float32)
     noisy = FeaturePanel(features=noisy_feats, labels=panel.labels, last_row=panel.last_row)
@@ -524,7 +525,7 @@ def test_unused_features_cannot_influence_scores() -> None:
         noisy,
         _universe(),
         sess,
-        [redacted]
+        _tiny_config(feature_set="subset_a_v1"),
         test_years=(2018,),
         authorization=_auth(sess),
     )
@@ -542,7 +543,7 @@ def test_missing_configured_feature_fails_closed() -> None:
             pruned,
             _universe(),
             sess,
-            [redacted]
+            _tiny_config(feature_set="subset_a_v1"),
             test_years=(2018,),
             authorization=_auth(sess),
         )
@@ -697,8 +698,8 @@ def test_all_year_folds_validated_before_submission(monkeypatch: pytest.MonkeyPa
 def test_empty_seeds_keeps_config_hash() -> None:
     import json
 
-    [redacted]
-    [redacted]
+    default = scorer_config()
+    explicit = scorer_config(seeds=())
     assert default.canonical_json() == explicit.canonical_json()
     assert "seeds" not in json.loads(default.canonical_json())
     assert model_mod._member_seeds(default) == (default.seed,)
@@ -708,28 +709,28 @@ def test_empty_seeds_keeps_config_hash() -> None:
 def test_seeds_change_identity() -> None:
     import json
 
-    [redacted]
+    cfg = scorer_config(seed=11, seeds=(11, 12, 13))
     assert json.loads(cfg.canonical_json())["seeds"] == [11, 12, 13]
-    [redacted]
+    assert cfg.config_hash != scorer_config().config_hash
     assert model_mod._member_seeds(cfg) == (11, 12, 13)
 
 
 def test_invalid_seeds_rejected() -> None:
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
+        scorer_config(seeds=(11,))
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
+        scorer_config(seeds=(11, 11))
     with pytest.raises(ValueError, match="seed"):
-        [redacted]
+        scorer_config(seed=11, seeds=(12, 13))
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
+        scorer_config(seeds=(True, 2))  # type: ignore[list-item]
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
+        scorer_config(seeds=5)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
+        scorer_config(seeds=(11, "x"))  # type: ignore[list-item]
     with pytest.raises(ValueError, match="seeds"):
-        [redacted]
-    [redacted]
+        scorer_config(seeds=(11, -1))
+    assert scorer_config(seeds=[]).seeds == ()
 
 
 def test_ensemble_equals_mean_of_member_runs() -> None:

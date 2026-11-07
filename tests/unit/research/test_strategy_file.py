@@ -13,44 +13,44 @@ FUTURES = Path("config/market/futures.toml")
 
 _POLICY = {
     "family": "ml_sleeve_hedge",
-    [redacted]
-    "keep_rank_multiple": 3.0,
-    "rebalance_every_sessions": 5,
-    "trend_min_ret21": 0.0,
-    [redacted]
-    [redacted]
+    "n": 16,
+    "keep_rank_multiple": 2.5,
+    "rebalance_every_sessions": 4,
+    "trend_min_ret21": -0.02,
+    "min_units_per_slot": 2,
+    "universe": {"min_adtv20_krw": 300000000, "min_price_krw": 2000},
 }
 _SCORER = {
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    "horizons": [5, 10],
+    "num_boost_round": 120,
+    "learning_rate": 0.05,
+    "num_leaves": 23,
+    "min_data_in_leaf": 400,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 2,
+    "lambda_l2": 20.0,
     "seed": 11,
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    "first_test_year": 2018,
+    "num_threads": 6,
+    "min_cross_section": 40,
+    "winsor_low_pct": 2.0,
+    "winsor_high_pct": 98.0,
+    "purge_extra_sessions": 3,
+    "min_train_rows": 15000,
+    "first_test_year": 2019,
 }
-[redacted]
+_BOOK = {"sleeves": 4, "stock_capital_fraction": 0.65}
 _HEDGE = {
-    "hedge_ratio": 1.0,
-    "beta_window_sessions": 120,
-    "beta_min_sessions": 40,
-    "beta_cap": 2.0,
-    "rebalance_every_sessions": 5,
+    "hedge_ratio": 0.8,
+    "beta_window_sessions": 90,
+    "beta_min_sessions": 30,
+    "beta_cap": 1.5,
+    "rebalance_every_sessions": 4,
     "use_futures": True,
     "contract_multiplier_krw": 10000,
     "initial_margin_rate": 0.2175,
-    "margin_buffer_rate": 0.10,
-    "margin_topup_trigger_fraction": 0.75,
+    "margin_buffer_rate": 0.12,
+    "margin_topup_trigger_fraction": 0.8,
     "futures_cost_rate": 0.0003,
     "inverse_cost_rate": 0.0007,
     "resize_sell_cost_rate": 0.0025,
@@ -60,28 +60,28 @@ _HEDGE = {
     "inverse_tax_rate": 0.154,
 }
 _TREND = {
-    [redacted]
-    "long_fraction": 1.0,
-    "short_fraction": 0.5,
-    "rebalance_every_sessions": 1,
+    "ma_sessions": 80,
+    "long_fraction": 0.9,
+    "short_fraction": 0.4,
+    "rebalance_every_sessions": 2,
     "contract_multiplier_krw": 50000,
     "initial_margin_rate": 0.2175,
-    "margin_buffer_rate": 0.10,
-    "margin_topup_trigger_fraction": 0.75,
+    "margin_buffer_rate": 0.12,
+    "margin_topup_trigger_fraction": 0.8,
     "futures_cost_rate": 0.0003,
     "futures_tax_rate": 0.11,
     "futures_annual_deduction_krw": 2500000,
 }
 _REGIME = {
-    [redacted]
-    "target_vol": 0.10,
-    [redacted]
-    [redacted]
-    "rebalance_every_sessions": 1,
+    "tsmom_horizons": [10, 42, 84, 168],
+    "target_vol": 0.12,
+    "max_fraction": 1.25,
+    "vol_window_sessions": 50,
+    "rebalance_every_sessions": 2,
     "contract_multiplier_krw": 10000,
     "initial_margin_rate": 0.2175,
-    "margin_buffer_rate": 0.10,
-    "margin_topup_trigger_fraction": 0.75,
+    "margin_buffer_rate": 0.12,
+    "margin_topup_trigger_fraction": 0.8,
     "futures_cost_rate": 0.0003,
     "futures_tax_rate": 0.11,
     "futures_annual_deduction_krw": 2500000,
@@ -214,13 +214,13 @@ def test_extends_merges_tables_and_replaces_scalars(tmp_path: Path) -> None:
     _write(tmp_path, "base.toml")
     child = tmp_path / "child.toml"
     child.write_text(
-        [redacted]
+        'extends = "base.toml"\n[policy]\nn = 7\n[policy.universe]\nmin_price_krw = 3000\n'
         '[scorer]\nseeds = [11, 12, 13]\n', encoding="utf-8"
     )
     merged = resolve_strategy_tables(child, futures_constants=FUTURES)
     assert merged["policy"]["n"] == 7
     assert merged["policy"]["family"] == "ml_sleeve_hedge"
-    [redacted]
+    assert merged["policy"]["universe"] == {"min_adtv20_krw": 300000000, "min_price_krw": 3000}
     assert merged["scorer"]["seeds"] == [11, 12, 13]
     assert merged["scorer"]["seed"] == 11
     assert "extends" not in merged
@@ -244,7 +244,7 @@ def test_arrays_are_replaced_whole(tmp_path: Path) -> None:
     from src.research.strategy_file import resolve_strategy_tables
 
     base = _write(tmp_path, "base.toml", tables=("hedge", "trend_overlay", "regime_hedge"), hedge_ratio=0.0)
-    [redacted]
+    base.write_text(base.read_text(encoding="utf-8").replace("[10, 42, 84, 168]", "[10, 42]"), encoding="utf-8")
     child = tmp_path / "child.toml"
     child.write_text(
         'extends = "base.toml"\n[regime_hedge]\ntsmom_horizons = [5]\n', encoding="utf-8"

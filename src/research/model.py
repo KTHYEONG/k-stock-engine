@@ -45,32 +45,30 @@ class ScorerConfig(BaseModel):
     Why frozen: a scorer change is a new strategy identity that must win a champion/challenger comparison;
     silently re-tuning in place would make every stored run irreproducible.
 
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    Every hyper-parameter is required: values come from the strategy file, never from code defaults.
+    Defaults: num_threads=8; feature_set="full62" (a name from ``resolve_feature_set``;
+    part of the identity); seeds=() (ensemble member seeds; empty means the single ``seed``).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    seed: int = REDACTED
+    horizons: tuple[int, ...]
+    num_boost_round: int
+    learning_rate: float
+    num_leaves: int
+    min_data_in_leaf: int
+    feature_fraction: float
+    bagging_fraction: float
+    bagging_freq: int
+    lambda_l2: float
+    seed: int
     num_threads: int = 8
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+    min_cross_section: int
+    winsor_low_pct: float
+    winsor_high_pct: float
+    purge_extra_sessions: int
+    min_train_rows: int
+    first_test_year: int
     feature_set: str = "full62"
     seeds: tuple[int, ...] = ()
 
@@ -649,8 +647,8 @@ def walk_forward_scores(
     universe row of the test year (daily), so any rebalance phase can be evaluated.
     Ensemble: per-horizon scores are z-scored within each universe row, then averaged with NaN-mean.
 
-    [redacted]
-    [redacted]
+    Why ranked features + z target: rank inputs are robust to outliers, while a magnitude-preserving target keeps
+    the information in large moves that ordinal or robust losses would discard.
 
     Memory: feature matrices are read in the panel's float32 dtype. Only the rank-normalised design rows are
     float64, built one session row at a time. A float32-to-float64 cast is exact, so scores are bitwise

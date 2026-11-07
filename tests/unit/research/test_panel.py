@@ -292,19 +292,19 @@ def test_full_set_equals_production_names() -> None:
     assert known_feature_set_names()[0] == "full62"
 
 
-[redacted]
-    [redacted]
-    [redacted]
-    [redacted]
+def test_store_set_is_the_placeholder_40_name_subset() -> None:
+    names = feature_names_for("subset_a_v1")
+    assert len(names) == 40
+    assert len(set(names)) == 40
     assert set(names) <= set(FEATURE_NAMES)
-    [redacted]
+    assert names == FEATURE_NAMES[:40]
 
 
 def test_store_sets_fail_closed_without_a_store(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KSE_STRATEGY_STORE")
     assert feature_names_for("full62") == FEATURE_NAMES
     with pytest.raises(ValueError, match="no strategy store"):
-        [redacted]
+        feature_names_for("subset_a")
     assert known_feature_set_names() == ("full62",)
 
 
@@ -315,12 +315,12 @@ def test_unknown_set_fails_closed() -> None:
 
 def test_unknown_store_name_is_rejected_even_with_a_store() -> None:
     with pytest.raises(ValueError, match="unknown feature_set"):
-        [redacted]
+        feature_names_for("subset_a_missing")
 
 
-[redacted]
-    [redacted]
-    [redacted]
+def test_store_alias_is_the_same_set() -> None:
+    assert feature_names_for("subset_a") == feature_names_for("subset_a_v1")
+    assert len(feature_names_for("subset_a")) == 40
 
 
 def test_hand_written_files_do_not_use_the_alias() -> None:
@@ -334,7 +334,7 @@ def test_hand_written_files_do_not_use_the_alias() -> None:
         for path in sorted(root.rglob("*.toml")):
             if path.name == "champion.toml" or "strategy_store" in path.parts:
                 continue
-            [redacted]
+            if "subset_a_v1" in path.read_text(encoding="utf-8"):
                 hits.append(str(path))
     assert hits == []
 

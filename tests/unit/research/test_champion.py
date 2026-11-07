@@ -25,6 +25,7 @@ from src.research.champion import (
 from src.research.evaluation import CheckResult, EvaluationEvidence, EvaluationPolicy, ReportCard
 from src.research.ledger_bridge import LedgerOutcome
 from src.research.pipeline import EvaluationRun, StrategySpec
+from tests.research_builders import scorer_config, trend_cash_policy
 
 _NOW = datetime(2026, 9, 30, tzinfo=UTC)
 _SPY = 252
@@ -69,8 +70,6 @@ def _sessions(n: int = 60) -> list[date]:
 def _spec(**overrides: Any) -> StrategySpec:
     from src.research.book import BookSpec
     from src.research.hedge import HedgeSpec
-    from src.research.model import ScorerConfig
-    from src.research.policy import TrendCashPolicy
 
     policy_kw: dict[str, Any] = {"rebalance_every_sessions": 5, "min_units_per_slot": 0, "n": 20}
     scorer_kw: dict[str, Any] = {
@@ -106,8 +105,8 @@ def _spec(**overrides: Any) -> StrategySpec:
     book_kw.update(overrides.pop("book", {}))
     hedge_kw.update(overrides.pop("hedge", {}))
     return StrategySpec(
-        [redacted]
-        [redacted]
+        policy=trend_cash_policy(**policy_kw),
+        scorer=scorer_config(**scorer_kw),
         book=BookSpec(**book_kw),
         hedge=HedgeSpec(**hedge_kw),
     )
@@ -393,7 +392,7 @@ def test_bool_and_string_leaves_are_not_knobs() -> None:
     assert knob_changes(base, _spec(policy={"family": "other"})) == ()
     assert knob_changes(base, _spec(policy={"n": 21})) == ("policy.n",)
     assert knob_changes(base, _spec(book={"stock_capital_fraction": 0.5})) == ("book.stock_capital_fraction",)
-    [redacted]
+    assert knob_changes(base, _spec(policy={"universe": {"min_adtv20_krw": 1_000, "min_price_krw": 2_000}})) == (
         "policy.universe.min_adtv20_krw",
     )
 
@@ -1139,12 +1138,12 @@ def test_growth_runbook_neighbors_cover_strategy_knobs(missing: str | None) -> N
     from src.research.pipeline import load_strategy_spec
 
     root = Path("tests/fixtures/strategies")
-    [redacted]
-    [redacted]
+    champion_spec = load_strategy_spec(root / "sleeve_hedge.toml")
+    challenger_spec = load_strategy_spec(root / "grid_base.toml")
     sessions = _sessions()
     neighbor_specs = [
-        [redacted]
-        [redacted]
+        load_strategy_spec(path) for path in sorted(root.glob("grid_base_*.toml"))
+        if path.name != "grid_base.toml"
     ]
     neighbors = tuple(
         _run(spec, sessions, drift=0.0011) for spec in neighbor_specs
@@ -1508,9 +1507,9 @@ def test_signal_switch_exempts_ma_sessions() -> None:
         trend_overlay={
             "signal": "tsmom",
             "ma_sessions": None,
-            [redacted]
-            [redacted]
-            [redacted]
+            "tsmom_horizons": (20, 60, 120, 250),
+            "vol_cap": 0.3,
+            "vol_window_sessions": 45,
         }
     )
     decision = decide_challenge(
@@ -1533,7 +1532,7 @@ def _regime_spec(**overrides: Any) -> StrategySpec:
     regime_kw: dict[str, Any] = {
         "tsmom_horizons": (5, 10, 15, 20),
         "target_vol": 0.10,
-        [redacted]
+        "max_fraction": 1.25,
         "vol_window_sessions": 20,
         "rebalance_every_sessions": 5,
         "contract_multiplier_krw": 10000,
@@ -1771,8 +1770,8 @@ def test_rebaseline_refuses_design_and_comparator_problems(tmp_path: Path) -> No
 def test_same_design_thread_count_and_alias_are_neutral() -> None:
     from src.research.champion import same_design
 
-    [redacted]
-    [redacted]
+    base = _spec(scorer={"feature_set": "subset_a_v1", "num_threads": 8})
+    twin = _spec(scorer={"feature_set": "subset_a", "num_threads": 4})
     assert same_design(base, twin) is True
     other = _spec(scorer={"feature_set": "full62", "num_threads": 4})
     assert same_design(base, other) is False
@@ -1932,7 +1931,7 @@ def test_rebaseline_challenge_config_is_equal_design() -> None:
     store = Path("tests/fixtures/strategy_store/k-stock-engine/kr_swing_2019_v1")
     stored = load_strategy_spec(store / "champion.toml")
     successor = load_strategy_spec(store / "challenge" / "three_seeds.toml")
-    [redacted]
-    [redacted]
-    [redacted]
+    assert successor.scorer.seeds == (7, 8, 9)
+    assert successor.scorer.num_threads == 3
+    assert successor.scorer.feature_set == "subset_a"
     assert same_design(successor, with_seeds(stored, successor.scorer.seeds))
