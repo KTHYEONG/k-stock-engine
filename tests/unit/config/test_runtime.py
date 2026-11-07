@@ -28,6 +28,26 @@ def test_read_only_runtime_does_not_create_mutable_roots(tmp_path: Path) -> None
     assert config.logs_root.is_dir()
 
 
+@pytest.fixture(autouse=True)
+def _no_strategy_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KSE_STRATEGY_STORE", raising=False)
+
+
+def test_strategy_store_env_overrides_champion_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.config import load_runtime_config
+
+    monkeypatch.setenv("KSE_STRATEGY_STORE", str(tmp_path))
+    assert load_runtime_config().champion_file == tmp_path / "k-stock-engine" / "kr_swing_2019_v1" / "champion.toml"
+
+
+def test_relative_strategy_store_env_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.config import ConfigError, load_runtime_config
+
+    monkeypatch.setenv("KSE_STRATEGY_STORE", "relative/store")
+    with pytest.raises(ConfigError, match="KSE_STRATEGY_STORE"):
+        load_runtime_config()
+
+
 def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.config import load_runtime_config
 
@@ -46,7 +66,7 @@ def test_paths_resolve_against_repository_root_not_working_directory(tmp_path: P
     assert config.cash_series == repo / "config" / "data" / "cash_series.toml"
     assert config.engine == repo / "config" / "backtest" / "default_engine.toml"
     assert config.futures_constants == repo / "config" / "market" / "futures.toml"
-    assert config.champion_file == repo / "config" / "research" / "champion.toml"
+    assert config.champion_file == repo / "config" / "research" / "champion.example.toml"
     assert config.live_gate == repo / "config" / "research" / "live_gate.toml"
     for path in (
         config.data_root,
@@ -169,7 +189,7 @@ def test_missing_champion_file_loads_but_missing_futures_fails(tmp_path: Path) -
         ("engine", "config/backtest/default_engine.toml"),
         ("research_protocol", "config/research/protocol.toml"),
         ("futures_constants", "config/market/futures.toml"),
-        ("champion_file", "config/research/champion.toml"),
+        ("champion_file", "config/research/champion.example.toml"),
         ("live_gate", "config/research/live_gate.toml"),
     ):
         document = document.replace(f'{key} = "{relative}"', f'{key} = "{repo / relative}"')
@@ -182,26 +202,26 @@ def test_missing_champion_file_loads_but_missing_futures_fails(tmp_path: Path) -
         f'"{tmp_path / "config/market/krx_market_rules.toml"}"',
     )
     (tmp_path / "config" / "research").mkdir(parents=True)
-    (tmp_path / "config" / "research" / "champion.toml").write_bytes(
+    (tmp_path / "config" / "research" / "champion.example.toml").write_bytes(
         (repo / "config/market/krx_market_rules.toml").read_bytes()
     )
     document = document.replace(
-        f'"{repo / "config/research/champion.toml"}"',
-        f'"{tmp_path / "config/research/champion.toml"}"',
+        f'"{repo / "config/research/champion.example.toml"}"',
+        f'"{tmp_path / "config/research/champion.example.toml"}"',
     )
     broken = tmp_path / "config" / "runtime.toml"
     broken.write_text(document, encoding="utf-8")
     config = load_runtime_config(broken)
-    assert config.champion_file == tmp_path / "config" / "research" / "champion.toml"
+    assert config.champion_file == tmp_path / "config" / "research" / "champion.example.toml"
 
     missing_champion = document.replace(
-        f'"{tmp_path / "config/research/champion.toml"}"', f'"{tmp_path / "absent-champion.toml"}"'
+        f'"{tmp_path / "config/research/champion.example.toml"}"', f'"{tmp_path / "absent-champion.toml"}"'
     )
     broken.write_text(missing_champion, encoding="utf-8")
     load_runtime_config(broken)
 
     champion_directory = document.replace(
-        f'"{tmp_path / "config/research/champion.toml"}"', f'"{tmp_path / "config/research"}"'
+        f'"{tmp_path / "config/research/champion.example.toml"}"', f'"{tmp_path / "config/research"}"'
     )
     broken.write_text(champion_directory, encoding="utf-8")
     with pytest.raises(ConfigError, match="champion_file"):

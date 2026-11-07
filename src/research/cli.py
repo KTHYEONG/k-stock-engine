@@ -406,6 +406,7 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
 
     import numpy as np
 
+    from src.config.strategy_store import store_revision, strategy_store_root
     from src.core.krx_calendar import xkrx_calendar_through
     from src.core.time import KRX_TZ
     from src.research.operate import (
@@ -488,6 +489,8 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
 
     sealed: list[str] = []
     prepared: list[SealedDecision] = []
+    store = strategy_store_root()
+    revision = None if store is None else store_revision(store)
     current = state
     index_of = {inst: col for col, inst in enumerate(cube.instrument_ids)}
     close = np.asarray(cube.arrays["close"], dtype=np.float64)
@@ -563,6 +566,7 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
                     state_digest=state_digest(snapshot),
                     prev_hash="",
                     hash="",
+                    strategy_store_revision=revision,
                 ),
             )
         current = final
@@ -716,22 +720,36 @@ def _champion_file_state(current: ChampionRecord, path: Path, futures_constants:
     if not target.is_file():
         return "drift"
     from src.research.pipeline import load_strategy_spec
+    from src.research.strategy_file import split_meta_block
 
     try:
+        text = target.read_text(encoding="utf-8")
         file_spec = load_strategy_spec(target, futures_constants=Path(futures_constants))
     except (OSError, ValueError):
         return "drift"
-    return "synced" if file_spec.spec_hash == current.spec_hash else "drift"
+    if file_spec.spec_hash != current.spec_hash:
+        return "drift"
+    _, body = split_meta_block(text)
+    return "synced" if body == _rendered_champion_text(current, futures_constants) else "drift"
 
 
-def _write_champion_file(current: ChampionRecord, path: Path, futures_constants: Path) -> None:
-    """Atomically replace ``path`` with the rendered stored champion spec."""
+def _rendered_champion_text(current: ChampionRecord, futures_constants: Path) -> str:
     from src.research.pipeline import strategy_spec_from_canonical_json
     from src.research.strategy_file import render_strategy_toml
 
     spec = strategy_spec_from_canonical_json(current.spec_json)
-    text = render_strategy_toml(spec, futures_constants=Path(futures_constants))
+    return render_strategy_toml(spec, futures_constants=Path(futures_constants))
+
+
+def _write_champion_file(current: ChampionRecord, path: Path, futures_constants: Path) -> None:
+    """Atomically replace ``path`` with the rendered stored champion spec, keeping any leading ``[meta]`` block."""
+    from src.research.strategy_file import split_meta_block
+
     target = Path(path)
+    meta = ""
+    if target.is_file():
+        meta, _ = split_meta_block(target.read_text(encoding="utf-8"))
+    text = meta + _rendered_champion_text(current, futures_constants)
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False
@@ -772,6 +790,18 @@ def _rewrite_champion_file(record: ChampionRecord, args: argparse.Namespace) -> 
     _write_champion_file(record, _champion_file_path(args), _champion_futures_constants(args))
 
 
+def _require_sync_target(path: Path) -> None:
+    """Sync may repair a missing store file, so it only requires the store; an existing file must pass the full gate."""
+    from src.config.errors import ConfigError
+    from src.config.strategy_store import strategy_store_root
+    from src.research.strategy_file import require_production_spec
+
+    if path.exists():
+        require_production_spec(path)
+    elif strategy_store_root() is None:
+        raise ConfigError("production strategy requires KSE_STRATEGY_STORE to be set")
+
+
 def _run_champion(args: argparse.Namespace) -> Mapping[str, object]:
     from src.research.champion import champion_record_fields
 
@@ -782,6 +812,7 @@ def _run_champion(args: argparse.Namespace) -> Mapping[str, object]:
         if current is None:
             raise ValueError("no champion: run 'promote --spec PATH --bootstrap' first")
         path = _champion_file_path(args)
+        _require_sync_target(Path(path))
         _write_champion_file(current, path, _champion_futures_constants(args))
         return {"champion_file": _repo_relative_champion(Path(path)), "state": "synced"}
     if current is None:

@@ -1,0 +1,6 @@
+extends = "../champion.toml"
+
+[scorer]
+feature_set = "subset_a"
+seeds = [7, 8, 9]
+num_threads = 3

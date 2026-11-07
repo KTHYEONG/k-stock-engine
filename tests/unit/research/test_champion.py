@@ -1929,8 +1929,9 @@ def test_rebaseline_challenge_config_is_equal_design() -> None:
     from src.research.champion import same_design, with_seeds
     from src.research.pipeline import load_strategy_spec
 
-    stored = load_strategy_spec(Path("config/research/champion.toml"))
-    successor = load_strategy_spec(Path("config/research/challenge/three_seeds.toml"))
+    store = Path("tests/fixtures/strategy_store/k-stock-engine/kr_swing_2019_v1")
+    stored = load_strategy_spec(store / "champion.toml")
+    successor = load_strategy_spec(store / "challenge" / "three_seeds.toml")
     [redacted]
     [redacted]
     [redacted]

@@ -26,9 +26,11 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
 from _pytest.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PLACEHOLDER_STRATEGY_STORE = PROJECT_ROOT / "tests" / "fixtures" / "strategy_store"
 _TEMP_ROOT = PROJECT_ROOT / "tmp" / "pytest"
 _ACTIVE_TEMP_ROOT: Path | None = None
 
@@ -72,3 +74,9 @@ def pytest_sessionfinish(session: object, exitstatus: int) -> None:
                     item.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+@pytest.fixture(autouse=True)
+def _placeholder_strategy_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every test at the public placeholder store; tests needing no store delete the variable."""
+    monkeypatch.setenv("KSE_STRATEGY_STORE", str(_PLACEHOLDER_STRATEGY_STORE))

@@ -29,6 +29,7 @@ from src.ops.jobs import (
     collect_eve,
     main,
     morning,
+    morning_late,
     weekly_report,
 )
 from src.ops.run_outcome import load_run_outcomes
@@ -145,6 +146,23 @@ def test_morning_waits_for_krx_then_seals(tmp_path: Path, monkeypatch: pytest.Mo
     assert clock.sleeps == [60.0, 60.0]
     outcomes = load_run_outcomes(tmp_path / "ops" / "events", DAY)
     assert outcomes == {"morning": "OK"}
+
+
+def test_morning_refuses_without_strategy_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.delenv("KSE_STRATEGY_STORE")
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert calls == []
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning": "DEGRADED"}
+
+
+def test_morning_late_refuses_without_strategy_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    monkeypatch.delenv("KSE_STRATEGY_STORE")
+    assert morning_late(tmp_path, today=DAY, now=_morning_now) == 1
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"morning_late": "DEGRADED"}
 
 
 def test_krx_never_arrives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

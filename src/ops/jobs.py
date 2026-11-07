@@ -341,10 +341,26 @@ def _models_base(spec_path: Path, state_root: Path) -> Path:
     return Path(state_root) / "research" / "models" / identity[:16]
 
 
+def _production_spec_refusal(root: Path, job: str, today: date, now: datetime) -> bool:
+    """True when the champion spec may drive decisions; otherwise records the refusal as DEGRADED."""
+    from src.config.errors import ConfigError
+    from src.research.strategy_file import require_production_spec
+
+    try:
+        require_production_spec(_research_paths(root).spec)
+    except ConfigError as exc:
+        _log_job_failure(job, exc)
+        _record(root, job, "DEGRADED", today, _aware(now), reason=type(exc).__name__)
+        return True
+    return False
+
+
 def _decide_phase(data_root: Path) -> list[str]:
     from src.research.cli import _run_decide
+    from src.research.strategy_file import require_production_spec
 
     paths = _research_paths(Path(data_root))
+    require_production_spec(paths.spec)
     args = argparse.Namespace(
         scope_config=None, data_root=Path(data_root), spec=paths.spec, state=paths.state,
         models_dir=_models_base(paths.spec, paths.state_root), decisions_dir=paths.decisions,
@@ -359,8 +375,10 @@ def _decide_phase(data_root: Path) -> list[str]:
 def _shadow_phase(data_root: Path) -> None:
     from src.research.cli import _run_shadow
     from src.research.operate import read_chain
+    from src.research.strategy_file import require_production_spec
 
     paths = _research_paths(Path(data_root))
+    require_production_spec(paths.spec)
     chain = read_chain(paths.decisions)
     if chain and min(item.execution_session for item in chain) > max(item.data_session for item in chain):
         return
@@ -762,6 +780,8 @@ def morning(data_root: Path, *, today: date, now: Callable[[], datetime], sleep:
     if not trading_day(today):
         _record(root, "morning", "SKIPPED", today, _aware(now()), reason="non_trading_day")
         return 0
+    if _production_spec_refusal(root, "morning", today, now()):
+        return 1
     with exclusive_run_lock(root / MORNING_LOCK_RELPATH) as held:
         if not held:
             _record(root, "morning", "DEGRADED", today, _aware(now()), reason="morning_lock_held")
@@ -802,6 +822,8 @@ def morning_late(data_root: Path, *, today: date, now: Callable[[], datetime]) -
         return 0
     if today != _aware(now()).astimezone(KRX_TZ).date():
         _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason="date_not_current")
+        return 1
+    if _production_spec_refusal(root, MORNING_LATE_JOB, today, now()):
         return 1
     with exclusive_run_lock(root / MORNING_LOCK_RELPATH) as held:
         if not held:

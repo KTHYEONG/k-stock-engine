@@ -22,7 +22,7 @@ from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.data.research_protocol import WindowAuthorization, WindowError
-from src.research.panel import FEATURE_SETS, FeaturePanel, feature_names_for
+from src.research.panel import FeaturePanel, feature_names_for, known_feature_set_names, resolve_feature_set
 
 __all__ = [
     "FrozenScorer",
@@ -49,7 +49,7 @@ class ScorerConfig(BaseModel):
     [redacted]
     [redacted]
     [redacted]
-    ``FEATURE_SETS``; part of the identity; seeds=() — ensemble member seeds; empty means the single `seed`.
+    [redacted]
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -112,9 +112,11 @@ class ScorerConfig(BaseModel):
 
     @field_validator("feature_set")
     @classmethod
-    def _known_feature_set(cls, value: object) -> str:
-        if not isinstance(value, str) or value not in FEATURE_SETS:
-            raise ValueError(f"feature_set must be one of {sorted(FEATURE_SETS)}, got {value!r}")
+    def _known_feature_set(cls, value: str) -> str:
+        try:
+            resolve_feature_set(value)
+        except ValueError as exc:
+            raise ValueError(f"feature_set must be one of {list(known_feature_set_names())}, got {value!r}") from exc
         return value
 
     @field_validator("horizons")

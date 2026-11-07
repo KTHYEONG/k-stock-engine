@@ -23,6 +23,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "legacy_docker_argv.json"
 PINNED_LIB_SHA256 = "d3a0228685c6110b04cb6bb7f0dd20aafff24c2e1cf1adf2de7c7fb84660b191"
 IMAGE = "ghcr.io/kthyeong/k-stock-engine:latest"
 DRIVE_SLOTS = {(9, 15), (21, 0), (21, 30), (22, 15), (23, 30)}
+STORE_UNITS = {"kse-morning.service", "kse-morning-late.service"}
 SIBLING_WINDOWS = [((8, 50), (9, 40)), ((15, 10), (15, 43))]
 UNIT_JOBS = {
     "kse-alert@.service": "alert",
@@ -173,6 +174,8 @@ def test_effective_command_equivalent_to_legacy() -> None:
             if unit not in json.loads(FIXTURE.read_text(encoding="utf-8")):
                 continue
             effective = _normalize(_unit_effective(unit, home=home))
+            effective["vols"] = [v for v in effective["vols"] if "/quant-strategy-store:" not in v]
+            effective["envs"] = [e for e in effective["envs"] if not e.startswith("KSE_STRATEGY_STORE=")]
             legacy = _legacy_normalized(unit, home, uidgid)
             assert effective["scalars"] == legacy["scalars"], unit
             assert effective["rm"] == legacy["rm"], unit
@@ -297,6 +300,10 @@ def test_mount_allowlist_on_effective_argv() -> None:
         for unit in UNIT_JOBS:
             norm = _normalize(_unit_effective(unit, home=home))
             for mount in norm["vols"]:
+                if "/quant-strategy-store:" in mount:
+                    assert unit in STORE_UNITS, unit
+                    assert mount == home + "/quant-strategy-store:/run/strategy-store:ro", unit
+                    continue
                 assert mount.startswith(home + "/k-stock-engine/data:") or mount.startswith(home + "/k-stock-engine/logs:") \
                     or mount.startswith(home + "/.cache/kis:") or mount.startswith(home + "/.cache/dbsec:") \
                     or mount.startswith(home + "/.config/rclone:"), f"{unit}: {mount}"
@@ -481,6 +488,10 @@ def test_units_are_safe_by_construction() -> None:
             assert "UV_CACHE_DIR=/tmp/uv-cache" in norm["envs"]
             assert norm["vols"]
             for mount in norm["vols"]:
+                if "/quant-strategy-store:" in mount:
+                    assert path.name in STORE_UNITS, f"{path.name}: {mount}"
+                    assert mount.endswith(":ro"), f"{path.name}: {mount}"
+                    continue
                 assert mount.startswith(prefixes), f"{path.name}: {mount}"
                 if mount.startswith(home + "/.config/rclone:"):
                     assert path.name == "kse-backup.service"

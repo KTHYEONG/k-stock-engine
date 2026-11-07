@@ -516,7 +516,9 @@ def test_unused_features_cannot_influence_scores() -> None:
     noisy_feats = dict(panel.features)
     rng = np.random.default_rng(1234)
     blown = rng.standard_normal((N_SESS, N_INST))
-    noisy_feats["vol60"] = np.ascontiguousarray(blown, dtype=np.float32)
+    [redacted]
+    unused = next(name for name in FEATURE_NAMES if name not in configured)
+    noisy_feats[unused] = np.ascontiguousarray(blown, dtype=np.float32)
     noisy = FeaturePanel(features=noisy_feats, labels=panel.labels, last_row=panel.last_row)
     other = walk_forward_scores(
         noisy,

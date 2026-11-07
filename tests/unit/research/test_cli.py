@@ -503,6 +503,37 @@ def test_champion_file_fresh_is_synced(
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["champion_file_state"] == "synced"
 
 
+def test_sync_target_requires_store_when_file_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.config import ConfigError
+    from src.research.cli import _require_sync_target
+
+    monkeypatch.delenv("KSE_STRATEGY_STORE")
+    with pytest.raises(ConfigError, match="KSE_STRATEGY_STORE"):
+        _require_sync_target(tmp_path / "absent.toml")
+
+
+def test_champion_file_with_store_meta_block_is_synced_and_kept(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.research.cli import _champion_file_state, main
+
+    store, spec, record = _bootstrap_record(tmp_path, _write_spec(tmp_path / "c.toml", n=2))
+    champion_file = tmp_path / "champion.toml"
+    futures = Path("config/market/futures.toml")
+    _sync_helpers(monkeypatch, store, champion_file)
+    assert main(["champion", "--sync-file"]) == 0
+    capsys.readouterr()
+    meta = '[meta]\nschema = 1\nversion = "placeholder"\n\n'
+    champion_file.write_text(meta + champion_file.read_text(encoding="utf-8"), encoding="utf-8")
+    assert _champion_file_state(record, champion_file, futures) == "synced"
+    assert main(["champion", "--sync-file"]) == 0
+    capsys.readouterr()
+    assert champion_file.read_text(encoding="utf-8").startswith(meta)
+    assert _champion_file_state(record, champion_file, futures) == "synced"
+    champion_file.write_text(champion_file.read_text(encoding="utf-8") + "# hand edit\n", encoding="utf-8")
+    assert _champion_file_state(record, champion_file, futures) == "drift"
+
+
 def test_champion_file_drift_guards_challenge_and_promote(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -691,9 +722,10 @@ def test_sync_reports_repo_relative_path_outside_repo_cwd(
     from src.config.runtime import load_runtime_config
     from src.research.cli import _repo_relative_champion
 
+    monkeypatch.delenv("KSE_STRATEGY_STORE")
     path = load_runtime_config().champion_file
     monkeypatch.chdir(tmp_path)
-    assert _repo_relative_champion(path) == "config/research/champion.toml"
+    assert _repo_relative_champion(path) == "config/research/champion.example.toml"
 
 
 def test_champion_file_state_edge_cases(
