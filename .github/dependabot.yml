@@ -29,9 +29,6 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
-      # pandas 3.1 changed crypto-pilot's live decision golden digest (2026-11-07); adopt minors via a reviewed spec.
-      - dependency-name: "pandas"
-        update-types: ["version-update:semver-minor"]
     groups:
       python-minor-patch:
         update-types: [minor, patch]
