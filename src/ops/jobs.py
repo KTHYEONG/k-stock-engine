@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import json
 import logging
-import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal
 
+from src.config.secrets import read_secret
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
 from src.ops.audit import BRONZE_PRUNE_AFTER, run_daily_audit
@@ -1237,7 +1237,7 @@ def audit(data_root: Path, *, today: date, now: datetime) -> int:
     alerts_dir = _alerts_dir(root)
     sender, secrets = _alert_sender()
     _drain_best_effort(sender, alerts_dir, secrets, moment)
-    registry = os.environ.get("KSE_CREDENTIAL_REGISTRY", "")
+    registry = read_secret("KSE_CREDENTIAL_REGISTRY", default="")
     heartbeat = run_daily_audit(
         root, today=today, now=moment, undelivered_alerts=count_undelivered(alerts_dir),
         registry_path=Path(registry) if registry else None,
