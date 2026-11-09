@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
@@ -176,6 +177,24 @@ def validated_current_directories(
     return dict(current), retired_ids
 
 
+def _newest_mtime(path: Path) -> float | None:
+    """Newest mtime in the tree under ``path`` without following symlinks; None when any entry is unreadable."""
+    failures: list[OSError] = []
+    try:
+        newest = path.lstat().st_mtime
+        for dirpath, dirnames, filenames in os.walk(path, onerror=failures.append):
+            for name in (*dirnames, *filenames):
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+    except OSError:
+        return None
+    return None if failures else newest
+
+
+def _older_than(dataset_dir: Path, cutoff_ts: float) -> bool:
+    newest = _newest_mtime(dataset_dir)
+    return newest is not None and newest < cutoff_ts
+
+
 def prune_plan(
     runtime: DataRuntime, registry: DatasetRegistry
 ) -> tuple[list[Path], list[tuple[Path, str]]]:
@@ -302,9 +321,15 @@ def prune_datasets(
     *,
     apply: bool,
     emit: Callable[[Mapping[str, object]], None],
+    created_before_ts: float | None = None,
 ) -> dict[str, object]:
-    """List and optionally delete only revalidated unreferenced datasets."""
+    """List and optionally delete only revalidated unreferenced datasets; ``created_before_ts`` keeps newer orphans."""
     candidates, unreadable = prune_plan(runtime, registry)
+    kept_recent = 0
+    if created_before_ts is not None:
+        recent = [item for item in candidates if not _older_than(item, created_before_ts)]
+        kept_recent = len(recent)
+        candidates = [item for item in candidates if item not in recent]
 
     for dataset_dir in candidates:
         emit(
@@ -343,6 +368,8 @@ def prune_datasets(
                 continue
             if dataset_dir.is_symlink() or not dataset_dir.is_dir():
                 continue
+            if created_before_ts is not None and not _older_than(dataset_dir, created_before_ts):
+                continue
             try:
                 try:
                     load_manifest(dataset_dir)
@@ -378,11 +405,13 @@ def prune_datasets(
         "applied": bool(apply),
         "deleted": deleted,
         "failed": delete_failed,
+        "kept_recent": kept_recent,
     }
     _LOG.info(
-        "[DATA] command=prune_datasets action=summary candidates=%d deleted=%d failed=%d",
+        "[DATA] command=prune_datasets action=summary candidates=%d deleted=%d failed=%d kept_recent=%d",
         len(candidates),
         deleted,
         delete_failed,
+        kept_recent,
     )
     return summary

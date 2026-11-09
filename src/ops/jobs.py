@@ -396,8 +396,8 @@ def _sealed_at_for(paths_decisions: Path, execution: date) -> datetime | None:
     return max(stamps) if stamps else None
 
 
-def _prune_unreferenced_datasets(root: Path) -> dict[str, object]:
-    """Delete unreferenced dataset generations; never raises so a prune fault cannot fail collection."""
+def _prune_unreferenced_datasets(root: Path, *, created_before_ts: float | None = None) -> dict[str, object]:
+    """Delete unreferenced dataset generations; never raises so a prune fault cannot fail its job."""
     from src.data.dataset_maintenance import prune_datasets
     from src.data.dataset_registry import DatasetRegistry
     from src.data.runtime import resolve_data_runtime
@@ -406,6 +406,7 @@ def _prune_unreferenced_datasets(root: Path) -> dict[str, object]:
         runtime = resolve_data_runtime(data_root=root)
         summary = prune_datasets(
             runtime, DatasetRegistry(runtime.workspace.state_root), apply=True, emit=lambda payload: None,
+            created_before_ts=created_before_ts,
         )
     except Exception as exc:
         return {"prune_error": type(exc).__name__}
@@ -413,6 +414,7 @@ def _prune_unreferenced_datasets(root: Path) -> dict[str, object]:
         "pruned": _as_int(summary.get("deleted")),
         "prune_failed": _as_int(summary.get("failed")),
         "prune_unreadable": _as_int(summary.get("unreadable")),
+        "prune_kept_recent": _as_int(summary.get("kept_recent")),
     }
 
 
@@ -456,14 +458,13 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     except Exception as exc:
         warm_metrics = {"flag_cache_error": type(exc).__name__}
         warm_error = type(exc).__name__
-    prune_metrics = _prune_unreferenced_datasets(root)
     if degraded:
         _record(
             root, "collect_eve", "DEGRADED", today, moment,
             reason=f"optional:{','.join(degraded)}"[:300],
             metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **prune_metrics, **industry},
+                      **warm_metrics, **industry},
         )
         return 0
     if warm_error is not None:
@@ -471,13 +472,13 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
             root, "collect_eve", "DEGRADED", today, moment, reason="flag_cache_warm_failed",
             metrics={"planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **prune_metrics, **industry},
+                      **warm_metrics, **industry},
         )
         return 0
     _record(
         root, "collect_eve", "OK", today, moment,
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(),
-                 "node_peak_rss_mb": node_peaks, **warm_metrics, **prune_metrics, **industry},
+                 "node_peak_rss_mb": node_peaks, **warm_metrics, **industry},
     )
     return 0
 
@@ -1041,8 +1042,22 @@ def _failure_detail(exc: BaseException) -> str:
     return redact(str(exc), collect_secret_values(environment_snapshot()))[:300]
 
 
+def _prune_datasets_after_push(
+    root: Path, *, sources: dict[str, object], push_started_ts: float,
+) -> dict[str, object]:
+    if "silver" not in sources or "gold" not in sources:
+        return {"dataset_prune": "skipped_no_push"}
+    try:
+        with exclusive_run_lock(root / MORNING_LOCK_RELPATH) as held:
+            if not held:
+                return {"dataset_prune": "skipped_lock_held"}
+            return _prune_unreferenced_datasets(root, created_before_ts=push_started_ts)
+    except Exception as exc:
+        return {"prune_error": type(exc).__name__}
+
+
 def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
-    """Push the config's daily sources to Drive, then pack and prune loose Bronze confirmed offsite."""
+    """Push the config's daily sources to Drive, then prune Bronze and superseded datasets that were pushed."""
     root = Path(data_root)
     moment = _aware(now)
     run_date = moment.astimezone(KRX_TZ).date()
@@ -1052,6 +1067,7 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
                 metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
         return 1
     status_path = root / "state" / "lake_backup_status.json"
+    push_started_ts = moment.timestamp()
     try:
         sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
     except Exception as exc:
@@ -1067,8 +1083,9 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
                 metrics={"sources": sorted(sources), "detail": _failure_detail(exc)})
         return 1
+    dataset_prune = _prune_datasets_after_push(root, sources=sources, push_started_ts=push_started_ts)
     _record(root, "backup", "OK", run_date, moment,
-            metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed"))})
+            metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed")), **dataset_prune})
     return 0
 
 

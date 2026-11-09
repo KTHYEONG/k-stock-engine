@@ -726,3 +726,38 @@ def test_pack_bronze_defaults_to_every_kind(tmp_path, capsys) -> None:
         assert read_payload(loose) == body
     out = capsys.readouterr().out
     assert '"packed": 2' in out
+
+
+def test_prune_datasets_keeps_orphans_newer_than_cutoff(tmp_path) -> None:
+    import os
+    import time
+
+    from src.data.dataset_maintenance import prune_datasets
+    from src.data.dataset_registry import DatasetRegistry
+
+    runtime = _dataset_runtime(tmp_path)
+    anchor = _publish_cli_dataset(runtime, "anchor")
+    DatasetRegistry(runtime.workspace.state_root).register("anchor", anchor.dataset_id)
+    old_dir = runtime.workspace.silver_root / _publish_cli_dataset(runtime, "orphan_old").dataset_id
+    new_dir = runtime.workspace.silver_root / _publish_cli_dataset(runtime, "orphan_new").dataset_id
+    cutoff = time.time() - 1800
+    for path in (*old_dir.rglob("*"), old_dir):
+        os.utime(path, (cutoff - 3600, cutoff - 3600), follow_symlinks=False)
+
+    summary = prune_datasets(
+        runtime, DatasetRegistry(runtime.workspace.state_root), apply=True, emit=lambda _: None,
+        created_before_ts=cutoff,
+    )
+
+    assert summary["deleted"] == 1
+    assert summary["kept_recent"] == 1
+    assert not old_dir.exists()
+    assert new_dir.is_dir()
+
+    summary = prune_datasets(
+        runtime, DatasetRegistry(runtime.workspace.state_root), apply=True, emit=lambda _: None,
+        created_before_ts=None,
+    )
+
+    assert summary["deleted"] == 1
+    assert not new_dir.exists()

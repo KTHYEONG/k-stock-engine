@@ -1173,56 +1173,124 @@ def _prune_summary(**fields: object) -> dict[str, object]:
     return {"type": "summary", "candidates": 0, "unreadable": 0, "applied": True, "deleted": 0, "failed": 0, **fields}
 
 
-def test_collect_eve_records_prune_metrics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.data import dataset_maintenance
-
+def test_collect_eve_never_prunes_datasets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _trading(monkeypatch, True)
     _healthy_guard(monkeypatch)
     monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
-    applied: list[bool] = []
-
-    def prune(runtime: object, registry: object, *, apply: bool, emit: object) -> dict[str, object]:
-        applied.append(apply)
-        return _prune_summary(deleted=4, failed=1, unreadable=2)
-
-    monkeypatch.setattr(dataset_maintenance, "prune_datasets", prune)
+    monkeypatch.setattr(
+        jobs, "_prune_unreferenced_datasets", lambda *a, **k: pytest.fail("collect_eve must not prune datasets"),
+    )
     assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert applied == [True]
     event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
     assert event["outcome"] == "OK"
-    assert event["metrics"]["pruned"] == 4
-    assert event["metrics"]["prune_failed"] == 1
-    assert event["metrics"]["prune_unreadable"] == 2
+    assert not {"pruned", "prune_failed", "prune_unreadable", "prune_error"} & set(event["metrics"])
 
 
-def test_collect_eve_survives_prune_fault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _dataset_prune_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     from src.data import dataset_maintenance
 
-    _trading(monkeypatch, True)
+    calls: list[dict[str, object]] = []
+
+    def prune(runtime: object, registry: object, *, apply: bool, emit: object,
+              created_before_ts: float | None = None) -> dict[str, object]:
+        calls.append({"apply": apply, "created_before_ts": created_before_ts})
+        return _prune_summary(deleted=4, failed=1, unreadable=2, kept_recent=3)
+
+    monkeypatch.setattr(dataset_maintenance, "prune_datasets", prune)
+    return calls
+
+
+def _last_event(root: Path) -> dict[str, object]:
+    lines = (root / "ops/events/2026-10/2026-10-08.jsonl").read_text(encoding="utf-8").splitlines()
+    return json.loads(lines[-1])
+
+
+def _backup_push_ok(monkeypatch: pytest.MonkeyPatch, sources: dict[str, object]) -> None:
     _healthy_guard(monkeypatch)
-    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report(None, ()))
+    monkeypatch.setattr(jobs, "_push_backup_sources", lambda **kwargs: sources)
+    monkeypatch.setattr(jobs, "_prune_bronze", lambda *a, **k: {"removed": 0})
+
+
+def test_backup_prunes_datasets_after_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _backup_push_ok(monkeypatch, {"silver": {}, "gold": {}, "bronze": {}})
+    calls = _dataset_prune_calls(monkeypatch)
+    assert backup(tmp_path, now=_morning_now()) == 0
+    assert len(calls) == 1
+    event = _last_event(tmp_path)
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["pruned"] == 4
+    assert event["metrics"]["prune_kept_recent"] == 3
+
+
+def test_backup_passes_push_start_cutoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _backup_push_ok(monkeypatch, {"silver": {}, "gold": {}})
+    calls = _dataset_prune_calls(monkeypatch)
+    assert backup(tmp_path, now=_morning_now()) == 0
+    assert calls[0]["created_before_ts"] == _morning_now().timestamp()
+
+
+def test_backup_skips_dataset_prune_without_silver_gold_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _backup_push_ok(monkeypatch, {"bronze": {}})
+    calls = _dataset_prune_calls(monkeypatch)
+    assert backup(tmp_path, now=_morning_now()) == 0
+    assert calls == []
+    assert _last_event(tmp_path)["metrics"]["dataset_prune"] == "skipped_no_push"
+
+
+def test_backup_push_failure_never_prunes_datasets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_guard(monkeypatch)
+    calls = _dataset_prune_calls(monkeypatch)
+
+    def _fail(**kwargs: object) -> dict[str, object]:
+        raise PITDataError("lake backup push failed rc=1")
+
+    monkeypatch.setattr(jobs, "_push_backup_sources", _fail)
+    assert backup(tmp_path, now=_morning_now()) == 1
+    assert calls == []
+    assert _last_event(tmp_path)["outcome"] == "DEGRADED"
+
+
+def test_backup_bronze_prune_failure_skips_dataset_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_push_backup_sources", lambda **kwargs: {"silver": {}, "gold": {}})
+
+    def _prune_fail(root: Path, **kwargs: object) -> dict[str, object]:
+        raise PITDataError("pack failed")
+
+    monkeypatch.setattr(jobs, "_prune_bronze", _prune_fail)
+    calls = _dataset_prune_calls(monkeypatch)
+    assert backup(tmp_path, now=_morning_now()) == 1
+    assert calls == []
+
+
+def test_backup_skips_dataset_prune_when_lock_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.guards import exclusive_run_lock
+
+    _backup_push_ok(monkeypatch, {"silver": {}, "gold": {}})
+    calls = _dataset_prune_calls(monkeypatch)
+    with exclusive_run_lock(tmp_path / jobs.MORNING_LOCK_RELPATH) as held:
+        assert held is True
+        assert backup(tmp_path, now=_morning_now()) == 0
+    assert calls == []
+    assert _last_event(tmp_path)["metrics"]["dataset_prune"] == "skipped_lock_held"
+
+
+def test_backup_survives_dataset_prune_fault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data import dataset_maintenance
+
+    _backup_push_ok(monkeypatch, {"silver": {}, "gold": {}})
 
     def prune(*args: object, **kwargs: object) -> dict[str, object]:
         raise PITDataError("private manifest path")
 
     monkeypatch.setattr(dataset_maintenance, "prune_datasets", prune)
-    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
-    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert backup(tmp_path, now=_morning_now()) == 0
+    event = _last_event(tmp_path)
     assert event["outcome"] == "OK"
     assert event["metrics"]["prune_error"] == "PITDataError"
     assert "private manifest path" not in json.dumps(event)
-
-
-def test_collect_eve_prune_runs_only_after_unblocked_collection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _trading(monkeypatch, True)
-    _healthy_guard(monkeypatch)
-    monkeypatch.setattr(jobs, "_run_refresh", lambda *a, **k: _collect_report("dart_facts", ()))
-    monkeypatch.setattr(
-        jobs, "_prune_unreferenced_datasets", lambda root: pytest.fail("prune must not run after a blocked collection"),
-    )
-    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 1
 
 
 def test_node_peak_metrics_ignores_malformed_reports() -> None:
@@ -2330,3 +2398,20 @@ def test_morning_late_rerun_of_read_error_still_seals(tmp_path: Path, monkeypatc
     event = json.loads((tmp_path / "ops" / "events" / "2026-10" / "2026-10-08.jsonl").read_text())
     assert (event["outcome"], event["reason"]) == ("DEGRADED", "late_seal")
     assert event["metrics"]["rerun_of"] is None
+
+
+def test_backup_survives_lock_fault_without_pruning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _backup_push_ok(monkeypatch, {"silver": {}, "gold": {}})
+    calls = _dataset_prune_calls(monkeypatch)
+
+    @contextlib.contextmanager
+    def _broken_lock(path: Path):  # type: ignore[no-untyped-def]
+        raise OSError("lock file unavailable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(jobs, "exclusive_run_lock", _broken_lock)
+    assert backup(tmp_path, now=_morning_now()) == 0
+    assert calls == []
+    event = _last_event(tmp_path)
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["prune_error"] == "OSError"
