@@ -15,6 +15,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[3]
 SYSTEMD = REPO / "deploy" / "systemd"
 WRAPPER = REPO / "deploy" / "kse-run"
@@ -420,6 +422,9 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
             encoding="utf-8",
         )
         command.chmod(0o755)
+    docker = bin_dir / "docker"
+    docker.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    docker.chmod(0o755)
     env = {"HOME": str(home), "USER": "tester", "PATH": f"{bin_dir}:/usr/bin:/bin", "EVENT_LOG": str(events)}
     with target.open(encoding="utf-8") as old:
         result = subprocess.run(  # noqa: S603
@@ -776,3 +781,168 @@ def test_deploy_removes_staging_trees_after_converge() -> None:
     assert "-name 'staging-*' -mmin +60 -exec rm -rf {} +" in text
     skip = text.index('echo "SKIP: superseded by')
     assert text.index("rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA", skip) < text.index("exit 0", skip)
+
+
+PRUNE = REPO / "deploy" / "prune_images.sh"
+KSE_IMAGE = "ghcr.io/kthyeong/k-stock-engine"
+FAKE_DOCKER = """#!__PYTHON__
+import json, os, sys
+argv = sys.argv[1:]
+with open(os.environ["FAKE_DOCKER_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\\n")
+state = json.load(open(os.environ["FAKE_DOCKER_STATE"], encoding="utf-8"))
+if "-f" in argv or "prune" in argv:
+    sys.exit(99)
+if argv[:2] == ["image", "ls"]:
+    for row in state["images"]:
+        print(row["repo"], row["tag"], row["id"])
+elif argv[:2] == ["image", "inspect"]:
+    matches = [row for row in state["images"] if row["repo"] + ":" + row["tag"] == argv[-1]]
+    if not matches:
+        sys.exit(1)
+    print(matches[0]["created"])
+elif argv[:2] == ["ps", "-a"]:
+    for container in state["containers"]:
+        print(container["id"])
+elif argv[0] == "inspect":
+    matches = [c for c in state["containers"] if c["id"] == argv[-1]]
+    if not matches:
+        sys.exit(1)
+    print(matches[0]["image"])
+elif argv[0] == "rmi":
+    sys.exit(1 if argv[-1] in state["fail_rmi"] else 0)
+else:
+    sys.exit(99)
+"""
+
+
+def _sha(index: int) -> str:
+    return f"sha-{index:040x}"
+
+
+def _image_id(index: int) -> str:
+    return f"sha256:{index:064x}"
+
+
+def _sha_row(index: int, repo: str = KSE_IMAGE) -> dict:
+    return {"repo": repo, "tag": _sha(index), "id": _image_id(index),
+            "created": f"2026-11-{index:02d}T00:00:00.000000000Z"}
+
+
+def _run_prune(tmp_path: Path, images: list[dict], *, containers: list[dict] = (), args: tuple[str, ...] = (),
+               keep: str = "1", fail_rmi: tuple[str, ...] = (), docker: bool = True) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"images": images, "containers": list(containers), "fail_rmi": list(fail_rmi)}), encoding="utf-8")
+    log = tmp_path / "docker.jsonl"
+    if docker:
+        fake = bin_dir / "docker"
+        fake.write_text(FAKE_DOCKER.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        fake.chmod(0o755)
+        path = f"{bin_dir}:/usr/bin:/bin"
+    else:
+        path = str(bin_dir)
+    env = {"PATH": path, "KSE_IMAGE_KEEP": keep, "FAKE_DOCKER_STATE": str(state), "FAKE_DOCKER_LOG": str(log)}
+    result = subprocess.run(  # noqa: S603
+        ["/bin/bash", str(PRUNE), *args], capture_output=True, text=True, env=env, check=False,
+    )
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    return result, calls
+
+
+def _rmi_refs(calls: list[list[str]]) -> list[str]:
+    return sorted(call[1] for call in calls if call[0] == "rmi")
+
+
+def test_prune_script_is_valid_bash() -> None:
+    for script in (PRUNE, INSTALLER):
+        result = subprocess.run(["bash", "-n", str(script)], capture_output=True, check=False)  # noqa: S603,S607
+        assert result.returncode == 0, result.stderr
+
+
+def test_prune_keeps_latest_container_and_newest_n(tmp_path: Path) -> None:
+    images = [_sha_row(i) for i in range(1, 9)]
+    images.append({"repo": KSE_IMAGE, "tag": "latest", "id": _image_id(3), "created": "2026-11-03T00:00:00Z"})
+    containers = [{"id": "c" * 64, "image": _image_id(1)}]
+    result, calls = _run_prune(tmp_path, images, containers=containers, keep="2")
+    assert result.returncode == 0, result.stderr
+    assert _rmi_refs(calls) == sorted(f"{KSE_IMAGE}:{_sha(i)}" for i in (2, 4, 5, 6))
+    assert "image_prune status=OK kept=4 removed=4 failed=0" in result.stdout
+
+
+def test_prune_ignores_other_repos_and_non_sha_tags(tmp_path: Path) -> None:
+    other = "ghcr.io/kthyeong/crypto-pilot-live"
+    images = [_sha_row(i) for i in range(1, 4)]
+    images += [_sha_row(1, repo=other), _sha_row(2, repo=other)]
+    images += [{"repo": KSE_IMAGE, "tag": "sha-short", "id": _image_id(9), "created": "2026-10-01T00:00:00Z"}]
+    images += [{"repo": KSE_IMAGE, "tag": "latest", "id": _image_id(3), "created": "2026-11-03T00:00:00Z"}]
+    result, calls = _run_prune(tmp_path, images, keep="1")
+    assert result.returncode == 0, result.stderr
+    refs = _rmi_refs(calls)
+    assert refs == sorted(f"{KSE_IMAGE}:{_sha(i)}" for i in (1, 2))
+    assert not any(other in ref or ":latest" in ref or "sha-short" in ref for ref in refs)
+
+
+def test_prune_aliased_tags_share_protection(tmp_path: Path) -> None:
+    alias_a = {"repo": KSE_IMAGE, "tag": _sha(8), "id": _image_id(8), "created": "2026-11-08T00:00:00Z"}
+    alias_b = {"repo": KSE_IMAGE, "tag": _sha(7), "id": _image_id(8), "created": "2026-11-08T00:00:00Z"}
+    images = [alias_a, alias_b, _sha_row(1)]
+    result, calls = _run_prune(tmp_path, images, keep="1")
+    assert result.returncode == 0, result.stderr
+    assert _rmi_refs(calls) == [f"{KSE_IMAGE}:{_sha(1)}"]
+
+
+def test_prune_continues_after_rmi_failure(tmp_path: Path) -> None:
+    images = [_sha_row(i) for i in range(1, 5)]
+    result, calls = _run_prune(tmp_path, images, keep="1", fail_rmi=(f"{KSE_IMAGE}:{_sha(2)}",))
+    assert result.returncode == 0, result.stderr
+    assert _rmi_refs(calls) == sorted(f"{KSE_IMAGE}:{_sha(i)}" for i in (1, 2, 3))
+    assert "image_prune status=OK kept=1 removed=2 failed=1" in result.stdout
+
+
+def test_prune_dry_run_removes_nothing(tmp_path: Path) -> None:
+    images = [_sha_row(i) for i in range(1, 4)]
+    result, calls = _run_prune(tmp_path, images, args=("--dry-run",), keep="1")
+    assert result.returncode == 0, result.stderr
+    assert _rmi_refs(calls) == []
+    assert "image_prune action=would_remove tag=" + _sha(1) in result.stdout
+    assert "image_prune action=would_remove tag=" + _sha(2) in result.stdout
+
+
+def test_prune_without_docker_exits_zero(tmp_path: Path) -> None:
+    images = [_sha_row(1)]
+    result, calls = _run_prune(tmp_path, images, keep="1", docker=False)
+    assert result.returncode == 0, result.stderr
+    assert "image_prune status=SKIPPED reason=docker_unavailable" in result.stdout
+    assert calls == []
+
+
+@pytest.mark.parametrize(("keep", "args"), [("0", ()), ("abc", ()), ("1", ("--bogus",))])
+def test_prune_rejects_bad_usage(tmp_path: Path, keep: str, args: tuple[str, ...]) -> None:
+    result, calls = _run_prune(tmp_path, [_sha_row(1)], keep=keep, args=args)
+    assert result.returncode == 64
+    assert "image_prune status=USAGE" in result.stderr
+    assert calls == []
+
+
+def test_installer_runs_prune_after_linger_and_tolerates_failure(tmp_path: Path) -> None:
+    source = tmp_path / "staging"
+    shutil.copytree(SYSTEMD.parent, source)
+    (source / "prune_images.sh").write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert text.index("loginctl enable-linger") < text.index("prune_images.sh")
+    home = tmp_path / "home"
+    (home / "quant-secrets").mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("systemctl", "loginctl"):
+        command = bin_dir / name
+        command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        command.chmod(0o755)
+    env = {"HOME": str(home), "USER": "tester", "PATH": f"{bin_dir}:/usr/bin:/bin"}
+    result = subprocess.run(  # noqa: S603
+        ["/bin/bash", str(source / "install_systemd.sh")], capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "[SYS] image_prune status=FAILED" in result.stderr

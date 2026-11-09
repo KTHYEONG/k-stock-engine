@@ -31,3 +31,5 @@ mapfile -t timers < <(basename -a "${SRC_DIR}"/kse-*.timer)
 systemctl --user enable --now "${timers[@]}"
 
 loginctl enable-linger "${USER}"
+
+bash "$(dirname "${BASH_SOURCE[0]}")/prune_images.sh" || printf '[SYS] image_prune status=FAILED\n' >&2
