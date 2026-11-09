@@ -132,7 +132,7 @@ core → config → integrations → data → backtest → research → ops
 | 모델 | LightGBM(5·10·21일 앞 수익률 예측, 52개 팩터), scikit-learn |
 | 연동 | KRX, KIND, OpenDART, LS증권, 한국투자증권(KIS), DB금융투자, aiohttp, pydantic |
 | 배포·운영 | Docker, GitHub Actions(테스트 후 이미지 빌드·서버 배포), systemd 타이머, rclone |
-| 테스트 | pytest(테스트 함수 약 3,300개, 정적 집계), 변경분 커버리지 검사 [verify.py](./tools/verify.py) |
+| 테스트 | pytest(테스트 함수 약 3,590개, `def test_` 단순 집계(2026-11-09 기준)), 변경분 커버리지 검사 [verify.py](./tools/verify.py) |
 
 ## 📂 프로젝트 구조
 
