@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ from src.integrations.errors import (
 )
 
 _DEFAULT_RETRY_STATUSES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+_LOG = logging.getLogger(__name__)
 
 ClassifyHook = Callable[[requests.Response], None]
 
@@ -225,6 +227,18 @@ class HttpTransport:
         result: float = min(self._retry.base_backoff_seconds * (2**attempt), self._retry.max_backoff_seconds)
         return result
 
+    def _log_retry(self, *, endpoint: str, attempt: int, cause: str) -> None:
+        _LOG.warning(
+            "[SYS] stage=http_retry provider=%s endpoint=%s attempt=%d/%d cause=%s",
+            self._provider, endpoint, attempt + 1, self._retry.max_attempts, cause,
+        )
+
+    def _log_failed(self, *, endpoint: str, attempt: int, cause: str) -> None:
+        _LOG.error(
+            "[SYS] stage=http_failed provider=%s endpoint=%s attempts=%d cause=%s",
+            self._provider, endpoint, attempt + 1, cause,
+        )
+
     def _sleep_before_retry(self, *, attempt: int, retry_after: float | None) -> None:
         delay = self._backoff(attempt)
         if retry_after is not None and retry_after > delay:
@@ -279,7 +293,9 @@ class HttpTransport:
                     endpoint=endpoint,
                 )
                 if attempt + 1 >= self._retry.max_attempts:
+                    self._log_failed(endpoint=endpoint, attempt=attempt, cause=type(exc).__name__)
                     raise last_error from exc
+                self._log_retry(endpoint=endpoint, attempt=attempt, cause=type(exc).__name__)
                 self._sleep_before_retry(attempt=attempt, retry_after=None)
                 continue
             if response.status_code == 200:
@@ -288,7 +304,9 @@ class HttpTransport:
                         classify(response)
                     except ProviderRetryableError:
                         if attempt + 1 >= self._retry.max_attempts:
+                            self._log_failed(endpoint=endpoint, attempt=attempt, cause="classify")
                             raise
+                        self._log_retry(endpoint=endpoint, attempt=attempt, cause="classify")
                         self._sleep_before_retry(attempt=attempt, retry_after=None)
                         continue
                     except ProviderQuotaExhaustedError:
@@ -305,7 +323,9 @@ class HttpTransport:
                     error_classify(response)
                 except ProviderRetryableError:
                     if attempt + 1 >= self._retry.max_attempts:
+                        self._log_failed(endpoint=endpoint, attempt=attempt, cause="classify")
                         raise
+                    self._log_retry(endpoint=endpoint, attempt=attempt, cause="classify")
                     self._sleep_before_retry(attempt=attempt, retry_after=None)
                     continue
                 except (ProviderTerminalError, ProviderQuotaExhaustedError):
@@ -319,8 +339,11 @@ class HttpTransport:
                     provider=self._provider,
                     endpoint=endpoint,
                 )
+                cause = f"http_{response.status_code}"
                 if attempt + 1 >= self._retry.max_attempts:
+                    self._log_failed(endpoint=endpoint, attempt=attempt, cause=cause)
                     raise last_error
+                self._log_retry(endpoint=endpoint, attempt=attempt, cause=cause)
                 self._sleep_before_retry(attempt=attempt, retry_after=retry_after)
                 continue
             if 400 <= response.status_code < 500:

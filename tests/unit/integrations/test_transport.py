@@ -612,3 +612,73 @@ def test_error_classify_quota_propagates_unchanged() -> None:
     with pytest.raises(ProviderQuotaExhaustedError):
         transport.post("ep", {}, error_classify=_hook)
     assert calls["n"] == 1
+
+
+def test_retry_logs_one_warning_per_retry(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def fake_get(*_a, **_kw):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return SimpleNamespace(status_code=503, headers={}, json=lambda: {})
+        return _ok_response()
+
+    caplog.set_level(logging.INFO, logger="src.integrations.transport")
+    transport = _transport(session=SimpleNamespace(get=fake_get), sleep=lambda _s: None)
+    assert transport.get("ep", {}).status_code == 200
+    retries = [r.getMessage() for r in caplog.records if "stage=http_retry" in r.getMessage()]
+    assert len(retries) == 1
+    assert "attempt=1/" in retries[0]
+    assert retries[0].endswith("cause=http_503")
+    assert not [r for r in caplog.records if "stage=http_failed" in r.getMessage()]
+
+
+def test_exhausted_retries_log_error(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+    from types import SimpleNamespace
+
+    import pytest
+    import requests
+
+    from src.integrations.errors import ProviderRetryableError
+
+    def fake_get(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise requests.exceptions.ConnectionError("https://example.invalid/ep?key=1")
+
+    caplog.set_level(logging.INFO, logger="src.integrations.transport")
+    transport = _transport(session=SimpleNamespace(get=fake_get), sleep=lambda _s: None)
+    with pytest.raises(ProviderRetryableError):
+        transport.get("ep", {"key": "1"})
+    retries = [r for r in caplog.records if "stage=http_retry" in r.getMessage()]
+    failed = [r for r in caplog.records if "stage=http_failed" in r.getMessage()]
+    assert len(retries) == 2
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.ERROR
+    assert failed[0].getMessage() == (
+        "[SYS] stage=http_failed provider=TEST endpoint=ep attempts=3 cause=ConnectionError"
+    )
+    assert "key=1" not in caplog.text
+    assert "example.invalid" not in caplog.text
+
+
+def test_no_logging_on_success_or_terminal_4xx(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.errors import ProviderTerminalError
+
+    caplog.set_level(logging.INFO, logger="src.integrations.transport")
+    ok = _transport(session=SimpleNamespace(get=lambda *_a, **_kw: _ok_response()), sleep=lambda _s: None)
+    ok.get("ep", {})
+    not_found = _transport(
+        session=SimpleNamespace(get=lambda *_a, **_kw: _ok_response(status_code=404)), sleep=lambda _s: None
+    )
+    with pytest.raises(ProviderTerminalError):
+        not_found.get("ep", {})
+    assert not [r for r in caplog.records if "stage=http_" in r.getMessage()]
+

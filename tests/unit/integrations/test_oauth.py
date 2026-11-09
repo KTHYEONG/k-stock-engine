@@ -220,3 +220,61 @@ def test_secrets_never_in_errors_or_logs(caplog) -> None:  # type: ignore[no-unt
             text = f"{record.getMessage()} {record.args}"
             for needle in (key, secret, token):
                 assert needle not in text
+
+
+def _raw_response(status_code: int, body: bytes) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = body
+    return response
+
+
+def test_non_2xx_message_carries_status_and_rsp_cd_and_stays_retryable() -> None:
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.oauth import issue_client_credentials_token
+
+    ls, _ = _grants()
+    body = b'{"rsp_cd":"IGW00105","rsp_msg":"secret-detail"}'
+    with pytest.raises(ProviderRetryableError) as excinfo:
+        issue_client_credentials_token(_RecordingSession(_raw_response(403, body)), ls, app_key="K", app_secret="S")
+    assert isinstance(excinfo.value.__cause__, requests.HTTPError)
+    text = str(excinfo.value)
+    assert "http=403 rsp_cd=IGW00105" in text
+    assert "secret-detail" not in text
+
+
+def test_unsafe_rsp_cd_is_dropped() -> None:
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.oauth import issue_client_credentials_token
+
+    ls, _ = _grants()
+    body = b'{"rsp_cd":"bad code\\nBearer abc"}'
+    with pytest.raises(ProviderRetryableError) as excinfo:
+        issue_client_credentials_token(_RecordingSession(_raw_response(400, body)), ls, app_key="K", app_secret="S")
+    assert "rsp_cd=-" in str(excinfo.value)
+    assert "Bearer" not in str(excinfo.value)
+
+
+def test_non_json_non_2xx_has_http_only() -> None:
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.oauth import issue_client_credentials_token
+
+    ls, _ = _grants()
+    with pytest.raises(ProviderRetryableError) as excinfo:
+        issue_client_credentials_token(_RecordingSession(_raw_response(503, b"<html>down</html>")), ls, app_key="K", app_secret="S")
+    assert "http=503 rsp_cd=-" in str(excinfo.value)
+
+
+def test_transport_error_names_class_only() -> None:
+    from src.integrations.errors import ProviderRetryableError
+    from src.integrations.oauth import issue_client_credentials_token
+
+    ls, _ = _grants()
+    with pytest.raises(ProviderRetryableError) as excinfo:
+        issue_client_credentials_token(
+            _RecordingSession(requests.ConnectionError("secret-url?key=1")), ls, app_key="K", app_secret="S"
+        )
+    text = str(excinfo.value)
+    assert "ConnectionError" in text
+    assert "secret-url" not in text
+

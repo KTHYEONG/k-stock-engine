@@ -1,7 +1,10 @@
 """KIS transport-only client for active integrations."""
 from __future__ import annotations
 
+import logging
+import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,6 +19,24 @@ from src.core.market_rules import KrxMarket, KrxMarketRules
 from src.integrations.errors import ProviderRetryableError, ProviderTerminalError
 from src.integrations.kis.admission import HostPacedLimiter, SharedTokenStore
 from src.integrations.transport import HttpTransport, RetryPolicy
+
+_LOG = logging.getLogger(__name__)
+_BOUNDED_CODE = re.compile(r"[A-Za-z0-9_.\-]{1,32}")
+
+
+def _bounded_code(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text if _BOUNDED_CODE.fullmatch(text) else ""
+
+
+def _error_code(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+    except ValueError:
+        return ""
+    return _bounded_code(payload.get("error_code")) if isinstance(payload, Mapping) else ""
 
 
 @dataclass
@@ -207,11 +228,16 @@ class KisClient:
         url = f"{self.base_url}/oauth2/tokenP"
         body = {"grant_type": "client_credentials", "appkey": self.creds.app_key, "appsecret": self.creds.app_secret}
         resp = self.session.post(url, json=body, timeout=self.timeout)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            _LOG.warning("[SYS] stage=kis_token status=failed http=%d error_code=%s", resp.status_code, _error_code(resp) or "-")
+            raise
         payload = resp.json()
         raw_token = payload.get("access_token")
         if not raw_token:
-            raise ProviderTerminalError(f"Failed to issue token: {payload}", provider="KIS", endpoint="oauth2/tokenP")
+            code = _bounded_code(payload.get("error_code")) or "-"
+            raise ProviderTerminalError(f"Failed to issue token: error_code={code}", provider="KIS", endpoint="oauth2/tokenP")
         return str(raw_token), int(payload.get("expires_in", 86400))
 
     def _request_new_token(self) -> str:

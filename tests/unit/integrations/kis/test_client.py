@@ -790,3 +790,92 @@ def test_default_client_follows_loaded_policy(monkeypatch, tmp_path) -> None:
     assert primary.creds.app_key == "primary-key"
     assert primary._limiter is None
     assert primary._token_store is None
+
+
+def test_post_token_http_error_logs_status_and_error_code_and_reraises(tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+    from types import SimpleNamespace
+
+    import pytest
+    import requests
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+    )
+
+    def _forbidden() -> None:
+        raise requests.HTTPError("403 Forbidden")
+
+    client.session = SimpleNamespace(  # type: ignore[assignment]
+        post=lambda *a, **k: SimpleNamespace(
+            status_code=403, raise_for_status=_forbidden, json=lambda: {"error_code": "EGW00103"}
+        )
+    )
+    caplog.set_level(logging.WARNING, logger="src.integrations.kis.client")
+    with pytest.raises(requests.HTTPError):
+        client._post_token()
+    warnings = [r.getMessage() for r in caplog.records if "stage=kis_token" in r.getMessage()]
+    assert warnings == ["[SYS] stage=kis_token status=failed http=403 error_code=EGW00103"]
+
+
+def test_post_token_missing_access_token_does_not_echo_payload(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.integrations.errors import ProviderTerminalError
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+    )
+    client.session = SimpleNamespace(  # type: ignore[assignment]
+        post=lambda *a, **k: SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: {"foo": "s3cret"}
+        )
+    )
+    with pytest.raises(ProviderTerminalError) as excinfo:
+        client._post_token()
+    assert "s3cret" not in str(excinfo.value)
+    assert "error_code=-" in str(excinfo.value)
+
+
+def test_post_token_error_code_absent_for_non_json_or_non_object_body(tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+    from types import SimpleNamespace
+
+    import pytest
+    import requests
+
+    from src.integrations.kis.client import KisClient, KisCredentials
+
+    client = KisClient(
+        KisCredentials(app_key="k", app_secret="s", account_no="1", account_product_code="01", env="demo"),
+        token_cache_dir=tmp_path,
+        policy=_policy(),
+    )
+
+    def _failing() -> None:
+        raise requests.HTTPError("500")
+
+    def _not_json() -> object:
+        raise ValueError("not json")
+
+    caplog.set_level(logging.WARNING, logger="src.integrations.kis.client")
+    for body in (_not_json, lambda: ["oops"]):
+        client.session = SimpleNamespace(  # type: ignore[assignment]
+            post=lambda *a, _body=body, **k: SimpleNamespace(status_code=500, raise_for_status=_failing, json=_body)
+        )
+        with pytest.raises(requests.HTTPError):
+            client._post_token()
+    assert [r.getMessage() for r in caplog.records if "stage=kis_token" in r.getMessage()] == [
+        "[SYS] stage=kis_token status=failed http=500 error_code=-",
+        "[SYS] stage=kis_token status=failed http=500 error_code=-",
+    ]
+
