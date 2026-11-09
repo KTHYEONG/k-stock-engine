@@ -413,5 +413,6 @@ def _scheduled_capture(args: argparse.Namespace) -> int:
         _emit(result)
         return 0
     except Exception as exc:
+        _LOG.error("[EXEC] stage=auction_open status=failed error=%s", type(exc).__name__, exc_info=True)
         record("DEGRADED", type(exc).__name__)
         return 1

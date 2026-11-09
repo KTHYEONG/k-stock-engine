@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from src.core.time import KRX_TZ
 from src.execution.auction_capture import (
@@ -894,3 +897,76 @@ def test_open_phase_call_budget() -> None:
     assert [row for row in result.rows if row.kind == "open"] == []
     open_calls = sum(1 for kind, _ in client.calls if kind == "open")
     assert open_calls <= 80 * _OPEN_SLOW_MAX_ATTEMPTS
+
+
+def _auction_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "src.execution.auction_capture" and r.levelno == logging.WARNING]
+
+
+def test_expected_phase_failure_logged_once_per_class(caplog: pytest.LogCaptureFixture) -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+
+    class _AllBad(_StubClient):
+        def inquire_asking_price_exp_ccn(self, symbol: str) -> Any:
+            self.calls.append(("expected", symbol))
+            raise ValueError("bad payload")
+
+    caplog.set_level(logging.WARNING, logger="src.execution.auction_capture")
+    result = _capture(_AllBad(), ["a", "b", "c"], day, clock)
+    assert result.failed == {"a": "ValueError", "b": "ValueError", "c": "ValueError"}
+    expected = [r for r in _auction_warnings(caplog) if "phase=expected" in r.getMessage()]
+    assert len(expected) == 1
+    assert expected[0].exc_info is not None
+    assert "stage=auction_capture phase=expected symbol=a error=ValueError" in expected[0].getMessage()
+
+
+def test_open_phase_failure_logged(caplog: pytest.LogCaptureFixture) -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+
+    class _OpenBroken(_StubClient):
+        def inquire_price(self, symbol: str) -> Any:
+            self.calls.append(("open", symbol))
+            if symbol == "bad":
+                raise RuntimeError("open boom")
+            return {"stck_oprc": "100"}
+
+    caplog.set_level(logging.WARNING, logger="src.execution.auction_capture")
+    result = _capture(_OpenBroken(), ["good", "bad"], day, clock)
+    assert result.failed == {"bad": "RuntimeError"}
+    opened = [r for r in _auction_warnings(caplog) if "phase=open " in r.getMessage()]
+    assert len(opened) == 1
+    assert opened[0].exc_info is not None
+
+
+def test_partial_summary_line(caplog: pytest.LogCaptureFixture) -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+
+    class _SlowBad(_StubClient):
+        # Each call burns 250s of a 600s slot: a and b fail, c hits the slot deadline.
+        def inquire_asking_price_exp_ccn(self, symbol: str) -> Any:
+            self.calls.append(("expected", symbol))
+            clock.current += timedelta(seconds=250)
+            if symbol in ("a", "b"):
+                raise ValueError("bad payload")
+            return {"output1": {}, "output2": []}
+
+    caplog.set_level(logging.WARNING, logger="src.execution.auction_capture")
+    result = _capture(_SlowBad(), ["a", "b", "c"], day, clock)
+    assert result.failed == {"a": "ValueError", "b": "ValueError", "c": SLOT_DEADLINE_ERROR}
+    summaries = [r.getMessage() for r in _auction_warnings(caplog) if "status=partial" in r.getMessage()]
+    assert len(summaries) == 1
+    assert "failed=3" in summaries[0]
+    assert "'ValueError': 2" in summaries[0]
+    assert f"'{SLOT_DEADLINE_ERROR}': 1" in summaries[0]
+
+
+def test_no_failures_no_summary(caplog: pytest.LogCaptureFixture) -> None:
+    day = date(2026, 10, 5)
+    clock = _Clock(_open_at(day) - timedelta(minutes=25))
+    caplog.set_level(logging.WARNING, logger="src.execution.auction_capture")
+    result = _capture(_StubClient(), ["a"], day, clock)
+    assert result.failed == {}
+    assert _auction_warnings(caplog) == []

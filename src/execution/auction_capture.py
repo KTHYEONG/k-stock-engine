@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -14,6 +16,8 @@ from pathlib import Path
 from typing import Any, Final
 
 from src.core.time import OPEN_SNAPSHOT_OFFSETS_MIN
+
+_LOG = logging.getLogger(__name__)
 
 __all__ = [
     "OPEN_CONFIRM_FROM_S",
@@ -152,6 +156,17 @@ def _open_pollable(attempts: int, not_open: bool) -> bool:
     return attempts < _OPEN_CONFIRM_MAX_ATTEMPTS or (not_open and attempts < _OPEN_SLOW_MAX_ATTEMPTS)
 
 
+def _log_symbol_failure(phase: str, symbol: str, exc: Exception, seen: set[tuple[str, str]]) -> None:
+    key = (phase, type(exc).__name__)
+    if key in seen:
+        return
+    seen.add(key)
+    _LOG.warning(
+        "[EXEC] stage=auction_capture phase=%s symbol=%s error=%s",
+        phase, symbol, type(exc).__name__, exc_info=exc,
+    )
+
+
 def capture_open_auction(
     client: Any,
     symbols: Sequence[str],
@@ -173,6 +188,7 @@ def capture_open_auction(
         raise ValueError("open_at must be timezone-aware")
     rows: list[AuctionRow] = []
     failed: dict[str, str] = {}
+    seen_failures: set[tuple[str, str]] = set()
     offsets = sorted(OPEN_SNAPSHOT_OFFSETS_MIN)
     scheduled_list = [open_at + timedelta(minutes=int(offset)) for offset in offsets]
     started = now()
@@ -217,6 +233,7 @@ def capture_open_auction(
                     output2=json.dumps(payload.get("output2", []), sort_keys=True),
                 )
             except Exception as exc:
+                _log_symbol_failure("expected", symbol, exc, seen_failures)
                 failed.setdefault(symbol, type(exc).__name__)
                 continue
             slot_rows.append(row)
@@ -261,6 +278,7 @@ def capture_open_auction(
                     output2=json.dumps(output.get("output2", {}), sort_keys=True),
                 )
             except Exception as exc:
+                _log_symbol_failure("open", symbol, exc, seen_failures)
                 first_open_failure.setdefault(symbol, type(exc).__name__)
                 continue
             unresolved.remove(symbol)
@@ -278,6 +296,11 @@ def capture_open_auction(
     open_rows = [row for row in rows if row.kind == "open" and row.scheduled_at == open_at]
     if open_rows and on_batch is not None:
         on_batch(CaptureBatch(kind="open", scheduled_at=open_at, rows=tuple(open_rows)))
+    if failed:
+        _LOG.warning(
+            "[EXEC] stage=auction_capture status=partial failed=%d errors=%s",
+            len(failed), dict(sorted(Counter(failed.values()).items())),
+        )
     return CaptureResult(rows=tuple(rows), failed=dict(failed), slots_expected=slots_expected, slots_captured=slots_captured)
 
 

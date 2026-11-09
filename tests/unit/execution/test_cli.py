@@ -654,3 +654,35 @@ def test_few_untraded_names_do_not_degrade_the_run(tmp_path, monkeypatch, metric
                    "--out", str(tmp_path / "o"), "--events-root", str(events)])
     assert rc == 0
     assert load_run_outcomes(events, day) == {"auction_open": "OK"}
+
+
+def test_auction_open_unexpected_exception_logs_traceback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    from types import SimpleNamespace
+
+    from src.execution import cli
+    from src.ops.run_outcome import load_run_outcomes
+
+    day = date(2026, 10, 8)
+    monkeypatch.setattr(cli, "_today", lambda: day)
+    monkeypatch.setattr("src.ops.guards.trading_day", lambda _: True)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda _: (SimpleNamespace(execution_session=day),))
+    open_at = datetime(2026, 10, 8, 9, 0, tzinfo=KRX_TZ)
+    monkeypatch.setattr(cli, "_session_open", lambda _: open_at)
+    monkeypatch.setattr(cli, "_now", lambda: open_at)
+
+    def boom(args):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "_run_auction_open", boom)
+    events = tmp_path / "events"
+    caplog.set_level(logging.ERROR, logger="src.execution.cli")
+    rc = cli.main(["auction-open", "--decisions-dir", str(tmp_path), "--shadow-dir", str(tmp_path),
+                   "--out", str(tmp_path / "out.json"), "--events-root", str(events)])
+    assert rc == 1
+    assert load_run_outcomes(events, day) == {"auction_open": "DEGRADED"}
+    failed = [r for r in caplog.records if "stage=auction_open status=failed" in r.getMessage()]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.ERROR
+    assert failed[0].exc_info is not None
+    assert "error=RuntimeError" in failed[0].getMessage()
