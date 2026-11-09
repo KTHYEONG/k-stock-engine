@@ -170,4 +170,6 @@ if [[ "$PRINT" -eq 1 ]]; then
   exit 0
 fi
 
+printf '[SYS] kse-run status=START job=%s image=%s\n' "${JOB//$'\n'/ }" "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2>/dev/null </dev/null | cut -c1-12 || true)" >&2
+
 exec docker "${ARGS[@]}"

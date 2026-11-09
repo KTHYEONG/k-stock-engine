@@ -801,3 +801,52 @@ def test_no_prune_artifacts_remain() -> None:
         if path.resolve() == this_file or not path.is_file():
             continue
         assert marker not in path.read_text(encoding="utf-8", errors="ignore"), name
+
+
+def _fake_docker_env(tmp_path: Path, *, inspect_exit: int, label: str) -> tuple[dict[str, str], Path]:
+    docker = tmp_path / "docker"
+    log = tmp_path / "docker-calls.jsonl"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "argv = sys.argv[1:]\n"
+        "if argv[:2] == ['image', 'inspect']:\n"
+        f"    print({label!r})\n"
+        f"    sys.exit({inspect_exit})\n"
+        "with open(%r, 'a', encoding='utf-8') as fh:\n" % str(log)
+        + "    fh.write(json.dumps(argv) + '\\n')\n"
+        "print('RUN', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    return {"PATH": f"{tmp_path}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}, log
+
+
+def test_print_mode_output_unchanged_and_banner_absent() -> None:
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp/fakehome"}  # noqa: S108
+    result = subprocess.run(["bash", str(WRAPPER), "--print", "backup"],  # noqa: S603,S607
+                            capture_output=True, text=False, env=env, check=False)
+    assert result.returncode == 0
+    assert b"status=START" not in result.stderr
+    assert result.stdout.decode().split("\0")[:-1] == _print_argv("backup")
+
+
+def test_banner_line_precedes_exec(tmp_path: Path) -> None:
+    env, log = _fake_docker_env(tmp_path, inspect_exit=0, label="0123456789abcdef0123")
+    result = subprocess.run(["bash", str(WRAPPER), "morning"],  # noqa: S603,S607
+                            capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "[SYS] kse-run status=START job=morning image=0123456789ab\n" in result.stderr
+    assert result.stderr.index("status=START") < result.stderr.index("RUN")
+    runs = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(runs) == 1
+    assert runs[0][0] == "run"
+
+
+def test_banner_survives_inspect_failure(tmp_path: Path) -> None:
+    env, log = _fake_docker_env(tmp_path, inspect_exit=1, label="")
+    result = subprocess.run(["bash", str(WRAPPER), "morning"],  # noqa: S603,S607
+                            capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "[SYS] kse-run status=START job=morning image=\n" in result.stderr
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 1

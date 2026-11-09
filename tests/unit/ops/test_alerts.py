@@ -611,3 +611,47 @@ def test_drain_stops_when_suppressed_copy_cannot_be_deleted(tmp_path: Path, monk
     assert drain_outbox(sender=sender, alerts_dir=tmp_path, now=_now()) == 0
     assert len(sender.calls) == 1
     assert count_undelivered(tmp_path) == 1
+
+
+def test_send_failure_logged_at_warning_without_secrets(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    secret = "abcd efgh ijkl mnop"
+    recipient = "operator@example.invalid"
+    error = smtplib.SMTPAuthenticationError(535, f"bad creds {recipient} {secret}".encode())
+    message = AlertMessage(f"[kse] {recipient}", f"password={secret}", f"key|{secret}|{recipient}")
+    caplog.set_level(logging.WARNING, logger="src.ops.alerts")
+    assert dispatch(message, sender=_Failing(error), alerts_dir=tmp_path, now=_now(),
+                    secret_values={secret}) == DispatchOutcome.QUEUED
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("alert send attempt failed attempt=1 error=SMTPAuthenticationError smtp_code=535" in w for w in warnings)
+    assert secret not in caplog.text
+    assert recipient not in caplog.text
+    assert "bad creds" not in caplog.text
+
+
+def test_drain_failure_with_zero_delivered_is_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    dispatch(AlertMessage("queued", "b", "queued-key"), sender=_Failing(OSError("down")),
+             alerts_dir=tmp_path, now=_now())
+    caplog.set_level(logging.WARNING, logger="src.ops.alerts")
+    assert drain_outbox(sender=_Failing(smtplib.SMTPServerDisconnected("gone")), alerts_dir=tmp_path, now=_now()) == 0
+    assert any(
+        r.levelno == logging.WARNING and "alert drain stopped delivered=0 error=SMTPServerDisconnected smtp_code=-" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_sender_unavailable_warns_with_class_only(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    def _boom(name: str, default: str | None = None) -> str:
+        raise RuntimeError("secretvalue")
+
+    monkeypatch.setattr(alerts_mod, "read_secret", _boom)
+    caplog.set_level(logging.WARNING, logger="src.ops.alerts")
+    assert sender_from_env(None) is None
+    assert any(r.levelno == logging.WARNING and "alert sender unavailable error=RuntimeError" in r.getMessage()
+               for r in caplog.records)
+    assert "secretvalue" not in caplog.text

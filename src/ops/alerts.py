@@ -106,8 +106,8 @@ def sender_from_env(environ: Mapping[str, str] | None = None) -> AlertSender | N
             user = read_secret("ALERT_GMAIL_USER", default="")
             password = read_secret("ALERT_GMAIL_APP_PASSWORD", default="")
             to_addr = read_secret("ALERT_GMAIL_TO", default="")
-        except Exception:
-            _LOG.debug("[SYS] alert sender unavailable")
+        except Exception as exc:
+            _LOG.warning("[SYS] alert sender unavailable error=%s", type(exc).__name__)
             return None
     else:
         user = environ.get("ALERT_GMAIL_USER", "")
@@ -281,13 +281,17 @@ def dispatch(
         _LOG.info("[SYS] alert outcome=QUEUED")
         return DispatchOutcome.QUEUED
     delivered = False
-    for _ in range(2):
+    for attempt in range(1, 3):
         try:
             sender.send(subject, body)
             delivered = True
             break
-        except (smtplib.SMTPException, OSError, TimeoutError):
-            _LOG.debug("[SYS] alert send attempt failed")
+        except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+            code = getattr(exc, "smtp_code", None)
+            _LOG.warning(
+                "[SYS] alert send attempt failed attempt=%d error=%s smtp_code=%s",
+                attempt, type(exc).__name__, code if code is not None else "-",
+            )
             continue
     if delivered:
         try:
@@ -351,8 +355,13 @@ def drain_outbox(
             continue
         try:
             sender.send(subject, body)
-        except (smtplib.SMTPException, OSError, TimeoutError):
-            _LOG.info("[SYS] alert drain stopped delivered=%d", delivered)
+        except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+            code = getattr(exc, "smtp_code", None)
+            _LOG.log(
+                logging.WARNING if delivered == 0 else logging.INFO,
+                "[SYS] alert drain stopped delivered=%d error=%s smtp_code=%s",
+                delivered, type(exc).__name__, code if code is not None else "-",
+            )
             break
         delivered += 1
         try:
