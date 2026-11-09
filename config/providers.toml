@@ -20,37 +20,15 @@ trusted = true
 min_precision = 0.995
 benchmark_sample = 300
 
-# Primary key shared with other projects: conservative budget and reserve.
+# Single key shared with kca (separate ledgers): conservative budget and reserve.
+# Another key can be declared the same way; the one marked default collects jobs.
 [dart.keys.OPENDART_API_KEY]
 daily_limit = 20000
 daily_budget = 16000
 daily_reserve = 400
 min_interval_seconds = 0.2
 max_workers = 2
-
-# Dedicated key with its own ledger. IP-level blocking is shared, so pacing matches.
-# The unshared key is the default for job collection.
-[dart.keys.OPENDART_API_KEY_2]
-daily_limit = 20000
-daily_budget = 19500
-daily_reserve = 500
-min_interval_seconds = 0.2
-max_workers = 2
 default = true
-
-[dart.keys.OPENDART_API_KEY_3]
-daily_limit = 20000
-daily_budget = 19500
-daily_reserve = 500
-min_interval_seconds = 0.2
-max_workers = 2
-
-[dart.keys.OPENDART_API_KEY_4]
-daily_limit = 20000
-daily_budget = 19500
-daily_reserve = 500
-min_interval_seconds = 0.2
-max_workers = 2
 
 [kis]
 app_key_env = "KIS_APP_KEY"

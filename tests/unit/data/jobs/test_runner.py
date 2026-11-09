@@ -413,8 +413,8 @@ def test_build_job_context_defaults_to_default_key(tmp_path: Path) -> None:
     provider = load_provider_policy(load_runtime_config())
     ctx = build_job_context(runtime=runtime, provider=provider, key_env=None, collector=None)
 
-    assert ctx.key_env == provider.default_key_env == "OPENDART_API_KEY_2"
-    assert provider.default_key_env != provider.primary_key_env
+    assert ctx.key_env == provider.default_key_env == "OPENDART_API_KEY"
+    assert provider.default_key_env == provider.primary_key_env
 
 
 def test_runner_policy_rejects_invalid_budgets(tmp_path) -> None:  # type: ignore[no-untyped-def]

@@ -35,6 +35,12 @@ def _quota_store(tmp_path):  # type: ignore[no-untyped-def]
     return ProviderQuotaStateStore(tmp_path / "quota")
 
 
+def _two_key_provider():  # type: ignore[no-untyped-def]
+    from tests.fixtures.dart_keys import with_second_dart_key
+
+    return with_second_dart_key(_provider())
+
+
 def _capped_provider(*, daily_budget, daily_reserve, batch_identities):  # type: ignore[no-untyped-def]
     from src.config.providers import DartKeyPolicy, DartPolicy, ProviderPolicy
 
@@ -391,7 +397,7 @@ def test_headroom_meters_each_key_against_its_own_policy(tmp_path, monkeypatch) 
 
     monkeypatch.setenv("OPENDART_API_KEY", "primary-key")
     monkeypatch.setenv("OPENDART_API_KEY_2", "second-key")
-    provider = _provider()
+    provider = _two_key_provider()
     store = _quota_store(tmp_path)
     moment = datetime(2026, 9, 24, 3, tzinfo=UTC)
     primary_policy = provider.dart_key(provider.primary_key_env)
@@ -420,7 +426,7 @@ def test_scoped_collector_uses_the_declared_policy_of_the_selected_key(tmp_path,
 
     monkeypatch.setattr(backfill, "DartXbrlCollector", _Collector)
     monkeypatch.setenv("OPENDART_API_KEY_2", "second-key")
-    provider = _provider()
+    provider = _two_key_provider()
     policy = provider.dart_key("OPENDART_API_KEY_2")
     build_scoped_dart_collector(provider=provider, quota_store=_quota_store(tmp_path), key_env="OPENDART_API_KEY_2")
 
@@ -436,7 +442,7 @@ def test_undeclared_or_unset_key_is_refused(tmp_path, monkeypatch) -> None:
     from src.config.errors import ConfigError
     from src.data.dart_backfill import build_scoped_dart_collector
 
-    provider = _provider()
+    provider = _two_key_provider()
     store = _quota_store(tmp_path)
     monkeypatch.delenv("OPENDART_API_KEY_2", raising=False)
     with pytest.raises(ValueError, match="is not set"):

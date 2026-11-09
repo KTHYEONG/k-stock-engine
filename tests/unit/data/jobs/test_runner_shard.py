@@ -14,8 +14,9 @@ _JOB = "dart_shard_probe"
 
 def _provider():  # type: ignore[no-untyped-def]
     from src.config import load_provider_policy, load_runtime_config
+    from tests.fixtures.dart_keys import with_second_dart_key
 
-    return load_provider_policy(load_runtime_config())
+    return with_second_dart_key(load_provider_policy(load_runtime_config()))
 
 
 def _runtime(tmp_path: Path):  # type: ignore[no-untyped-def]

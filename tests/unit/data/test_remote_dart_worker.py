@@ -230,7 +230,9 @@ def _named_job(tmp_path: Path, *, job: str = "dart_disclosures", dry_run: bool =
     from src.data.research_scope import load_research_scope
 
     scope = load_research_scope(Path("config/research/kr_swing_2019_v1.toml"))
-    provider = load_provider_policy(load_runtime_config())
+    from tests.fixtures.dart_keys import with_second_dart_key
+
+    provider = with_second_dart_key(load_provider_policy(load_runtime_config()))
     payload: dict[str, Any] = {
         "job": job,
         "scope_id": scope.scope_id,

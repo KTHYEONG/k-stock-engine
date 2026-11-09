@@ -17,19 +17,15 @@ def test_moved_values_are_unchanged() -> None:
     assert (primary.daily_limit, primary.daily_budget, primary.daily_reserve) == (20000, 16000, 400)
     assert (primary.min_interval_seconds, primary.max_workers) == (0.2, 2)
 
-    secondary = provider.dart_key("OPENDART_API_KEY_2")
-    assert (secondary.daily_limit, secondary.daily_budget, secondary.daily_reserve) == (20000, 19500, 500)
-    assert (secondary.min_interval_seconds, secondary.max_workers) == (0.2, 2)
-
     assert provider.dart.circuit_threshold == 3
     assert provider.dart.requests_per_identity == 3
     assert provider.dart.batch_identities == 500
     assert [tuple(window) for window in provider.dart.shared_ip_avoid_windows_kst] == [("21:25", "21:50")]
 
     assert provider.primary_key_env == "OPENDART_API_KEY"
-    assert provider.default_key_env == "OPENDART_API_KEY_2"
+    assert provider.default_key_env == "OPENDART_API_KEY"
     assert provider.dart_key(provider.default_key_env).default is True
-    assert provider.dart_key(provider.primary_key_env).default is False
+    assert provider.dart_key(provider.primary_key_env).default is True
     assert tuple(provider.dart.disclosure_types) == ("A", "I001", "I002", "I003")
     assert (provider.kis.app_key_env, provider.kis.app_secret_env) == ("KIS_APP_KEY", "KIS_APP_SECRET")
     assert provider.kis.min_interval_seconds == 1.0
@@ -76,19 +72,42 @@ def test_undeclared_key_is_rejected() -> None:
         _policy().dart_key("OPENDART_API_KEY_9")
 
 
-def test_four_keys_declared_with_one_default() -> None:
+def test_single_key_declared_as_default() -> None:
     provider = _policy()
 
-    assert set(provider.dart.keys) == {
-        "OPENDART_API_KEY", "OPENDART_API_KEY_2", "OPENDART_API_KEY_3", "OPENDART_API_KEY_4",
-    }
-    for key_env in ("OPENDART_API_KEY_3", "OPENDART_API_KEY_4"):
-        key = provider.dart_key(key_env)
-        assert (key.daily_limit, key.daily_budget, key.daily_reserve) == (20000, 19500, 500)
-        assert (key.min_interval_seconds, key.max_workers) == (0.2, 2)
-        assert key.default is False
-    assert provider.default_key_env == "OPENDART_API_KEY_2"
+    assert set(provider.dart.keys) == {"OPENDART_API_KEY"}
+    assert provider.dart_key("OPENDART_API_KEY").default is True
+    assert provider.default_key_env == "OPENDART_API_KEY"
+    assert provider.primary_key_env == provider.default_key_env
     assert provider.dart.host_min_interval_seconds == 0.1
+
+
+def test_multi_key_policy_still_supported() -> None:
+    from src.config.providers import DartKeyPolicy
+    from tests.fixtures.dart_keys import SECOND_KEY_ENV, with_second_dart_key
+
+    provider = with_second_dart_key(_policy())
+    primary = provider.dart_key("OPENDART_API_KEY")
+    second = provider.dart_key(SECOND_KEY_ENV)
+
+    assert isinstance(second, DartKeyPolicy)
+    assert provider.default_key_env == "OPENDART_API_KEY"
+    assert second.default is False
+    assert provider.runner("dart", key_env="OPENDART_API_KEY").daily_budget == primary.daily_budget
+    assert provider.runner("dart", key_env=SECOND_KEY_ENV).daily_budget == second.daily_budget == 19500
+
+
+def test_provision_env_lists_only_primary_dart_key() -> None:
+    import tomllib
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[3]
+    secrets = tomllib.loads((repo / "config" / "data" / "provision_env.toml").read_text(encoding="utf-8"))[
+        "secret_keys"
+    ]
+
+    assert "OPENDART_API_KEY" in secrets
+    assert not [name for name in secrets if name.startswith("OPENDART_API_KEY_")]
 
 
 def test_host_interval_floor_enforced() -> None:
@@ -148,9 +167,10 @@ def test_default_key_falls_back_to_primary_without_marker() -> None:
 
     from src.config import load_provider_policy, load_runtime_config
     from src.config.providers import DartPolicy
+    from tests.fixtures.dart_keys import with_second_dart_key
 
-    provider = load_provider_policy(load_runtime_config())
-    assert provider.default_key_env == "OPENDART_API_KEY_2"
+    provider = with_second_dart_key(load_provider_policy(load_runtime_config()))
+    assert provider.default_key_env == provider.primary_key_env
     unmarked = provider.model_copy(
         update={
             "dart": provider.dart.model_copy(
@@ -370,15 +390,16 @@ def test_blank_env_names_are_rejected() -> None:
 
 def test_runner_policy_per_provider() -> None:
     from src.config import ConfigError
+    from tests.fixtures.dart_keys import with_second_dart_key
 
     provider = _policy()
 
     dart = provider.runner("dart")
-    assert (dart.quota_provider, dart.daily_budget, dart.daily_reserve) == ("DART", 19500, 500)
+    assert (dart.quota_provider, dart.daily_budget, dart.daily_reserve) == ("DART", 16000, 400)
     assert dart.circuit_threshold == 3
     assert tuple(dart.avoid_windows_kst) == (("21:25", "21:50"),)
-    primary = provider.runner("dart", key_env=provider.primary_key_env)
-    assert (primary.daily_budget, primary.daily_reserve) == (16000, 400)
+    with_second = with_second_dart_key(provider).runner("dart", key_env="OPENDART_API_KEY_2")
+    assert (with_second.daily_budget, with_second.daily_reserve) == (19500, 500)
 
     ls = provider.runner("ls")
     assert (ls.quota_provider, ls.daily_budget, ls.daily_reserve) == ("LS", 10000, 0)
