@@ -2,8 +2,11 @@
 
 import fcntl
 import json
+import re
+import stat
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,8 @@ from src.config.providers import load_provider_policy
 from src.config.runtime import load_runtime_config
 from tools.devops import lake_backup as backup_tool
 from tools.devops import provision_env
+
+REPO = Path(__file__).resolve().parents[3]
 
 
 def test_push_failure_records_status_and_carries_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -258,3 +263,95 @@ def test_restore_at_parses_state_numbers_and_aware_timestamps() -> None:
     assert backup_tool._parse_at("2026-10-30T17:30:00+00:00") == datetime(2026, 10, 30, 17, 30, tzinfo=UTC)
     with pytest.raises(Exception, match="UTC offset"):
         backup_tool._parse_at("2026-10-30T17:30:00")
+
+
+def _known_hosts_from(command: list[str]) -> Path:
+    option = next(item for item in command if item.startswith("UserKnownHostsFile="))
+    return Path(option.removeprefix("UserKnownHostsFile="))
+
+
+def test_provision_pins_host_key_and_is_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def ssh(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(provision_env.subprocess, "run", ssh)
+    provision_env._push_over_ssh(host="fixture", user="ubuntu", ssh_key=None, dest="fixture.env",
+                                 payload="SECRET=value\n", key_names=["X"])
+    command, kwargs = calls[0]
+    assert "StrictHostKeyChecking=yes" in command
+    assert "BatchMode=yes" in command
+    assert _known_hosts_from(command) != Path("/dev/null")
+    assert not any("StrictHostKeyChecking=no" in item or "/dev/null" in item for item in command)
+    assert kwargs["input"] == "SECRET=value\n"
+    assert "SECRET=value" not in " ".join(command)
+
+
+@pytest.mark.parametrize("returncode", [0, 255])
+def test_known_hosts_file_has_pinned_key_mode_0600_and_is_removed(
+    monkeypatch: pytest.MonkeyPatch, returncode: int
+) -> None:
+    observed: dict[str, object] = {}
+
+    def ssh(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        known_hosts = _known_hosts_from(command)
+        observed["path"] = known_hosts
+        observed["text"] = known_hosts.read_text(encoding="utf-8")
+        observed["mode"] = stat.S_IMODE(known_hosts.stat().st_mode)
+        return subprocess.CompletedProcess(command, returncode, "", "")
+
+    monkeypatch.setattr(provision_env.subprocess, "run", ssh)
+    try:
+        provision_env._push_over_ssh(host="fixture", user="ubuntu", ssh_key=None, dest="fixture.env",
+                                     payload="x\n", key_names=["X"])
+    except SystemExit:
+        assert returncode != 0
+    assert observed["text"] == f"* {provision_env._host_key()}\n"
+    assert observed["mode"] == 0o600
+    assert not observed["path"].exists()
+    assert not observed["path"].parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("config_text", "value"),
+    [
+        ('secret_keys = ["REQUIRED"]\n', None),
+        ('vps_host_key = "ssh-ed25519"\nsecret_keys = ["REQUIRED"]\n', "ssh-ed25519"),
+        ('vps_host_key = "ssh-ed25519 AAAA extra"\nsecret_keys = ["REQUIRED"]\n', "extra"),
+        ('vps_host_key = "AAAA-not-ssh AAAA"\nsecret_keys = ["REQUIRED"]\n', "AAAA-not-ssh"),
+    ],
+)
+def test_missing_or_malformed_host_key_aborts_before_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_text: str, value: str | None
+) -> None:
+    config_dir = tmp_path / "config" / "data"
+    config_dir.mkdir(parents=True)
+    (config_dir / "provision_env.toml").write_text(config_text, encoding="utf-8")
+    monkeypatch.setattr(provision_env, "REPO", tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(provision_env.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(SystemExit) as excinfo:
+        provision_env._push_over_ssh(host="fixture", user="ubuntu", ssh_key=None, dest="fixture.env",
+                                     payload="x\n", key_names=["X"])
+    assert not calls
+    assert value is None or value not in str(excinfo.value)
+
+
+def test_host_key_matches_deploy_workflow() -> None:
+    config = tomllib.loads((REPO / "config" / "data" / "provision_env.toml").read_text(encoding="utf-8"))
+    workflow = (REPO / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    match = re.search(r"^\s*VPS_HOST_KEY:\s*(.+?)\s*$", workflow, re.MULTILINE)
+    assert match is not None
+    assert config["vps_host_key"] == match.group(1)
+
+
+def test_no_weak_ssh_options_in_tools() -> None:
+    for path in (REPO / "tools").rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        data = path.read_bytes()
+        assert b"StrictHostKeyChecking=no" not in data, path
+        assert b"UserKnownHostsFile=/dev/null" not in data, path

@@ -8,9 +8,11 @@ Only key names are ever logged; values never leave the SSH channel.
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -31,6 +33,15 @@ def _optional_keys() -> list[str]:
     """Return optional secret names in configuration order."""
     config = tomllib.loads((REPO / "config" / "data" / "provision_env.toml").read_text(encoding="utf-8"))
     return list(config.get("optional_keys", []))
+
+
+def _host_key() -> str:
+    config = tomllib.loads((REPO / "config" / "data" / "provision_env.toml").read_text(encoding="utf-8"))
+    raw = str(config.get("vps_host_key", ""))
+    fields = raw.split()
+    if len(fields) != 2 or not fields[0].startswith("ssh-") or any(char in raw for char in "\r\n"):
+        raise SystemExit("vps_host_key must be a single-line ssh public key in config/data/provision_env.toml")
+    return " ".join(fields)
 
 
 def _read_secret_file(path: Path) -> dict[str, str]:
@@ -69,23 +80,30 @@ def _render_env(values: dict[str, str], allowed: list[str], optional: list[str] 
 def _push_over_ssh(*, host: str, user: str, ssh_key: str | None, dest: str, payload: str, key_names: list[str]) -> None:
     if KIS_DATA_MARKER in dest:
         raise SystemExit("refusing to write the shared pool file")
+    host_key = _host_key()
     quoted_dest = shlex.quote(dest)
     remote = (
         f"umask 077 && mkdir -p $(dirname {quoted_dest})"
         f" && cat > {quoted_dest}.tmp && chmod 600 {quoted_dest}.tmp"
         f" && mv {quoted_dest}.tmp {quoted_dest}"
     )
-    command = ["ssh"]
-    if ssh_key:
-        command += ["-i", ssh_key]
-    command += [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=20",
-        f"{user}@{host}", remote,
-    ]
-    sys.stdout.write(f"[SYS] provision_env keys={','.join(key_names)}\n")
-    completed = subprocess.run(command, input=payload, capture_output=True, text=True, check=False)  # noqa: S603
+    with tempfile.TemporaryDirectory(prefix="kse-known-hosts-") as tmp_dir:
+        known_hosts = Path(tmp_dir) / "known_hosts"
+        fd = os.open(known_hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"* {host_key}\n")
+        command = ["ssh"]
+        if ssh_key:
+            command += ["-i", ssh_key]
+        command += [
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=20",
+            f"{user}@{host}", remote,
+        ]
+        sys.stdout.write(f"[SYS] provision_env keys={','.join(key_names)}\n")
+        completed = subprocess.run(command, input=payload, capture_output=True, text=True, check=False)  # noqa: S603
     if completed.returncode != 0:
         raise SystemExit(f"ssh push failed rc={completed.returncode}")
     sys.stdout.write(f"[SYS] provision_env pushed keys={','.join(key_names)}\n")
