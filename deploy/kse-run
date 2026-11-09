@@ -70,8 +70,11 @@ case "$JOB" in
     NAME="kse-daily-audit"; MEM="512m"; CPUS="0.5"
     EXTRA_ENVS=("${HOME}/quant-secrets/kis-data.env" "${HOME}/quant-secrets/kse-alert.env")
     WANT_KIS=1; WANT_MALLOC=0
-    EXTRA_E=()
+    EXTRA_E=("KSE_CREDENTIAL_REGISTRY=/run/credential-registry.toml")
     EXTRA_V=(); WANT_LOG=1; WANT_STDIN=0
+    if [[ -f "${HOME}/quant-secrets/credential-registry.toml" ]]; then
+      EXTRA_V=("${HOME}/quant-secrets/credential-registry.toml:/run/credential-registry.toml:ro")
+    fi
     MODULE_ARGV=(src.ops.jobs audit)
     ;;
   morning)

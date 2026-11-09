@@ -314,3 +314,112 @@ def test_failure_streak_becomes_critical_issue(tmp_path: Path, monkeypatch: pyte
     heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning())
     assert {"key": "auction_open_streak", "text": "auction_open failed 3 consecutive run days"} in heartbeat["open_issues"]
     assert heartbeat["critical_incidents"] == ["auction_open_streak"]
+
+
+def _credential_registry(path: Path, entries: dict[str, int], *, estimated: str = "") -> Path:
+    blocks = ['schema = "credential-registry.v1"']
+    for name, days in entries.items():
+        confidence = "estimated" if name == estimated else "confirmed"
+        blocks.append(
+            "[[credential]]\n"
+            f'name = "{name}"\nprovider = "p"\nstore = "quant-secrets/kse-alert.env"\nenv_vars = ["X"]\n'
+            'consumers = ["kse"]\nstatus = "active"\n'
+            f'confidence = "{confidence}"\nexpires_on = {(DAY + timedelta(days=days)).isoformat()}\n'
+            'basis = "b"\nrenew_hint = "h"\n'
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(blocks), encoding="utf-8")
+    return path
+
+
+def _healthy_trading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: True)
+    monkeypatch.setattr("src.research.operate.read_chain", lambda path: (_decision(DAY, 8, 31),))
+    _record_all_ok(tmp_path, _morning())
+    _write_status(tmp_path)
+
+
+def _credential_keys(heartbeat: dict[str, object]) -> dict[str, str]:
+    return {item["key"]: item["text"] for item in heartbeat["open_issues"]}  # type: ignore[index]
+
+
+def test_notice_on_30_and_14_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    registry = _credential_registry(tmp_path / "reg.toml", {"N30": 30, "N14": 14, "N20": 20, "N8": 8})
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=registry)
+    issues = _credential_keys(heartbeat)
+    assert "credential_expiry" not in issues
+    notice = issues["credential_expiry_notice"]
+    assert "N30 d30 " in notice
+    assert "N14 d14 " in notice
+    assert "N20" not in notice
+    assert "N8" not in notice
+    assert heartbeat["critical_incidents"] == []
+
+
+def test_page_window_issue_and_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    registry = _credential_registry(
+        tmp_path / "reg.toml", {"P7": 7, "P0": 0, "PM3": -3, "NOTICE": 30}
+    )
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=registry)
+    issues = _credential_keys(heartbeat)
+    assert "credential_expiry_notice" not in issues
+    listed = issues["credential_expiry"]
+    assert "P7 d7 " in listed
+    assert "P0 d0 " in listed
+    assert "PM3 d-3 " in listed
+    assert "NOTICE" not in listed
+    assert heartbeat["critical_incidents"] == ["credential_expiry"]
+    assert heartbeat["severity"] == "WARNING"
+
+
+def test_registry_problem_is_warning_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    missing = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=tmp_path / "absent.toml")
+    assert _credential_keys(missing)["credential_registry"] == "registry unreadable: FileNotFoundError"
+    assert missing["critical_incidents"] == []
+    assert (tmp_path / audit_mod.AUDIT_HEARTBEAT_RELPATH).is_file()
+
+    broken = tmp_path / "broken.toml"
+    broken.write_text("schema = [unterminated", encoding="utf-8")
+    invalid = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=broken)
+    assert _credential_keys(invalid)["credential_registry"].startswith("registry unreadable: ")
+    assert invalid["critical_incidents"] == []
+
+
+def test_no_registry_path_means_no_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    registry = _credential_registry(tmp_path / "reg.toml", {"P0": 0})
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning())
+    assert heartbeat["open_issues"] == []
+    assert heartbeat["critical_incidents"] == []
+    assert registry.is_file()
+
+
+def test_closed_day_still_checks_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(audit_mod, "trading_day", lambda day: False)
+    _write_status(tmp_path)
+    registry = _credential_registry(tmp_path / "reg.toml", {"HOL3": 3})
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=registry)
+    assert heartbeat["day_kind"] == "closed"
+    assert heartbeat["severity"] == "HOLIDAY_SKIP"
+    assert "credential_expiry" in _credential_keys(heartbeat)
+    assert heartbeat["critical_incidents"] == ["credential_expiry"]
+
+
+def test_issue_texts_have_no_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    registry = _credential_registry(tmp_path / "reg.toml", {"NAMEX": 7}, estimated="NAMEX")
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=registry)
+    assert _credential_keys(heartbeat)["credential_expiry"] == (
+        f"NAMEX d7 {(DAY + timedelta(days=7)).isoformat()}(추정)"
+    )
+
+
+def test_far_expiry_is_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_trading(tmp_path, monkeypatch)
+    registry = _credential_registry(tmp_path / "reg.toml", {"FAR": 120})
+    heartbeat = run_daily_audit(tmp_path, today=DAY, now=_morning(), registry_path=registry)
+    assert heartbeat["open_issues"] == []
+    assert heartbeat["critical_incidents"] == []

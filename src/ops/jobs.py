@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -1155,6 +1156,48 @@ def _page(
     return queued
 
 
+_CREDENTIAL_NOTICES: Final[dict[str, tuple[str, str]]] = {
+    "credential_expiry_notice": (
+        "[알림][kse] 자격증명 갱신 필요",
+        "api-manager에서 check --consumer kse로 확인하고 포털 갱신 뒤 renew --publish 하세요.",
+    ),
+    "credential_registry": (
+        "[알림][kse] 자격증명 등록부 확인 필요",
+        "api-manager에서 publish로 등록부를 VPS에 다시 올리세요.",
+    ),
+}
+
+
+def _credential_notices(
+    issues: list[object],
+    *,
+    sender: AlertSender | None,
+    secrets: frozenset[str],
+    alerts_dir: Path,
+    today: date,
+    moment: datetime,
+) -> None:
+    """Mail one plain notice per credential warning per day; never opens an incident or raises."""
+    from src.ops.alerts import AlertMessage, dispatch
+
+    for issue in issues:
+        if not isinstance(issue, dict) or issue.get("key") not in _CREDENTIAL_NOTICES:
+            continue
+        key = str(issue["key"])
+        subject, action = _CREDENTIAL_NOTICES[key]
+        message = AlertMessage(
+            subject=subject,
+            body=f"무슨 일: {issue.get('text', '')}\n지금 할 일: {action}",
+            key=f"credential_notice|{key}|{today.isoformat()}",
+        )
+        try:
+            outcome = dispatch(message, sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
+        except OSError:
+            _LOG.debug("[OPS] credential notice dispatch failed")
+            continue
+        _LOG.info("[OPS] command=notice issue=%s outcome=%s", key, outcome.name)
+
+
 def alert(data_root: Path, *, unit: str, result: str, exit_status: str, journal_tail: str, now: datetime) -> int:
     """Record one unit failure and page only critical incidents; 1 only when a page could just be queued."""
     from src.ops.alert_policy import record_unit_failure, unit_incidents
@@ -1194,7 +1237,11 @@ def audit(data_root: Path, *, today: date, now: datetime) -> int:
     alerts_dir = _alerts_dir(root)
     sender, secrets = _alert_sender()
     _drain_best_effort(sender, alerts_dir, secrets, moment)
-    heartbeat = run_daily_audit(root, today=today, now=moment, undelivered_alerts=count_undelivered(alerts_dir))
+    registry = os.environ.get("KSE_CREDENTIAL_REGISTRY", "")
+    heartbeat = run_daily_audit(
+        root, today=today, now=moment, undelivered_alerts=count_undelivered(alerts_dir),
+        registry_path=Path(registry) if registry else None,
+    )
     raw = heartbeat.get("critical_incidents")
     kinds = tuple(IncidentKind(value) for value in raw) if isinstance(raw, list) else ()
     queued = _page(root, kinds, sender=sender, secrets=secrets, today=today, moment=moment)
@@ -1210,8 +1257,10 @@ def audit(data_root: Path, *, today: date, now: datetime) -> int:
         except OSError:
             _LOG.debug("[OPS] incident state write failed")
     issues = heartbeat.get("open_issues")
+    open_issues = issues if isinstance(issues, list) else []
+    _credential_notices(open_issues, sender=sender, secrets=secrets, alerts_dir=alerts_dir, today=today, moment=moment)
     _LOG.info("[OPS] command=audit severity=%s issues=%d critical=%d resolved=%d queued=%s",
-              str(heartbeat.get("severity", "")), len(issues) if isinstance(issues, list) else 0,
+              str(heartbeat.get("severity", "")), len(open_issues),
               len(kinds), len(resolved), queued)
     return 1 if queued else 0
 

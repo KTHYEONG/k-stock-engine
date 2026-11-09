@@ -100,7 +100,7 @@ def test_audit_incidents_map_only_critical_keys_once() -> None:
 
 def test_closed_day_evaluates_only_backup() -> None:
     assert evaluated_kinds("trading") == frozenset(IncidentKind)
-    assert evaluated_kinds("closed") == frozenset({IncidentKind.BACKUP_STALE})
+    assert evaluated_kinds("closed") == frozenset({IncidentKind.BACKUP_STALE, IncidentKind.CREDENTIAL_EXPIRY})
 
 
 def test_backup_staleness_uses_last_success() -> None:
@@ -201,3 +201,23 @@ def test_open_incident_state_roundtrip_and_tolerance(tmp_path: Path) -> None:
     assert load_open_incidents(tmp_path) == {}
     target.write_text("{", encoding="utf-8")
     assert load_open_incidents(tmp_path) == {}
+
+
+def test_credential_kind_has_page_and_resolves_on_closed_days() -> None:
+    assert PAGE_TEXT[IncidentKind.CREDENTIAL_EXPIRY].summary == "자격증명 만료 임박"
+    page = build_page(IncidentKind.CREDENTIAL_EXPIRY, THU)
+    assert page.subject.startswith("[긴급][kse] ")
+    assert IncidentKind.CREDENTIAL_EXPIRY in evaluated_kinds("closed")
+    assert IncidentKind.CREDENTIAL_EXPIRY in evaluated_kinds("trading")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"credential_notice_days": (7, 14), "credential_page_days": 7},
+     {"credential_notice_days": (30, 30)},
+     {"credential_notice_days": (0,)},
+     {"credential_page_days": 0}],
+)
+def test_policy_rejects_bad_credential_days(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="credential"):
+        AlertPolicy(**kwargs)  # type: ignore[arg-type]

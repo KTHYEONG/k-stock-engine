@@ -2415,3 +2415,88 @@ def test_backup_survives_lock_fault_without_pruning(tmp_path: Path, monkeypatch:
     event = _last_event(tmp_path)
     assert event["outcome"] == "OK"
     assert event["metrics"]["prune_error"] == "OSError"
+
+
+def test_audit_reads_registry_path_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _alert_sender(monkeypatch, None)
+    seen: list[object] = []
+
+    def fake_audit(root: Path, **kwargs: object) -> dict[str, object]:
+        seen.append(kwargs["registry_path"])
+        return {"severity": "OK", "open_issues": []}
+
+    monkeypatch.setattr(jobs, "run_daily_audit", fake_audit)
+    monkeypatch.setenv("KSE_CREDENTIAL_REGISTRY", "/run/credential-registry.toml")
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    monkeypatch.setenv("KSE_CREDENTIAL_REGISTRY", "")
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    monkeypatch.delenv("KSE_CREDENTIAL_REGISTRY")
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert seen == [Path("/run/credential-registry.toml"), None, None]
+
+
+def _audit_with_issues(monkeypatch: pytest.MonkeyPatch, issues: list[dict[str, str]]) -> None:
+    def fake_audit(root: Path, **kwargs: object) -> dict[str, object]:
+        return {"severity": "WARNING", "day_kind": "trading", "open_issues": issues}
+
+    monkeypatch.setattr(jobs, "run_daily_audit", fake_audit)
+    monkeypatch.delenv("KSE_CREDENTIAL_REGISTRY", raising=False)
+
+
+_NOTICE = {"key": "credential_expiry_notice", "text": "KRX_OPENAPI_KEY d30 2026-12-19"}
+
+
+def test_notice_issue_is_mailed_once_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import load_open_incidents
+
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    _audit_with_issues(monkeypatch, [_NOTICE])
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert len(sender.calls) == 1
+    subject, body = sender.calls[0]
+    assert subject.startswith("[알림][kse]")
+    assert body.splitlines()[0] == "무슨 일: KRX_OPENAPI_KEY d30 2026-12-19"
+    assert load_open_incidents(tmp_path) == {}
+
+
+def test_notice_body_survives_redaction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = _AlertRecorder()
+    monkeypatch.setattr(jobs, "_alert_sender", lambda: (sender, frozenset({"sekret-value-123"})))
+    _audit_with_issues(monkeypatch, [_NOTICE])
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert len(sender.calls) == 1
+    _, body = sender.calls[0]
+    assert "d30" in body
+    assert "2026-12-19" in body
+    assert "***" not in body
+
+
+def test_registry_problem_is_mailed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    _audit_with_issues(monkeypatch, [{"key": "credential_registry", "text": "registry unreadable: OSError"}])
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [subject for subject, _ in sender.calls] == ["[알림][kse] 자격증명 등록부 확인 필요"]
+
+
+def test_no_credential_issue_no_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    _audit_with_issues(monkeypatch, [{"key": "stale_something", "text": "x"}])
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert sender.calls == []
+
+
+def test_notice_dispatch_failure_is_swallowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.ops.alerts as alerts
+
+    _alert_sender(monkeypatch, _AlertRecorder())
+    _audit_with_issues(monkeypatch, [_NOTICE])
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(alerts, "dispatch", broken)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0

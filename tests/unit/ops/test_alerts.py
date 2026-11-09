@@ -173,6 +173,13 @@ def test_untagged_subject_gets_kse_tag(tmp_path: Path) -> None:
     assert sender.calls[0][0] == "[kse] plain"
 
 
+def test_notice_subject_tag_is_preserved(tmp_path: Path) -> None:
+    sender = _Recording()
+    subject = "[알림][kse] x"
+    dispatch(AlertMessage(subject=subject, body="b", key="n"), sender=sender, alerts_dir=tmp_path, now=_now())
+    assert sender.calls[0][0] == subject
+
+
 def test_same_cause_sent_once_per_day(tmp_path: Path) -> None:
     message = build_unit_failure(
         "u.service", result="failed", exit_status="1", journal_tail="x", now=_now())

@@ -19,6 +19,7 @@ from src.ops.alert_policy import (
     consecutive_failure_days,
     streak_issue_key,
 )
+from src.ops.credential_expiry import ExpiringCredential, load_kse_credentials
 from src.ops.guards import trading_day
 from src.ops.run_outcome import load_run_outcomes
 
@@ -149,6 +150,25 @@ def _streak_issues(data_root: Path, today: date, policy: AlertPolicy) -> list[di
     return issues
 
 
+def _credential_label(item: ExpiringCredential) -> str:
+    suffix = "(추정)" if item.estimated else ""
+    return f"{item.name} d{item.days_left} {item.expires_on.isoformat()}{suffix}"
+
+
+def _credential_issues(path: Path, today: date, policy: AlertPolicy) -> list[dict[str, str]]:
+    try:
+        entries = load_kse_credentials(path, today)
+    except (ValueError, OSError) as exc:
+        return [{"key": "credential_registry", "text": f"registry unreadable: {type(exc).__name__}"}]
+    paged = [item for item in entries if item.days_left <= policy.credential_page_days]
+    if paged:
+        return [{"key": "credential_expiry", "text": ", ".join(_credential_label(item) for item in paged)}]
+    noticed = [item for item in entries if item.days_left in policy.credential_notice_days]
+    if noticed:
+        return [{"key": "credential_expiry_notice", "text": ", ".join(_credential_label(item) for item in noticed)}]
+    return []
+
+
 def _decision_issues(decisions_dir: Path, today: date) -> list[tuple[str, str]]:
     from src.research.operate import read_chain
 
@@ -174,12 +194,15 @@ def run_daily_audit(
     now: datetime,
     undelivered_alerts: int = 0,
     policy: AlertPolicy = DEFAULT_ALERT_POLICY,
+    registry_path: Path | None = None,
 ) -> dict[str, object]:
     """Check the day's outcomes and artefacts, write the heartbeat with its critical incidents, and return it."""
     root = Path(data_root)
     moment = now if now.tzinfo is not None else now.replace(tzinfo=KRX_TZ)
     queued = undelivered_alerts if isinstance(undelivered_alerts, int) and not isinstance(undelivered_alerts, bool) and undelivered_alerts >= 0 else 0
     open_issues: list[dict[str, str]] = []
+    if registry_path is not None:
+        open_issues.extend(_credential_issues(Path(registry_path), today, policy))
     if trading_day(today):
         day_kind = "trading"
         try:

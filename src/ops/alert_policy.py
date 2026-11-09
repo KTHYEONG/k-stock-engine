@@ -53,6 +53,7 @@ class IncidentKind(StrEnum):
     COLLECT_EVE_STREAK = "collect_eve_streak"
     COLLECT_DBSEC_STREAK = "collect_dbsec_streak"
     AUCTION_OPEN_STREAK = "auction_open_streak"
+    CREDENTIAL_EXPIRY = "credential_expiry"
 
 
 _KIND_VALUES: Final = frozenset(kind.value for kind in IncidentKind)
@@ -105,6 +106,12 @@ PAGE_TEXT: Final[Mapping[IncidentKind, PageText]] = MappingProxyType({
         auto_action="거래일마다 일정대로 자동 재실행됐지만 계속 실패했습니다.",
         next_step="kse-auction-open 로그와 그날 아침 봉인 여부를 확인해 원인을 고치세요.",
     ),
+    IncidentKind.CREDENTIAL_EXPIRY: PageText(
+        summary="자격증명 만료 임박",
+        what="만료가 7일 이내이거나 지난 API 키나 토큰이 있습니다.",
+        auto_action="없음. 키는 자동으로 갱신되지 않습니다.",
+        next_step="api-manager에서 check --consumer kse로 대상을 확인하고 포털에서 갱신한 뒤, renew --publish로 등록부를 갱신하세요.",
+    ),
 })
 
 
@@ -137,9 +144,12 @@ class AlertPolicy:
             IncidentKind.COLLECT_EVE_STREAK.value: IncidentKind.COLLECT_EVE_STREAK,
             IncidentKind.COLLECT_DBSEC_STREAK.value: IncidentKind.COLLECT_DBSEC_STREAK,
             IncidentKind.AUCTION_OPEN_STREAK.value: IncidentKind.AUCTION_OPEN_STREAK,
+            "credential_expiry": IncidentKind.CREDENTIAL_EXPIRY,
         })
     )
-    closed_day_kinds: frozenset[IncidentKind] = frozenset({IncidentKind.BACKUP_STALE})
+    closed_day_kinds: frozenset[IncidentKind] = frozenset({IncidentKind.BACKUP_STALE, IncidentKind.CREDENTIAL_EXPIRY})
+    credential_notice_days: tuple[int, ...] = (30, 14)
+    credential_page_days: int = 7
 
     def __post_init__(self) -> None:
         if self.streak_threshold < 1:
@@ -148,6 +158,12 @@ class AlertPolicy:
             raise ValueError("streak_lookback_days must cover streak_threshold")
         if self.backup_stale_after <= timedelta(0):
             raise ValueError("backup_stale_after must be positive")
+        if self.credential_page_days < 1:
+            raise ValueError("credential_page_days must be positive")
+        if len(set(self.credential_notice_days)) != len(self.credential_notice_days):
+            raise ValueError("credential_notice_days must be unique")
+        if any(days <= self.credential_page_days for days in self.credential_notice_days):
+            raise ValueError("credential_notice_days must be greater than credential_page_days")
 
 
 DEFAULT_ALERT_POLICY: Final = AlertPolicy()

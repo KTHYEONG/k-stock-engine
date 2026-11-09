@@ -44,7 +44,7 @@ _SUPPRESS_WINDOW: Final = timedelta(hours=24)
 _GMAIL_HOST: Final = "smtp.gmail.com"
 _GMAIL_PORT: Final = 465
 _CAUSE_MAX_CHARS: Final = 300
-_SUBJECT_TAGS: Final = ("[kse]", "[긴급][kse]", "[해결][kse]")
+_SUBJECT_TAGS: Final = ("[kse]", "[긴급][kse]", "[해결][kse]", "[알림][kse]")
 _CAUSE_RE: Final = re.compile(r"(Error|Exception|Traceback|CRITICAL|FATAL|FAIL)", re.IGNORECASE)
 
 _BEARER_RE: Final = re.compile(r"(Bearer\s+)[^\s\"'`,;}\]]+", re.IGNORECASE)

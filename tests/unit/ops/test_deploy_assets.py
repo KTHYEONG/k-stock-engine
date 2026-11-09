@@ -176,6 +176,8 @@ def test_effective_command_equivalent_to_legacy() -> None:
             effective = _normalize(_unit_effective(unit, home=home))
             effective["vols"] = [v for v in effective["vols"] if "/quant-strategy-store:" not in v]
             effective["envs"] = [e for e in effective["envs"] if not e.startswith("KSE_STRATEGY_STORE=")]
+            effective["vols"] = [v for v in effective["vols"] if "/credential-registry.toml:" not in v]
+            effective["envs"] = [e for e in effective["envs"] if not e.startswith("KSE_CREDENTIAL_REGISTRY=")]
             legacy = _legacy_normalized(unit, home, uidgid)
             assert effective["scalars"] == legacy["scalars"], unit
             assert effective["rm"] == legacy["rm"], unit
@@ -304,6 +306,10 @@ def test_mount_allowlist_on_effective_argv() -> None:
                     assert unit in STORE_UNITS, unit
                     assert mount == home + "/quant-strategy-store:/run/strategy-store:ro", unit
                     continue
+                if "/credential-registry.toml:" in mount:
+                    assert unit == "kse-daily-audit.service", unit
+                    assert mount == home + "/quant-secrets/credential-registry.toml:/run/credential-registry.toml:ro", unit
+                    continue
                 assert mount.startswith(home + "/k-stock-engine/data:") or mount.startswith(home + "/k-stock-engine/logs:") \
                     or mount.startswith(home + "/.cache/kis:") or mount.startswith(home + "/.cache/dbsec:") \
                     or mount.startswith(home + "/.config/rclone:"), f"{unit}: {mount}"
@@ -313,6 +319,25 @@ def test_mount_allowlist_on_effective_argv() -> None:
                 if "/.config/rclone:" in mount:
                     assert unit == "kse-backup.service", unit
                     assert mount.endswith(":ro"), unit
+
+
+def test_audit_unit_mounts_registry_readonly_only_when_present() -> None:
+    registry = "/quant-secrets/credential-registry.toml:/run/credential-registry.toml:ro"
+    with tempfile.TemporaryDirectory() as home:
+        absent = _normalize(_unit_effective("kse-daily-audit.service", home=home))
+        assert "KSE_CREDENTIAL_REGISTRY=/run/credential-registry.toml" in absent["envs"]
+        assert not any("/credential-registry.toml" in mount for mount in absent["vols"])
+
+        (Path(home) / "quant-secrets").mkdir()
+        (Path(home) / "quant-secrets" / "credential-registry.toml").write_text('schema = "x"\n', encoding="utf-8")
+        for unit in UNIT_JOBS:
+            norm = _normalize(_unit_effective(unit, home=home))
+            mounts = [mount for mount in norm["vols"] if "/credential-registry.toml" in mount]
+            if unit == "kse-daily-audit.service":
+                assert "KSE_CREDENTIAL_REGISTRY=/run/credential-registry.toml" in norm["envs"], unit
+                assert mounts == [home + registry], unit
+            else:
+                assert mounts == [], unit
 
 
 def test_alert_credentials_reach_only_audit_and_alert_units() -> None:
