@@ -72,9 +72,9 @@ class PageText:
 PAGE_TEXT: Final[Mapping[IncidentKind, PageText]] = MappingProxyType({
     IncidentKind.NO_SEAL: PageText(
         summary="장전 매매 결정 미봉인",
-        what="오늘 장 시작 전 매매 결정이 봉인되지 않았습니다.",
-        auto_action="아침 봉인 실패 직후 늦은 봉인(morning-late)을 자동 실행했지만 결정이 만들어지지 않았습니다.",
-        next_step="kse-morning-late 로그에서 원인(KRX 지연, 결정 체인 손상, 메모리 부족 등)을 고친 뒤 kse-morning-late를 다시 실행하세요.",
+        what="오늘 장 시작 전 매매 결정이 봉인되지 않았습니다. 오늘치 결정 체인과 섀도 원장(shadow ledger) 기록이 비어 있습니다. 09시 이후 봉인은 늦은 봉인(late_seal)으로만 기록됩니다.",
+        auto_action="늦은 봉인(morning-late)은 아침 봉인이 실패했을 때만 자동 실행됩니다. 오늘 아침 작업이 아예 시작되지 않았거나, 아침 봉인과 늦은 봉인 모두 결정을 만들지 못했을 수 있습니다.",
+        next_step="kse-morning.timer가 오늘 실행됐는지, 오늘 events의 morning 및 morning_late 기록을 확인하세요. 그다음 kse-morning-late 로그에서 원인(KRX 지연, 결정 체인 손상, 메모리 부족 등)을 고친 뒤 kse-morning-late를 다시 실행하세요.",
     ),
     IncidentKind.EVENTS_UNREADABLE: PageText(
         summary="작업 결과 기록 판독 불가",

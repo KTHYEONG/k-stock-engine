@@ -62,6 +62,16 @@ def test_every_kind_has_three_line_korean_page_without_paths() -> None:
         assert page.key == incident_key(kind, THU) == f"incident|{kind.value}|2026-10-08"
 
 
+def test_no_seal_text_never_claims_unconditional_morning_late_run() -> None:
+    text = PAGE_TEXT[IncidentKind.NO_SEAL]
+    body = build_page(IncidentKind.NO_SEAL, THU).body
+    assert "아침 봉인이 실패했을 때만 자동 실행됩니다" in text.auto_action
+    assert "아침 봉인 실패 직후 늦은 봉인(morning-late)을 자동 실행했지만" not in body
+    assert "오늘치 결정 체인과 섀도 원장(shadow ledger) 기록이 비어 있습니다" in body
+    assert "늦은 봉인(late_seal)으로만 기록됩니다" in body
+    assert "kse-morning.timer" in body
+
+
 def test_streak_text_follows_policy_threshold() -> None:
     page = build_page(IncidentKind.COLLECT_EVE_STREAK, THU, AlertPolicy(streak_threshold=4))
     assert "4거래일" in page.subject
