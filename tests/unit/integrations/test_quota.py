@@ -1,4 +1,8 @@
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
 
 
 def test_record_attempt_under_concurrent_threads_never_crashes_and_counts_exactly(tmp_path) -> None:
@@ -138,3 +142,98 @@ def test_ledger_gate_uses_wall_clock_without_binding(tmp_path) -> None:
     gate = LedgerQuotaGate(store, provider="P", daily_limit=100)
     gate.acquire(endpoint="e")
     gate.record_rate_limit(endpoint="e", retry_after=1.0)
+
+
+_NOW = datetime(2026, 11, 10, 3, tzinfo=UTC)
+
+
+def _seed(root, state: dict[str, Any]) -> None:  # type: ignore[no-untyped-def]
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "quota_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def _saved(root) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    return json.loads((root / "quota_state.json").read_text(encoding="utf-8"))
+
+
+def _aged(days: int, **extra: Any) -> dict[str, Any]:
+    moment = _NOW - timedelta(days=days)
+    return {"attempted_requests": 5, "daily_attempt_day": moment.date().isoformat(),
+            "daily_attempted_requests": 5, "updated_at": moment.isoformat(), **extra}
+
+
+def test_stale_entry_pruned_on_write(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    _seed(tmp_path, {"KIND|old": _aged(45)})
+    ProviderQuotaStateStore(tmp_path).acquire_and_record(provider="KIND", endpoint="new", now=_NOW)
+    saved = _saved(tmp_path)
+    assert "KIND|old" not in saved
+    assert saved["KIND|new"]["attempted_requests"] == 1
+
+
+def test_recent_entry_kept(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    _seed(tmp_path, {"KIND|recent": _aged(10)})
+    ProviderQuotaStateStore(tmp_path).record_attempt(provider="KIND", endpoint="new", now=_NOW)
+    assert "KIND|recent" in _saved(tmp_path)
+
+
+def test_active_block_never_pruned(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.errors import ProviderQuotaExhaustedError
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    blocked = (_NOW + timedelta(hours=1)).isoformat()
+    _seed(tmp_path, {"KIND|blocked": _aged(90, blocked_until=blocked)})
+    store = ProviderQuotaStateStore(tmp_path)
+    store.record_attempt(provider="KIND", endpoint="new", now=_NOW)
+    assert "KIND|blocked" in _saved(tmp_path)
+    with pytest.raises(ProviderQuotaExhaustedError):
+        store.acquire(provider="KIND", endpoint="blocked", now=_NOW)
+
+
+def test_expired_block_old_entry_pruned(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    expired = (_NOW - timedelta(hours=1)).isoformat()
+    _seed(tmp_path, {"KIND|expired": _aged(90, blocked_until=expired)})
+    ProviderQuotaStateStore(tmp_path).record_rate_limit(provider="KIND", endpoint="new", now=_NOW, retry_after=60.0)
+    assert "KIND|expired" not in _saved(tmp_path)
+
+
+def test_missing_dates_and_malformed_entries_kept(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    state: dict[str, Any] = {"KIND|empty": {}, "KIND|bad": {"updated_at": "not-a-date"}, "KIND|scalar": "garbage",
+                             "KIND|badblock": _aged(90, blocked_until=12345)}
+    _seed(tmp_path, state)
+    ProviderQuotaStateStore(tmp_path).acquire_and_record(provider="KIND", endpoint="new", now=_NOW)
+    saved = _saved(tmp_path)
+    assert {k: saved[k] for k in state} == state
+
+
+def test_daily_limit_accounting_unchanged(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    today = _NOW.date().isoformat()
+    recent = (_NOW - timedelta(hours=1)).isoformat()
+    _seed(tmp_path, {
+        "P|a": {"daily_attempt_day": today, "daily_attempted_requests": 3, "updated_at": recent},
+        "P|b": {"daily_attempt_day": today, "daily_attempted_requests": 2, "updated_at": recent},
+        "P|old": _aged(60),
+    })
+    store = ProviderQuotaStateStore(tmp_path)
+    assert store.remaining_daily_attempts(provider="P", now=_NOW, daily_limit=10) == 5
+    store.record_attempt(provider="P", endpoint="c", now=_NOW)
+    assert "P|old" not in _saved(tmp_path)
+    assert store.remaining_daily_attempts(provider="P", now=_NOW, daily_limit=10) == 4
+
+
+def test_fallback_to_daily_attempt_day(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    day = (_NOW - timedelta(days=60)).date().isoformat()
+    _seed(tmp_path, {"KIND|folded": {"daily_attempt_day": day, "daily_attempted_requests": 1, "attempted_requests": 1}})
+    ProviderQuotaStateStore(tmp_path).acquire_and_record(provider="KIND", endpoint="new", now=_NOW)
+    assert "KIND|folded" not in _saved(tmp_path)

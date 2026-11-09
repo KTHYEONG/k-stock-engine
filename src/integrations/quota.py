@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import threading
 import uuid
@@ -11,16 +12,20 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from src.integrations.errors import ProviderQuotaExhaustedError
 
 __all__ = [
+    "QUOTA_ENTRY_RETENTION_DAYS",
     "LedgerQuotaGate",
     "ProviderQuotaExhaustedError",
     "ProviderQuotaState",
     "ProviderQuotaStateStore",
 ]
+
+QUOTA_ENTRY_RETENTION_DAYS: Final[int] = 30
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +42,32 @@ def _next_kst_midnight_utc(now: datetime) -> datetime:
     kst = moment + timedelta(hours=9)
     nxt = (kst + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return (nxt - timedelta(hours=9)).astimezone(UTC)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _parse_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(raw))
+    except ValueError:
+        return None
+
+
+def _is_stale_entry(entry: object, *, cutoff: datetime, now: datetime) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    activity = _parse_utc(entry.get("updated_at")) or _parse_utc(entry.get("daily_attempt_day"))
+    if activity is None or activity >= cutoff:
+        return False
+    raw_blocked = entry.get("blocked_until")
+    if not raw_blocked:
+        return True
+    blocked_until = _parse_utc(raw_blocked)
+    return blocked_until is not None and blocked_until <= now
 
 
 class ProviderQuotaStateStore:
@@ -90,6 +121,16 @@ class ProviderQuotaStateStore:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _prune_stale_nolock(self, state: dict[str, dict[str, Any]], *, now: datetime) -> int:
+        moment = _as_utc(now)
+        cutoff = moment - timedelta(days=QUOTA_ENTRY_RETENTION_DAYS)
+        stale = [key for key, entry in state.items() if _is_stale_entry(entry, cutoff=cutoff, now=moment)]
+        for key in stale:
+            del state[key]
+        if stale:
+            _LOG.info("[SYS] quota_state pruned=%d remaining=%d", len(stale), len(state))
+        return len(stale)
 
     def _key(self, *, provider: str, endpoint: str) -> str:
         return f"{provider}|{endpoint}"
@@ -152,6 +193,7 @@ class ProviderQuotaStateStore:
             )
             entry["updated_at"] = now.isoformat()
             state[key] = entry
+            self._prune_stale_nolock(state, now=now)
             self._save_nolock(state)
 
     def record_attempt(self, *, provider: str, endpoint: str, now: datetime, daily_limit: int | None = None) -> None:
@@ -171,6 +213,7 @@ class ProviderQuotaStateStore:
             )
             entry["updated_at"] = now.isoformat()
             state[key] = entry
+            self._prune_stale_nolock(state, now=now)
             self._save_nolock(state)
 
     def add_attempts(self, *, provider: str, endpoint: str, day: str, count: int) -> None:
@@ -202,6 +245,7 @@ class ProviderQuotaStateStore:
             entry["blocked_until"] = blocked_until.isoformat()
             entry["updated_at"] = now.isoformat()
             state[key] = entry
+            self._prune_stale_nolock(state, now=now)
             self._save_nolock(state)
             return ProviderQuotaState(provider=provider, endpoint=endpoint, blocked_until=blocked_until, attempted_requests=int(entry["attempted_requests"]), rate_limited_requests=int(entry["rate_limited_requests"]))
 
