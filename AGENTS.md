@@ -32,6 +32,7 @@ Verify code changes against the project's native toolchains before concluding ta
 - Before touching any logging call, log format, or credential handling: read `.agents/rules/logging.md`
 - Before touching hot loops, bulk I/O, or parallelism: read `.agents/rules/performance.md`
 - Before touching docstrings, comments, or `docs/architecture/**`: read `.agents/rules/documentation.md`
+- Before touching `src/config/**`, `docs/flags.toml`, or any on/off switch: read `.agents/rules/config-flags.md`
 
 ## 6. Workflow Profile
 - verify: `uv run python tools/verify.py`

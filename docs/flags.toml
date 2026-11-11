@@ -1,0 +1,2 @@
+# Config toggle registry enforced by tests/unit/test_flag_policy.py. Rules: .agents/rules/config-flags.md
+# Zero rows today: no config model or env read in src/ is a feature toggle. A new toggle needs a [[flag]] row.

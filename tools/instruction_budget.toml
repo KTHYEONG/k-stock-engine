@@ -107,3 +107,7 @@ phrase = "scratch/"
 [[retention]]
 file = "AGENTS.md"
 phrase = "Core Quant Invariants"
+
+[[retention]]
+file = ".agents/rules/config-flags.md"
+phrase = "ships ON"
