@@ -52,6 +52,29 @@ def test_session_open_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _session_open(friday) is None
 
 
+def test_session_open_honours_verified_csat_override() -> None:
+    from src.execution.cli import _session_open
+
+    # exchange_calendars reports 09:00 for the 2026-11-19 CSAT day; KRX opened at 10:00.
+    assert _session_open(date(2026, 11, 19)) is None
+    before = _session_open(date(2026, 11, 18))
+    assert before is not None
+    assert (before.hour, before.minute) == (9, 0)
+
+
+def test_verified_session_open_only_touches_listed_days() -> None:
+    from datetime import datetime as _datetime
+
+    from src.core.krx_calendar import KRX_OPEN_OVERRIDES, verified_session_open
+
+    package = _datetime(2026, 11, 19, 9, 0, tzinfo=KRX_TZ)
+    shifted = verified_session_open(date(2026, 11, 19), package)
+    assert (shifted.hour, shifted.minute, shifted.tzinfo) == (10, 0, KRX_TZ)
+    other = _datetime(2026, 11, 20, 9, 0, tzinfo=KRX_TZ)
+    assert verified_session_open(date(2026, 11, 20), other) is other
+    assert all(day.weekday() < 5 for day in KRX_OPEN_OVERRIDES)
+
+
 def test_net_holdings_from_fills(tmp_path: Path) -> None:
     import polars as pl
 

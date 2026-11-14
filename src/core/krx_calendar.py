@@ -1,12 +1,27 @@
 """KRX trading-session calendar sourced from the XKRX exchange calendar."""
 from __future__ import annotations
 
-from datetime import date
+from collections.abc import Mapping
+from datetime import date, datetime, time
+from types import MappingProxyType
 from typing import Final
 
 import exchange_calendars as xcals
 
 from src.core.time import SessionCalendar
+
+# KRX-announced session opens that exchange_calendars 4.13.2 reports as 09:00 (2026-11-19 CSAT: KRX notice,
+# regular session 10:00-16:30). Applied only where an open drives wall-clock work; dataset builders keep the
+# package calendar because its digest is part of every dataset identity.
+KRX_OPEN_OVERRIDES: Final[Mapping[date, time]] = MappingProxyType({date(2026, 11, 19): time(10, 0)})
+
+
+def verified_session_open(day: date, package_open: datetime) -> datetime:
+    """Return ``day``'s open with ``KRX_OPEN_OVERRIDES`` applied to the XKRX ``package_open`` (aware, same zone)."""
+    override = KRX_OPEN_OVERRIDES.get(day)
+    if override is None:
+        return package_open
+    return package_open.replace(hour=override.hour, minute=override.minute, second=0, microsecond=0)
 
 
 def xkrx_session_calendar(start: date | None = None, end: date | None = None) -> SessionCalendar:

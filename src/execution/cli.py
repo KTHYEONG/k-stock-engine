@@ -58,7 +58,7 @@ def _emit(payload: Mapping[str, object]) -> None:
 
 
 def _session_open(session: object) -> datetime | None:
-    from src.core.krx_calendar import xkrx_calendar_through
+    from src.core.krx_calendar import verified_session_open, xkrx_calendar_through
     from src.core.time import KRX_TZ
 
     try:
@@ -68,6 +68,7 @@ def _session_open(session: object) -> datetime | None:
     for instant in calendar.sessions:
         local = instant.astimezone(KRX_TZ)
         if local.date() == session:
+            local = verified_session_open(session, local)  # type: ignore[arg-type]
             if (local.hour, local.minute) != (9, 0):
                 return None
             return local
