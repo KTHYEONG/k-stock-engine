@@ -6,6 +6,7 @@ host_data_slots = [1, 2, 3, 4]
 [selectors.kca]
 KIS_DECISION_SHARD_SLOTS = [1, 5]
 COLLECTION_RESEARCH_SLOTS = [3, 4]
+COLLECTION_AUCTION_HANDOFF_SLOTS = [5]
 COLLECTION_ALTDATA_EXTRA_SLOTS = [2, 3]
 COLLECTION_BACKFILL_SLOTS = [2, 3]
 COLLECTION_AFTERMARKET_BOOK_SLOTS = [2, 3]
@@ -53,9 +54,9 @@ windows = ["00:00-24:00"]
 [[assignment]]
 slot = 5
 project = "kca"
-purpose = "decision shard 2"
+purpose = "decision shard 2, then auction research handoff after collect"
 channel = "rest"
-windows = ["15:20-15:29"]
+windows = ["15:20-15:30"]
 
 [[assignment]]
 slot = 5
