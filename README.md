@@ -181,7 +181,7 @@ uv run python -m src.execution rehearse
 uv run python -m src.ops.jobs audit
 ```
 
-증권사별 API 특성과 한도는 [브로커 API 종합 명세](./docs/architecture/brokers/api_master.md)와 같은 폴더의 문서에 정리했습니다.
+증권사별 API 특성과 한도는 별도 저장소 api-manager의 `docs/brokers/`에 정리했습니다.
 
 ## 🤖 개발 과정에서의 AI 활용
 
@@ -194,4 +194,4 @@ AI 코딩 도구를 코드 작성에 주로 사용했고, 아이디어 정리와
 
 ## 📚 참고
 
-- 증권사·공급자 연동 명세: [`docs/architecture/brokers/`](./docs/architecture/brokers/)
+- 공급자(DART, KIND) 연동 명세: [`docs/architecture/brokers/`](./docs/architecture/brokers/), 증권사 API 명세는 api-manager 저장소 참조

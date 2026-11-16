@@ -33,6 +33,7 @@ Verify code changes against the project's native toolchains before concluding ta
 - Before touching hot loops, bulk I/O, or parallelism: read `.agents/rules/performance.md`
 - Before touching docstrings, comments, or `docs/architecture/**`: read `.agents/rules/documentation.md`
 - Before touching `src/config/**`, `docs/flags.toml`, or any on/off switch: read `.agents/rules/config-flags.md`
+- Before touching broker API code (TR ids, paths, fields, limits): query the official spec with `uv run --project ~/api-manager api-manager-spec lookup <ls|kiwoom|kis|dbsec> <TR or path>`; narrative docs live in `~/api-manager/docs/brokers/`; never copy broker docs into this repo
 
 ## 6. Workflow Profile
 - verify: `uv run python tools/verify.py`
