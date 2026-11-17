@@ -1730,3 +1730,25 @@ def test_kind_availability_is_independent_of_import_time(tmp_path: Path) -> None
     kind_rows = frames[0].filter(pl.col("rcept_no") == f"KIND-{acptno}")
     assert kind_rows.height == 1
     assert kind_rows["available_at"][0] == datetime(2018, 9, 14, 9, 0, tzinfo=KRX_TZ)
+
+
+def test_kind_display_name_conflict_across_windows_still_builds(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    listed = kind_row_html("20180913000001", "2018-09-13 18:59", "상장폐지", "00598", "유가증권시장본부",
+                           company_name="이전 상호")
+    renamed = kind_row_html("20180913000001", "2018-09-13 18:59", "상장폐지", "00598", "유가증권시장본부",
+                            company_name="현재 상호")
+    _publish_kind_search(runtime, keyword="상장폐지", start="2018-09-13", end="2018-09-28", rows=[listed])
+    _publish_kind_search(runtime, keyword="정리매매", start="2018-09-13", end="2018-09-28", rows=[renamed])
+    _publish_kind_document(runtime, acptno="20180913000001", html=KIND_DELISTING_HTML,
+                           disclosed_at="2018-09-13T18:59:00+09:00")
+    _publish_daily(runtime, session=date(2018, 9, 13), records=[{"ISU_SRT_CD": "005980"}])
+    path = materialize_market_actions(
+        catalog=_catalog(runtime), silver_root=runtime.workspace.silver_root,
+        calendar=_calendar(date(2018, 9, 13), date(2018, 9, 14), date(2018, 9, 17)),
+        bridge=_bridge(), kind_keywords=("상장폐지", "정리매매"),
+        kind_max_stale_sessions=5, kind_coverage_start=date(2018, 9, 13),
+    )
+    kind_rows = read_dataset(path).collect().filter(pl.col("source") == "kind")
+    assert kind_rows.height == 1
+    assert kind_rows.to_dicts()[0]["kind"] == MarketActionKind.DELISTING_DECIDED.value

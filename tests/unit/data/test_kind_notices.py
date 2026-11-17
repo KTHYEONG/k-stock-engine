@@ -64,7 +64,7 @@ def _catalog(runtime):  # type: ignore[no-untyped-def]
 
 
 
-def _publish_search(runtime, *, keyword: str, start: str, end: str, reported_total: int, pages: list[str]) -> None:  # type: ignore[no-untyped-def]
+def _publish_search(runtime, *, keyword: str, start: str, end: str, reported_total: int, pages: list[str], retrieved_at: datetime = RETRIEVED_AT) -> None:  # type: ignore[no-untyped-def]
     from src.core.pit import EvidenceKind
     from src.data.bronze import BronzeStore
     from src.data.receipt_catalog import BlobEntry, EvidenceStatus, ReceiptIndexEntry
@@ -75,7 +75,7 @@ def _publish_search(runtime, *, keyword: str, start: str, end: str, reported_tot
         sort_keys=True, ensure_ascii=False,
     ).encode("utf-8")
     store = BronzeStore(runtime.workspace.bronze_root)
-    receipt = store.import_bytes(body, kind=EvidenceKind.DISCLOSURES, retrieved_at=RETRIEVED_AT, source_label="test")
+    receipt = store.import_bytes(body, kind=EvidenceKind.DISCLOSURES, retrieved_at=retrieved_at, source_label="test")
     _catalog(runtime).publish(
         [
             ReceiptIndexEntry(
@@ -241,6 +241,123 @@ def test_iter_notices_with_contradictory_duplicate_fails_closed(tmp_path: Path) 
 
     with pytest.raises(PITDataError):
         list(iter_kind_notices(_catalog(runtime)))
+
+
+EARLIER_RETRIEVED_AT = datetime(2024, 5, 31, tzinfo=UTC)
+LATER_RETRIEVED_AT = datetime(2024, 6, 2, tzinfo=UTC)
+ACPTNO = "20240101000001"
+DISCLOSED = "2024-01-02 15:30"
+
+
+def _publish_windows(runtime, windows: list[tuple[str, str, datetime]]) -> None:  # type: ignore[no-untyped-def]
+    """Publish one single-row search window per ``(keyword, row_html, retrieved_at)``, in the given order."""
+    for keyword, row, retrieved_at in windows:
+        _publish_search(runtime, keyword=keyword, start="2024-01-01", end="2024-01-31", reported_total=1,
+                        pages=[kind_search_html([row], 1)], retrieved_at=retrieved_at)
+
+
+def test_name_only_difference_reconciles_to_latest_retrieval(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    older = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="A")
+    newer = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="B")
+    _publish_windows(runtime, [("상장폐지", older, EARLIER_RETRIEVED_AT), ("관리종목", newer, LATER_RETRIEVED_AT)])
+
+    notices = list(iter_kind_notices(_catalog(runtime)))
+
+    assert [notice.acptno for notice in notices] == [ACPTNO]
+    assert notices[0].company_name == "B"
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["publish_forward", "publish_reversed"])
+def test_name_choice_independent_of_publish_order(tmp_path: Path, reverse: bool) -> None:
+    runtime = _runtime(tmp_path)
+    older = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="A")
+    newer = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="B")
+    windows = [("상장폐지", older, EARLIER_RETRIEVED_AT), ("관리종목", newer, LATER_RETRIEVED_AT)]
+    if reverse:
+        windows.reverse()
+    _publish_windows(runtime, windows)
+
+    notices = list(iter_kind_notices(_catalog(runtime)))
+
+    assert [notice.company_name for notice in notices] == ["B"]
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["publish_forward", "publish_reversed"])
+def test_equal_retrieval_tie_breaks_on_natural_key(tmp_path: Path, reverse: bool) -> None:
+    # 상장폐지:... sorts after 관리종목:... so the 상장폐지 window's name wins the tie.
+    runtime = _runtime(tmp_path)
+    from_listing = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="A")
+    from_designation = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="B")
+    windows = [("상장폐지", from_listing, LATER_RETRIEVED_AT), ("관리종목", from_designation, LATER_RETRIEVED_AT)]
+    if reverse:
+        windows.reverse()
+    _publish_windows(runtime, windows)
+
+    notices = list(iter_kind_notices(_catalog(runtime)))
+
+    assert [notice.company_name for notice in notices] == ["A"]
+
+
+def test_title_difference_with_name_difference_still_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    first = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="A")
+    second = kind_row_html(ACPTNO, DISCLOSED, "관리종목 지정", "005930", "유가증권시장본부", company_name="B")
+    _publish_windows(runtime, [("상장폐지", first, EARLIER_RETRIEVED_AT), ("관리종목", second, LATER_RETRIEVED_AT)])
+
+    with pytest.raises(PITDataError, match="contradictory KIND notice fields"):
+        list(iter_kind_notices(_catalog(runtime)))
+
+
+def test_company_code_difference_fails_closed(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    first = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name="A")
+    second = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "000660", "유가증권시장본부", company_name="A")
+    _publish_windows(runtime, [("상장폐지", first, EARLIER_RETRIEVED_AT), ("관리종목", second, LATER_RETRIEVED_AT)])
+
+    with pytest.raises(PITDataError, match="contradictory KIND notice fields"):
+        list(iter_kind_notices(_catalog(runtime)))
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        pytest.param({"disclosed": "2024-01-02 15:31"}, id="disclosed_at"),
+        pytest.param({"submitter": "코스닥시장본부"}, id="submitter"),
+    ],
+)
+def test_identity_field_difference_alone_fails_closed(tmp_path: Path, changed: dict[str, str]) -> None:
+    runtime = _runtime(tmp_path)
+    base = {"acptno": ACPTNO, "disclosed": DISCLOSED, "title": "상장폐지", "company": "005930",
+            "submitter": "유가증권시장본부"}
+    first = kind_row_html(company_name="A", **base)
+    second = kind_row_html(company_name="A", **{**base, **changed})
+    _publish_windows(runtime, [("상장폐지", first, EARLIER_RETRIEVED_AT), ("관리종목", second, LATER_RETRIEVED_AT)])
+
+    with pytest.raises(PITDataError, match="contradictory KIND notice fields"):
+        list(iter_kind_notices(_catalog(runtime)))
+
+
+def test_name_change_is_logged_once_per_acptno_naming_the_kept_name(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    runtime = _runtime(tmp_path)
+    catalog = _catalog(runtime)
+    for keyword, name, retrieved_at in (
+        ("상장폐지", "A", EARLIER_RETRIEVED_AT),
+        ("관리종목", "B", RETRIEVED_AT),
+        ("정리매매", "C", LATER_RETRIEVED_AT),
+    ):
+        row = kind_row_html(ACPTNO, DISCLOSED, "상장폐지", "005930", "유가증권시장본부", company_name=name)
+        _publish_search(runtime, keyword=keyword, start="2024-01-01", end="2024-01-31", reported_total=1,
+                        pages=[kind_search_html([row], 1)], retrieved_at=retrieved_at)
+
+    with caplog.at_level("INFO", logger="src.data.kind_notices"):
+        notices = list(iter_kind_notices(catalog))
+
+    changed = [r for r in caplog.records if "status=NAME_CHANGED" in r.getMessage()]
+    assert [notice.company_name for notice in notices] == ["C"]
+    assert len(changed) == 1
+    assert f"acptno={ACPTNO}" in changed[0].getMessage()
+    assert "kept=C" in changed[0].getMessage()
 
 
 def test_require_coverage_gap_fails_closed_naming_first_gap(tmp_path: Path) -> None:

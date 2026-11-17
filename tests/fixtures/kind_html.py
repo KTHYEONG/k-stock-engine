@@ -17,12 +17,14 @@ def kind_fixture(name: str) -> str:
     return (KIND_FIXTURE_DIR / name).read_text(encoding="utf-8")
 
 
-def kind_row_html(acptno: str, disclosed: str, title: str, company: str | None, submitter: str) -> str:
+def kind_row_html(
+    acptno: str, disclosed: str, title: str, company: str | None, submitter: str, *, company_name: str = "Co"
+) -> str:
     """One result row in live column order; ``company=None`` renders a market-wide notice."""
     company_cell = (
         "<img src='/images/common/icn_t_yu.gif' class='vmiddle legend' alt='유가증권'> "
         f"<a id=\"companysum\" href=\"#companysum\" onclick=\"companysummary_open('{company}'); return false;\""
-        f" title='Co'> Co</a>"
+        f" title='{company_name}'> {company_name}</a>"
         if company is not None
         else ""
     )

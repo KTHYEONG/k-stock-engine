@@ -10,10 +10,11 @@ from __future__ import annotations
 import hashlib
 import html as _html
 import json
+import logging
 import re
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Final
 
@@ -36,6 +37,8 @@ __all__ = [
     "read_kind_document",
     "require_kind_coverage",
 ]
+
+_LOG = logging.getLogger(__name__)
 
 _ANSWERED: Final = frozenset(
     {EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY, EvidenceStatus.EXTRACTION_FAILED}
@@ -251,13 +254,20 @@ def _search_pages(document: dict[str, object], *, label: str) -> tuple[str, ...]
 def iter_kind_notices(catalog: ReceiptCatalog) -> Iterator[KindNoticeRow]:
     """Stream every KIND search row once, across keyword windows, in ``(disclosed_at, acptno)`` order.
 
+    Windows that disagree on any field other than the display ``company_name`` raise. A differing
+    ``company_name`` is reconciled to the name from the window retrieved latest (ties: greater
+    natural key).
+
     Raises:
         PITDataError: a payload is missing, unreadable, fails its hash or does not parse, or one
-            ``acptno`` appears with contradictory fields.
+            ``acptno`` appears with contradictory fields other than ``company_name``.
     """
     seen: dict[str, KindNoticeRow] = {}
+    ranks: dict[str, tuple[datetime, str]] = {}
+    names: dict[str, set[str]] = {}
     for entry in catalog.entries(source=KIND_NOTICE_SEARCH_SOURCE):
         document = _read_search_document(entry.content_hash, Path(entry.payload_path), label=entry.natural_key)
+        rank = (entry.retrieved_at, entry.natural_key)
         for page in _search_pages(document, label=entry.natural_key):
             try:
                 parsed = parse_kind_search_page(page)
@@ -269,8 +279,24 @@ def iter_kind_notices(catalog: ReceiptCatalog) -> Iterator[KindNoticeRow]:
                 previous = seen.get(row.acptno)
                 if previous is None:
                     seen[row.acptno] = row
-                elif previous != row:
+                    ranks[row.acptno] = rank
+                    names[row.acptno] = {row.company_name}
+                    continue
+                if replace(previous, company_name="") != replace(row, company_name=""):
                     raise PITDataError(f"contradictory KIND notice fields for {row.acptno}")
+                names[row.acptno].add(row.company_name)
+                if rank > ranks[row.acptno]:
+                    seen[row.acptno] = row
+                    ranks[row.acptno] = rank
+    for acptno, row in seen.items():
+        observed = names[acptno]
+        if len(observed) > 1:
+            _LOG.info(
+                "[DATA] stage=kind_notices status=NAME_CHANGED acptno=%s kept=%s dropped=%s",
+                acptno,
+                row.company_name,
+                ",".join(sorted(observed - {row.company_name})),
+            )
     ordered = sorted(seen.values(), key=lambda row: (row.disclosed_at, row.acptno))
     yield from ordered
 
