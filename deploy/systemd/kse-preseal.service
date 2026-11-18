@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE pre-seal read-only check (surfaces seal input gate failures before 08:32)
+OnFailure=kse-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=5min
+ExecStart=%h/.local/lib/kse/kse-run preseal
+ExecStopPost=-/usr/bin/docker rm -f kse-preseal

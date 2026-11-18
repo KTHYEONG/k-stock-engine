@@ -54,6 +54,7 @@ class IncidentKind(StrEnum):
     COLLECT_DBSEC_STREAK = "collect_dbsec_streak"
     AUCTION_OPEN_STREAK = "auction_open_streak"
     CREDENTIAL_EXPIRY = "credential_expiry"
+    PRESEAL_BLOCKED = "preseal_blocked"
 
 
 _KIND_VALUES: Final = frozenset(kind.value for kind in IncidentKind)
@@ -75,6 +76,12 @@ PAGE_TEXT: Final[Mapping[IncidentKind, PageText]] = MappingProxyType({
         what="오늘 장 시작 전 매매 결정이 봉인되지 않았습니다. 오늘치 결정 체인과 섀도 원장(shadow ledger) 기록이 비어 있습니다. 09시 이후 봉인은 늦은 봉인(late_seal)으로만 기록됩니다.",
         auto_action="늦은 봉인(morning-late)은 아침 봉인이 실패했을 때만 자동 실행됩니다. 오늘 아침 작업이 아예 시작되지 않았거나, 아침 봉인과 늦은 봉인 모두 결정을 만들지 못했을 수 있습니다.",
         next_step="kse-morning.timer가 오늘 실행됐는지, 오늘 events의 morning 및 morning_late 기록을 확인하세요. 그다음 kse-morning-late 로그에서 원인(KRX 지연, 결정 체인 손상, 메모리 부족 등)을 고친 뒤 kse-morning-late를 다시 실행하세요.",
+    ),
+    IncidentKind.PRESEAL_BLOCKED: PageText(
+        summary="장전 봉인 사전 점검 실패",
+        what="08시 30분 봉인 전 07시 30분 읽기 전용 사전 점검에서 실패 항목이 있습니다. 실패한 항목 ID는 오늘 events의 preseal 기록 reason에 있습니다(KIND_CONSISTENCY, FLOW_FRESHNESS, KIND_RELAY_AGE).",
+        auto_action="없음. 사전 점검은 데이터를 쓰거나 고치지 않고 봉인을 막지도 않습니다. 08시 32분 아침 봉인은 예정대로 실행됩니다.",
+        next_step="실패 항목의 원인을 고치세요. 그다음 08시 32분 아침 봉인을 기다리거나, 봉인이 실패했다면 kse-morning-late를 실행하세요.",
     ),
     IncidentKind.EVENTS_UNREADABLE: PageText(
         summary="작업 결과 기록 판독 불가",
@@ -126,7 +133,10 @@ class AlertPolicy:
         default_factory=lambda: MappingProxyType({"kse-morning.service": "kse-morning-late.service"})
     )
     critical_units: Mapping[str, IncidentKind] = field(
-        default_factory=lambda: MappingProxyType({"kse-morning-late.service": IncidentKind.NO_SEAL})
+        default_factory=lambda: MappingProxyType({
+            "kse-morning-late.service": IncidentKind.NO_SEAL,
+            "kse-preseal.service": IncidentKind.PRESEAL_BLOCKED,
+        })
     )
     streak_units: Mapping[str, tuple[str, IncidentKind]] = field(
         default_factory=lambda: MappingProxyType({

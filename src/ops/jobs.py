@@ -1387,6 +1387,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     sub.add_parser("collect-dbsec")
     sub.add_parser("morning")
     sub.add_parser("morning-late")
+    sub.add_parser("preseal")
     prune = sub.add_parser("backup")
     prune.add_argument("--no-lock", action="store_true")
     sub.add_parser("audit")
@@ -1410,6 +1411,10 @@ def main(argv: list[str] | None = None) -> int:
         return collect_eve(data_root, today=today, now=moment)
     if args.command == "collect-dbsec":
         return collect_dbsec(data_root, today=today, now=moment)
+    if args.command == "preseal":
+        from src.ops.preseal import preseal_check
+
+        return preseal_check(data_root, today=today, now=moment)
     if args.command == "morning":
         return morning(data_root, today=today, now=lambda: datetime.now(KRX_TZ), sleep=time.sleep)
     if args.command == "morning-late":

@@ -467,6 +467,11 @@ def _decision_from_payload(payload: Mapping[str, Any]) -> SealedDecision:
         raise ValueError(f"malformed sealed decision: {exc}") from exc
 
 
+def required_source_sessions(sessions: Sequence[date], first_new: int) -> tuple[date, ...]:
+    """Previous-session flow sources of ``sessions[first_new:]``; the seal and the pre-seal check share it."""
+    return tuple(sessions[pos - 1] for pos in range(first_new, len(sessions)))
+
+
 def read_chain(decisions_dir: Path) -> tuple[SealedDecision, ...]:
     """All sealed decisions in order after verifying the hash chain; raises ValueError on a broken link."""
     path = _chain_path(decisions_dir)

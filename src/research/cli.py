@@ -415,6 +415,7 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
         load_state,
         overlay_signals,
         read_chain,
+        required_source_sessions,
         save_state,
         seal,
         state_digest,
@@ -478,7 +479,7 @@ def _run_decide(args: argparse.Namespace) -> Mapping[str, object]:
         check_investor_flow_freshness(
             runtime=resolved.runtime,
             flow_dataset_dir=resolved.inputs.investor_flow,
-            source_sessions=[sessions[pos - 1] for pos in new_positions],
+            source_sessions=list(required_source_sessions(sessions, first_new)),
             seal_time=ctx.now(),
             policy=load_live_gate_policy(load_runtime_config().live_gate),
         )

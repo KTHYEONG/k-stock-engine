@@ -667,7 +667,11 @@ def test_main_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert main(["--data-root", str(tmp_path), "weekly-report"]) == 0
     monkeypatch.setattr(jobs, "alert_drain", lambda root, **kwargs: seen.append("alert-drain") or 0)
     assert main(["--data-root", str(tmp_path), "alert-drain"]) == 0
-    assert seen == ["collect-eve", "morning", "morning-late", "backup", "audit", "weekly-report", "alert-drain"]
+    import src.ops.preseal as preseal_module
+
+    monkeypatch.setattr(preseal_module, "preseal_check", lambda root, **kwargs: seen.append("preseal") or 0)
+    assert main(["--data-root", str(tmp_path), "preseal"]) == 0
+    assert seen == ["collect-eve", "morning", "morning-late", "backup", "audit", "weekly-report", "alert-drain", "preseal"]
     assert jobs._as_int(3) == 3
     assert jobs._as_int(True) == 0
     assert jobs._as_int("x") == 0

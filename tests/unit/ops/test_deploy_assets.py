@@ -35,6 +35,7 @@ UNIT_JOBS = {
     "kse-daily-audit.service": "daily-audit",
     "kse-morning.service": "morning",
     "kse-morning-late.service": "morning-late",
+    "kse-preseal.service": "preseal",
     "kse-weekly-report.service": "weekly-report",
 }
 
@@ -168,7 +169,7 @@ def test_effective_command_equivalent_to_legacy() -> None:
         uidgid += ":" + subprocess.run(["id", "-g"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         assert len(json.loads(FIXTURE.read_text(encoding="utf-8"))) == 8
         assert set(UNIT_JOBS) - set(json.loads(FIXTURE.read_text(encoding="utf-8"))) == {
-        "kse-morning-late.service", "kse-alert-drain.service",
+        "kse-morning-late.service", "kse-alert-drain.service", "kse-preseal.service",
     }
         for unit in UNIT_JOBS:
             if unit not in json.loads(FIXTURE.read_text(encoding="utf-8")):
@@ -277,7 +278,7 @@ def test_swap_equals_memory_for_every_job() -> None:
 
 def test_units_carry_no_docker_flags() -> None:
     units = sorted(SYSTEMD.glob("kse-*.service"))
-    assert len(units) == 10
+    assert len(units) == 11
     for path in units:
         text = path.read_text(encoding="utf-8")
         assert "docker run" not in text, path.name
@@ -414,7 +415,7 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
             "import json, os, pathlib, sys\n"
             "home = pathlib.Path(os.environ['HOME'])\n"
             "assert (home / '.local/lib/kse/kse-run').stat().st_mode & 0o111\n"
-            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 10\n"
+            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 11\n"
             "with open(os.environ['EVENT_LOG'], 'a') as log:\n"
             "    log.write(json.dumps([pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')\n",
             encoding="utf-8",
@@ -494,7 +495,7 @@ def test_alert_drain_runs_only_with_queued_mail() -> None:
 
 def test_units_are_safe_by_construction() -> None:
     services = _services()
-    assert len(services) == 9
+    assert len(services) == 10
     with tempfile.TemporaryDirectory() as home:
         prefixes = (home + "/k-stock-engine/data:", home + "/k-stock-engine/logs:",
                     home + "/.cache/kis:", home + "/.cache/dbsec:", home + "/.config/rclone:")
@@ -579,7 +580,7 @@ def _in_window(mark: tuple[int, int], window: tuple[tuple[int, int], tuple[int, 
 
 def test_timers_avoid_sibling_windows() -> None:
     timers = sorted(SYSTEMD.glob("kse-*.timer"))
-    assert len(timers) == 8
+    assert len(timers) == 9
     for path in timers:
         if path.name == "kse-alert-drain.timer":
             # Wildcard-hour drain is exempt: its ExecCondition starts no container while the outbox is empty.

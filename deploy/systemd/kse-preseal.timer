@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE pre-seal read-only check (Mon-Fri 07:30 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 07:30:00 Asia/Seoul
+AccuracySec=1s
+Persistent=false
+Unit=kse-preseal.service
+
+[Install]
+WantedBy=timers.target
