@@ -176,7 +176,12 @@ def _previous_session(day: date) -> date:
 
 
 def _run_refresh(
-    data_root: Path, *, decision_time: datetime, collect: bool, collect_steps: frozenset[str] | None
+    data_root: Path,
+    *,
+    decision_time: datetime,
+    collect: bool,
+    collect_steps: frozenset[str] | None,
+    deferred_build_kinds: frozenset[str] | None = None,
 ) -> object:
     from dataclasses import replace
 
@@ -185,7 +190,9 @@ def _run_refresh(
 
     runtime = resolve_data_runtime(data_root=Path(data_root))
     ctx = build_refresh_context(runtime, decision_time=_aware(decision_time))
-    if collect_steps == EVENING_COLLECT_STEPS:
+    if deferred_build_kinds is not None:
+        ctx = replace(ctx, deferred_build_kinds=deferred_build_kinds)
+    elif collect_steps == EVENING_COLLECT_STEPS:
         ctx = replace(ctx, deferred_build_kinds=frozenset({
             "ordinary_universe", "daily_market", "hedge_series", "trend_series", "cash_series",
             "market_panel", "reference_benchmarks", "market_actions",
@@ -208,6 +215,53 @@ def _data_session_present(data_root: Path, session: date) -> bool:
     except PITDataError:
         return False
     return False
+
+
+def _silver_lags_bronze(data_root: Path, today: date) -> bool:
+    """True when Silver's ordinary universe ends before the previous session whose KRX Bronze is present; never raises."""
+    from src.data.dataset_registry import DatasetRegistry
+    from src.data.datasets import universe_sessions
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        runtime = resolve_data_runtime(data_root=Path(data_root))
+        universe_id = DatasetRegistry(runtime.workspace.state_root).require("ordinary_universe")
+        _, sessions = universe_sessions(runtime.workspace.silver_root, universe_id, allow_legacy=False)
+        expected = _previous_session(today)
+    except (PITDataError, OSError):
+        return False
+    if not sessions or sessions[-1] >= expected:
+        return False
+    try:
+        return _data_session_present(data_root, expected)
+    except (PITDataError, OSError):
+        return False
+
+
+def _catchup_build(data_root: Path, *, decision_time: datetime) -> None:
+    """Build only ordinary_universe and daily_market; every other scope kind stays deferred."""
+    from src.data.pipeline_graph import SCOPE_GRAPH
+
+    catchup_kinds = frozenset({"ordinary_universe", "daily_market"})
+    deferred = frozenset(node.kind for node in SCOPE_GRAPH) - catchup_kinds
+    _run_refresh(
+        data_root, decision_time=decision_time, collect=False, collect_steps=frozenset(),
+        deferred_build_kinds=deferred,
+    )
+
+
+def _run_catchup(data_root: Path, today: date, moment: datetime) -> dict[str, object]:
+    """Pre-collection catch-up build; a failure degrades to the normal collection and is only recorded."""
+    if not _silver_lags_bronze(data_root, today):
+        return {}
+    lag = _previous_session(today).isoformat()
+    try:
+        _catchup_build(data_root, decision_time=moment)
+    except Exception as exc:
+        _LOG.warning("[OPS] stage=catchup_build status=FAILED lag_session=%s error=%s", lag, type(exc).__name__)
+        return {"lag_session": lag, "catchup_build_error": type(exc).__name__}
+    _LOG.info("[OPS] stage=catchup_build status=OK lag_session=%s", lag)
+    return {"lag_session": lag, "catchup_build": "OK"}
 
 
 def _poll_krx_once(data_root: Path, session: date, decision_time: datetime) -> bool:
@@ -431,11 +485,13 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
         _record(root, "collect_eve", "DEGRADED", today, moment, reason=str(refused)[:300],
                 metrics={"guard": "headroom", "available_mb": refused.available_mb, "free_disk_gb": refused.free_disk_gb})
         return 1
+    catchup = _run_catchup(root, today, moment)
     try:
         report = _run_refresh(root, decision_time=moment, collect=True, collect_steps=EVENING_COLLECT_STEPS)
     except Exception as exc:
         _log_job_failure("collect_eve", exc)
-        _record(root, "collect_eve", "DEGRADED", today, moment, reason=type(exc).__name__)
+        _record(root, "collect_eve", "DEGRADED", today, moment, reason=type(exc).__name__,
+                metrics=catchup or None)
         return 1
     blocking = getattr(report, "blocking_job", None)
     degraded = list(getattr(report, "degraded_jobs", ()) or ())
@@ -443,7 +499,7 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
     if blocking is not None:
         _record(
             root, "collect_eve", "DEGRADED", today, moment, reason=f"blocked on {blocking}"[:300],
-            metrics={"blocking_job": str(blocking), "degraded_jobs": degraded, **industry},
+            metrics={"blocking_job": str(blocking), "degraded_jobs": degraded, **industry, **catchup},
         )
         return 1
     planned = list(getattr(report, "planned", ()))
@@ -465,7 +521,7 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
             reason=f"optional:{','.join(degraded)}"[:300],
             metrics={"degraded_jobs": degraded, "planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **industry},
+                      **warm_metrics, **industry, **catchup},
         )
         return 0
     if warm_error is not None:
@@ -473,13 +529,13 @@ def collect_eve(data_root: Path, *, today: date, now: datetime) -> int:
             root, "collect_eve", "DEGRADED", today, moment, reason="flag_cache_warm_failed",
             metrics={"planned": len(planned), "built": len(built),
                       "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": node_peaks,
-                      **warm_metrics, **industry},
+                      **warm_metrics, **industry, **catchup},
         )
         return 0
     _record(
         root, "collect_eve", "OK", today, moment,
         metrics={"planned": len(planned), "built": len(built), "peak_rss_mb": _peak_rss_mb(),
-                 "node_peak_rss_mb": node_peaks, **warm_metrics, **industry},
+                 "node_peak_rss_mb": node_peaks, **warm_metrics, **industry, **catchup},
     )
     return 0
 

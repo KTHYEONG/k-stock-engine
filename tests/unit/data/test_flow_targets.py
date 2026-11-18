@@ -307,3 +307,26 @@ def test_overlapping_ranges_merge() -> None:
     )
 
     assert pending["session"].to_list() == [days[5]]
+
+
+def test_flow_targets_include_session_after_catchup(tmp_path: Path) -> None:
+    from src.data.flow_targets import investor_flow_targets
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    d2 = date(2024, 1, 3)
+    schema = {"session": pl.Date, "ticker": pl.String}
+    _publish_pair(
+        runtime,
+        pl.DataFrame({"session": [D1, d2], "ticker": ["000001", "000001"], "eligible": [True, True]},
+                     schema={**schema, "eligible": pl.Boolean}),
+        pl.DataFrame({"session": [D1, d2], "ticker": ["000001", "000001"], "price_state": ["tradable", "tradable"]},
+                     schema={**schema, "price_state": pl.String}),
+    )
+
+    targets = investor_flow_targets(runtime)
+
+    assert targets.cells.sort(["session"]).to_dicts() == [
+        {"ticker": "000001", "session": D1},
+        {"ticker": "000001", "session": d2},
+    ]

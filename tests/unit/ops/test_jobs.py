@@ -120,6 +120,123 @@ def test_collect_eve_outcomes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert collect_eve(tmp_path, today=date(2026, 10, 13), now=_morning_now()) == 1
 
 
+def _refresh_recorder(
+    monkeypatch: pytest.MonkeyPatch, *, fail_catchup: BaseException | None = None
+) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+
+    def _run(root: Path, **kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        if fail_catchup is not None and kwargs["collect"] is False:
+            raise fail_catchup
+        return SimpleNamespace(blocking_job=None, planned=["a"], built=["a"], degraded_jobs=())
+
+    monkeypatch.setattr(jobs, "_run_refresh", _run)
+    return calls
+
+
+def _capture_records(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+
+    def _record(root: Path, job: str, outcome: str, run_date: date, moment: datetime, reason: str = "",
+                metrics: dict[str, object] | None = None) -> None:
+        records.append({"job": job, "outcome": outcome, "metrics": dict(metrics or {})})
+
+    monkeypatch.setattr(jobs, "_record", _record)
+    return records
+
+
+def _lagging_silver(monkeypatch: pytest.MonkeyPatch, *, bronze: bool, last: date) -> None:
+    import src.data.dataset_registry as registry_module
+    import src.data.datasets as datasets_module
+    import src.data.runtime as runtime_module
+
+    runtime = SimpleNamespace(workspace=SimpleNamespace(state_root=Path("state"), silver_root=Path("silver")))
+    monkeypatch.setattr(runtime_module, "resolve_data_runtime", lambda data_root: runtime)
+
+    class _Registry:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def require(self, kind: str) -> str:
+            return f"{kind}-id"
+
+    monkeypatch.setattr(registry_module, "DatasetRegistry", _Registry)
+    monkeypatch.setattr(
+        datasets_module, "universe_sessions",
+        lambda silver_root, universe_id, allow_legacy: (universe_id, (last,)),
+    )
+    monkeypatch.setattr(jobs, "_data_session_present", lambda root, session: bronze)
+
+
+def test_catchup_runs_once_before_collection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.data.pipeline_graph import SCOPE_GRAPH
+
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_silver_lags_bronze", lambda root, today: True)
+    calls = _refresh_recorder(monkeypatch)
+    records = _capture_records(monkeypatch)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [call["collect"] for call in calls] == [False, True]
+    catchup, collection = calls
+    assert catchup["collect_steps"] == frozenset()
+    assert collection["collect_steps"] == EVENING_COLLECT_STEPS
+    deferred = catchup["deferred_build_kinds"]
+    assert {node.kind for node in SCOPE_GRAPH} - deferred == {"ordinary_universe", "daily_market"}
+    assert {"hedge_series", "trend_series", "cash_series", "market_panel", "market_actions"} <= deferred
+    assert records[-1]["outcome"] == "OK"
+    assert records[-1]["metrics"]["catchup_build"] == "OK"
+    assert records[-1]["metrics"]["lag_session"] == jobs._previous_session(DAY).isoformat()
+
+
+def test_catchup_skipped_on_normal_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_silver_lags_bronze", lambda root, today: False)
+    calls = _refresh_recorder(monkeypatch)
+    records = _capture_records(monkeypatch)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [call["collect"] for call in calls] == [True]
+    assert not any(key.startswith("catchup") or key == "lag_session" for key in records[-1]["metrics"])
+
+
+def test_catchup_skipped_without_bronze_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _lagging_silver(monkeypatch, bronze=False, last=date(2026, 10, 1))
+    assert jobs._silver_lags_bronze(tmp_path, DAY) is False
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    calls = _refresh_recorder(monkeypatch)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [call["collect"] for call in calls] == [True]
+
+
+def test_lagging_silver_with_bronze_is_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _lagging_silver(monkeypatch, bronze=True, last=date(2026, 10, 1))
+    assert jobs._silver_lags_bronze(tmp_path, DAY) is True
+    _lagging_silver(monkeypatch, bronze=True, last=jobs._previous_session(DAY))
+    assert jobs._silver_lags_bronze(tmp_path, DAY) is False
+    _lagging_silver(monkeypatch, bronze=True, last=date(2026, 10, 1))
+
+    def _unreadable(root: Path, session: date) -> bool:
+        raise OSError("receipt catalog unreadable")
+
+    monkeypatch.setattr(jobs, "_data_session_present", _unreadable)
+    assert jobs._silver_lags_bronze(tmp_path, DAY) is False
+
+
+def test_catchup_failure_degrades_not_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _trading(monkeypatch, True)
+    _healthy_guard(monkeypatch)
+    monkeypatch.setattr(jobs, "_silver_lags_bronze", lambda root, today: True)
+    calls = _refresh_recorder(monkeypatch, fail_catchup=PITDataError("kind mismatch"))
+    records = _capture_records(monkeypatch)
+    assert collect_eve(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert [call["collect"] for call in calls] == [False, True]
+    assert records[-1]["outcome"] == "OK"
+    assert records[-1]["metrics"]["catchup_build_error"] == "PITDataError"
+
+
 def _morning_stubs(
     monkeypatch: pytest.MonkeyPatch, calls: list[str], sealed_at: datetime
 ) -> None:
@@ -451,6 +568,12 @@ def test_run_refresh_and_research_wiring(tmp_path: Path, monkeypatch: pytest.Mon
     assert seen["scope"]["collect_steps"] == frozenset({"a"})
     jobs._run_refresh(tmp_path, decision_time=_morning_now(), collect=True, collect_steps=EVENING_COLLECT_STEPS)
     assert "daily_market" in seen["ctx"].deferred_build_kinds
+    assert {"market_actions", "market_panel", "hedge_series", "trend_series", "cash_series"} <= seen["ctx"].deferred_build_kinds
+    jobs._run_refresh(
+        tmp_path, decision_time=_morning_now(), collect=False, collect_steps=frozenset(),
+        deferred_build_kinds=frozenset({"x"}),
+    )
+    assert seen["ctx"].deferred_build_kinds == frozenset({"x"})
 
     paths = jobs._research_paths(tmp_path)
     assert paths.decisions.name == "decisions"
