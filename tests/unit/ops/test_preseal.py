@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +15,7 @@ import pytest
 from src.core.pit import PITDataError
 from src.core.time import KRX_TZ
 from src.ops import preseal
-from src.ops.alert_policy import PAGE_TEXT, IncidentKind, build_resolved, unit_incidents
+from src.ops.alert_policy import PAGE_TEXT, IncidentKind, build_page, build_resolved, unit_incidents
 
 REPO = Path(__file__).resolve().parents[3]
 SYSTEMD = REPO / "deploy" / "systemd"
@@ -311,3 +313,115 @@ def test_alert_policy_pages_preseal_once_per_day(tmp_path: Path) -> None:
     assert "kse-morning-late" in text.next_step
     resolved = build_resolved(IncidentKind.PRESEAL_BLOCKED, TODAY)
     assert resolved.key == f"resolved|preseal_blocked|{TODAY.isoformat()}"
+
+
+def _event_rows(root: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for path in sorted((root / "ops" / "events").rglob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def _stub_peaks(monkeypatch: pytest.MonkeyPatch, peak: float | None) -> None:
+    import src.data.pipeline_graph as pipeline_graph
+
+    monkeypatch.setattr(pipeline_graph, "reset_peak_rss", lambda **_kwargs: True)
+    monkeypatch.setattr(pipeline_graph, "node_peak_rss_mb", lambda **_kwargs: peak)
+
+
+def test_start_and_end_lines_per_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seeded_tree(tmp_path)
+    fake_limit = tmp_path / "memory.max"
+    fake_limit.write_text("1073741824\n", encoding="utf-8")
+    monkeypatch.setattr(preseal, "_CGROUP_MEMORY_MAX", fake_limit)
+    _stub_entrypoints(monkeypatch, tmp_path, {})
+    _stub_peaks(monkeypatch, 512.7)
+    with caplog.at_level(logging.INFO, logger="src.ops.preseal"):
+        assert preseal.preseal_check(tmp_path, today=TODAY, now=MORNING_LOOK) == 0
+    assert "status=CONTEXT cgroup_limit_mb=1024" in caplog.text
+    progress = [record.getMessage() for record in caplog.records if "status=START" in record.getMessage()
+                or "status=END" in record.getMessage()]
+    assert len(progress) == 6
+    for index, check in enumerate(("KIND_CONSISTENCY", "FLOW_FRESHNESS", "KIND_RELAY_AGE")):
+        start, end = progress[2 * index], progress[2 * index + 1]
+        assert f"check={check} status=START" in start
+        assert f"check={check} status=END verdict=PASS" in end
+        assert " elapsed_s=" in end
+        assert end.endswith("peak_rss_mb=512")
+
+
+def test_incomplete_event_names_running_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _seeded_tree(tmp_path)
+    _stub_entrypoints(monkeypatch, tmp_path, {})
+    _stub_peaks(monkeypatch, None)
+
+    def _killed(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit(137)
+
+    monkeypatch.setattr(preseal, "check_flow_freshness", _killed)
+    with pytest.raises(SystemExit):
+        preseal.preseal_check(tmp_path, today=TODAY, now=MORNING_LOOK)
+    assert [(row["outcome"], row["reason"]) for row in _event_rows(tmp_path)] == [
+        ("DEGRADED", "incomplete:starting"),
+        ("DEGRADED", "incomplete:running_KIND_CONSISTENCY"),
+        ("DEGRADED", "incomplete:running_FLOW_FRESHNESS"),
+    ]
+
+
+def test_final_event_supersedes_incomplete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _seeded_tree(tmp_path)
+    _stub_entrypoints(monkeypatch, tmp_path, {})
+    _stub_peaks(monkeypatch, 300.0)
+    assert preseal.preseal_check(tmp_path, today=TODAY, now=MORNING_LOOK) == 0
+    rows = _event_rows(tmp_path)
+    assert [row["reason"] for row in rows[:-1]] == [
+        "incomplete:starting",
+        "incomplete:running_KIND_CONSISTENCY",
+        "incomplete:running_FLOW_FRESHNESS",
+        "incomplete:running_KIND_RELAY_AGE",
+    ]
+    last = rows[-1]
+    assert (last["outcome"], last["reason"]) == ("OK", "")
+    metrics = last["metrics"]
+    assert isinstance(metrics, dict)
+    for check in ("KIND_CONSISTENCY", "FLOW_FRESHNESS", "KIND_RELAY_AGE"):
+        assert metrics[check] == "PASS"
+        assert metrics[f"{check}_peak_rss_mb"] == "300"
+        assert float(metrics[f"{check}_elapsed_s"]) >= 0.0
+
+
+def test_peak_na_when_unreadable_and_verdict_unchanged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _stub_peaks(monkeypatch, None)
+    started: list[str] = []
+    with caplog.at_level(logging.INFO, logger="src.ops.preseal"):
+        result = preseal._run_check(
+            "KIND_CONSISTENCY", lambda: preseal.CheckResult("KIND_CONSISTENCY", preseal.PASS),
+            on_start=started.append,
+        )
+    assert started == ["KIND_CONSISTENCY"]
+    assert (result.verdict, dict(result.fields)["peak_rss_mb"]) == (preseal.PASS, "na")
+    assert "check=KIND_CONSISTENCY status=END verdict=PASS" in caplog.text
+    assert "peak_rss_mb=na" in caplog.text
+
+
+@pytest.mark.parametrize(("content", "expected"), [("1073741824\n", "1024"), ("max\n", "na"), ("junk", "na"), (None, "na")])
+def test_cgroup_limit_context_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str | None, expected: str
+) -> None:
+    limit = tmp_path / "memory.max"
+    if content is not None:
+        limit.write_text(content, encoding="ascii")
+    monkeypatch.setattr(preseal, "_CGROUP_MEMORY_MAX", limit)
+    assert preseal._cgroup_limit_mb() == expected
+
+
+def test_alert_text_names_both_causes() -> None:
+    body = build_page(IncidentKind.PRESEAL_BLOCKED, TODAY).body
+    assert "incomplete:running_" in body
+    assert "KIND_CONSISTENCY" in body
+    assert "메모리" in body

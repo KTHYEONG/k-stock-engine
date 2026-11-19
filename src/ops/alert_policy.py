@@ -79,9 +79,9 @@ PAGE_TEXT: Final[Mapping[IncidentKind, PageText]] = MappingProxyType({
     ),
     IncidentKind.PRESEAL_BLOCKED: PageText(
         summary="장전 봉인 사전 점검 실패",
-        what="08시 30분 봉인 전 07시 30분 읽기 전용 사전 점검에서 실패 항목이 있습니다. 실패한 항목 ID는 오늘 events의 preseal 기록 reason에 있습니다(KIND_CONSISTENCY, FLOW_FRESHNESS, KIND_RELAY_AGE).",
+        what="08시 30분 봉인 전 07시 30분 읽기 전용 사전 점검이 실패했거나 끝나지 않았습니다. 오늘 events의 preseal 마지막 기록 reason이 항목 ID(KIND_CONSISTENCY, FLOW_FRESHNESS, KIND_RELAY_AGE)이면 그 항목이 실패한 것입니다. 마지막 기록이 DEGRADED incomplete:running_<항목>이면 점검이 그 항목을 실행하던 중 강제 종료된 것이며, 메모리 부족일 가능성이 큽니다.",
         auto_action="없음. 사전 점검은 데이터를 쓰거나 고치지 않고 봉인을 막지도 않습니다. 08시 32분 아침 봉인은 예정대로 실행됩니다.",
-        next_step="실패 항목의 원인을 고치세요. 그다음 08시 32분 아침 봉인을 기다리거나, 봉인이 실패했다면 kse-morning-late를 실행하세요.",
+        next_step="실패 항목이면 그 원인을 고치세요. 강제 종료였다면 kse-preseal 로그의 check=... status=END peak_rss_mb 줄과 cgroup_limit_mb를 확인하세요. 그다음 08시 32분 아침 봉인을 기다리거나, 봉인이 실패했다면 kse-morning-late를 실행하세요.",
     ),
     IncidentKind.EVENTS_UNREADABLE: PageText(
         summary="작업 결과 기록 판독 불가",

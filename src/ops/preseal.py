@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Final
 
 from src.core.time import KRX_TZ
@@ -31,6 +32,9 @@ _KIND: Final = "KIND_CONSISTENCY"
 _FLOW: Final = "FLOW_FRESHNESS"
 _RELAY: Final = "KIND_RELAY_AGE"
 _EVENT_JOB: Final = "preseal"
+_CGROUP_MEMORY_MAX: Final = Path("/sys/fs/cgroup/memory.max")
+_MIB: Final = 1024 * 1024
+_TIMING_FIELDS: Final = frozenset({"elapsed_s", "peak_rss_mb"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +164,41 @@ def _guarded(check: str, run: Callable[[], CheckResult]) -> CheckResult:
         return CheckResult(check, FAIL, (("error", type(exc).__name__),))
 
 
-def _record(root: Path, outcome: str, today: date, moment: datetime, reason: str, metrics: dict[str, str]) -> None:
+def _run_check(check: str, run: Callable[[], CheckResult], *, on_start: Callable[[str], None]) -> CheckResult:
+    """Run one check guarded, logging START and END with its wall time and peak RSS so a kill names the check."""
+    from src.data.pipeline_graph import node_peak_rss_mb, reset_peak_rss
+
+    on_start(check)
+    _LOG.info("[DATA] stage=preseal_check check=%s status=START", check)
+    reset_peak_rss()
+    started = perf_counter()
+    result = _guarded(check, run)
+    elapsed_s = f"{perf_counter() - started:.3f}"
+    peak = node_peak_rss_mb()
+    peak_rss_mb = "na" if peak is None else str(int(peak))
+    _LOG.info(
+        "[DATA] stage=preseal_check check=%s status=END verdict=%s elapsed_s=%s peak_rss_mb=%s",
+        check, result.verdict, elapsed_s, peak_rss_mb,
+    )
+    return CheckResult(result.check, result.verdict, (*result.fields, ("elapsed_s", elapsed_s), ("peak_rss_mb", peak_rss_mb)))
+
+
+def _cgroup_limit_mb() -> str:
+    """Container memory cap in MB from cgroup v2; ``na`` when unlimited or unreadable."""
+    try:
+        raw = _CGROUP_MEMORY_MAX.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return "na"
+    return str(int(raw) // _MIB) if raw.isdigit() else "na"
+
+
+def _metrics(result: CheckResult) -> dict[str, str]:
+    """Verdict plus per-check timing; the context line has no timing fields."""
+    timing = {f"{result.check}_{key}": value for key, value in result.fields if key in _TIMING_FIELDS}
+    return {result.check: result.verdict, **timing}
+
+
+def _record(root: Path, outcome: str, today: date, moment: datetime, reason: str, metrics: Mapping[str, str]) -> None:
     from src.ops.run_outcome import record_run_outcome
 
     record_run_outcome(
@@ -187,6 +225,11 @@ def preseal_check(data_root: Path, *, today: date, now: datetime) -> int:
     seal_at = _at(today, SEAL_TIME)
     runtime = resolve_data_runtime(data_root=root)
     state_root = runtime.workspace.state_root
+    context = CheckResult(_CONTEXT, PASS, (("day_kind", "trading"), ("data_session", data_session.isoformat()),
+                                           ("seal_at", SEAL_TIME.strftime("%H:%M"))))
+    _LOG.info(
+        "[DATA] stage=preseal_check status=CONTEXT cgroup_limit_mb=%s %s", _cgroup_limit_mb(), context.line()
+    )
 
     def _flow() -> CheckResult:
         try:
@@ -199,18 +242,21 @@ def preseal_check(data_root: Path, *, today: date, now: datetime) -> int:
         policy = load_provider_policy(load_runtime_config()).kind
         return check_kind_relay_age(state_root, policy=policy, now=moment, seal_at=seal_at)
 
-    results = [
-        CheckResult(_CONTEXT, PASS, (("day_kind", "trading"), ("data_session", data_session.isoformat()),
-                                     ("seal_at", SEAL_TIME.strftime("%H:%M")))),
-        _guarded(_KIND, lambda: check_kind_consistency(runtime.workspace.bronze_root)),
-        _guarded(_FLOW, _flow),
-        _guarded(_RELAY, _relay),
-    ]
-    for result in results:
-        _LOG.info("[DATA] stage=preseal %s", result.line())
+    def _mark_running(check: str) -> None:
+        # A kill before the final event leaves this as the day's last event, naming the check that was running.
+        _record(root, "DEGRADED", today, moment, f"incomplete:running_{check}", {})
+
+    _record(root, "DEGRADED", today, moment, "incomplete:starting", {})
+    results = [context]
+    for check, run in (
+        (_KIND, lambda: check_kind_consistency(runtime.workspace.bronze_root)),
+        (_FLOW, _flow),
+        (_RELAY, _relay),
+    ):
+        results.append(_run_check(check, run, on_start=_mark_running))
     failed = [result for result in results if result.verdict == FAIL]
-    _record(
-        root, "DEGRADED" if failed else "OK", today, moment,
-        failed[0].check if failed else "", {result.check: result.verdict for result in results},
-    )
+    metrics: dict[str, str] = {}
+    for result in results:
+        metrics.update(_metrics(result))
+    _record(root, "DEGRADED" if failed else "OK", today, moment, failed[0].check if failed else "", metrics)
     return 1 if failed else 0
