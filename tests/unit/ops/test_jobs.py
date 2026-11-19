@@ -934,7 +934,8 @@ def test_audit_pages_stale_backup_once_then_announces_resolution(
     assert [subject for subject, _ in sender.calls] == ["[긴급][kse] 오프사이트 백업 2일 이상 중단"]
     _write_backup_status(tmp_path)
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert sender.calls[-1] == ("[해결][kse] 오프사이트 백업 2일 이상 중단", "해결됨: 오프사이트 백업 2일 이상 중단")
+    assert sender.calls[-1][0] == "[해결][kse] 오프사이트 백업 2일 이상 중단"
+    assert sender.calls[-1][1].endswith("해소 근거: 일일 감사(21:40)에서 해당 위험 항목 없음")
     assert load_open_incidents(tmp_path) == {}
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
     assert len(sender.calls) == 2
@@ -1076,7 +1077,7 @@ def test_audit_resolution_state_write_failure_is_nonfatal(tmp_path: Path, monkey
 
     monkeypatch.setattr(policy_mod, "save_open_incidents", _ro)
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
-    assert sender.calls == [("[해결][kse] 오프사이트 백업 2일 이상 중단", "해결됨: 오프사이트 백업 2일 이상 중단")]
+    assert [subject for subject, _ in sender.calls] == ["[해결][kse] 오프사이트 백업 2일 이상 중단"]
 
 
 def _collect_report(blocking: str | None, degraded: tuple[str, ...]) -> SimpleNamespace:
@@ -2627,3 +2628,143 @@ def test_notice_dispatch_failure_is_swallowed(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr(alerts, "dispatch", broken)
     assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+
+
+class _FailingSender:
+    def send(self, subject: str, body: str) -> None:
+        raise RuntimeError("smtp exploded")
+
+
+def _open_seal_incidents(root: Path, *kinds: str) -> None:
+    from src.ops.alert_policy import IncidentKind, save_open_incidents
+
+    save_open_incidents(root, {IncidentKind(kind): "2026-10-07" for kind in kinds})
+
+
+def test_seal_success_resolves_open_no_seal_and_preseal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import load_open_incidents
+
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    _open_seal_incidents(tmp_path, "no_seal", "preseal_blocked")
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert [subject for subject, _ in sender.calls] == [
+        "[해결][kse] 장전 매매 결정 미봉인", "[해결][kse] 장전 봉인 사전 점검 실패",
+    ]
+    assert all(body.endswith("해소 근거: 08:31 장전 결정 봉인 완료(morning)") for _, body in sender.calls)
+    assert load_open_incidents(tmp_path) == {}
+
+
+def test_seal_success_leaves_other_incidents_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import IncidentKind, load_open_incidents
+
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    _open_seal_incidents(tmp_path, "backup_stale", "no_seal")
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert [subject for subject, _ in sender.calls] == ["[해결][kse] 장전 매매 결정 미봉인"]
+    assert set(load_open_incidents(tmp_path)) == {IncidentKind.BACKUP_STALE}
+
+
+def test_seal_success_without_open_incident_sends_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert sender.calls == []
+
+
+def test_late_seal_degraded_morning_still_resolves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.alert_policy import load_open_incidents
+
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 9, 4, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    _open_seal_incidents(tmp_path, "no_seal")
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    assert [body.splitlines()[-1] for _, body in sender.calls] == ["해소 근거: 09:04 장전 결정 봉인 완료(morning)"]
+    assert load_open_incidents(tmp_path) == {}
+
+
+def test_morning_late_new_seal_resolves_once_and_rerun_stays_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs(monkeypatch, datetime(2026, 10, 8, 10, 58, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    _open_seal_incidents(tmp_path, "no_seal")
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    now = datetime(2026, 10, 8, 10, 57, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    assert [body.splitlines()[-1] for _, body in sender.calls] == [
+        "해소 근거: 10:58 장전 결정 봉인 완료(morning_late)",
+    ]
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    assert len(sender.calls) == 1
+
+
+def test_already_sealed_evidence_shows_original_seal_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.ops.jobs import morning_late
+
+    _late_stubs_sealed(monkeypatch, datetime(2026, 10, 8, 8, 33, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", _raiser(AssertionError("poll must not run")))
+    _open_seal_incidents(tmp_path, "no_seal")
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    now = datetime(2026, 10, 8, 9, 12, tzinfo=KRX_TZ)
+    assert morning_late(tmp_path, today=DAY, now=lambda: now) == 0
+    assert len(sender.calls) == 1
+    assert sender.calls[0][1].splitlines()[-1] == "해소 근거: 08:33 장전 결정 봉인 완료(morning_late)"
+
+
+def test_resolve_failure_never_changes_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    _alert_sender(monkeypatch, _FailingSender())
+    clock = _Clock(_morning_now())
+    baseline = morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep)
+    _open_seal_incidents(tmp_path, "no_seal")
+    with caplog.at_level("WARNING", logger="src.ops.jobs"):
+        assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == baseline == 0
+    assert "command=resolve_after_seal status=FAILED reason=RuntimeError" in caplog.text
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY)["morning"] == "OK"
+
+
+def test_audit_resolution_unchanged_with_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from src.ops.alert_policy import load_open_incidents
+
+    _healthy_audit_state(tmp_path, monkeypatch)
+    _write_backup_status(tmp_path, hours=72.0)
+    sender = _AlertRecorder()
+    _alert_sender(monkeypatch, sender)
+    assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    _write_backup_status(tmp_path)
+    with caplog.at_level("INFO", logger="src.ops.jobs"):
+        assert audit(tmp_path, today=DAY, now=_morning_now()) == 0
+    assert sender.calls[-1] == (
+        "[해결][kse] 오프사이트 백업 2일 이상 중단",
+        "해결됨: 오프사이트 백업 2일 이상 중단\n해소 근거: 일일 감사(21:40)에서 해당 위험 항목 없음",
+    )
+    assert "resolved=1" in caplog.text
+    assert load_open_incidents(tmp_path) == {}

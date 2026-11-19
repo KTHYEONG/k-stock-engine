@@ -206,11 +206,16 @@ def build_page(kind: IncidentKind, day: date, policy: AlertPolicy = DEFAULT_ALER
     )
 
 
-def build_resolved(kind: IncidentKind, day: date, policy: AlertPolicy = DEFAULT_ALERT_POLICY) -> AlertMessage:
-    """One-line ``해결됨`` notice for a previously paged incident."""
+def build_resolved(
+    kind: IncidentKind, day: date, policy: AlertPolicy = DEFAULT_ALERT_POLICY, *, evidence: str = ""
+) -> AlertMessage:
+    """``해결됨`` notice for a previously paged incident; ``evidence`` adds a ``해소 근거`` line when non-empty."""
     summary = _format(PAGE_TEXT[kind].summary, policy)
+    lines = [f"해결됨: {summary}"]
+    if evidence:
+        lines.append(f"해소 근거: {evidence}")
     return AlertMessage(
-        subject=f"[해결][kse] {summary}", body=f"해결됨: {summary}",
+        subject=f"[해결][kse] {summary}", body="\n".join(lines),
         key=f"resolved|{kind.value}|{day.isoformat()}",
     )
 

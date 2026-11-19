@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -827,8 +827,10 @@ def _morning_impl(
     opened = datetime(today.year, today.month, today.day, _LATE_SEAL_HOUR, tzinfo=KRX_TZ)
     if _aware(result.sealed_at).astimezone(KRX_TZ) >= opened:
         _record(root, "morning", "DEGRADED", today, _aware(now()), reason="late_seal", metrics=metrics)
+        _resolve_after_seal(root, today=today, now=now, sealed_at=result.sealed_at, source="morning")
         return 1
     _record(root, "morning", "OK", today, _aware(now()), metrics=metrics)
+    _resolve_after_seal(root, today=today, now=now, sealed_at=result.sealed_at, source="morning")
     return 0
 
 
@@ -897,6 +899,7 @@ def morning_late(data_root: Path, *, today: date, now: Callable[[], datetime]) -
         if already is not None:
             _record(root, MORNING_LATE_JOB, "SKIPPED", today, _aware(now()), reason="already_sealed",
                     metrics={"sealed_at": _aware(already).astimezone(KRX_TZ).isoformat()})
+            _resolve_after_seal(root, today=today, now=now, sealed_at=already, source="morning_late")
             return 0
         refused = _guard_headroom(root)
         if refused is not None:
@@ -963,6 +966,7 @@ def morning_late(data_root: Path, *, today: date, now: Callable[[], datetime]) -
         }
         _record(root, MORNING_LATE_JOB, "DEGRADED", today, _aware(now()), reason="late_seal",
                 metrics=metrics)
+        _resolve_after_seal(root, today=today, now=now, sealed_at=sealed_at, source="morning_late")
         return 0
 
 
@@ -1212,6 +1216,55 @@ def _page(
     return queued
 
 
+_AUDIT_RESOLVED_EVIDENCE: Final = "일일 감사(21:40)에서 해당 위험 항목 없음"
+
+
+def _announce_resolved(
+    data_root: Path,
+    kinds: Collection[IncidentKind],
+    *,
+    today: date,
+    moment: datetime,
+    evidence: str,
+    sender: AlertSender | None,
+    secrets: frozenset[str],
+) -> list[IncidentKind]:
+    """Mail ``해결됨`` for each open incident in ``kinds`` and drop it from the open map; returns those kinds."""
+    from src.ops.alert_policy import build_resolved, load_open_incidents, save_open_incidents
+    from src.ops.alerts import dispatch
+
+    alerts_dir = _alerts_dir(data_root)
+    opened = load_open_incidents(data_root)
+    resolved = [kind for kind in opened if kind in kinds]
+    for kind in resolved:
+        dispatch(build_resolved(kind, today, evidence=evidence), sender=sender, alerts_dir=alerts_dir,
+                 now=moment, secret_values=secrets)
+        del opened[kind]
+    if resolved:
+        try:
+            save_open_incidents(data_root, opened)
+        except OSError:
+            _LOG.debug("[OPS] incident state write failed")
+    return resolved
+
+
+def _resolve_after_seal(
+    root: Path, *, today: date, now: Callable[[], datetime], sealed_at: datetime, source: str,
+) -> None:
+    """Announce that a decision seal now clears no_seal and preseal_blocked; never raises."""
+    from src.ops.alert_policy import IncidentKind
+
+    try:
+        sender, secrets = _alert_sender()
+        seal_kst = _aware(sealed_at).astimezone(KRX_TZ)
+        _announce_resolved(
+            root, (IncidentKind.NO_SEAL, IncidentKind.PRESEAL_BLOCKED), today=today, moment=_aware(now()),
+            evidence=f"{seal_kst:%H:%M} 장전 결정 봉인 완료({source})", sender=sender, secrets=secrets,
+        )
+    except Exception as exc:
+        _LOG.warning("[OPS] command=resolve_after_seal status=FAILED reason=%s", type(exc).__name__)
+
+
 _CREDENTIAL_NOTICES: Final[dict[str, tuple[str, str]]] = {
     "credential_expiry_notice": (
         "[알림][kse] 자격증명 갱신 필요",
@@ -1279,14 +1332,8 @@ def alert(data_root: Path, *, unit: str, result: str, exit_status: str, journal_
 
 def audit(data_root: Path, *, today: date, now: datetime) -> int:
     """Run the daily audit, page critical incidents and announce resolved ones; 1 only when a page was queued."""
-    from src.ops.alert_policy import (
-        IncidentKind,
-        build_resolved,
-        evaluated_kinds,
-        load_open_incidents,
-        save_open_incidents,
-    )
-    from src.ops.alerts import count_undelivered, dispatch
+    from src.ops.alert_policy import IncidentKind, evaluated_kinds, load_open_incidents
+    from src.ops.alerts import count_undelivered
 
     root = Path(data_root)
     moment = _aware(now)
@@ -1303,15 +1350,10 @@ def audit(data_root: Path, *, today: date, now: datetime) -> int:
     queued = _page(root, kinds, sender=sender, secrets=secrets, today=today, moment=moment)
     opened = load_open_incidents(root)
     checked = evaluated_kinds(str(heartbeat.get("day_kind", "")))
-    resolved = [kind for kind in opened if kind in checked and kind not in kinds]
-    for kind in resolved:
-        dispatch(build_resolved(kind, today), sender=sender, alerts_dir=alerts_dir, now=moment, secret_values=secrets)
-        del opened[kind]
-    if resolved:
-        try:
-            save_open_incidents(root, opened)
-        except OSError:
-            _LOG.debug("[OPS] incident state write failed")
+    resolved = _announce_resolved(
+        root, [kind for kind in opened if kind in checked and kind not in kinds],
+        today=today, moment=moment, evidence=_AUDIT_RESOLVED_EVIDENCE, sender=sender, secrets=secrets,
+    )
     issues = heartbeat.get("open_issues")
     open_issues = issues if isinstance(issues, list) else []
     _credential_notices(open_issues, sender=sender, secrets=secrets, alerts_dir=alerts_dir, today=today, moment=moment)

@@ -85,6 +85,14 @@ def test_resolved_notice_is_one_line() -> None:
     assert notice.key == "resolved|backup_stale|2026-10-08"
 
 
+def test_resolved_notice_adds_evidence_line_only_when_given() -> None:
+    notice = build_resolved(IncidentKind.NO_SEAL, THU, evidence="x")
+    assert notice.body.split("\n") == ["해결됨: 장전 매매 결정 미봉인", "해소 근거: x"]
+    assert notice.subject == "[해결][kse] 장전 매매 결정 미봉인"
+    assert notice.key == "resolved|no_seal|2026-10-08"
+    assert build_resolved(IncidentKind.NO_SEAL, THU, evidence="").body == "해결됨: 장전 매매 결정 미봉인"
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [{"streak_threshold": 0}, {"streak_threshold": 5, "streak_lookback_days": 4},
