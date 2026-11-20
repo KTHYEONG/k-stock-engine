@@ -538,7 +538,7 @@ def _materialize_with_market(
     bronze = tmp_path / "bronze"
     _write_sources(bronze)
     monkeypatch.setattr(module, "_decision_from_envelope", lambda _payload: decisions.pop(0))
-    monkeypatch.setattr(module, "_load_market_reference", lambda _path: market)
+    monkeypatch.setattr(module, "_load_market_reference", lambda _path, keys=None: market)
     silver = tmp_path / "silver-gated"
     path = module.materialize_dividend_events(
         catalog=_catalog_for(bronze),
@@ -653,7 +653,7 @@ def test_materialize_dividend_events_is_deterministic(tmp_path: Path, monkeypatc
     market = {("KRX:005930", date(2024, 1, 2)): (50000, 6000000000)}
     bronze = tmp_path / "bronze"
     _write_sources(bronze)
-    monkeypatch.setattr(module, "_load_market_reference", lambda _path: market)
+    monkeypatch.setattr(module, "_load_market_reference", lambda _path, keys=None: market)
     monkeypatch.setattr(module, "_decision_from_envelope", lambda _payload: first_decision)
     first = module.materialize_dividend_events(
         catalog=_catalog_for(bronze),
@@ -767,6 +767,148 @@ def test_load_market_reference_rejects_bad_amounts(tmp_path: Path) -> None:
 
     with pytest.raises(PITDataError):
         _load_market_reference(published.path)
+
+
+def _publish_market(tmp_path: Path, rows: list[tuple[object, object, int, int]]) -> Path:
+    import polars as pl
+
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+
+    frame = pl.DataFrame(
+        {
+            "session": [row[0] for row in rows],
+            "instrument_id": [row[1] for row in rows],
+            "close": [row[2] for row in rows],
+            "listed_shares": [row[3] for row in rows],
+        },
+        schema={"session": pl.Date, "instrument_id": pl.String, "close": pl.Int64, "listed_shares": pl.Int64},
+    )
+    return publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity(
+            kind="daily_market", layer=DatasetLayer.SILVER, policy_version="test-v1", inputs={}, params={},
+        ),
+        partitions={"part-00000.parquet": frame},
+    ).path
+
+
+def test_market_reference_with_keys_equals_filtered_full(tmp_path: Path) -> None:
+    from datetime import date
+
+    from src.data.dividend_events import _load_market_reference
+
+    path = _publish_market(
+        tmp_path,
+        [
+            (date(2024, 1, 2), "KRX:005930", 50000, 6000000000),
+            (date(2024, 1, 4), "KRX:005930", 51000, 6000000000),
+            (date(2024, 1, 2), "KRX:000660", 120000, 728000000),
+            (date(2024, 1, 4), "KRX:000660", 121000, 728000000),
+        ],
+    )
+    full = _load_market_reference(path)
+    keys = {("KRX:005930", date(2024, 1, 2)), ("KRX:000660", date(2024, 1, 4)), ("KRX:999999", date(2024, 1, 2))}
+
+    keyed = _load_market_reference(path, keys)
+
+    assert full is not None
+    assert keyed is not None
+    assert set(keyed) <= set(full)
+    assert ("KRX:999999", date(2024, 1, 2)) not in keyed
+    for key in keys & set(full):
+        assert keyed[key] == full[key]
+
+
+def test_market_reference_null_row_still_rejected_with_keys(tmp_path: Path) -> None:
+    from datetime import date
+
+    import polars as pl
+    import pytest
+
+    from src.core.pit import PITDataError
+    from src.data.datasets import DatasetIdentity, DatasetLayer, publish_dataset
+    from src.data.dividend_events import _load_market_reference
+
+    frame = pl.DataFrame(
+        {
+            "session": [date(2024, 1, 2), date(2024, 1, 4)],
+            "instrument_id": ["KRX:005930", None],
+            "close": [50000, 51000],
+            "listed_shares": [6000000000, 6000000000],
+        },
+        schema={"session": pl.Date, "instrument_id": pl.String, "close": pl.Int64, "listed_shares": pl.Int64},
+    )
+    path = publish_dataset(
+        layer_root=tmp_path / "silver",
+        identity=DatasetIdentity(
+            kind="daily_market", layer=DatasetLayer.SILVER, policy_version="test-v1", inputs={}, params={},
+        ),
+        partitions={"part-00000.parquet": frame},
+    ).path
+
+    with pytest.raises(PITDataError, match="invalid daily market reference row"):
+        _load_market_reference(path, {("KRX:005930", date(2024, 1, 2))})
+
+
+def test_market_reference_empty_keys_returns_empty_dict(tmp_path: Path) -> None:
+    from datetime import date
+
+    from src.data.dividend_events import _load_market_reference
+
+    path = _publish_market(tmp_path, [(date(2024, 1, 2), "KRX:005930", 50000, 6000000000)])
+
+    assert _load_market_reference(path, set()) == {}
+
+
+def test_prepass_skips_unresolvable_record_date_and_main_loop_still_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from datetime import date
+
+    import src.data.dividend_events as module
+    from src.core.pit import PITDataError
+
+    decision = _decision(
+        rcept_no="20240102000001", record=date(2024, 1, 1), received=date(2024, 1, 2), dps=100,
+    )
+    requested: list[object] = []
+
+    def _record_keys(_path, keys=None):  # type: ignore[no-untyped-def]
+        requested.append(keys)
+        return {}
+
+    bronze = tmp_path / "bronze"
+    _write_sources(bronze)
+    monkeypatch.setattr(module, "_decision_from_envelope", lambda _payload: decision)
+    monkeypatch.setattr(module, "_load_market_reference", _record_keys)
+
+    with pytest.raises(PITDataError, match="no certified session on or before record date 2024-01-01"):
+        module.materialize_dividend_events(
+            catalog=_catalog_for(bronze),
+            silver_root=tmp_path / "silver",
+            calendar=_calendar(),
+            daily_market_path=tmp_path / "daily_market_fixture",
+        )
+    assert requested == [set()]
+
+
+def test_market_reference_keys_follow_bridge_and_prior_session() -> None:
+    from datetime import date
+
+    from src.data.dividend_events import _market_reference_keys
+    from src.data.session_index import SessionIndex
+
+    mapped = _decision(rcept_no="20240102000001", record=date(2024, 1, 5), received=date(2024, 1, 2), dps=100)
+    unmapped = _decision(
+        rcept_no="20240102000002", record=date(2024, 1, 5), received=date(2024, 1, 2), dps=100,
+        corp="99999999",
+    )
+
+    keys = _market_reference_keys(
+        [mapped, unmapped], bridge={"00126380": "005930"}, index=SessionIndex.from_calendar(_calendar())
+    )
+
+    assert keys == {("KRX:005930", date(2024, 1, 2))}
 
 
 def test_decision_from_envelope_passes_report_title(tmp_path: Path) -> None:

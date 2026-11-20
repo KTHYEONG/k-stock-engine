@@ -5,7 +5,7 @@ import base64
 import hashlib
 import json
 from calendar import monthrange as calendar_monthrange
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -416,19 +416,34 @@ def dividend_dataset_inputs(
 
 def _load_market_reference(
     daily_market_path: Path | None,
+    keys: Collection[tuple[str, date]] | None = None,
 ) -> dict[tuple[str, date], tuple[int | None, int | None]] | None:
     """Map ``(instrument_id, session)`` to ``(close, listed_shares)``.
 
     Returns None when no daily-market dataset is supplied, in which case the
     plausibility gate is skipped (legacy/test path only; the pipeline always
-    supplies the dataset).
+    supplies the dataset). With ``keys`` only rows whose session and instrument
+    are among the keys are materialised; null keys are rejected over the full dataset.
     """
     if daily_market_path is None:
         return None
-    frame = read_dataset(
+    lazy = read_dataset(
         Path(daily_market_path), columns=["session", "instrument_id", "close", "listed_shares"]
-    ).collect()
+    )
+    null_rows = lazy.filter(pl.col("session").is_null() | pl.col("instrument_id").is_null()).head(1).collect()
+    if null_rows.height:
+        raise PITDataError(
+            f"invalid daily market reference row for dividend events: {null_rows.row(0, named=True)!r}"
+        )
     reference: dict[tuple[str, date], tuple[int | None, int | None]] = {}
+    if keys is not None:
+        if not keys:
+            return reference
+        lazy = lazy.filter(
+            pl.col("session").is_in(sorted({session for _, session in keys}))
+            & pl.col("instrument_id").is_in(sorted({instrument_id for instrument_id, _ in keys}))
+        )
+    frame = lazy.collect()
     try:
         for row in frame.iter_rows(named=True):
             session = row["session"]
@@ -441,6 +456,25 @@ def _load_market_reference(
     except (TypeError, ValueError) as exc:
         raise PITDataError(f"invalid daily market reference for dividend events: {exc}") from exc
     return reference
+
+
+def _market_reference_keys(
+    decisions: Sequence[DividendDecision], *, bridge: dict[str, str], index: SessionIndex
+) -> set[tuple[str, date]]:
+    """Daily-market keys the main loop can look up; unresolvable record dates are left to the loop."""
+    keys: set[tuple[str, date]] = set()
+    for decision in decisions:
+        ticker = bridge.get(decision.corp_code)
+        if ticker is None:
+            continue
+        try:
+            ex_session = _resolve_ex_session(decision.record_date, index=index)
+        except PITDataError:
+            continue
+        position = index.position_of_date(ex_session)
+        if position > 0:
+            keys.add((f"KRX:{ticker}", index.dates[position - 1]))
+    return keys
 
 
 def _resolve_ex_session(record_date: date, *, index: SessionIndex) -> date:
@@ -517,8 +551,10 @@ def materialize_dividend_events(
     kept, superseded = resolve_dividend_decisions(
         parsed, correction_window_days=active_policy.correction_window_days
     )
-    market = _load_market_reference(daily_market_path)
     index = SessionIndex.from_calendar(calendar)
+    market = _load_market_reference(
+        daily_market_path, _market_reference_keys(kept, bridge=bridge, index=index)
+    )
 
     rows: list[dict[str, Any]] = []
     quarantine: list[DividendQuarantine] = []

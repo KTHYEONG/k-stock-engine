@@ -592,3 +592,162 @@ def test_reference_benchmark_panel_reader_boundaries(tmp_path: Path, monkeypatch
         materialize_reference_benchmarks(
             market_panel_path=panel_path, definitions=(), definitions_version="test-v1", gold_root=gold_root
         )
+
+
+def _multi_definition_rows() -> list[dict[str, object]]:
+    return [
+        _prow(DAY0, "KRX:A", adtv20=2_000_000_000.0, market_cap=1000, ret=None),
+        _prow(DAY0, "KRX:B", adtv20=500_000_000.0, market_cap=3000, ret=None),
+        _prow(DAY0, "KRX:C", eligible=False, market_cap=500, ret=None),
+        _prow(DAY0, "KRX:D", adtv20=None, market_cap=700, ret=None),
+        _prow(DAY1, "KRX:A", adtv20=2_000_000_000.0, market_cap=1100, ret=0.0123457),
+        _prow(DAY1, "KRX:B", adtv20=600_000_000.0, market_cap=2900, ret=-0.0456789),
+        _prow(DAY1, "KRX:C", eligible=False, market_cap=500, ret=0.5),
+        _prow(DAY1, "KRX:D", adtv20=1_500_000_000.0, market_cap=720, ret=0.0271828),
+        _prow(DAY2, "KRX:A", adtv20=2_100_000_000.0, market_cap=1050, ret=0.031415),
+        _prow(DAY2, "KRX:B", adtv20=1_200_000_000.0, market_cap=3100, ret=0.00001),
+        _prow(DAY2, "KRX:C", adtv20=3_000_000_000.0, market_cap=2222, ret=-0.007),
+        _prow(DAY2, "KRX:D", price_state="halted", adtv20=1_500_000_000.0, market_cap=715, ret=0.1),
+        _prow(DAY3, "KRX:A", adtv20=2_000_000_000.0, market_cap=1020, ret=-0.0123),
+        _prow(DAY3, "KRX:B", adtv20=1_300_000_000.0, market_cap=3300, ret=0.0777),
+        _prow(DAY3, "KRX:C", adtv20=2_900_000_000.0, market_cap=2100, ret=0.0333),
+        _prow(DAY3, "KRX:D", adtv20=2_000_000_000.0, market_cap=999, ret=0.0002),
+    ]
+
+
+def _legacy_benchmark_frame(
+    *,
+    base: pl.DataFrame,
+    calendar: pl.DataFrame,
+    sessions: list[date],
+    definition: BenchmarkDefinition,
+) -> pl.DataFrame:
+    """Pre-hoist per-definition algorithm, kept as the bit-identity oracle."""
+    from src.data.reference_benchmarks import _OUTPUT_SCHEMA
+
+    weight = (
+        pl.lit(1.0)
+        if definition.weighting is Weighting.EQUAL
+        else pl.col("market_cap").cast(pl.Float64)
+    )
+    candidates = (
+        base.with_columns(
+            w=weight,
+            next_ret=pl.col("ret_price").shift(-1).over("instrument_id"),
+            next_pos=pl.col("pos").shift(-1).over("instrument_id"),
+            target_pos=pl.col("pos") + 1,
+        )
+        .join(
+            calendar.select(pl.col("session").alias("t"), pl.col("pos").alias("target_pos")),
+            on="target_pos",
+            how="left",
+        )
+        .filter(
+            pl.col("eligible")
+            & (pl.col("price_state") == "tradable")
+            & (
+                pl.lit(True)
+                if definition.min_adtv20_krw is None
+                else pl.col("adtv20").is_not_null() & (pl.col("adtv20") >= definition.min_adtv20_krw)
+            )
+            & pl.col("t").is_not_null()
+        )
+        .select(
+            "t",
+            "w",
+            "next_ret",
+            kept=(pl.col("next_pos") == pl.col("target_pos")) & pl.col("next_ret").is_not_null(),
+        )
+    )
+    grouped = (
+        candidates.group_by("t", maintain_order=True)
+        .agg(
+            n_total=pl.len(),
+            total_w=pl.col("w").sum(),
+            kept_n=pl.col("kept").sum(),
+            kept_w=pl.when(pl.col("kept")).then(pl.col("w")).otherwise(0.0).sum(),
+            ret_num=pl.when(pl.col("kept")).then(pl.col("w") * pl.col("next_ret")).otherwise(0.0).sum(),
+        )
+        .sort("t")
+    )
+    inception_index = sessions.index(grouped["t"][0]) - 1
+    inception = sessions[inception_index]
+    expected = sessions[inception_index + 1 :]
+    formed = set(grouped["t"].to_list())
+    assert all(session in formed for session in expected)
+    body = grouped.with_columns(
+        session=pl.col("t"),
+        benchmark_id=pl.lit(definition.benchmark_id),
+        ret=pl.col("ret_num") / pl.col("kept_w"),
+        constituents=pl.col("n_total").cast(pl.Int32),
+        dropped_exit_weight=(pl.col("total_w") - pl.col("kept_w")) / pl.col("total_w"),
+    ).select("session", "benchmark_id", "ret", "constituents", "dropped_exit_weight")
+    first = pl.DataFrame(
+        {
+            "session": [inception],
+            "benchmark_id": [definition.benchmark_id],
+            "ret": [None],
+            "constituents": [0],
+            "dropped_exit_weight": [0.0],
+        },
+        schema={
+            "session": pl.Date,
+            "benchmark_id": pl.String,
+            "ret": pl.Float64,
+            "constituents": pl.Int32,
+            "dropped_exit_weight": pl.Float64,
+        },
+    )
+    return (
+        pl.concat([first, body], how="vertical_relaxed")
+        .sort("session")
+        .with_columns(index_level=(pl.lit(1.0) + pl.col("ret").fill_null(0.0)).cum_prod())
+        .select(list(_OUTPUT_SCHEMA))
+    )
+
+
+def test_benchmark_output_bit_identical_after_hoist(tmp_path: Path) -> None:
+    from polars.testing import assert_frame_equal
+
+    from src.data.reference_benchmarks import _load_panel_frame
+
+    definitions = (EW, CW, LIQ)
+    panel_path, gold_root = _inputs(tmp_path, _multi_definition_rows())
+    result = materialize_reference_benchmarks(
+        market_panel_path=panel_path, definitions=definitions, definitions_version="test-v1", gold_root=gold_root
+    )
+    _, frame, sessions = _load_panel_frame(panel_path)
+    calendar = frame.select("session").unique().sort("session").with_row_index("pos")
+    base = frame.join(calendar, on="session", how="left").sort(["instrument_id", "session"])
+    expected = pl.concat(
+        [
+            _legacy_benchmark_frame(base=base, calendar=calendar, sessions=sessions, definition=definition)
+            for definition in definitions
+        ],
+        how="vertical_relaxed",
+    ).sort(["benchmark_id", "session"])
+
+    assert_frame_equal(_frame(result.dataset_path), expected, check_exact=True)
+
+
+def test_hoisted_prepared_not_mutated_between_definitions(tmp_path: Path) -> None:
+    from polars.testing import assert_frame_equal
+
+    rows = _multi_definition_rows()
+    solo_panel, solo_gold = _inputs(tmp_path / "solo", rows)
+    solo = materialize_reference_benchmarks(
+        market_panel_path=solo_panel, definitions=(CW,), definitions_version="test-v1", gold_root=solo_gold
+    )
+    paired_panel, paired_gold = _inputs(tmp_path / "paired", rows)
+    paired = materialize_reference_benchmarks(
+        market_panel_path=paired_panel,
+        definitions=(EW, CW),
+        definitions_version="test-v1",
+        gold_root=paired_gold,
+    )
+
+    assert_frame_equal(
+        _frame(solo.dataset_path).filter(pl.col("benchmark_id") == "cw_pr"),
+        _frame(paired.dataset_path).filter(pl.col("benchmark_id") == "cw_pr"),
+        check_exact=True,
+    )

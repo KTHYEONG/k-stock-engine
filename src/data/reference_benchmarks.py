@@ -135,10 +135,22 @@ def _load_panel_frame(market_panel_path: Path) -> tuple[str, pl.DataFrame, list[
     return market_panel_path.name, frame, sessions
 
 
+def _prepare_panel(base: pl.DataFrame, calendar: pl.DataFrame) -> pl.DataFrame:
+    """Definition-independent columns, computed once for every benchmark definition."""
+    return base.with_columns(
+        next_ret=pl.col("ret_price").shift(-1).over("instrument_id"),
+        next_pos=pl.col("pos").shift(-1).over("instrument_id"),
+        target_pos=pl.col("pos") + 1,
+    ).join(
+        calendar.select(pl.col("session").alias("t"), pl.col("pos").alias("target_pos")),
+        on="target_pos",
+        how="left",
+    )
+
+
 def _benchmark_frame(
     *,
-    base: pl.DataFrame,
-    calendar: pl.DataFrame,
+    prepared: pl.DataFrame,
     sessions: list[Any],
     definition: BenchmarkDefinition,
 ) -> pl.DataFrame:
@@ -148,17 +160,7 @@ def _benchmark_frame(
         else pl.col("market_cap").cast(pl.Float64)
     )
     candidates = (
-        base.with_columns(
-            w=weight,
-            next_ret=pl.col("ret_price").shift(-1).over("instrument_id"),
-            next_pos=pl.col("pos").shift(-1).over("instrument_id"),
-            target_pos=pl.col("pos") + 1,
-        )
-        .join(
-            calendar.select(pl.col("session").alias("t"), pl.col("pos").alias("target_pos")),
-            on="target_pos",
-            how="left",
-        )
+        prepared.with_columns(w=weight)
         .filter(
             pl.col("eligible")
             & (pl.col("price_state") == "tradable")
@@ -244,11 +246,11 @@ def materialize_reference_benchmarks(
     panel_id, frame, sessions = _load_panel_frame(Path(market_panel_path))
     calendar = frame.select("session").unique().sort("session").with_row_index("pos")
     base = frame.join(calendar, on="session", how="left").sort(["instrument_id", "session"])
+    prepared = _prepare_panel(base, calendar)
     combined = pl.concat(
         [
             _benchmark_frame(
-                base=base,
-                calendar=calendar,
+                prepared=prepared,
                 sessions=sessions,
                 definition=definition,
             )
