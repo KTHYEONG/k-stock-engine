@@ -1,7 +1,7 @@
 """Flow-target invariants: Silver-only requirement set and range coverage."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -330,3 +330,72 @@ def test_flow_targets_include_session_after_catchup(tmp_path: Path) -> None:
         {"ticker": "000001", "session": D1},
         {"ticker": "000001", "session": d2},
     ]
+
+
+def _five_session_pair(runtime) -> list[date]:  # type: ignore[no-untyped-def]
+    days = [D1 + timedelta(days=index) for index in range(5)]
+    schema = {"session": pl.Date, "ticker": pl.String}
+    rows = [(day, ticker) for day in days for ticker in ("000001", "000002")]
+    _publish_pair(
+        runtime,
+        pl.DataFrame({"session": [d for d, _ in rows], "ticker": [t for _, t in rows],
+                      "eligible": [t == "000001" or d != days[3] for d, t in rows]},
+                     schema={**schema, "eligible": pl.Boolean}),
+        pl.DataFrame({"session": [d for d, _ in rows], "ticker": [t for _, t in rows],
+                      "price_state": ["halted" if d == days[1] else "tradable" for d, _ in rows]},
+                     schema={**schema, "price_state": pl.String}),
+    )
+    return days
+
+
+def test_sessions_filter_equals_post_filter(tmp_path: Path) -> None:
+    from src.data.flow_targets import investor_flow_targets
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    days = _five_session_pair(runtime)
+    wanted = [days[1], days[3]]
+
+    full = investor_flow_targets(runtime).cells
+    restricted = investor_flow_targets(runtime, sessions=wanted).cells
+
+    assert restricted.equals(full.filter(pl.col("session").is_in(wanted)))
+    assert restricted.schema == full.schema
+    assert restricted["session"].to_list() == sorted(restricted["session"].to_list())
+
+
+def test_sessions_none_matches_default(tmp_path: Path) -> None:
+    from src.data.flow_targets import investor_flow_targets
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    _five_session_pair(runtime)
+
+    assert investor_flow_targets(runtime, sessions=None).cells.equals(investor_flow_targets(runtime).cells)
+
+
+def test_empty_sessions_yields_empty_cells(tmp_path: Path) -> None:
+    from src.data.flow_targets import investor_flow_targets
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    _five_session_pair(runtime)
+
+    cells = investor_flow_targets(runtime, sessions=[]).cells
+
+    assert cells.height == 0
+    assert cells.schema == investor_flow_targets(runtime).cells.schema
+
+
+def test_sessions_and_since_combine(tmp_path: Path) -> None:
+    from src.data.flow_targets import investor_flow_targets
+    from src.data.runtime import load_data_runtime
+
+    runtime = load_data_runtime(scope_config=SCOPE_CONFIG, data_root=tmp_path / "data")
+    days = _five_session_pair(runtime)
+
+    cells = investor_flow_targets(runtime, since=days[2], sessions=[days[1], days[3], days[4]]).cells
+
+    assert set(cells["session"].to_list()) == {days[3], days[4]}
+    assert cells.equals(investor_flow_targets(runtime, since=days[2]).cells.filter(
+        pl.col("session").is_in([days[3], days[4]])))

@@ -137,9 +137,11 @@ def _stub_io(
     import src.data.investor_flow_freshness as freshness_module
 
     collected = flow.collect()
-    monkeypatch.setattr(
-        freshness_module, "investor_flow_targets", lambda runtime: SimpleNamespace(cells=targets)
-    )
+    def _targets_for(runtime: object, *, sessions: Any = None) -> SimpleNamespace:
+        kept = targets if sessions is None else targets.filter(pl.col("session").is_in(list(sessions)))
+        return SimpleNamespace(cells=kept)
+
+    monkeypatch.setattr(freshness_module, "investor_flow_targets", _targets_for)
     monkeypatch.setattr(freshness_module, "read_dataset", lambda path, columns=None: collected.lazy())
 
     class _Catalog:
@@ -227,3 +229,42 @@ def test_other_sessions_ignored() -> None:
         seal_time=SEAL,
     )
     assert only.missing_cells == 0
+
+
+def test_freshness_unchanged_with_restricted_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.data.investor_flow_freshness as freshness_module
+
+    tickers = [f"{i:06d}" for i in range(20)]
+    full = pl.concat([_targets(SESSION, 20), _targets(OTHER, 50)])
+    flow = _flow(SESSION, tickers[:18])
+    retrieved = _retrieved(tickers[:18])
+    runtime = SimpleNamespace(workspace=SimpleNamespace(bronze_root=tmp_path))
+    _stub_io(monkeypatch, full, flow, retrieved)
+    requested: list[object] = []
+    original = freshness_module.investor_flow_targets
+
+    def _record(runtime_arg: object, *, sessions: Any = None) -> Any:
+        requested.append(sessions)
+        return original(runtime_arg, sessions=sessions)
+
+    monkeypatch.setattr(freshness_module, "investor_flow_targets", _record)
+    expected = investor_flow_freshness(
+        targets=full,
+        flow=flow,
+        retrieved_at=retrieved,
+        source_sessions=[SESSION],
+        seal_time=SEAL,
+    )
+
+    actual = check_investor_flow_freshness(
+        runtime=runtime,  # type: ignore[arg-type]
+        flow_dataset_dir=tmp_path / "flow",
+        source_sessions=[SESSION],
+        seal_time=SEAL,
+        policy=LiveGatePolicy(max_missing_flow_fraction=0.5),
+    )
+
+    assert requested == [[SESSION]]
+    assert actual == expected

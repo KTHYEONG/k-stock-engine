@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -46,25 +46,44 @@ def _verified_partitions(dataset_dir: Path, *, label: str) -> list[str]:
     return [str(path) for path in paths]
 
 
+def _restrict_sessions(frame: pl.LazyFrame, sessions: list[date] | None) -> pl.LazyFrame:
+    """Narrow a scan to the given sessions before collection; untouched when None."""
+    return frame if sessions is None else frame.filter(pl.col("session").is_in(sessions))
+
+
 def investor_flow_targets_from_ids(
-    silver_root: Path, universe_id: str, daily_id: str, *, since: date | None = None
+    silver_root: Path,
+    universe_id: str,
+    daily_id: str,
+    *,
+    since: date | None = None,
+    sessions: Collection[date] | None = None,
 ) -> FlowTargets:
     """Cells for explicit Silver inputs, so phased builds use resolved ids."""
     silver = Path(silver_root)
     universe_files = _verified_partitions(silver / universe_id, label="ordinary-universe")
     daily_files = _verified_partitions(silver / daily_id, label="daily-market")
+    wanted = None if sessions is None else list(sessions)
     try:
         eligible = (
-            pl.scan_parquet(universe_files)
-            .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String), pl.col("eligible"))
+            _restrict_sessions(
+                pl.scan_parquet(universe_files).select(
+                    pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String), pl.col("eligible")
+                ),
+                wanted,
+            )
             .filter(pl.col("eligible"))
             .select("session", "ticker")
             .unique()
             .collect()
         )
         tradable = (
-            pl.scan_parquet(daily_files)
-            .select(pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String), pl.col("price_state"))
+            _restrict_sessions(
+                pl.scan_parquet(daily_files).select(
+                    pl.col("session").cast(pl.Date), pl.col("ticker").cast(pl.String), pl.col("price_state")
+                ),
+                wanted,
+            )
             .filter(pl.col("price_state") == "tradable")
             .select("session", "ticker")
             .unique()
@@ -78,7 +97,9 @@ def investor_flow_targets_from_ids(
     return FlowTargets(universe_dataset_id=universe_id, daily_market_dataset_id=daily_id, cells=cells)
 
 
-def investor_flow_targets(runtime: DataRuntime, *, since: date | None = None) -> FlowTargets:
+def investor_flow_targets(
+    runtime: DataRuntime, *, since: date | None = None, sessions: Collection[date] | None = None
+) -> FlowTargets:
     """Cells that need investor flow: eligible ordinary shares on sessions they were tradable.
 
     Derived only from Silver (the registry's current ``ordinary_universe`` and
@@ -92,7 +113,7 @@ def investor_flow_targets(runtime: DataRuntime, *, since: date | None = None) ->
     universe_id = registry.require("ordinary_universe")
     daily_id = registry.require("daily_market")
     return investor_flow_targets_from_ids(
-        Path(runtime.workspace.silver_root), universe_id, daily_id, since=since
+        Path(runtime.workspace.silver_root), universe_id, daily_id, since=since, sessions=sessions
     )
 
 

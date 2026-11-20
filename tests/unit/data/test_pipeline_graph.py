@@ -2591,3 +2591,40 @@ def test_phase_split_closes_inputs_and_tolerates_unknown_gates(monkeypatch: pyte
     assert graph._blocked_kinds(nodes, frozenset({"krx_security_master"})) == {
         "ordinary_universe", "investor_flow_ls", "investor_flow",
     }
+
+
+def test_current_rss_parses_vmrss(tmp_path: Path) -> None:
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status="VmHWM:\t    4096 kB\nVmRSS:\t    1536 kB\n")
+    assert graph.current_rss_mb(proc_root=root) == 1.5
+    assert graph.current_rss_mb(proc_root=_fake_proc_root(tmp_path / "bare", status="VmHWM:\t 1 kB\n")) is None
+
+
+@pytest.mark.parametrize("status", [None, "VmRSS:\t 2048 kB\n"])
+def test_build_with_peak_logs_start_rss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, status: str | None
+) -> None:
+    import logging
+
+    from src.data import pipeline_graph as graph
+
+    root = _fake_proc_root(tmp_path, status=status)
+    real_current = graph.current_rss_mb
+    monkeypatch.setattr(graph, "current_rss_mb", lambda: real_current(proc_root=root))
+    monkeypatch.setattr(graph, "node_peak_rss_mb", lambda: 77.0)
+    monkeypatch.setattr(graph, "reset_peak_rss", lambda: True)
+    node = BuildNode(kind="fake_kind", inputs=(), bronze_sources=(), build=lambda ctx, inputs: "built")
+
+    with caplog.at_level(logging.INFO, logger=graph.__name__):
+        outcome, peak = graph._build_with_peak(node, None, {})  # type: ignore[arg-type]
+
+    assert (outcome, peak) == ("built", 77.0)
+    starts = [record.getMessage() for record in caplog.records if "refresh_build_start" in record.getMessage()]
+    assert len(starts) == 1
+    expected = "[DATA] stage=refresh_build_start kind=fake_kind"
+    if status is None:
+        assert starts[0] == expected
+    else:
+        assert starts[0] == f"{expected} rss_start_mb=2"
+

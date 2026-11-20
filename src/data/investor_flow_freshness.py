@@ -140,7 +140,7 @@ def check_investor_flow_freshness(
             if seen is None or blob.retrieved_at < seen:
                 retrieved_at[blob.content_hash] = blob.retrieved_at
     freshness = investor_flow_freshness(
-        targets=investor_flow_targets(runtime).cells,
+        targets=investor_flow_targets(runtime, sessions=wanted).cells,
         flow=flow,
         retrieved_at=retrieved_at,
         source_sessions=wanted,

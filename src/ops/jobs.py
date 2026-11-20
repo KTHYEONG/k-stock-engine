@@ -732,6 +732,15 @@ class SealRun:
     sealed_at: datetime | None
 
 
+def _note_phase_peak(peaks: dict[str, float], phase: str) -> None:
+    """Record the RSS watermark a finished phase reached, when the platform reports one."""
+    from src.data.pipeline_graph import node_peak_rss_mb  # lazy: keeps polars out of the small ops jobs
+
+    value = node_peak_rss_mb()
+    if value is not None:
+        peaks[phase] = round(value, 1)
+
+
 def _run_seal_phases(
     root: Path, *, today: date, data_session: date, now: Callable[[], datetime],
     base_metrics: Mapping[str, object],
@@ -742,21 +751,29 @@ def _run_seal_phases(
     relay_s = time.monotonic() - mark
     phase = "build"
     build_report: object = None
+    phase_peaks: dict[str, float] = {}
     from src.data.investor_flow_freshness import StaleInvestorFlowError
+    from src.data.pipeline_graph import reset_peak_rss
 
     try:
         mark = time.monotonic()
+        reset_peak_rss()
         build_report = _build_all(root, decision_time=_aware(now()))
+        _note_phase_peak(phase_peaks, "build")
         build_s = time.monotonic() - mark
         mark = time.monotonic()
+        reset_peak_rss()
         sealed = _decide_phase(root)
+        _note_phase_peak(phase_peaks, "decide")
         decide_s = time.monotonic() - mark
         sealed_at = _sealed_at_for(_research_paths(root).decisions, today)
         if sealed_at is None:
             raise PITDataError("no sealed decision for today's execution session")
         phase = "shadow"
         mark = time.monotonic()
+        reset_peak_rss()
         _shadow_phase(root)
+        _note_phase_peak(phase_peaks, "shadow")
         shadow_s = time.monotonic() - mark
     except StaleInvestorFlowError as exc:
         from dataclasses import asdict
@@ -765,6 +782,7 @@ def _run_seal_phases(
             "NO_DECISION", exc.reason,
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "phase_peak_rss_mb": dict(phase_peaks),
              "kind_relay": relay,
              "flow_freshness": [{**asdict(item), "source_session": item.source_session.isoformat()}
                                 for item in exc.freshness]},
@@ -776,6 +794,7 @@ def _run_seal_phases(
             outcome, type(exc).__name__,
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "phase_peak_rss_mb": dict(phase_peaks),
              "kind_relay": relay},
             None,
         )
@@ -785,6 +804,7 @@ def _run_seal_phases(
             "DEGRADED", type(exc).__name__,
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+             "phase_peak_rss_mb": dict(phase_peaks),
              "kind_relay": relay},
             None,
         )
@@ -793,6 +813,7 @@ def _run_seal_phases(
         {"data_session": data_session.isoformat(), **dict(base_metrics),
          "sealed": sealed, "sealed_at": _aware(sealed_at).astimezone(KRX_TZ).isoformat(),
          "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
+         "phase_peak_rss_mb": dict(phase_peaks),
          "build_s": build_s, "decide_s": decide_s, "shadow_s": shadow_s,
          "relay_s": relay_s, "kind_relay": relay},
         sealed_at,

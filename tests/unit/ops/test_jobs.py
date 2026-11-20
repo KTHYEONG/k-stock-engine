@@ -2768,3 +2768,48 @@ def test_audit_resolution_unchanged_with_evidence(
     )
     assert "resolved=1" in caplog.text
     assert load_open_incidents(tmp_path) == {}
+
+
+def _stub_phase_peaks(monkeypatch: pytest.MonkeyPatch, peaks: dict[str, float | None]) -> list[str]:
+    """Each phase reports its own watermark via the next queued reading; resets are recorded."""
+    readings = iter(peaks.items())
+    resets: list[str] = []
+    import src.data.pipeline_graph as pipeline_graph
+
+    monkeypatch.setattr(pipeline_graph, "reset_peak_rss", lambda: resets.append("reset") or True)
+    monkeypatch.setattr(pipeline_graph, "node_peak_rss_mb", lambda: next(readings)[1])
+    return resets
+
+
+def test_seal_metrics_carry_phase_peaks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **k: _report_with_peaks({"x": 9.876}))
+    resets = _stub_phase_peaks(monkeypatch, {"build": 1234.56, "decide": 88.04, "shadow": 45.0})
+    monkeypatch.setattr(jobs, "_peak_rss_mb", lambda: 321.0)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["metrics"]["phase_peak_rss_mb"] == {"build": 1234.6, "decide": 88.0, "shadow": 45.0}
+    assert event["metrics"]["peak_rss_mb"] == 321.0
+    assert len(resets) == 3
+
+
+def test_failure_metrics_carry_phase_peaks_for_phases_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _morning_stubs(monkeypatch, [], datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+    monkeypatch.setattr(jobs, "_build_all", lambda root, **k: _report_with_peaks({}))
+    _stub_phase_peaks(monkeypatch, {"build": 512.0})
+
+    def _boom(root: Path) -> None:
+        raise PITDataError("decide failed")
+
+    monkeypatch.setattr(jobs, "_decide_phase", _boom)
+    clock = _Clock(_morning_now())
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 1
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "NO_DECISION"
+    assert event["reason"] == "PITDataError"
+    assert event["metrics"]["phase_peak_rss_mb"] == {"build": 512.0}
+    assert "peak_rss_mb" in event["metrics"]
+

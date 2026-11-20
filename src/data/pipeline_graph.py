@@ -37,17 +37,27 @@ _LOG = logging.getLogger(__name__)
 _NON_STALENESS_PARAMS: Final = frozenset({"decision_time"})
 
 
-def node_peak_rss_mb(*, proc_root: Path = Path("/proc")) -> float | None:
-    """Peak resident set in MB since the last reset."""
+def _status_field_mb(field: str, *, proc_root: Path) -> float | None:
+    """One ``kB`` field of ``/proc/self/status`` in MB, None when unavailable."""
     try:
         text = (Path(proc_root) / "self" / "status").read_text(encoding="utf-8", errors="replace")
         for line in text.splitlines():
-            match = re.fullmatch(r"VmHWM:\s+([0-9]+)\s+kB\s*", line)
+            match = re.fullmatch(rf"{field}:\s+([0-9]+)\s+kB\s*", line)
             if match is not None:
                 return float(int(match[1])) / 1024.0
     except (OSError, ValueError, OverflowError):
         return None
     return None
+
+
+def node_peak_rss_mb(*, proc_root: Path = Path("/proc")) -> float | None:
+    """Peak resident set in MB since the last reset."""
+    return _status_field_mb("VmHWM", proc_root=proc_root)
+
+
+def current_rss_mb(*, proc_root: Path = Path("/proc")) -> float | None:
+    """Current resident set in MB; None when unsupported."""
+    return _status_field_mb("VmRSS", proc_root=proc_root)
 
 
 def reset_peak_rss(*, proc_root: Path = Path("/proc")) -> bool:
@@ -63,6 +73,11 @@ def _build_with_peak(
     node: BuildNode, ctx: RefreshContext, inputs: Mapping[str, str]
 ) -> tuple[PublishedDataset, float | None]:
     """Reset the watermark, run one node build, then read its peak."""
+    start_rss = current_rss_mb()
+    if start_rss is not None:
+        _LOG.info("[DATA] stage=refresh_build_start kind=%s rss_start_mb=%d", node.kind, int(start_rss))
+    else:
+        _LOG.info("[DATA] stage=refresh_build_start kind=%s", node.kind)
     reset_peak_rss()
     outcome = node.build(ctx, inputs)
     return outcome, node_peak_rss_mb()
