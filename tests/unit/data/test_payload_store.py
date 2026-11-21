@@ -699,3 +699,80 @@ def test_warm_payload_read_resolves_candidate_once(tmp_path: Path, monkeypatch: 
         patch.setattr(Path, "resolve", _counted)
         assert read_payload(path) == b"body" * 200
     assert calls == [path]
+
+
+def test_selected_subset_packs_only_selected_and_leaves_rest_loose(tmp_path: Path) -> None:
+    root = _bronze(tmp_path)
+    bodies = {"daily_market": b"sel" * 100, "investor_flow": b"flow" * 100}
+    chosen = [_loose(root, "daily_market", f"s{idx}.json", bodies["daily_market"]) for idx in range(3)]
+    chosen.append(_loose(root, "investor_flow", "s-flow.json", bodies["investor_flow"]))
+    other = _loose(root, "daily_market", "other.json", b"other" * 100)
+    rels = {path.relative_to(root).as_posix() for path in chosen}
+    report = pack_loose(root, kinds=["daily_market", "investor_flow"], offsite_paths=rels, remove=True, paths=rels)
+    assert report.packed == len(rels)
+    assert report.removed == len(rels)
+    for path in chosen:
+        assert not path.exists()
+        assert read_payload(path) == bodies[path.relative_to(root).parts[0]]
+    assert other.read_bytes() == b"other" * 100
+    assert read_payload(other) == b"other" * 100
+
+
+def test_selected_paths_do_not_walk_kind_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _bronze(tmp_path)
+    chosen = _loose(root, "daily_market", "a.json", b"alpha" * 100)
+    rel = chosen.relative_to(root).as_posix()
+
+    def _forbidden(self: Path, pattern: str) -> Iterator[Path]:
+        raise AssertionError("rglob must not run when paths are given")
+
+    monkeypatch.setattr(Path, "rglob", _forbidden)
+    report = pack_loose(root, kinds=["daily_market"], offsite_paths={rel}, remove=True, paths={rel})
+    assert report.packed == 1
+    monkeypatch.undo()
+    assert read_payload(chosen) == b"alpha" * 100
+
+
+def test_selected_missing_path_is_skipped_and_escaping_symlink_raises(tmp_path: Path) -> None:
+    root = _bronze(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"outside" * 100)
+    link = root / "daily_market" / "escape.json"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+    report = pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=False,
+                        paths={"daily_market/missing.json"})
+    assert report.packed == 0
+    with pytest.raises(PITDataError, match="escapes its kind directory"):
+        pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=False,
+                   paths={"daily_market/escape.json"})
+
+
+def test_selected_members_are_indexed_in_sorted_path_order(tmp_path: Path) -> None:
+    import sqlite3
+
+    from src.data.payload_store import _index_path
+
+    root = _bronze(tmp_path)
+    names = ["c.json", "a.json", "b.json"]
+    rels = {path.relative_to(root).as_posix() for path in (_loose(root, "daily_market", name, name.encode() * 200) for name in names)}
+    report = pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=False, paths=rels)
+    assert report.packed == len(names)
+    with sqlite3.connect(_index_path(root)) as connection:
+        rows = connection.execute("SELECT rel_path FROM members ORDER BY offset").fetchall()
+    assert [row[0] for row in rows] == sorted(rels)
+
+
+def test_unselected_unreadable_files_are_never_read(tmp_path: Path) -> None:
+    root = _bronze(tmp_path)
+    chosen = _loose(root, "daily_market", "pick.json", b"pick" * 100)
+    hidden = _loose(root, "daily_market", "hidden.json", b"hidden" * 100)
+    hidden.chmod(0o000)
+    try:
+        report = pack_loose(root, kinds=["daily_market"], offsite_paths=None, remove=True,
+                            paths={chosen.relative_to(root).as_posix()})
+    finally:
+        hidden.chmod(0o644)
+    assert report.packed == 1
+    assert hidden.exists()
+    assert not chosen.exists()

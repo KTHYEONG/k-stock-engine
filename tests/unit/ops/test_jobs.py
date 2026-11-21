@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import json
 import os
 import subprocess
@@ -2813,3 +2814,47 @@ def test_failure_metrics_carry_phase_peaks_for_phases_run(tmp_path: Path, monkey
     assert event["metrics"]["phase_peak_rss_mb"] == {"build": 512.0}
     assert "peak_rss_mb" in event["metrics"]
 
+
+
+def _backup_records(root: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for path in (root / "ops" / "events").rglob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def _ticking_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    ticks = iter(float(step) for step in range(0, 100, 10))
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: next(ticks))
+
+
+def test_backup_logs_stage_elapsed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    _healthy_guard(monkeypatch)
+    _ticking_clock(monkeypatch)
+    monkeypatch.setattr(jobs, "_push_backup_sources", lambda **kwargs: {"bronze": {}})
+    monkeypatch.setattr(jobs, "_prune_bronze", lambda *a, **k: {"removed": 2})
+    monkeypatch.setattr(jobs, "_prune_datasets_after_push", lambda *a, **k: {"dataset_prune": "skipped_no_push"})
+    caplog.set_level(logging.INFO, logger="src.ops.jobs")
+    assert backup(tmp_path, now=_morning_now()) == 0
+    for stage in ("push", "prune_bronze", "prune_datasets"):
+        assert f"[OPS] command=backup stage={stage} elapsed_s=" in caplog.text
+    ok = next(item for item in _backup_records(tmp_path) if item["job"] == "backup")
+    assert ok["outcome"] == "OK"
+    assert set(ok["metrics"]["elapsed_s"]) == {"push", "prune_bronze", "prune_datasets"}
+    assert ok["metrics"]["elapsed_s"]["push"] == 10.0
+
+
+def test_backup_prune_failure_records_elapsed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _healthy_guard(monkeypatch)
+    _ticking_clock(monkeypatch)
+    monkeypatch.setattr(jobs, "_push_backup_sources", lambda **kwargs: {"bronze": {}})
+
+    def _prune_fail(root: Path, **kwargs: object) -> dict[str, object]:
+        raise PITDataError("pack failed")
+
+    monkeypatch.setattr(jobs, "_prune_bronze", _prune_fail)
+    assert backup(tmp_path, now=_morning_now()) == 1
+    degraded = next(item for item in _backup_records(tmp_path) if item["job"] == "backup")
+    assert degraded["outcome"] == "DEGRADED"
+    assert {"push", "prune_bronze"} <= set(degraded["metrics"]["elapsed_s"])

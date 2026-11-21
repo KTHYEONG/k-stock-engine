@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -1138,6 +1138,20 @@ def _prune_datasets_after_push(
         return {"prune_error": type(exc).__name__}
 
 
+@contextlib.contextmanager
+def _timed_stage(stage: str, elapsed: dict[str, float]) -> Iterator[None]:
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        elapsed[stage] = time.monotonic() - started
+        _LOG.info("[OPS] command=backup stage=%s elapsed_s=%.1f", stage, elapsed[stage])
+
+
+def _stage_elapsed(elapsed: Mapping[str, float]) -> dict[str, object]:
+    return {"elapsed_s": {stage: round(seconds, 1) for stage, seconds in elapsed.items()}}
+
+
 def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     """Push the config's daily sources to Drive, then prune Bronze and superseded datasets that were pushed."""
     root = Path(data_root)
@@ -1150,24 +1164,29 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
         return 1
     status_path = root / "state" / "lake_backup_status.json"
     push_started_ts = moment.timestamp()
+    elapsed: dict[str, float] = {}
     try:
-        sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
+        with _timed_stage("push", elapsed):
+            sources = _push_backup_sources(status_path=status_path, no_lock=no_lock)
     except Exception as exc:
         _log_job_failure("backup", exc)
         _ensure_backup_failure_status(status_path, moment)
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
-                metrics={"detail": _failure_detail(exc)})
+                metrics={"detail": _failure_detail(exc), **_stage_elapsed(elapsed)})
         return 1
     try:
-        pruned = _prune_bronze(root, now=moment)
+        with _timed_stage("prune_bronze", elapsed):
+            pruned = _prune_bronze(root, now=moment)
     except Exception as exc:
         _log_job_failure("backup", exc)
         _record(root, "backup", "DEGRADED", run_date, moment, reason=type(exc).__name__,
-                metrics={"sources": sorted(sources), "detail": _failure_detail(exc)})
+                metrics={"sources": sorted(sources), "detail": _failure_detail(exc), **_stage_elapsed(elapsed)})
         return 1
-    dataset_prune = _prune_datasets_after_push(root, sources=sources, push_started_ts=push_started_ts)
+    with _timed_stage("prune_datasets", elapsed):
+        dataset_prune = _prune_datasets_after_push(root, sources=sources, push_started_ts=push_started_ts)
     _record(root, "backup", "OK", run_date, moment,
-            metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed")), **dataset_prune})
+            metrics={"sources": sorted(sources), "removed": _as_int(pruned.get("removed")), **dataset_prune,
+                     **_stage_elapsed(elapsed)})
     return 0
 
 

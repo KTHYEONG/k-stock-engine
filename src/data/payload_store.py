@@ -263,6 +263,12 @@ def pack_loose(
         return _pack_loose(root, kinds=kinds, offsite_paths=offsite_paths, remove=remove, paths=paths)
 
 
+def _kind_files(root: Path, kind_dir: Path, kind: str, selected: set[str] | None) -> list[Path]:
+    if selected is None:
+        return sorted(kind_dir.rglob("*"))
+    return sorted(root / rel for rel in selected if rel.split("/", 1)[0] == kind)
+
+
 def _pack_loose(
     bronze_root: Path, *, kinds: Sequence[str], offsite_paths: Collection[str] | None, remove: bool,
     paths: Collection[str] | None = None,
@@ -287,7 +293,7 @@ def _pack_loose(
                 continue
             if (root / PACK_DIR_NAME / kind).is_symlink():
                 raise PITDataError(f"Bronze kind pack directory must not be a symlink: {kind}")
-            for file_path in sorted(kind_dir.rglob("*")):
+            for file_path in _kind_files(root, kind_dir, kind, selected):
                 if not file_path.is_file():
                     continue
                 if PACK_DIR_NAME in file_path.relative_to(root).parts:
