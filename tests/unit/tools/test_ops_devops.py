@@ -256,6 +256,38 @@ def test_gc_cli_prints_a_dry_run_plan_and_apply_requires_the_lock(
     assert not (tmp_path / "remote" / "bronze" / "seg-00000000000000cc.tar.zst").exists()
 
 
+def test_gc_apply_with_lock_file_takes_that_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "remote" / "bronze").mkdir(parents=True)
+    orphan = tmp_path / "remote" / "bronze" / "seg-00000000000000cc.tar.zst"
+    orphan.write_bytes(b"x")
+    lock = tmp_path / "gdrive.lock"
+    holder = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c",
+         "import fcntl, sys, time\n"
+         "handle = open(sys.argv[1], 'w')\n"
+         "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+         "print('locked', flush=True)\n"
+         "time.sleep(60)\n",
+         str(lock)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+        monkeypatch.setattr(sys, "argv", _gc_argv(tmp_path, "--apply", "--lock-file", str(lock), "--lock-wait-s", "1"))
+        assert backup_tool.main() == backup_tool.LOCK_TIMEOUT_RC
+        assert "lock timeout" in capsys.readouterr().out
+        assert orphan.exists()
+    finally:
+        holder.kill()
+        holder.wait()
+    monkeypatch.setattr(sys, "argv", _gc_argv(tmp_path, "--apply", "--lock-file", str(lock), "--lock-wait-s", "1"))
+    assert backup_tool.main() == 0
+    assert not orphan.exists()
+
+
 def test_restore_at_parses_state_numbers_and_aware_timestamps() -> None:
     from datetime import UTC, datetime
 

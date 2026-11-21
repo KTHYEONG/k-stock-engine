@@ -1,0 +1,12 @@
+[Unit]
+Description=KSE Drive archive GC (weekly Sunday 13:00 KST, shared Drive lock)
+OnFailure=kse-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-stock-engine
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=2h30min
+ExecStartPre=/usr/bin/touch %t/quant-gdrive.lock
+ExecStart=%h/.local/lib/kse/kse-run backup-gc
+ExecStopPost=-/usr/bin/docker rm -f kse-backup-gc

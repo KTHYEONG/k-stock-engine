@@ -1,0 +1,11 @@
+[Unit]
+Description=KSE Drive archive GC (Sunday 13:00 KST)
+
+[Timer]
+OnCalendar=Sun *-*-* 13:00:00 Asia/Seoul
+AccuracySec=1min
+Persistent=true
+Unit=kse-backup-gc.service
+
+[Install]
+WantedBy=timers.target

@@ -50,6 +50,7 @@ __all__ = [
     "alert_drain",
     "audit",
     "backup",
+    "backup_gc",
     "collect_dbsec",
     "collect_eve",
     "main",
@@ -1196,6 +1197,75 @@ def backup(data_root: Path, *, now: datetime, no_lock: bool = False) -> int:
     return 0
 
 
+_BACKUP_GC_KEEP_DAILY: Final = 14
+_BACKUP_GC_KEEP_MONTHLY: Final = 120
+_BACKUP_GC_LOCK_FILE: Final = "/run/quant-gdrive.lock"
+_BACKUP_GC_LOCK_WAIT_S: Final = 3600
+_BACKUP_GC_TIMEOUT_S: Final = 2 * 3600
+# Exit code the backup tool returns when the shared Drive lock wait expires.
+_BACKUP_LOCK_TIMEOUT_RC: Final = 75
+
+
+def _run_backup_gc_tool(data_root: Path) -> tuple[int, dict[str, dict[str, object]]]:
+    command = [sys.executable, str(_tool_path()), "gc", "--apply", "--lock-file", _BACKUP_GC_LOCK_FILE,
+               "--keep-daily", str(_BACKUP_GC_KEEP_DAILY), "--keep-monthly", str(_BACKUP_GC_KEEP_MONTHLY),
+               "--lock-wait-s", str(_BACKUP_GC_LOCK_WAIT_S), "--data-root", str(data_root)]
+    for name in daily_push_sources(_backup_config_path()):
+        command += ["--source", name]
+    # stderr is inherited so the tool's progress lines reach journald; only the JSON report on stdout is captured.
+    try:
+        completed = subprocess.run(  # noqa: S603
+            command, stdout=subprocess.PIPE, text=True, timeout=_BACKUP_GC_TIMEOUT_S, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PITDataError(f"lake backup gc timed out: {exc}") from exc
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError) as exc:
+        raise PITDataError(f"lake backup gc returned no report: {exc}") from exc
+    report = {str(name): dict(value) for name, value in dict(payload).items() if isinstance(value, dict)}
+    return completed.returncode, report
+
+
+def _gc_source_metrics(value: dict[str, object]) -> dict[str, object]:
+    retained = value.get("retained")
+    return {
+        "delete": _as_int(value.get("delete")),
+        "delete_mib": value.get("delete_mib"),
+        "orphans": _as_int(value.get("orphans")),
+        "keep": _as_int(value.get("keep")),
+        "retained": len(retained) if isinstance(retained, list) else 0,
+        "applied": value.get("applied") is True,
+        "error": value.get("error"),
+    }
+
+
+def backup_gc(data_root: Path, *, now: datetime) -> int:
+    """Delete Drive archives that no retained lake state needs, holding the shared Drive lock."""
+    root = Path(data_root)
+    moment = _aware(now)
+    run_date = moment.astimezone(KRX_TZ).date()
+    try:
+        returncode, report = _run_backup_gc_tool(root)
+    except Exception as exc:
+        _log_job_failure("backup-gc", exc)
+        _record(root, "backup-gc", "DEGRADED", run_date, moment, reason=type(exc).__name__,
+                metrics={"detail": _failure_detail(exc)})
+        return 1
+    sources = {name: _gc_source_metrics(value) for name, value in report.items()}
+    if returncode == _BACKUP_LOCK_TIMEOUT_RC:
+        _record(root, "backup-gc", "DEGRADED", run_date, moment, reason="lock_timeout", metrics={"sources": sources})
+        return 1
+    failed = sorted(name for name, value in report.items() if "error" in value)
+    if returncode != 0 or failed:
+        reason = "source_error" if failed else f"rc_{returncode}"
+        _record(root, "backup-gc", "DEGRADED", run_date, moment, reason=reason,
+                metrics={"sources": sources, "failed": failed})
+        return 1
+    _record(root, "backup-gc", "OK", run_date, moment, metrics={"sources": sources})
+    return 0
+
+
 def _alerts_dir(data_root: Path) -> Path:
     return Path(data_root) / "ops" / "alerts"
 
@@ -1478,6 +1548,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     sub.add_parser("preseal")
     prune = sub.add_parser("backup")
     prune.add_argument("--no-lock", action="store_true")
+    sub.add_parser("backup-gc")
     sub.add_parser("audit")
     sub.add_parser("weekly-report")
     failure = sub.add_parser("alert")
@@ -1509,6 +1580,8 @@ def main(argv: list[str] | None = None) -> int:
         return morning_late(data_root, today=today, now=lambda: datetime.now(KRX_TZ))
     if args.command == "backup":
         return backup(data_root, now=moment, no_lock=args.no_lock)
+    if args.command == "backup-gc":
+        return backup_gc(data_root, now=moment)
     if args.command == "audit":
         return audit(data_root, today=today, now=moment)
     if args.command == "weekly-report":

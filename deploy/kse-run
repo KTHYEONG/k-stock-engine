@@ -49,6 +49,16 @@ case "$JOB" in
     WANT_LOG=1; WANT_STDIN=0
     MODULE_ARGV=(src.ops.jobs backup --no-lock)
     ;;
+  backup-gc)
+    NAME="kse-backup-gc"; MEM="1g"; CPUS="0.5"
+    EXTRA_ENVS=()
+    WANT_KIS=0; WANT_MALLOC=0
+    EXTRA_E=()
+    EXTRA_V=("${HOME}/.config/rclone:/tmp/.config/rclone:ro"
+             "${XDG_RUNTIME_DIR:-/run/user/${UID}}/quant-gdrive.lock:/run/quant-gdrive.lock")
+    WANT_LOG=1; WANT_STDIN=0
+    MODULE_ARGV=(src.ops.jobs backup-gc)
+    ;;
   collect-dbsec)
     NAME="kse-collect-dbsec"; MEM="1g"; CPUS="0.5"
     EXTRA_ENVS=()

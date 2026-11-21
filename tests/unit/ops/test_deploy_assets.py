@@ -30,6 +30,7 @@ UNIT_JOBS = {
     "kse-alert-drain.service": "alert-drain",
     "kse-auction-open.service": "auction-open",
     "kse-backup.service": "backup",
+    "kse-backup-gc.service": "backup-gc",
     "kse-collect-dbsec.service": "collect-dbsec",
     "kse-collect-eve.service": "collect-eve",
     "kse-daily-audit.service": "daily-audit",
@@ -169,7 +170,7 @@ def test_effective_command_equivalent_to_legacy() -> None:
         uidgid += ":" + subprocess.run(["id", "-g"], capture_output=True, text=True, check=True).stdout.strip()  # noqa: S603,S607
         assert len(json.loads(FIXTURE.read_text(encoding="utf-8"))) == 8
         assert set(UNIT_JOBS) - set(json.loads(FIXTURE.read_text(encoding="utf-8"))) == {
-        "kse-morning-late.service", "kse-alert-drain.service", "kse-preseal.service",
+        "kse-morning-late.service", "kse-alert-drain.service", "kse-preseal.service", "kse-backup-gc.service",
     }
         for unit in UNIT_JOBS:
             if unit not in json.loads(FIXTURE.read_text(encoding="utf-8")):
@@ -278,7 +279,7 @@ def test_swap_equals_memory_for_every_job() -> None:
 
 def test_units_carry_no_docker_flags() -> None:
     units = sorted(SYSTEMD.glob("kse-*.service"))
-    assert len(units) == 11
+    assert len(units) == 12
     for path in units:
         text = path.read_text(encoding="utf-8")
         assert "docker run" not in text, path.name
@@ -311,6 +312,11 @@ def test_mount_allowlist_on_effective_argv() -> None:
                     assert unit == "kse-daily-audit.service", unit
                     assert mount == home + "/quant-secrets/credential-registry.toml:/run/credential-registry.toml:ro", unit
                     continue
+                if mount.endswith(":/run/quant-gdrive.lock"):
+                    assert unit == "kse-backup-gc.service", unit
+                    assert mount.startswith("/run/user/"), unit
+                    assert mount.count(":") == 1, unit
+                    continue
                 assert mount.startswith(home + "/k-stock-engine/data:") or mount.startswith(home + "/k-stock-engine/logs:") \
                     or mount.startswith(home + "/.cache/kis:") or mount.startswith(home + "/.cache/dbsec:") \
                     or mount.startswith(home + "/.config/rclone:"), f"{unit}: {mount}"
@@ -318,7 +324,7 @@ def test_mount_allowlist_on_effective_argv() -> None:
                     assert unit == "kse-collect-dbsec.service", unit
                     assert mount.endswith(":ro"), unit
                 if "/.config/rclone:" in mount:
-                    assert unit == "kse-backup.service", unit
+                    assert unit in ("kse-backup.service", "kse-backup-gc.service"), unit
                     assert mount.endswith(":ro"), unit
 
 
@@ -415,7 +421,7 @@ def test_installer_atomically_installs_wrapper_and_discovers_timers(tmp_path: Pa
             "import json, os, pathlib, sys\n"
             "home = pathlib.Path(os.environ['HOME'])\n"
             "assert (home / '.local/lib/kse/kse-run').stat().st_mode & 0o111\n"
-            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 11\n"
+            "assert len(list((home / '.config/systemd/user').glob('kse-*.service'))) == 12\n"
             "with open(os.environ['EVENT_LOG'], 'a') as log:\n"
             "    log.write(json.dumps([pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]) + '\\n')\n",
             encoding="utf-8",
@@ -495,7 +501,7 @@ def test_alert_drain_runs_only_with_queued_mail() -> None:
 
 def test_units_are_safe_by_construction() -> None:
     services = _services()
-    assert len(services) == 10
+    assert len(services) == 11
     with tempfile.TemporaryDirectory() as home:
         prefixes = (home + "/k-stock-engine/data:", home + "/k-stock-engine/logs:",
                     home + "/.cache/kis:", home + "/.cache/dbsec:", home + "/.config/rclone:")
@@ -518,9 +524,12 @@ def test_units_are_safe_by_construction() -> None:
                     assert path.name in STORE_UNITS, f"{path.name}: {mount}"
                     assert mount.endswith(":ro"), f"{path.name}: {mount}"
                     continue
+                if mount.endswith(":/run/quant-gdrive.lock"):
+                    assert path.name == "kse-backup-gc.service", f"{path.name}: {mount}"
+                    continue
                 assert mount.startswith(prefixes), f"{path.name}: {mount}"
                 if mount.startswith(home + "/.config/rclone:"):
-                    assert path.name == "kse-backup.service"
+                    assert path.name in ("kse-backup.service", "kse-backup-gc.service")
                     assert ":ro" in mount
             if path.name == "kse-backup.service":
                 assert _exec_start(text).startswith("ExecStart=/usr/bin/flock -w 7200 %t/quant-gdrive.lock ")
@@ -580,7 +589,7 @@ def _in_window(mark: tuple[int, int], window: tuple[tuple[int, int], tuple[int, 
 
 def test_timers_avoid_sibling_windows() -> None:
     timers = sorted(SYSTEMD.glob("kse-*.timer"))
-    assert len(timers) == 9
+    assert len(timers) == 10
     for path in timers:
         if path.name == "kse-alert-drain.timer":
             # Wildcard-hour drain is exempt: its ExecCondition starts no container while the outbox is empty.
@@ -593,6 +602,28 @@ def test_timers_avoid_sibling_windows() -> None:
             for window in SIBLING_WINDOWS:
                 assert not _in_window(mark, window), f"{path.name}: {mark}"
     assert (SYSTEMD / "kse-backup.timer").read_text(encoding="utf-8").count("Persistent=true") == 1
+
+
+def test_backup_gc_unit_has_no_flock_and_mounts_host_lock() -> None:
+    text = (SYSTEMD / "kse-backup-gc.service").read_text(encoding="utf-8")
+    assert "flock" not in _exec_start(text)
+    mounts = _normalize(_unit_effective("kse-backup-gc.service"))["vols"]
+    lock_mounts = [mount for mount in mounts if mount.split(":")[-1] == "/run/quant-gdrive.lock"]
+    assert len(lock_mounts) == 1
+    # A missing host lock file would be created as a directory by the bind mount, so it is touched first.
+    assert "ExecStartPre=/usr/bin/touch %t/quant-gdrive.lock" in text.splitlines()
+
+
+def test_backup_gc_timer_sunday_1300() -> None:
+    text = (SYSTEMD / "kse-backup-gc.timer").read_text(encoding="utf-8")
+    assert [line for line in text.splitlines() if line.startswith("OnCalendar=")] == [
+        "OnCalendar=Sun *-*-* 13:00:00 Asia/Seoul",
+    ]
+    assert "Persistent=true" in text
+    mark = (13, 0)
+    assert _calendars(SYSTEMD / "kse-backup-gc.timer") == [mark]
+    assert mark not in DRIVE_SLOTS
+    assert not any(_in_window(mark, window) for window in SIBLING_WINDOWS)
 
 
 def test_vendored_deploy_library_is_pinned() -> None:

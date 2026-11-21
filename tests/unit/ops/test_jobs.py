@@ -27,6 +27,7 @@ from src.ops.jobs import (
     MORNING_RELAY_JOBS,
     audit,
     backup,
+    backup_gc,
     collect_eve,
     main,
     morning,
@@ -487,6 +488,104 @@ def test_push_backup_sources_branches(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(jobs.subprocess, "run", _bad)
     with pytest.raises(PITDataError, match="no report"):
         jobs._push_backup_sources(status_path=status, no_lock=True)
+
+
+def _gc_report(name: str = "bronze", **fields: object) -> str:
+    row: dict[str, object] = {"applied": True, "delete": 2, "delete_mib": 1.5, "orphans": 1, "keep": 4,
+                              "retained": [[1, None, 3], [2, None, 5]]}
+    row.update(fields)
+    return json.dumps({name: row}) + "\n"
+
+
+def test_backup_gc_runs_apply_with_host_lock_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[list[str], dict[str, object]]] = []
+
+    def _gc(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=_gc_report(), stderr="")
+
+    monkeypatch.setattr(jobs.subprocess, "run", _gc)
+    assert backup_gc(tmp_path, now=_morning_now()) == 0
+    command, kwargs = seen[0]
+    assert command[2:10] == ["gc", "--apply", "--lock-file", "/run/quant-gdrive.lock",
+                            "--keep-daily", "14", "--keep-monthly", "120"]
+    assert "--no-lock" not in command
+    assert [command[i + 1] for i, arg in enumerate(command) if arg == "--source"] == list(
+        jobs.daily_push_sources(jobs._backup_config_path()))
+    assert "stderr" not in kwargs
+    assert load_run_outcomes(tmp_path / "ops" / "events", DAY) == {"backup-gc": "OK"}
+
+
+def test_backup_gc_records_per_source_metrics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    records = _capture_records(monkeypatch)
+    payload = json.dumps({
+        "bronze": {"applied": True, "delete": 2, "delete_mib": 1.5, "orphans": 1, "keep": 4,
+                   "retained": [[1, None, 3], [2, None, 5]]},
+        "state": {"applied": True, "delete": 0, "delete_mib": 0.0, "orphans": 0, "keep": 9, "retained": []},
+    }) + "\n"
+    monkeypatch.setattr(jobs.subprocess, "run",
+                        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=payload, stderr=""))
+    assert backup_gc(tmp_path, now=_morning_now()) == 0
+    record = next(item for item in records if item["job"] == "backup-gc")
+    assert record["outcome"] == "OK"
+    sources = record["metrics"]["sources"]
+    assert sources["bronze"] == {"delete": 2, "delete_mib": 1.5, "orphans": 1, "keep": 4, "retained": 2,
+                                 "applied": True, "error": None}
+    assert sources["state"]["keep"] == 9
+    assert sources["state"]["retained"] == 0
+
+
+def test_backup_gc_lock_timeout_is_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reasons: list[str] = []
+
+    def _record(root: Path, job: str, outcome: str, run_date: date, moment: datetime, reason: str = "",
+                metrics: dict[str, object] | None = None) -> None:
+        reasons.append(f"{job}:{outcome}:{reason}")
+
+    monkeypatch.setattr(jobs, "_record", _record)
+    timeout_payload = json.dumps({"error": "lock timeout", "lock": "/run/quant-gdrive.lock"}) + "\n"
+    monkeypatch.setattr(jobs.subprocess, "run",
+                        lambda command, **kwargs: subprocess.CompletedProcess(command, 75, stdout=timeout_payload))
+    assert backup_gc(tmp_path, now=_morning_now()) == 1
+    assert reasons == ["backup-gc:DEGRADED:lock_timeout"]
+
+
+def test_backup_gc_source_error_is_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reasons: list[str] = []
+
+    def _record(root: Path, job: str, outcome: str, run_date: date, moment: datetime, reason: str = "",
+                metrics: dict[str, object] | None = None) -> None:
+        reasons.append(f"{job}:{outcome}:{reason}")
+
+    monkeypatch.setattr(jobs, "_record", _record)
+    monkeypatch.setattr(jobs.subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(
+        command, 1, stdout=json.dumps({"bronze": {"error": "BackupError"}}) + "\n"))
+    assert backup_gc(tmp_path, now=_morning_now()) == 1
+    assert reasons == ["backup-gc:DEGRADED:source_error"]
+
+
+def test_backup_gc_tool_failures_are_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    records = _capture_records(monkeypatch)
+
+    def _timeout(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    monkeypatch.setattr(jobs.subprocess, "run", _timeout)
+    assert backup_gc(tmp_path, now=_morning_now()) == 1
+    assert records[-1]["job"] == "backup-gc"
+    assert records[-1]["outcome"] == "DEGRADED"
+
+    monkeypatch.setattr(jobs.subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(
+        command, 1, stdout="not json\n", stderr=""))
+    assert backup_gc(tmp_path, now=_morning_now()) == 1
+    assert records[-1]["outcome"] == "DEGRADED"
+
+
+def test_main_dispatches_backup_gc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(jobs, "backup_gc", lambda root, **kwargs: seen.append("backup-gc") or 0)
+    assert main(["--data-root", str(tmp_path), "backup-gc"]) == 0
+    assert seen == ["backup-gc"]
 
 
 def test_backup_push_streams_stderr_and_captures_only_the_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
