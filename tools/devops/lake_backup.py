@@ -216,6 +216,7 @@ def _run_sources(
     for source in sources:
         work = None
         try:
+            log.info("[DATA] lake_backup command=%s source=%s status=START", args.command, source.name)
             if args.command == "push" and not source.root.is_dir():
                 if source.optional:
                     results[source.name] = {"skipped": "root_missing"}

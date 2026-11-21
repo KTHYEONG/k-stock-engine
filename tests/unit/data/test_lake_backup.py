@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 import tarfile
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -327,6 +328,11 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _plain_sha(path: Path) -> str:
+    with pa.OSFile(str(path), "rb") as raw, pa.CompressedInputStream(raw, "zstd") as stream:
+        return hashlib.sha256(stream.read()).hexdigest()
+
+
 def test_push_outputs_are_byte_identical_to_recorded_golden_digests(env: tuple[Path, Path, Path]) -> None:
     root, remote, work = env
     _golden_tree(root)
@@ -335,7 +341,9 @@ def test_push_outputs_are_byte_identical_to_recorded_golden_digests(env: tuple[P
     assert _sha(remote / "seg-8d0b2acde74edb2a.tar.zst") == "42c06b7e500d4fe783e113fda0047c7d710da5a56767cdd912212648fdb7a0d9"
     assert _sha(remote / "seg-a9060aca05adc2d9.tar.zst") == "6df185e68d67ddd69c7b2edc20668590c96a8f66f1a7eda8e175f93a937e10ea"
     assert _sha(remote / "seg-e53b9d1e47629f2f.tar.zst") == "8381ef06c12a00c6dd3413b6343afbbdba5263fd4662df28751d97b0f7c8bfc1"
-    assert _sha(remote / "index.jsonl.zst") == "fe01668bea5a21ca6eb6c4ffb39119ec3b21f01bc735cb8cc74402c53737a441"
+    # Index framing changed with the streaming rewrite; the decompressed index is the same as before.
+    assert _plain_sha(remote / "index.jsonl.zst") == "0e372dc8c29eb2ae77cf4dbb76c00ae310034db8113f3cded9d528d35e220259"
+    assert _sha(remote / "index.jsonl.zst") == "6328dd7b8dbeb8c4a3a42a5bced0f10efa3ddfdf0c4a95f52c5e53a9399453c6"
     assert _sha(remote / "MANIFEST.json") == "48e7e419e177dd7c65b540321a5fc6328cd666d8c1b9d0a0c8b5d04d8d27798c"
 
 
@@ -357,7 +365,8 @@ def test_second_push_after_new_files_matches_golden_incremental_digests(env: tup
 
     push(source, Counting(remote), work, now=datetime(2026, 10, 11, tzinfo=UTC))
     assert set(before).isdisjoint(uploaded)
-    assert _sha(remote / "index.jsonl.zst") == "1a2f85139865b74e47bd98e81a6d5ffdec0de937fe88e3c632d1ea631134426c"
+    assert _plain_sha(remote / "index.jsonl.zst") == "06eaf0091540ea15ec27ad0d628820590ce5d9d0fbcc87b4ce1c0042a7e427ea"
+    assert _sha(remote / "index.jsonl.zst") == "b3d871fa419f1c904bd194ca7b6def4b2b2d51bbbcf7ff23d605af6523e1a502"
     assert _sha(remote / "MANIFEST.json") == "254d61cfcd4d340a3d7d8575a766555b8287587db2d3e9ba8719b1f1cbfe4365"
     for name, data in before.items():
         assert (remote / name).read_bytes() == data
@@ -849,3 +858,132 @@ def test_gc_refuses_to_delete_manifest_archives_behind_an_empty_index(env: tuple
     (remote / lb.INDEX_NAME).write_bytes(lb_empty)
     with pytest.raises(BackupError, match="index is empty"):
         lb.gc("s", LocalDirStore(remote), work, now=NOW, apply=True)
+
+
+def _index_rows(count: int, prefix: str) -> list[dict[str, object]]:
+    return [
+        {"path": f"{prefix}{i:06d}", "sha256": f"{i:064x}", "size": 1, "archive": "seg-old.tar.zst", "member": f"{prefix}{i:06d}"}
+        for i in range(count)
+    ]
+
+
+def _write_index(remote: Path, rows: list[dict[str, object]]) -> bytes:
+    remote.mkdir(parents=True, exist_ok=True)
+    payload = b"".join(json.dumps(row, sort_keys=True).encode() + b"\n" for row in rows)
+    (remote / lb.INDEX_NAME).write_bytes(pa.Codec("zstd").compress(payload, asbytes=True))
+    return payload
+
+
+def _plain_index(remote: Path) -> bytes:
+    with pa.OSFile(str(remote / lb.INDEX_NAME), "rb") as raw, pa.CompressedInputStream(raw, "zstd") as stream:
+        return stream.read()
+
+
+def test_summary_filtered_to_local_paths(env: tuple[Path, Path, Path]) -> None:
+    root, remote, work = env
+    local = {f"f{i:02d}.bin": f"content-{i}".encode() for i in range(50)}
+    for rel, data in local.items():
+        _write(root, rel, data)
+    rows = _index_rows(9_950, "old")
+    rows += [
+        {"path": rel, "sha256": f"{i:064x}", "size": 1, "archive": "seg-old.tar.zst", "member": rel}
+        for i, rel in enumerate(local, start=10_000)
+    ]
+    _write_index(remote, rows)
+    wanted = frozenset(lb._iter_files(BackupSource("s", root)))
+    work.mkdir(parents=True, exist_ok=True)
+    summary = lb._summarize_index(LocalDirStore(remote), work, wanted)
+    assert len(summary.by_path) == 50
+    assert summary.hashes == set()
+    assert summary.files == 10_000
+    assert summary.raw_bytes == 10_000
+    report = push(BackupSource("s", root), LocalDirStore(remote), work, now=NOW)
+    assert (report.scanned, report.stored, report.referenced) == (50, 50, 0)
+
+
+def test_content_reference_found_by_streaming_pass(env: tuple[Path, Path, Path]) -> None:
+    root, remote, work = env
+    payload = b"shared payload"
+    _write(root, "copy.bin", payload)
+    _write_index(remote, [{
+        "path": "gone.bin", "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload),
+        "archive": "seg-old.tar.zst", "member": "gone.bin",
+    }])
+    report = push(BackupSource("s", root), LocalDirStore(remote), work, now=NOW)
+    assert (report.stored, report.referenced, report.archives) == (0, 1, 0)
+    last = json.loads(_plain_index(remote).splitlines()[-1])
+    assert (last["path"], last["archive"], last["member"]) == ("copy.bin", "seg-old.tar.zst", "gone.bin")
+
+
+def test_index_rewrite_streams_without_mmap(env: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    root, remote, work = env
+    _write(root, "a.bin", b"A" * 10)
+    old = _write_index(remote, _index_rows(200, "old"))
+    work.mkdir(parents=True, exist_ok=True)
+    store = LocalDirStore(remote)
+    summary = lb._summarize_index(store, work)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("index rewrite must stream, not map")
+
+    monkeypatch.setattr(lb, "_compress_mapped", forbidden)
+    monkeypatch.setattr(lb.mmap, "mmap", forbidden)
+    entry = lb._Entry("a.bin", hashlib.sha256(b"A" * 10).hexdigest(), 10, "seg-x.tar.zst", "a.bin")
+    lb._save_state(store, work, summary, [entry], {"source": "s", "archives": {}}, NOW)
+    assert _plain_index(remote) == old + json.dumps(asdict(entry), sort_keys=True).encode() + b"\n"
+    assert not (work / (lb.INDEX_NAME + ".prev")).exists()
+
+
+def test_manifest_totals_are_incremental_not_recounted(env: tuple[Path, Path, Path]) -> None:
+    root, remote, work = env
+    _write(root, "c.bin", b"C" * 5)
+    _write_index(remote, _index_rows(3, "old"))
+    (remote / lb.MANIFEST_NAME).write_text(json.dumps({"source": "s", "archives": {}, "files": 100, "raw_bytes": 1000}))
+    push(BackupSource("s", root), LocalDirStore(remote), work, now=NOW)
+    manifest = json.loads((remote / lb.MANIFEST_NAME).read_text())
+    assert (manifest["files"], manifest["raw_bytes"]) == (101, 1005)
+
+
+def test_push_memory_bounded_by_local_files(env: tuple[Path, Path, Path]) -> None:
+    import tracemalloc
+
+    root, remote, work = env
+    local_files = 50
+    for i in range(local_files):
+        _write(root, f"f{i:02d}.bin", f"content-{i}".encode())
+    _write_index(remote, _index_rows(20 * local_files, "old"))
+    tracemalloc.start()
+    try:
+        push(BackupSource("s", root), LocalDirStore(remote), work, now=NOW)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # The index is read in fixed-size chunks, so the peak is bounded by the chunk plus a per-file allowance.
+    bound = 3 * lb._INDEX_CHUNK + 64 * 1024 * local_files
+    assert peak < bound, (peak, bound)
+
+
+def test_manifest_without_totals_falls_back_to_counting(env: tuple[Path, Path, Path]) -> None:
+    root, remote, work = env
+    _write_index(remote, [
+        {"path": "a", "sha256": "aa" * 32, "size": 3, "archive": "seg-x.tar.zst", "member": "a"},
+        {"path": "a", "sha256": "bb" * 32, "size": 5, "archive": "seg-x.tar.zst", "member": "a"},
+        {"path": "b", "sha256": "cc" * 32, "size": 7, "archive": "seg-x.tar.zst", "member": "b"},
+    ])
+    (remote / lb.MANIFEST_NAME).write_text(json.dumps({"source": "s", "archives": {}}))
+    work.mkdir(parents=True, exist_ok=True)
+    summary = lb._summarize_index(LocalDirStore(remote), work, frozenset({"a"}))
+    assert (summary.files, summary.raw_bytes) == (2, 12)
+    assert summary.by_path == {"a": (bytes.fromhex("bb" * 32), 5)}
+
+
+def test_scan_logs_heartbeat_every_interval(env: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    root, remote, work = env
+    monkeypatch.setattr(lb, "_HEARTBEAT_FILES", 2)
+    for i in range(4):
+        _write(root, f"h{i}.bin", f"heartbeat-{i}".encode())
+    with caplog.at_level("INFO", logger="src.data.lake_backup"):
+        push(BackupSource("s", root), LocalDirStore(remote), work, now=NOW)
+    beats = [r.getMessage() for r in caplog.records if "scanned=" in r.getMessage()]
+    # pending counts candidates collected before the file that triggers the beat.
+    assert beats == ["[DATA] lake_backup source=s scanned=2 pending=1", "[DATA] lake_backup source=s scanned=4 pending=3"]

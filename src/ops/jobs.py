@@ -1067,6 +1067,9 @@ def daily_push_sources(config_path: Path) -> tuple[str, ...]:
     return names
 
 
+_BACKUP_PUSH_TIMEOUT_S: Final = 2 * 3600 + 30 * 60
+
+
 def _push_backup_sources(*, status_path: Path, no_lock: bool) -> dict[str, object]:
     command = [sys.executable, str(_tool_path()), "push", "--status", str(status_path),
                "--data-root", str(status_path.parent.parent)]
@@ -1074,12 +1077,15 @@ def _push_backup_sources(*, status_path: Path, no_lock: bool) -> dict[str, objec
         command += ["--source", name]
     if no_lock:
         command += ["--no-lock"]
+    # stderr is inherited so the tool's progress lines reach journald; only the JSON report on stdout is captured.
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=3 * 3600, check=False)  # noqa: S603
+        completed = subprocess.run(  # noqa: S603
+            command, stdout=subprocess.PIPE, text=True, timeout=_BACKUP_PUSH_TIMEOUT_S, check=False,
+        )
     except subprocess.TimeoutExpired as exc:
         raise PITDataError(f"lake backup push timed out: {exc}") from exc
     if completed.returncode != 0:
-        raise PITDataError(f"lake backup push failed rc={completed.returncode}: {completed.stderr.strip()[-300:]}")
+        raise PITDataError(f"lake backup push failed rc={completed.returncode}")
     try:
         payload = json.loads(completed.stdout.strip().splitlines()[-1])
     except (IndexError, ValueError) as exc:

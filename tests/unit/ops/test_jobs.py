@@ -489,6 +489,32 @@ def test_push_backup_sources_branches(tmp_path: Path, monkeypatch: pytest.Monkey
         jobs._push_backup_sources(status_path=status, no_lock=True)
 
 
+def test_backup_push_streams_stderr_and_captures_only_the_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def _run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"bronze": {"scanned": 2}}) + "\n", stderr=None)
+
+    monkeypatch.setattr(jobs.subprocess, "run", _run)
+    assert jobs._push_backup_sources(status_path=tmp_path / "status.json", no_lock=True) == {"bronze": {"scanned": 2}}
+    assert "capture_output" not in seen
+    assert "stderr" not in seen
+    assert seen["stdout"] == subprocess.PIPE
+    assert seen["timeout"] == jobs._BACKUP_PUSH_TIMEOUT_S
+
+
+def test_backup_push_timeout_is_below_unit_timeout_and_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert jobs._BACKUP_PUSH_TIMEOUT_S < 3 * 3600
+
+    def _timeout(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, float(kwargs["timeout"]))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(jobs.subprocess, "run", _timeout)
+    with pytest.raises(PITDataError, match="lake backup push timed out"):
+        jobs._push_backup_sources(status_path=tmp_path / "status.json", no_lock=True)
+
+
 def test_daily_push_covers_every_required_source() -> None:
     import tomllib
 

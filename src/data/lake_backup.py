@@ -51,6 +51,7 @@ _CHUNK: Final = 1 << 20
 _INDEX_CHUNK: Final = 8 * 1024 * 1024
 # Level 10 stores sampled Bronze payloads 38% smaller than level 1 at ~90 MB/s; 15 gains 5% more at 14 MB/s.
 _ZSTD_LEVEL: Final = 10
+_HEARTBEAT_FILES: Final = 5_000
 _SQLITE_SUFFIX: Final = ".sqlite3"
 _RCLONE_DIR_NOT_FOUND: Final = 3
 _ARCHIVE_RE: Final = re.compile(r"^seg-[0-9a-f]{16}\.tar\.zst$")
@@ -342,28 +343,61 @@ class _IndexSummary:
     raw_bytes: int
 
 
-def _summarize_index(store: RemoteStore, workdir: Path) -> _IndexSummary:
-    """Download and stream the index once; an absent index yields an empty summary."""
+def _manifest_totals(store: RemoteStore, workdir: Path) -> tuple[int, int] | None:
+    local = workdir / MANIFEST_NAME
+    if not store.fetch(MANIFEST_NAME, local):
+        return None
+    manifest: dict[str, Any] = json.loads(local.read_text(encoding="utf-8"))
+    files, raw_bytes = manifest.get("files"), manifest.get("raw_bytes")
+    if type(files) is int and type(raw_bytes) is int:
+        return files, raw_bytes
+    return None
+
+
+def _summarize_index(store: RemoteStore, workdir: Path, wanted_paths: frozenset[str] | None = None) -> _IndexSummary:
+    """Download and stream the index once; an absent index yields an empty summary.
+
+    ``by_path`` keeps only ``wanted_paths`` (all paths when None); ``hashes`` is filled only when None.
+    Totals come from the manifest when it carries them, otherwise from a per-path size count.
+    """
     local = workdir / INDEX_NAME
     if not store.fetch(INDEX_NAME, local):
         return _IndexSummary({}, set(), None, 0, 0)
+    totals = _manifest_totals(store, workdir)
+    counted: dict[str, int] | None = None if totals is not None else {}
     by_path: dict[str, tuple[bytes, int]] = {}
     hashes: set[bytes] = set()
     for line in _iter_index_lines(local):
         obj = json.loads(line)
+        path = obj["path"]
         digest = bytes.fromhex(obj["sha256"])
-        hashes.add(digest)
-        by_path[obj["path"]] = (digest, int(obj["size"]))
-    return _IndexSummary(by_path, hashes, local, len(by_path), sum(size for _, size in by_path.values()))
+        size = int(obj["size"])
+        if counted is not None:
+            counted[path] = size
+        if wanted_paths is None:
+            hashes.add(digest)
+            by_path[path] = (digest, size)
+        elif path in wanted_paths:
+            by_path[path] = (digest, size)
+    if totals is not None:
+        files, raw_bytes = totals
+    else:
+        assert counted is not None
+        files, raw_bytes = len(counted), sum(counted.values())
+    return _IndexSummary(by_path, hashes, local, files, raw_bytes)
 
 
-def _resolve_first_locations(summary: _IndexSummary, wanted: set[bytes]) -> dict[bytes, tuple[str, str]]:
+def _resolve_first_locations(
+    summary: _IndexSummary, wanted: set[bytes], *, require_all: bool = True
+) -> dict[bytes, tuple[str, str]]:
     """First (archive, member) per sha256 for the requested hashes via a second streaming pass."""
     found: dict[bytes, tuple[str, str]] = {}
     if not wanted:
         return found
     if summary.index_local is None:
-        raise BackupError("index has no location for referenced sha256")
+        if require_all:
+            raise BackupError("index has no location for referenced sha256")
+        return found
     for line in _iter_index_lines(summary.index_local):
         obj = json.loads(line)
         digest = bytes.fromhex(obj["sha256"])
@@ -372,7 +406,7 @@ def _resolve_first_locations(summary: _IndexSummary, wanted: set[bytes]) -> dict
             if len(found) == len(wanted):
                 break
     missing = wanted - found.keys()
-    if missing:
+    if missing and require_all:
         raise BackupError(f"index has no location for {len(missing)} referenced sha256")
     return found
 
@@ -394,13 +428,16 @@ def _save_state(
     now: datetime,
 ) -> None:
     index_path = workdir / INDEX_NAME
-    tmp_raw = workdir / (INDEX_NAME + ".raw.tmp")
-    last_byte = b"\n"
+    old_path = workdir / (INDEX_NAME + ".prev")
+    if summary.index_local is not None:
+        # The index is read from the same path it is rewritten to, so the old copy is moved aside first.
+        os.replace(summary.index_local, old_path)
     try:
-        with tmp_raw.open("wb") as out:
+        last_byte = b"\n"
+        with pa.OSFile(str(index_path), "wb") as sink, pa.CompressedOutputStream(sink, "zstd") as out:
             if summary.index_local is not None:
                 with (
-                    pa.OSFile(str(summary.index_local), "rb") as raw,
+                    pa.OSFile(str(old_path), "rb") as raw,
                     pa.CompressedInputStream(raw, "zstd") as stream,
                 ):
                     while chunk := stream.read(_INDEX_CHUNK):
@@ -410,13 +447,8 @@ def _save_state(
                 out.write(b"\n")
             for entry in new_entries:
                 out.write(json.dumps(asdict(entry), sort_keys=True).encode() + b"\n")
-        with (
-            tmp_raw.open("rb") as handle,
-            mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped,
-        ):
-            _compress_mapped(mapped, index_path)
     finally:
-        tmp_raw.unlink(missing_ok=True)
+        old_path.unlink(missing_ok=True)
     latest: dict[str, int] = {}
     files, raw_bytes = summary.files, summary.raw_bytes
     for entry in new_entries:
@@ -516,17 +548,14 @@ def _segments(pending: Sequence[_Pending], cap: int) -> Iterator[list[_Pending]]
         yield batch
 
 
-def _scan(
-    source: BackupSource, workdir: Path, summary: _IndexSummary
-) -> tuple[int, list[_Pending], list[_Pending], list[_Pending]]:
-    """Return scanned count, pending files, stored-content references, and in-run duplicates."""
-    pending: list[_Pending] = []
-    queued: set[str] = set()
-    refs: list[_Pending] = []
-    duplicates: list[_Pending] = []
+def _scan(source: BackupSource, workdir: Path, summary: _IndexSummary) -> tuple[int, list[_Pending]]:
+    """Return scanned count and every local file whose bytes may need upload or reference, in scan order."""
+    candidates: list[_Pending] = []
     scanned = 0
     for rel in _iter_files(source):
         scanned += 1
+        if scanned % _HEARTBEAT_FILES == 0:
+            _LOG.info("[DATA] lake_backup source=%s scanned=%d pending=%d", source.name, scanned, len(candidates))
         known = summary.by_path.get(rel)
         if known is not None and source.immutable:
             continue
@@ -534,14 +563,27 @@ def _scan(
         item = _Pending(rel, path, _file_sha256(path), path.stat().st_size)
         if known is not None and known[0] == bytes.fromhex(item.sha256):
             continue
-        if bytes.fromhex(item.sha256) in summary.hashes:
+        candidates.append(item)
+    return scanned, candidates
+
+
+def _classify(
+    candidates: Sequence[_Pending], found: dict[bytes, tuple[str, str]]
+) -> tuple[list[_Pending], list[_Pending], list[_Pending]]:
+    """Split candidates into pending uploads, stored-content references, and in-run duplicates."""
+    pending: list[_Pending] = []
+    queued: set[str] = set()
+    refs: list[_Pending] = []
+    duplicates: list[_Pending] = []
+    for item in candidates:
+        if bytes.fromhex(item.sha256) in found:
             refs.append(item)
         elif item.sha256 in queued:
             duplicates.append(item)
         else:
             queued.add(item.sha256)
             pending.append(item)
-    return scanned, pending, refs, duplicates
+    return pending, refs, duplicates
 
 
 def push(source: BackupSource, store: RemoteStore, workdir: Path, *, now: datetime) -> PushReport:
@@ -554,9 +596,14 @@ def push(source: BackupSource, store: RemoteStore, workdir: Path, *, now: dateti
         BackupError: a remote archive hash differs from the local one, or a store operation fails.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    summary = _summarize_index(store, workdir)
+    local_paths = frozenset(_iter_files(source))
+    summary = _summarize_index(store, workdir, local_paths)
     manifest = _load_manifest(store, workdir, source.name)
-    scanned, pending, ref_pendings, duplicates = _scan(source, workdir, summary)
+    scanned, candidates = _scan(source, workdir, summary)
+    found = _resolve_first_locations(
+        summary, {bytes.fromhex(item.sha256) for item in candidates}, require_all=False
+    )
+    pending, ref_pendings, duplicates = _classify(candidates, found)
     changed_paths = {item.rel for item in (*pending, *ref_pendings, *duplicates)}
     summary = _IndexSummary(
         {path: value for path, value in summary.by_path.items() if path in changed_paths},
@@ -591,11 +638,9 @@ def push(source: BackupSource, store: RemoteStore, workdir: Path, *, now: dateti
         archives += 1
         _LOG.info("[DATA] lake_backup source=%s archive=%s files=%d bytes=%d", source.name, name, len(batch), size)
     ref_entries: list[_Entry] = []
-    if ref_pendings:
-        locations = _resolve_first_locations(summary, {bytes.fromhex(item.sha256) for item in ref_pendings})
-        for item in ref_pendings:
-            archive, member = locations[bytes.fromhex(item.sha256)]
-            ref_entries.append(_Entry(item.rel, item.sha256, item.size, archive, member))
+    for item in ref_pendings:
+        archive, member = found[bytes.fromhex(item.sha256)]
+        ref_entries.append(_Entry(item.rel, item.sha256, item.size, archive, member))
     dup_entries: list[_Entry] = []
     for item in duplicates:
         loc = placed[item.sha256]
