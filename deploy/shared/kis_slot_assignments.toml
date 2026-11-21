@@ -1,6 +1,6 @@
 # canonical: krx-alpha/deploy/shared/kis_slot_assignments.toml schema=1
 schema_version = 1
-pool = [1, 2, 3, 4, 5]
+pool = [1, 2, 3, 4, 5, 6]
 host_data_slots = [1, 2, 3, 4]
 
 [selectors.kca]
@@ -14,7 +14,7 @@ COLLECTION_AFTERMARKET_BOOK_SLOTS = [2, 3]
 [selectors.krx]
 KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT = 2
 KRX_ALPHA_PREMARKET_CREDENTIAL_SLOT = 5
-KRX_ALPHA_REGULAR_KIS_CREDENTIAL_SLOTS = [3, 4]
+KRX_ALPHA_REGULAR_KIS_CREDENTIAL_SLOTS = [3, 4, 6]
 KRX_ALPHA_REGULAR_KIS_NXT_CREDENTIAL_SLOTS = [1, 2]
 
 [[assignment]]
@@ -110,6 +110,13 @@ windows = ["08:28-15:32"]
 
 [[assignment]]
 slot = 4
+project = "krx"
+purpose = "regular_kis_ws"
+channel = "ws"
+windows = ["08:28-15:32"]
+
+[[assignment]]
+slot = 6
 project = "krx"
 purpose = "regular_kis_ws"
 channel = "ws"
