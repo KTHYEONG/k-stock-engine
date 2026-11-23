@@ -202,6 +202,8 @@ jobs:
           vps_promote_latest ghcr.io/kthyeong/k-stock-engine $COMMIT_SHA
           vps_stage converge
           bash ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/install_systemd.sh
+          mkdir -p ~/k-stock-engine/deploy/ops
+          install -m 0755 ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/ops/* ~/k-stock-engine/deploy/ops/
           rm -f ~/k-stock-engine/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
           # install_systemd.sh copies units and kse-run out of staging, so staging trees are disposable;
           # also reap trees left by earlier deploys (deploys are serialized by the deploy-or-vps group).

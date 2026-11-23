@@ -882,3 +882,47 @@ def test_banner_survives_inspect_failure(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "[SYS] kse-run status=START job=morning image=\n" in result.stderr
     assert len(log.read_text(encoding="utf-8").splitlines()) == 1
+
+
+OPS = REPO / "deploy" / "ops"
+PROBE = OPS / "kse_probe.py"
+PROBE_HOST = OPS / "kse_probe_host.py"
+PROBE_WRAPPER = OPS / "kse-probe.sh"
+
+
+def test_kse_probe_shipped_by_deploy_workflow() -> None:
+    text = (REPO / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    install = text.index("staging-$COMMIT_SHA/install_systemd.sh")
+    step = "install -m 0755 ~/k-stock-engine/.deploy/staging-$COMMIT_SHA/ops/* ~/k-stock-engine/deploy/ops/"
+    assert install < text.index(step) < text.index("rm -rf ~/k-stock-engine/.deploy/staging-$COMMIT_SHA", install)
+    assert {"kse-probe.sh", "kse_probe.py", "kse_probe_host.py"} <= {path.name for path in OPS.iterdir()}
+
+
+def test_kse_probe_wrapper_usage_exit_2(tmp_path: Path) -> None:
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    for args in ([], ["BOGUS"], ["OPEN", "2026-1-1"], ["OPEN", "2026-11-24", "extra"]):
+        result = subprocess.run(["bash", str(PROBE_WRAPPER), *args],  # noqa: S603,S607
+                                capture_output=True, text=True, env=env, check=False)
+        assert result.returncode == 2, args
+        assert result.stdout == "", args
+        assert result.stderr.startswith("usage: kse-probe.sh"), args
+
+
+def test_kse_probe_container_is_offline_and_read_only() -> None:
+    text = PROBE_WRAPPER.read_text(encoding="utf-8")
+    assert "docker run --rm --network none --memory 1g --cpus 1" in text
+    assert '"$OPS:/ops:ro"' in text
+    assert '"$TMP:/host:ro"' in text
+    assert "--privileged" not in text
+
+
+def test_probe_has_no_ssh_hop() -> None:
+    assert re.search(r"\bssh\b", PROBE.read_text(encoding="utf-8")) is None
+
+
+def test_probe_sources_parse_and_host_part_is_stdlib_only() -> None:
+    for path in (PROBE, PROBE_HOST):
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    host_text = PROBE_HOST.read_text(encoding="utf-8")
+    assert "polars" not in host_text
+    assert "pyarrow" not in host_text
