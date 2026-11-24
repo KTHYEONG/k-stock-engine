@@ -16,7 +16,7 @@ KRX_ALPHA_SNAPSHOT_KIS_DATA_SLOT = 2
 KRX_ALPHA_MARKET_SWEEP_KIS_DATA_SLOT = 6
 KRX_ALPHA_PREMARKET_CREDENTIAL_SLOT = 5
 KRX_ALPHA_REGULAR_KIS_CREDENTIAL_SLOTS = [3, 4, 6]
-KRX_ALPHA_REGULAR_KIS_NXT_CREDENTIAL_SLOTS = [1, 2]
+KRX_ALPHA_REGULAR_KIS_NXT_CREDENTIAL_SLOTS = [1, 2, 5]
 
 [[assignment]]
 slot = 1
@@ -84,9 +84,9 @@ windows = ["07:58-08:50"]
 [[assignment]]
 slot = 5
 project = "krx"
-purpose = "regular_kis_dynamic_ws"
+purpose = "regular_nxt_ws"
 channel = "ws"
-windows = ["09:00-15:32"]
+windows = ["08:58-15:22"]
 
 [[assignment]]
 slot = 5
@@ -153,6 +153,20 @@ windows = ["15:40-20:00"]
 
 [[assignment]]
 slot = 4
+project = "krx"
+purpose = "aftermarket_ws"
+channel = "ws"
+windows = ["15:40-20:00"]
+
+[[assignment]]
+slot = 5
+project = "krx"
+purpose = "aftermarket_ws"
+channel = "ws"
+windows = ["15:40-20:00"]
+
+[[assignment]]
+slot = 6
 project = "krx"
 purpose = "aftermarket_ws"
 channel = "ws"
