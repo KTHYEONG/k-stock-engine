@@ -482,3 +482,124 @@ def test_morning_retry_preserves_empty_evidence_until_page_arrives(tmp_path: Pat
     latest = ctx.catalog.latest(source=job.source, natural_keys={SESSIONS[-1].isoformat()})
     assert latest[SESSIONS[-1].isoformat()].status == EvidenceStatus.SUCCESS
     assert job.pending(retry) == []
+
+
+def _record_daily_market(ctx, session, status):  # type: ignore[no-untyped-def]
+    import src.data.jobs.krx as krx_jobs
+    from src.core.pit import EvidenceKind
+    from src.data.receipt_catalog import EvidenceStatus
+
+    if status == EvidenceStatus.EMPTY:
+        payload = krx_jobs._krx_empty_scoped_payload(
+            kind=EvidenceKind.DAILY_MARKET,
+            source=krx_jobs.KRX_DAILY_MARKET_SOURCE,
+            session=session,
+            retrieved_at=NOW_AFTER_CLOSE,
+        )
+    else:
+        payload = krx_jobs.krx_daily_market_scoped_payload(
+            records=[_daily_row()], session=session, retrieved_at=NOW_AFTER_CLOSE
+        )
+    ctx.writer.persist_many((payload,))
+
+
+def _series_job_cases():  # type: ignore[no-untyped-def]
+    import src.data.jobs.krx as krx_jobs
+
+    return [krx_jobs.KrxHedgeSeriesJob, krx_jobs.KrxTrendSeriesJob, krx_jobs.KrxCashSeriesJob]
+
+
+@pytest.fixture
+def _series_env(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    import src.data.cash_series_silver as cash_silver
+    import src.data.jobs.krx as krx_jobs
+
+    monkeypatch.setattr(krx_jobs, "_xkrx_sessions", _stub_calendar)
+    monkeypatch.setattr(
+        cash_silver, "load_cash_series_config", lambda _cfg: type("_Cfg", (), {"collection_start": SESSIONS[0]})()
+    )
+
+
+@pytest.mark.parametrize("job_cls", _series_job_cases())
+@pytest.mark.usefixtures("_series_env")
+def test_series_skips_day_with_empty_daily_market(job_cls, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from src.data.receipt_catalog import EvidenceStatus
+
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_HedgeCollector())
+    _record_daily_market(ctx, SESSIONS[1], EvidenceStatus.EMPTY)
+
+    keys = [unit.natural_key for unit in job_cls().pending(ctx)]
+
+    assert SESSIONS[1].isoformat() not in keys
+    assert keys == [SESSIONS[0].isoformat(), SESSIONS[2].isoformat()]
+
+
+@pytest.mark.parametrize("job_cls", _series_job_cases())
+@pytest.mark.usefixtures("_series_env")
+def test_series_keeps_day_without_daily_market_receipt(job_cls, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_HedgeCollector())
+
+    keys = [unit.natural_key for unit in job_cls().pending(ctx)]
+
+    assert keys == [day.isoformat() for day in SESSIONS]
+
+
+@pytest.mark.parametrize("job_cls", _series_job_cases())
+@pytest.mark.usefixtures("_series_env")
+def test_series_keeps_retry_empty_session(job_cls, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from dataclasses import replace
+
+    from src.data.receipt_catalog import EvidenceStatus
+
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_HedgeCollector())
+    _record_daily_market(ctx, SESSIONS[1], EvidenceStatus.EMPTY)
+    retry = replace(ctx, retry_empty_session=SESSIONS[1])
+
+    keys = [unit.natural_key for unit in job_cls().pending(retry)]
+
+    assert keys == [day.isoformat() for day in SESSIONS]
+
+
+@pytest.mark.parametrize("job_cls", _series_job_cases())
+@pytest.mark.usefixtures("_series_env")
+def test_series_keeps_day_with_success_daily_market(job_cls, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from src.data.receipt_catalog import EvidenceStatus
+
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_HedgeCollector())
+    _record_daily_market(ctx, SESSIONS[1], EvidenceStatus.SUCCESS)
+
+    keys = [unit.natural_key for unit in job_cls().pending(ctx)]
+
+    assert keys == [day.isoformat() for day in SESSIONS]
+
+
+@pytest.mark.usefixtures("_series_env")
+def test_daily_market_pending_unchanged_by_series_filter(tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    import src.data.jobs.krx as krx_jobs
+    from src.data.receipt_catalog import EvidenceStatus
+
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_KrxCollector())
+    _record_daily_market(ctx, SESSIONS[1], EvidenceStatus.EMPTY)
+
+    keys = [unit.natural_key for unit in krx_jobs.KrxDailyMarketJob().pending(ctx)]
+
+    assert keys == [SESSIONS[0].isoformat(), SESSIONS[2].isoformat()]
+
+
+@pytest.mark.usefixtures("_series_env")
+def test_series_exchange_closed_skip_is_logged_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    import src.data.jobs.krx as krx_jobs
+    from src.data.receipt_catalog import EvidenceStatus
+
+    ctx = _ctx(_runtime(tmp_path), _provider(), collector=_HedgeCollector())
+    _record_daily_market(ctx, SESSIONS[1], EvidenceStatus.EMPTY)
+
+    with caplog.at_level(logging.INFO, logger=krx_jobs.__name__):
+        krx_jobs.KrxHedgeSeriesJob().pending(ctx)
+
+    records = [r.getMessage() for r in caplog.records if "job_pending" in r.getMessage()]
+    assert records == [
+        "[DATA] job_pending source=krx_hedge_series skipped_exchange_closed=1 sessions=2026-01-05"
+    ]

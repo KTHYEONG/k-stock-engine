@@ -8,6 +8,7 @@ after 18:00 KST of that day, so intraday partial data can never enter Bronze.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -64,6 +65,8 @@ KRX_CHUNK_SIZE = 5
 _KST = timedelta(hours=9)
 
 _ANSWERED = frozenset({EvidenceStatus.SUCCESS, EvidenceStatus.EMPTY, EvidenceStatus.EXTRACTION_FAILED})
+_LOG = logging.getLogger(__name__)
+_LOG_SKIPPED_SESSIONS_MAX = 5
 
 
 def _kst_now(now: datetime) -> datetime:
@@ -188,6 +191,35 @@ def _index_series_payload(
     )
 
 
+def _exchange_closed_sessions(ctx: JobContext, sessions: Sequence[date]) -> frozenset[date]:
+    """Sessions the exchange did not trade, by an EMPTY daily-market receipt.
+
+    The session whose empty answer is being retried is not yet evidence of closure.
+    """
+    if not sessions:
+        return frozenset()
+    latest = ctx.catalog.latest(
+        source=KRX_DAILY_MARKET_SOURCE, natural_keys={day.isoformat() for day in sessions}
+    )
+    return frozenset(
+        day
+        for day in sessions
+        if (entry := latest.get(day.isoformat())) is not None
+        and entry.status == EvidenceStatus.EMPTY
+        and day != ctx.retry_empty_session
+    )
+
+
+def _log_exchange_closed_skip(source: str, closed: frozenset[date]) -> None:
+    if not closed:
+        return
+    listed = ",".join(day.isoformat() for day in sorted(closed)[:_LOG_SKIPPED_SESSIONS_MAX])
+    _LOG.info(
+        "[DATA] job_pending source=%s skipped_exchange_closed=%d sessions=%s",
+        source, len(closed), listed,
+    )
+
+
 def _pending_index_series(
     *, source: str, config_path_of: Callable[[RuntimeConfig], Path], ctx: JobContext
 ) -> Sequence[JobUnit]:
@@ -197,6 +229,9 @@ def _pending_index_series(
 
     config = load_hedge_series_config(config_path_of(load_runtime_config()))
     sessions = completed_sessions(evidence_start=config.collection_start, now=ctx.now())
+    closed = _exchange_closed_sessions(ctx, sessions)
+    _log_exchange_closed_skip(source, closed)
+    sessions = tuple(day for day in sessions if day not in closed)
     if not sessions:
         return ()
     answered = ctx.catalog.latest(source=source, natural_keys={day.isoformat() for day in sessions})
@@ -451,6 +486,9 @@ class KrxCashSeriesJob:
 
         cash = load_cash_series_config(load_runtime_config().cash_series)
         sessions = completed_sessions(evidence_start=cash.collection_start, now=ctx.now())
+        closed = _exchange_closed_sessions(ctx, sessions)
+        _log_exchange_closed_skip(self.source, closed)
+        sessions = tuple(day for day in sessions if day not in closed)
         if not sessions:
             return ()
         answered = ctx.catalog.latest(source=self.source, natural_keys={day.isoformat() for day in sessions})
