@@ -317,11 +317,8 @@ def _golden_tree(root: Path) -> None:
     _write(root, "a3.bin", b"C" * 20)
     _write(root, "dup_copy.bin", b"A" * 20)
     _write(root, "sub/c.bin", b"D" * 20)
-    db = sqlite3.connect(root / "catalog.sqlite3")
-    db.execute("create table t (v integer)")
-    db.execute("insert into t values (42)")
-    db.commit()
-    db.close()
+    # No SQLite file here: backup-API snapshot bytes depend on the SQLite build (CI Python 3.11.18 broke the
+    # digests on 2026-11-26); the snapshot path is covered by test_sqlite_database_is_backed_up_as_a_consistent_snapshot.
 
 
 def _sha(path: Path) -> str:
@@ -337,14 +334,12 @@ def test_push_outputs_are_byte_identical_to_recorded_golden_digests(env: tuple[P
     root, remote, work = env
     _golden_tree(root)
     push(BackupSource("golden", root, segment_bytes=40), LocalDirStore(remote), work, now=NOW)
-    assert _sha(remote / "seg-0b6c11a1d219df95.tar.zst") == "055e152eb0df57a85e2834db3940b4139aa97914e126304780cd34d93509015c"
-    assert _sha(remote / "seg-8d0b2acde74edb2a.tar.zst") == "42c06b7e500d4fe783e113fda0047c7d710da5a56767cdd912212648fdb7a0d9"
+    assert sorted(p.name for p in remote.glob("seg-*.tar.zst")) == ["seg-41113b3e168cc3e8.tar.zst", "seg-a9060aca05adc2d9.tar.zst"]
+    assert _sha(remote / "seg-41113b3e168cc3e8.tar.zst") == "6d1d7648cc48ce9a790d55848109985bfa7ad804a22b4ede3bbea1e4adb103da"
     assert _sha(remote / "seg-a9060aca05adc2d9.tar.zst") == "6df185e68d67ddd69c7b2edc20668590c96a8f66f1a7eda8e175f93a937e10ea"
-    assert _sha(remote / "seg-e53b9d1e47629f2f.tar.zst") == "8381ef06c12a00c6dd3413b6343afbbdba5263fd4662df28751d97b0f7c8bfc1"
-    # Index framing changed with the streaming rewrite; the decompressed index is the same as before.
-    assert _plain_sha(remote / "index.jsonl.zst") == "0e372dc8c29eb2ae77cf4dbb76c00ae310034db8113f3cded9d528d35e220259"
-    assert _sha(remote / "index.jsonl.zst") == "6328dd7b8dbeb8c4a3a42a5bced0f10efa3ddfdf0c4a95f52c5e53a9399453c6"
-    assert _sha(remote / "MANIFEST.json") == "48e7e419e177dd7c65b540321a5fc6328cd666d8c1b9d0a0c8b5d04d8d27798c"
+    assert _plain_sha(remote / "index.jsonl.zst") == "d0e0055003dee80a8de93cc57cc9c17925e860ba8c1be6794de359dab14555b1"
+    assert _sha(remote / "index.jsonl.zst") == "1901dbf2d591b18513ff7b44cb21cb3c956a99abade70c31af2bc918cd361db3"
+    assert _sha(remote / "MANIFEST.json") == "3c7d2aaf1f019e1a97197fa137c91dbb9ce39d449088c49820934cc055c8f56a"
 
 
 def test_second_push_after_new_files_matches_golden_incremental_digests(env: tuple[Path, Path, Path]) -> None:
@@ -365,9 +360,9 @@ def test_second_push_after_new_files_matches_golden_incremental_digests(env: tup
 
     push(source, Counting(remote), work, now=datetime(2026, 10, 11, tzinfo=UTC))
     assert set(before).isdisjoint(uploaded)
-    assert _plain_sha(remote / "index.jsonl.zst") == "06eaf0091540ea15ec27ad0d628820590ce5d9d0fbcc87b4ce1c0042a7e427ea"
-    assert _sha(remote / "index.jsonl.zst") == "b3d871fa419f1c904bd194ca7b6def4b2b2d51bbbcf7ff23d605af6523e1a502"
-    assert _sha(remote / "MANIFEST.json") == "254d61cfcd4d340a3d7d8575a766555b8287587db2d3e9ba8719b1f1cbfe4365"
+    assert _plain_sha(remote / "index.jsonl.zst") == "bf288062b6b802a34150ce0823a04d047db673712dcd96e0d44863b25e9ff8cb"
+    assert _sha(remote / "index.jsonl.zst") == "8e72e61ef29a307d997f46c1960dd5efbe78266db9edf24836666fe692a4462f"
+    assert _sha(remote / "MANIFEST.json") == "4e1ce32ea62be5ea6a6cb7217c701ece2e4908fca13841561fa222a293923360"
     for name, data in before.items():
         assert (remote / name).read_bytes() == data
 
