@@ -582,12 +582,13 @@ def test_refresh_scope_collect_dry_run_reports_pending(tmp_path: Path) -> None:
     report = refresh_scope(ctx, collect=True, dry_run=True, emit=events.append)
     assert report.status == "dry_run"
     assert report.planned == ()
-    assert len(report.collection) == 18
+    assert len(report.collection) == 19
     assert {str(step["job"]) for step in report.collection} == {
         "dart_corp_codes", "dart_disclosures", "dart_facts", "dividend_decisions",
         "earnings_releases",
         "krx_daily_market", "krx_security_master",
         "krx_hedge_series", "krx_trend_series", "krx_cash_series",
+        "kis_stock_master",
         "kind_notice_search", "kind_notice_documents",
         "ls_investor_flow", "kis_investor_flow", "kis_industry",
         "dbsec_ticker_master", "dbsec_daily_chart", "dbsec_closing_bar",

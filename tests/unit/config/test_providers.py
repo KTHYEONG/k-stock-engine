@@ -743,3 +743,52 @@ def test_dbsec_reconcile_policy_rejects_out_of_range_rates() -> None:
         values[field] = bad
         with pytest.raises(pydantic.ValidationError):
             DbsecPolicy.model_validate(values)
+
+
+def test_kis_master_policy_loads_from_toml() -> None:
+    from src.config.providers import KisMasterPolicy
+
+    provider = _policy()
+
+    assert provider.kis_master == KisMasterPolicy(
+        base_url="https://new.real.download.dws.co.kr/common/master",
+        files={"kospi": "kospi_code.mst.zip", "kosdaq": "kosdaq_code.mst.zip"},
+        circuit_threshold=3,
+        min_interval_seconds=1.0,
+        timeout_seconds=30.0,
+        daily_limit=40,
+        max_bytes=8_000_000,
+        min_recapture_minutes=120,
+    )
+    runner = provider.runner("kis_master")
+    assert runner.quota_provider == "KISMASTER"
+    assert runner.daily_budget == 40
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"files": {"kospi": "kospi_code.mst.zip"}},
+        {"files": {"kospi": "kospi_code.mst.zip", "kosdaq": "kosdaq_code.zip"}},
+        {"base_url": "http://new.real.download.dws.co.kr/common/master"},
+    ],
+)
+def test_kis_master_policy_rejects_bad_files(overrides: dict) -> None:
+    from pydantic import ValidationError
+
+    from src.config.providers import KisMasterPolicy
+
+    values = {
+        "base_url": "https://new.real.download.dws.co.kr/common/master",
+        "files": {"kospi": "kospi_code.mst.zip", "kosdaq": "kosdaq_code.mst.zip"},
+        "circuit_threshold": 3,
+        "min_interval_seconds": 1.0,
+        "timeout_seconds": 30.0,
+        "daily_limit": 40,
+        "max_bytes": 8_000_000,
+        "min_recapture_minutes": 120,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError):
+        KisMasterPolicy(**values)

@@ -124,6 +124,17 @@ relay_max_age_hours = 36
 relay_clock_skew_seconds = 300
 relay_attempts = 3
 
+# KIS whole-market stock-master files (public, no auth). Captured into Bronze only.
+[kis_master]
+base_url = "https://new.real.download.dws.co.kr/common/master"
+files = { kospi = "kospi_code.mst.zip", kosdaq = "kosdaq_code.mst.zip" }
+circuit_threshold = 3
+min_interval_seconds = 1.0
+timeout_seconds = 30.0
+daily_limit = 40
+max_bytes = 8000000
+min_recapture_minutes = 120
+
 # Dividend decision plausibility gate. An implausible DPS is withheld, never repaired.
 [dividends]
 max_yield = 0.5

@@ -431,6 +431,37 @@ class KindPolicy(BaseModel):
         return cleaned
 
 
+class KisMasterPolicy(BaseModel):
+    """KIS stock-master file capture policy: public files, pacing and size bounds."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    base_url: str
+    files: dict[str, str]
+    circuit_threshold: PositiveInt
+    min_interval_seconds: PositiveFloat
+    timeout_seconds: PositiveFloat
+    daily_limit: PositiveInt
+    max_bytes: PositiveInt
+    min_recapture_minutes: PositiveInt
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("KIS master base_url must be an https URL")
+        return value
+
+    @field_validator("files")
+    @classmethod
+    def _check_files(cls, value: dict[str, str]) -> dict[str, str]:
+        if set(value) != {"kospi", "kosdaq"}:
+            raise ValueError("KIS master files must declare exactly kospi and kosdaq")
+        if not all(name.endswith(".mst.zip") for name in value.values()):
+            raise ValueError("KIS master file names must end with .mst.zip")
+        return value
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerPolicy:
     """Provider-specific safety limits the job runner enforces."""
@@ -465,6 +496,16 @@ class ProviderPolicy(BaseModel):
     ls: LsPolicy
     dbsec: DbsecPolicy
     kind: KindPolicy
+    kis_master: KisMasterPolicy = KisMasterPolicy(
+        base_url="https://new.real.download.dws.co.kr/common/master",
+        files={"kospi": "kospi_code.mst.zip", "kosdaq": "kosdaq_code.mst.zip"},
+        circuit_threshold=3,
+        min_interval_seconds=1.0,
+        timeout_seconds=30.0,
+        daily_limit=40,
+        max_bytes=8_000_000,
+        min_recapture_minutes=120,
+    )
     dividends: DividendPlausibilityPolicy = DividendPlausibilityPolicy()
     earnings_releases: EarningsReleasePolicy = EarningsReleasePolicy()
 
@@ -497,7 +538,7 @@ class ProviderPolicy(BaseModel):
         """Return the safety limits the job runner enforces for one provider.
 
         Args:
-            provider: ``"dart"``, ``"kis"``, ``"krx"``, ``"ls"``, ``"dbsec"`` or ``"kind"``.
+            provider: ``"dart"``, ``"kis"``, ``"krx"``, ``"ls"``, ``"dbsec"``, ``"kind"`` or ``"kis_master"``.
             key_env: DART key selecting its budget and reserve; the default
                 key applies when omitted. The DART ``quota_provider`` is a
                 ``"DART"`` placeholder here: the per-key ledger name depends on
@@ -557,6 +598,14 @@ class ProviderPolicy(BaseModel):
                 daily_budget=self.kind.daily_limit,
                 daily_reserve=0,
                 circuit_threshold=self.kind.circuit_threshold,
+                avoid_windows_kst=(),
+            )
+        if name == "kis_master":
+            return RunnerPolicy(
+                quota_provider="KISMASTER",
+                daily_budget=self.kis_master.daily_limit,
+                daily_reserve=0,
+                circuit_threshold=self.kis_master.circuit_threshold,
                 avoid_windows_kst=(),
             )
         raise ConfigError(f"unknown provider for runner policy: {provider!r}")

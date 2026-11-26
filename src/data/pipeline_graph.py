@@ -193,6 +193,7 @@ class CollectionReport:
 
 
 OPTIONAL_COLLECTION_JOBS: Final[frozenset[str]] = frozenset({
+    "kis_stock_master",
     "kind_notice_search",
     "kind_notice_documents",
     "kis_industry",
@@ -1437,6 +1438,39 @@ def _run_krx_collection_step(
     )
 
 
+def _run_kis_master_collection_step(
+    ctx: RefreshContext, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
+) -> CollectionStepReport:
+    """Capture the public KIS stock-master zips into Bronze without any credential."""
+    from src.config import load_provider_policy, load_runtime_config
+    from src.data.jobs.kis_master import KisStockMasterJob, build_kis_master_job_context
+    from src.data.jobs.runner import run_job
+    from src.integrations.kis.master import build_kis_master_client
+    from src.integrations.quota import ProviderQuotaStateStore
+
+    runtime_config = load_runtime_config()
+    provider = load_provider_policy(runtime_config)
+    collector = None
+    if not dry_run:  # pragma: no cover - live provider path
+        collector = build_kis_master_client(
+            policy=provider.kis_master,
+            quota_store=ProviderQuotaStateStore(ctx.runtime.workspace.state_root / "quota"),
+        )
+    job_ctx = build_kis_master_job_context(runtime=ctx.runtime, provider=provider, collector=collector)
+    report = run_job(
+        KisStockMasterJob(),
+        job_ctx,
+        chunk_size=2,
+        max_chunks=None,
+        dry_run=dry_run,
+        emit=emit,
+    )
+    return CollectionStepReport(
+        job="kis_stock_master", status=report.status, done=report.done,
+        pending_left=report.pending_left, requests_used=report.requests_used,
+    )
+
+
 def _run_dbsec_collection_step(
     ctx: RefreshContext, job_name: str, *, dry_run: bool, emit: Callable[[Mapping[str, object]], None]
 ) -> CollectionStepReport:
@@ -1746,6 +1780,7 @@ def _default_collection_steps() -> tuple[CollectionStep, ...]:
                 ctx, "krx_cash_series", dry_run=dry_run, emit=emit
             ),
         ),
+        ("kis_stock_master", _run_kis_master_collection_step),
         (
             "kind_notice_search",
             lambda ctx, *, dry_run, emit: _run_kind_collection_step(

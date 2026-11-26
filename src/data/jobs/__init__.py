@@ -30,6 +30,7 @@ from src.data.jobs.kind import (
     build_kind_job_context,
     resolve_kind_job,
 )
+from src.data.jobs.kis_master import KisStockMasterJob, build_kis_master_job_context
 from src.data.jobs.krx import (
     KRX_JOBS,
     KrxDailyMarketJob,
@@ -62,6 +63,7 @@ __all__ = [
     "KindNoticeDocumentJob",
     "KindNoticeSearchJob",
     "KisInvestorFlowJob",
+    "KisStockMasterJob",
     "KrxDailyMarketJob",
     "KrxHedgeSeriesJob",
     "KrxSecurityMasterJob",
@@ -71,6 +73,7 @@ __all__ = [
     "build_job_context",
     "build_kind_job_context",
     "build_kis_job_context",
+    "build_kis_master_job_context",
     "build_krx_job_context",
     "build_ls_job_context",
     "corp_code_bridge",

@@ -40,6 +40,15 @@ KRX_TZ = ZoneInfo("Asia/Seoul")
 DAY = date(2026, 10, 8)
 
 
+_REAL_COLLECT_KIS_MASTER = jobs._collect_kis_master
+
+
+@pytest.fixture(autouse=True)
+def _no_live_kis_master(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seal phases never reach the public KIS master URL from unit tests."""
+    monkeypatch.setattr(jobs, "_collect_kis_master", lambda root, *, now: {"status": "complete", "done": 0})
+
+
 def _morning_now() -> datetime:
     return datetime(2026, 10, 8, 7, 30, tzinfo=KRX_TZ)
 
@@ -2983,3 +2992,68 @@ def test_backup_prune_failure_records_elapsed(tmp_path: Path, monkeypatch: pytes
     degraded = next(item for item in _backup_records(tmp_path) if item["job"] == "backup")
     assert degraded["outcome"] == "DEGRADED"
     assert {"push", "prune_bronze"} <= set(degraded["metrics"]["elapsed_s"])
+
+
+def test_evening_steps_include_kis_master() -> None:
+    from src.data.pipeline_graph import OPTIONAL_COLLECTION_JOBS
+
+    assert "kis_stock_master" in EVENING_COLLECT_STEPS
+    assert "kis_stock_master" in OPTIONAL_COLLECTION_JOBS
+
+
+def test_collect_kis_master_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.data.pipeline_graph as graph
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(graph, "run_collection_jobs", _boom)
+
+    result = _REAL_COLLECT_KIS_MASTER(tmp_path, now=_morning_now())
+
+    assert result == {"status": "error", "error": "RuntimeError"}
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [((), {"status": "missing", "done": 0}), (("complete",), {"status": "complete", "done": 2})],
+)
+def test_collect_kis_master_reports_step_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steps: tuple[str, ...], expected: dict[str, object],
+) -> None:
+    from types import SimpleNamespace
+
+    import src.data.pipeline_graph as graph
+
+    report = SimpleNamespace(steps=[SimpleNamespace(status=status, done=2) for status in steps])
+    monkeypatch.setattr(graph, "build_refresh_context", lambda *a, **k: object())
+    monkeypatch.setattr(graph, "run_collection_jobs", lambda *a, **k: report)
+    monkeypatch.setattr("src.data.runtime.resolve_data_runtime", lambda **k: object())
+
+    assert _REAL_COLLECT_KIS_MASTER(tmp_path, now=_morning_now()) == expected
+
+
+def test_seal_phases_collect_master_before_relay_and_never_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    _morning_stubs(monkeypatch, calls, datetime(2026, 10, 8, 8, 31, tzinfo=KRX_TZ))
+    monkeypatch.setattr(jobs, "_poll_krx_once", lambda *a, **k: True)
+
+    def master(root: Path, *, now: datetime) -> dict[str, object]:
+        calls.append("master")
+        return {"status": "error", "error": "RuntimeError"}
+
+    def relay(root: Path, *, now: datetime) -> list[dict[str, object]]:
+        calls.append("relay")
+        return []
+
+    monkeypatch.setattr(jobs, "_collect_kis_master", master)
+    monkeypatch.setattr(jobs, "_import_kind_relay", relay)
+    clock = _Clock(_morning_now())
+
+    assert morning(tmp_path, today=DAY, now=clock.now, sleep=clock.sleep) == 0
+    assert calls[:2] == ["master", "relay"]
+    event = json.loads((tmp_path / "ops/events/2026-10/2026-10-08.jsonl").read_text())
+    assert event["outcome"] == "OK"
+    assert event["metrics"]["kis_master"]["status"] == "error"

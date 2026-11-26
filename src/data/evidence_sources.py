@@ -33,6 +33,7 @@ __all__ = [
     "KIND_NOTICE_SEARCH_SOURCE",
     "KIS_FLOW_SOURCE",
     "KIS_INDUSTRY_SOURCE",
+    "KIS_STOCK_MASTER_SOURCE",
     "KRX_CASH_SERIES_SOURCE",
     "KRX_DAILY_MARKET_SOURCE",
     "KRX_HEDGE_SERIES_SOURCE",
@@ -58,6 +59,7 @@ KRX_HEDGE_SERIES_SOURCE = "krx_hedge_series"
 KRX_TREND_SERIES_SOURCE = "krx_trend_series"
 KRX_CASH_SERIES_SOURCE = "krx_cash_series"
 KRX_SECURITY_MASTER_SOURCE = "krx_security_master"
+KIS_STOCK_MASTER_SOURCE = "kis_stock_master"
 FINANCIAL_FACTS_SOURCE = "financial_facts"
 DART_DISCLOSURES_SOURCE = "dart_disclosures"
 DART_CORP_DISCLOSURES_SOURCE = "dart_corp_disclosures"
@@ -218,6 +220,16 @@ SOURCE_CONTRACTS: Final[Mapping[str, SourceContract]] = {
             source=KRX_SECURITY_MASTER_SOURCE,
             kind=EvidenceKind.SECURITY_MASTER,
             provider="KRX",
+            endpoints=frozenset(),
+            envelope=EnvelopeFormat.NATIVE,
+            coverage=CoverageShape.KEYED,
+            row_fields=frozenset(),
+            query_fields=frozenset(),
+        ),
+        SourceContract(
+            source=KIS_STOCK_MASTER_SOURCE,
+            kind=EvidenceKind.SECURITY_MASTER,
+            provider="KISMASTER",
             endpoints=frozenset(),
             envelope=EnvelopeFormat.NATIVE,
             coverage=CoverageShape.KEYED,

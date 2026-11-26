@@ -78,8 +78,10 @@ EVENING_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
         "ls_investor_flow",
         "kis_investor_flow",
         "kis_industry",
+        "kis_stock_master",
     }
 )
+KIS_MASTER_COLLECT_STEPS: Final[frozenset[str]] = frozenset({"kis_stock_master"})
 KRX_COLLECT_STEPS: Final[frozenset[str]] = frozenset(
     {
         "krx_daily_market",
@@ -276,6 +278,23 @@ def _poll_krx_once(data_root: Path, session: date, decision_time: datetime) -> b
     steps = tuple(step for step in _default_collection_steps() if step[0] in KRX_COLLECT_STEPS)
     run_collection_jobs(ctx, dry_run=False, emit=lambda payload: None, steps=steps)
     return _data_session_present(Path(data_root), session)
+
+
+def _collect_kis_master(data_root: Path, *, now: datetime) -> dict[str, object]:
+    """Capture the KIS stock-master zips into Bronze; a failure is reported in the result, never raised."""
+    from src.data.pipeline_graph import _default_collection_steps, build_refresh_context, run_collection_jobs
+    from src.data.runtime import resolve_data_runtime
+
+    try:
+        ctx = build_refresh_context(resolve_data_runtime(data_root=Path(data_root)), decision_time=_aware(now))
+        steps = tuple(step for step in _default_collection_steps() if step[0] in KIS_MASTER_COLLECT_STEPS)
+        report = run_collection_jobs(ctx, dry_run=False, emit=lambda payload: None, steps=steps)
+    except Exception as exc:
+        _log_job_failure("kis_stock_master", exc)
+        return {"status": "error", "error": type(exc).__name__}
+    if not report.steps:
+        return {"status": "missing", "done": 0}
+    return {"status": report.steps[-1].status, "done": report.steps[-1].done}
 
 
 @dataclass(frozen=True, slots=True)
@@ -747,6 +766,7 @@ def _run_seal_phases(
     base_metrics: Mapping[str, object],
 ) -> SealRun:
     """Relay import, build, decide and shadow for ``today``; maps every failure to a (outcome, reason, metrics) triple."""
+    kis_master = _collect_kis_master(root, now=_aware(now()))
     mark = time.monotonic()
     relay = _import_kind_relay(root, now=_aware(now()))
     relay_s = time.monotonic() - mark
@@ -784,7 +804,7 @@ def _run_seal_phases(
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
              "phase_peak_rss_mb": dict(phase_peaks),
-             "kind_relay": relay,
+             "kind_relay": relay, "kis_master": kis_master,
              "flow_freshness": [{**asdict(item), "source_session": item.source_session.isoformat()}
                                 for item in exc.freshness]},
             None,
@@ -796,7 +816,7 @@ def _run_seal_phases(
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
              "phase_peak_rss_mb": dict(phase_peaks),
-             "kind_relay": relay},
+             "kind_relay": relay, "kis_master": kis_master},
             None,
         )
     except Exception as exc:
@@ -806,7 +826,7 @@ def _run_seal_phases(
             {"data_session": data_session.isoformat(), **dict(base_metrics),
              "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
              "phase_peak_rss_mb": dict(phase_peaks),
-             "kind_relay": relay},
+             "kind_relay": relay, "kis_master": kis_master},
             None,
         )
     return SealRun(
@@ -816,7 +836,7 @@ def _run_seal_phases(
          "peak_rss_mb": _peak_rss_mb(), "node_peak_rss_mb": _node_peak_metrics(build_report),
          "phase_peak_rss_mb": dict(phase_peaks),
          "build_s": build_s, "decide_s": decide_s, "shadow_s": shadow_s,
-         "relay_s": relay_s, "kind_relay": relay},
+         "relay_s": relay_s, "kind_relay": relay, "kis_master": kis_master},
         sealed_at,
     )
 
