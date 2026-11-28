@@ -1,10 +1,12 @@
-# Weekly dependency PRs. Security fixes arrive as soon as an advisory lands
-# (repository Dependabot security updates). Merging any PR still goes through
-# the production deploy approval.
+# Security updates only: open-pull-requests-limit 0 turns off scheduled version PRs.
+# Security fixes still arrive as soon as an advisory lands (repository Dependabot
+# security updates). Version and base-image bumps are done by hand.
+# Merging any PR still goes through the production deploy approval.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
       day: saturday
@@ -19,12 +21,12 @@ updates:
         patterns: ["*"]
   - package-ecosystem: uv
     directory: /
+    open-pull-requests-limit: 0
     schedule:
       interval: weekly
       day: saturday
       time: "11:00"
       timezone: Asia/Seoul
-    open-pull-requests-limit: 5
     # Majors (polars 2, pyarrow 26, ...) can change runtime behavior; adopt them via a reviewed spec.
     ignore:
       - dependency-name: "*"
@@ -34,6 +36,7 @@ updates:
         update-types: [minor, patch]
   - package-ecosystem: docker
     directory: /
+    open-pull-requests-limit: 0
     # Interpreter upgrades (3.11 -> 3.x) are a migration, not a routine bump.
     ignore:
       - dependency-name: "python"
